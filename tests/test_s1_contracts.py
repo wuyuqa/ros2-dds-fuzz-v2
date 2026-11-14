@@ -1,4 +1,6 @@
 import copy
+import json
+from pathlib import Path
 import unittest
 
 from r2f.modules.s1.module import S1Module
@@ -32,6 +34,26 @@ class S1Contracts(unittest.TestCase):
         late = module.targets["discovery.late_join_delivery"].to_dict()
         self.assertIn("volatile", str(late))
         self.assertNotIn("transient_local", str(late))
+
+    def test_scope_development_evidence_cannot_claim_target_maturity(self):
+        scope_path = Path(__file__).resolve().parents[1] / "config" / "s1_scope.json"
+        scope = json.loads(scope_path.read_text())
+        third = "discovery.interruption_recovery"
+        fourth = "builtin.discovery_projection_reconciliation"
+        self.assertNotIn("blocked", scope)
+        self.assertEqual(set(scope["development_status"]), {third, fourth})
+        self.assertEqual(set(scope["maturity_status"]), {third, fourth})
+        self.assertIn("development_ingest_only", scope["development_status"][third])
+        self.assertIn("without_capsule_execution", scope["development_status"][third])
+        self.assertIn("development_matrix_executed_24_rows", scope["development_status"][fourth])
+        self.assertIn("17_pass_1_unknown", scope["development_status"][fourth])
+        self.assertIn("seal_false", scope["maturity_status"][fourth])
+        self.assertTrue(all("not_mature" in status for status in scope["maturity_status"].values()))
+        self.assertEqual(scope["required_cells_per_target"], 18)
+        self.assertEqual(scope["independent_fault_controls_per_target"], 6)
+        self.assertEqual(scope["full_scope_required_cells"], 72)
+        self.assertEqual(scope["formal_acceptance"]["full_scope_required_cells"], 72)
+        self.assertTrue(scope["formal_acceptance"]["target_maturity_requires_all_required_controls_and_seal"])
 
     def test_primary_rule_checks_delivery_not_progress(self):
         result = evaluate_primary(valid_facts())

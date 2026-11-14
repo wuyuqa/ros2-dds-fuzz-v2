@@ -19,7 +19,8 @@ PROOF = {'host_net_namespace': 'net:[1]', 'host_user_namespace': 'user:[2]',
          'host_uid': 1000, 'host_cap_eff': 0}
 
 
-def frame(kind=0x15, writer='000003c2', prefix=PREFIX, sequence=1):
+def frame(kind=0x15, writer='000003c2', prefix=PREFIX, sequence=1,
+          source_port=53410, destination_port=53412):
     if kind == 0x15:
         body = b'\0\0' + struct.pack('<H', 16) + bytes(4) + bytes.fromhex(writer) + struct.pack('<iI', 0, sequence)
     else:
@@ -29,9 +30,21 @@ def frame(kind=0x15, writer='000003c2', prefix=PREFIX, sequence=1):
         elif kind == 0x06:
             body += struct.pack('<II', 0, 1)
     rtps = b'RTPS\x02\x01\x01\x10' + bytes.fromhex(prefix) + bytes([kind, 1]) + struct.pack('<H', len(body)) + body
-    udp = struct.pack('!HHHH', 53410, 53412, len(rtps) + 8, 0) + rtps
+    udp = struct.pack('!HHHH', source_port, destination_port, len(rtps) + 8, 0) + rtps
     ip = bytes.fromhex('4500') + struct.pack('!H', len(udp) + 20) + bytes(5) + b'\x11' + bytes(2) + b'\x7f\x00\x00\x01' * 2
     return bytes(12) + b'\x08\x00' + ip + udp
+
+
+def unassignable_rtps_frame(source_port=61000, destination_port=61002):
+    """Valid Ethernet/IP/UDP envelope with an RTPS payload too short for GUIDs."""
+    packet = bytearray(frame(source_port=source_port, destination_port=destination_port))
+    payload_start = 14 + 20 + 8
+    del packet[payload_start + 10:]
+    udp_length = len(packet) - (14 + 20)
+    ip_length = len(packet) - 14
+    struct.pack_into('!H', packet, 14 + 2, ip_length)
+    struct.pack_into('!H', packet, 14 + 20 + 4, udp_length)
+    return bytes(packet)
 
 
 class FakeSocket:
@@ -46,10 +59,12 @@ class FakeSocket:
 
     def recvmsg(self, *a):
         if self.frames:
-            packet, stamp = self.frames.pop(0)
+            item = self.frames.pop(0)
+            packet, stamp = item[:2]
+            flags = item[2] if len(item) > 2 else 0
             stamp = time.time_ns() if stamp is None else stamp
             ancillary = [(socket.SOL_SOCKET, 35, struct.pack('=qq', stamp // 10**9, stamp % 10**9))]
-            return packet, ancillary, 0, ('lo', 0, 4, 0, b'')
+            return packet, ancillary, flags, ('lo', 0, 4, 0, b'')
         time.sleep(.005)
         raise socket.timeout()
 
@@ -128,11 +143,120 @@ class PassiveCaptureContracts(unittest.TestCase):
                 self.assertTrue(fake.closed)
                 self.assertEqual(stopped['raw']['sha256'], hashlib.sha256((path/'normal-rtps.pcap').read_bytes()).hexdigest())
                 self.assertEqual(stopped['index']['sha256'], hashlib.sha256((path/'packet-index.jsonl').read_bytes()).hexdigest())
+                self.assertEqual(stopped['filtered_rtps_index']['records'], 0)
                 self.assertEqual(stopped['health']['status'], 'ok')
                 self.assertFalse(stopped['participant_created'])
                 self.assertFalse(stopped['packet_transmission'])
                 self.assertEqual(observer.snapshot_activity(since_ns=ready['unix_ns'], participant_prefixes=[PREFIX])['raw_prefix']['sha256'], stopped['raw']['sha256'])
             with self.assertRaises(RuntimeError): observer.start()
+
+    def test_filtered_target_rtps_is_indexed_and_makes_observation_unknown(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp)
+            packet = frame(prefix=PREFIX, source_port=61000, destination_port=61002)
+            observer = PassiveSedpObserver(self.spec(path))
+            fake = FakeSocket([(packet, None)])
+            with patch('r2f.instrumentation.sedp_capture.validate_capture_namespace', return_value={'isolated': True}), patch('r2f.instrumentation.sedp_capture.socket.socket', return_value=fake):
+                ready = observer.start()
+                end = time.monotonic() + 1
+                while observer._counters['filtered_rtps'] < 1 and time.monotonic() < end: time.sleep(.005)
+                result = observer.snapshot_activity(since_ns=ready['unix_ns'], participant_prefixes=[PREFIX])
+                self.assertEqual(result['status'], 'unknown')
+                self.assertEqual(result['observation_completeness'], 'incomplete')
+                self.assertEqual(result['health']['filtered_rtps_completeness'], 'incomplete')
+                self.assertIn('filtered_target_related_rtps', result['health']['reasons'])
+                detail = result['filtered_rtps']['target_related'][0]
+                self.assertEqual((detail['source_port'], detail['destination_port']), (61000, 61002))
+                self.assertEqual(detail['source_participant_prefix'], PREFIX)
+                self.assertEqual(detail['frame_sha256'], hashlib.sha256(packet).hexdigest())
+                self.assertEqual(detail['captured_length'], len(packet))
+                self.assertFalse(detail['truncated'])
+                self.assertEqual(detail['domain_id'], 184)
+                self.assertEqual(detail['domain_relation'], 'outside_domain_port_block')
+                self.assertIn('DATA', detail['submessage_kinds'])
+                stopped = observer.stop()
+                index_path = path/'filtered-rtps-index.jsonl'
+                self.assertEqual(stopped['filtered_rtps_index']['sha256'], hashlib.sha256(index_path.read_bytes()).hexdigest())
+                self.assertEqual(json.loads(index_path.read_text())['filter_reason'], 'rtps_ports_outside_standard_discovery_set')
+                self.assertEqual(stopped['health']['status'], 'degraded')
+
+    def test_filtered_unrelated_rtps_is_audited_without_health_downgrade(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp)
+            packet = frame(prefix=OTHER, source_port=61000, destination_port=61002)
+            observer = PassiveSedpObserver(self.spec(path))
+            fake = FakeSocket([(packet, None)])
+            with patch('r2f.instrumentation.sedp_capture.validate_capture_namespace', return_value={'isolated': True}), patch('r2f.instrumentation.sedp_capture.socket.socket', return_value=fake):
+                ready = observer.start()
+                end = time.monotonic() + 1
+                while observer._counters['filtered_rtps'] < 1 and time.monotonic() < end: time.sleep(.005)
+                result = observer.snapshot_activity(since_ns=ready['unix_ns'], participant_prefixes=[PREFIX])
+                self.assertEqual(result['status'], 'unknown')  # no positive target activity
+                self.assertEqual(result['observation_completeness'], 'complete_for_known_target_prefixes')
+                self.assertEqual(result['health']['status'], 'ok')
+                self.assertEqual(result['health']['filtered_rtps_target_related_count'], 0)
+                self.assertEqual(result['filtered_rtps']['target_related'], [])
+                stopped = observer.stop()
+                self.assertEqual(stopped['health']['status'], 'ok')
+                self.assertEqual(stopped['filtered_rtps_index']['records'], 1)
+
+    def test_unassignable_filtered_rtps_outside_domain_port_block_is_incomplete(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp)
+            packet = unassignable_rtps_frame()
+            observer = PassiveSedpObserver(self.spec(path))
+            fake = FakeSocket([(packet, None)])
+            with patch('r2f.instrumentation.sedp_capture.validate_capture_namespace', return_value={'isolated': True}), patch('r2f.instrumentation.sedp_capture.socket.socket', return_value=fake):
+                ready = observer.start()
+                end = time.monotonic() + 1
+                while observer._counters['filtered_rtps'] < 1 and time.monotonic() < end: time.sleep(.005)
+                result = observer.snapshot_activity(since_ns=ready['unix_ns'], participant_prefixes=[PREFIX])
+                self.assertEqual(result['status'], 'unknown')
+                self.assertEqual(result['observation_completeness'], 'incomplete')
+                self.assertEqual(result['health']['filtered_rtps_completeness'], 'incomplete')
+                detail = result['filtered_rtps']['target_related'][0]
+                self.assertIsNone(detail['source_participant_prefix'])
+                self.assertTrue(detail['parse_diagnostics'])
+                self.assertEqual(detail['domain_relation'], 'outside_domain_port_block')
+                stopped = observer.stop()
+                self.assertEqual(stopped['health']['status'], 'degraded')
+
+    def test_filtered_frame_records_digest_length_and_truncation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp)
+            packet = frame(prefix=OTHER, source_port=61000, destination_port=61002)
+            observer = PassiveSedpObserver(self.spec(path))
+            fake = FakeSocket([(packet, None, socket.MSG_TRUNC)])
+            with patch('r2f.instrumentation.sedp_capture.validate_capture_namespace', return_value={'isolated': True}), patch('r2f.instrumentation.sedp_capture.socket.socket', return_value=fake):
+                ready = observer.start()
+                end = time.monotonic() + 1
+                while observer._counters['filtered_rtps'] < 1 and time.monotonic() < end: time.sleep(.005)
+                result = observer.snapshot_activity(since_ns=ready['unix_ns'], participant_prefixes=[PREFIX])
+                self.assertEqual(result['health']['filtered_rtps_target_related_count'], 0)
+                record = json.loads((path/'filtered-rtps-index.jsonl').read_text())
+                self.assertEqual(record['frame_sha256'], hashlib.sha256(packet).hexdigest())
+                self.assertEqual(record['captured_length'], len(packet))
+                self.assertTrue(record['truncated'])
+                stopped = observer.stop()
+                self.assertEqual(stopped['filtered_rtps_index']['sha256'], hashlib.sha256((path/'filtered-rtps-index.jsonl').read_bytes()).hexdigest())
+
+    def test_filtered_metadata_overflow_is_explicitly_incomplete(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp)
+            packets = [frame(prefix=OTHER, source_port=61000, destination_port=61002) for _ in range(2)]
+            observer = PassiveSedpObserver(self.spec(path, limits={'max_packets': 1}))
+            fake = FakeSocket([(packets[0], None), (packets[1], None)])
+            with patch('r2f.instrumentation.sedp_capture.validate_capture_namespace', return_value={'isolated': True}), patch('r2f.instrumentation.sedp_capture.socket.socket', return_value=fake):
+                ready = observer.start()
+                end = time.monotonic() + 1
+                while observer._counters['filtered_rtps'] < 2 and time.monotonic() < end: time.sleep(.005)
+                result = observer.snapshot_activity(since_ns=ready['unix_ns'], participant_prefixes=[PREFIX])
+                self.assertEqual(result['status'], 'unknown')
+                self.assertEqual(result['health']['filtered_rtps_completeness'], 'incomplete')
+                self.assertIn('filtered_rtps_metadata_overflow', result['health']['reasons'])
+                stopped = observer.stop()
+                self.assertEqual(stopped['filtered_rtps_index']['records'], 1)
+                self.assertEqual(stopped['filtered_rtps_index']['overflow'], 1)
 
     def test_kernel_statistics_failure_is_not_healthy(self):
         with tempfile.TemporaryDirectory() as tmp:

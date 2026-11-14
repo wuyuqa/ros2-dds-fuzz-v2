@@ -47,36 +47,111 @@ def candidate_ledger(rows, instrumentation_summary=None):
     # Internal observations enrich the same canonical row, then enter the same
     # lifecycle. Unknown sidecars retain their intake count and never prove zero.
     observations=[]
+    instrumentation_admission_failures=[]
+    instrumentation_admitted_count=0
     from r2f.campaign.observations import instrumentation_evidence, observation_links
     for row in rows:
         qualification=row.get("instrumentation_observation")
         if qualification is None:continue
-        observations.append({"cell_id":row["cell_id"], "run_id":row["run_id"], **qualification})
-        for index,item in enumerate(qualification.get("qualified_intake",[])):
-            evidence=instrumentation_evidence(row,item)
+        observation_record={"cell_id":row["cell_id"], "run_id":row["run_id"], **qualification}
+        observations.append(observation_record)
+        if qualification.get("qualification") != "qualified":
+            observation_record["lifecycle_accounting"]={
+                "qualified_intake_count":None,"admitted_count":0,"status":"not_evaluated","admission_failures":[]}
+            continue
+        intake=qualification.get("qualified_intake")
+        count=qualification.get("admissible_count")
+        if not isinstance(intake,list) or type(count) is not int or count<0 or count!=len(intake):
+            detail="qualified intake count does not match qualified intake records"
+            if isinstance(intake,list) and intake:
+                # The batch count is inconsistent, so reject every actual intake
+                # independently; none may proceed to lifecycle admission.
+                row_failures=[{"cell_id":row["cell_id"],"run_id":row["run_id"],
+                               "candidate_source":"instrumentation","intake_index":index,
+                               "reason_code":"instrumentation_qualified_intake_count_mismatch",
+                               "detail":detail,"evidence":{"intake":item,"admissible_count":count}}
+                              for index,item in enumerate(intake)]
+            else:
+                # No concrete intake exists to index (for example, a claimed
+                # positive count with an empty intake); preserve the row-level
+                # mismatch without inventing a candidate intake.
+                row_failures=[{"cell_id":row["cell_id"],"run_id":row["run_id"],
+                               "candidate_source":"instrumentation","intake_index":None,
+                               "reason_code":"instrumentation_qualified_intake_count_mismatch",
+                               "detail":detail,"evidence":{"intake_count":len(intake) if isinstance(intake,list) else None,
+                                                               "admissible_count":count}}]
+            failures.extend(row_failures)
+            instrumentation_admission_failures.extend(row_failures)
+            observation_record["lifecycle_accounting"]={
+                "qualified_intake_count":None,"admitted_count":0,"status":"incomplete",
+                "admission_failures":row_failures}
+            continue
+        admitted_before=instrumentation_admitted_count
+        row_failures=[]
+        for index,item in enumerate(intake):
+            try:
+                evidence=instrumentation_evidence(row,item)
+            except (ValueError,KeyError,TypeError) as exc:
+                failure={"cell_id":row["cell_id"],"run_id":row["run_id"],"candidate_source":"instrumentation",
+                         "intake_index":index,"reason_code":"instrumentation_intake_identity_mismatch","detail":str(exc),
+                         "evidence":{"intake":item,"canonical_identity":{k:row.get(k) for k in
+                                    ("run_id","target_id","target_revision","rmw","arm","repeat","effective_input_sha256","raw_path","raw_sha256")}}}
+                failures.append(failure)
+                instrumentation_admission_failures.append(failure)
+                row_failures.append(failure)
+                continue
             admission_error=None
             try:
                 lifecycle=CandidateLifecycle(f"{row['run_id']}:{row['cell_id']}:instrumentation:{index}",evidence)
             except ValueError as exc:
-                failures.append({"cell_id":row["cell_id"],"candidate_source":"instrumentation",
-                                 "reason_code":"instrumentation_observation_identity_invalid","detail":str(exc),"evidence":evidence})
+                failure={"cell_id":row["cell_id"],"candidate_source":"instrumentation",
+                         "reason_code":"instrumentation_lifecycle_observation_failed","detail":str(exc),
+                         "lifecycle_status":"observed_rejected","evidence":evidence}
+                failures.append(failure)
+                admission_failure={"cell_id":row["cell_id"],"run_id":row["run_id"],"intake_index":index,
+                                   "reason_code":failure["reason_code"],"detail":str(exc),"evidence":evidence}
+                instrumentation_admission_failures.append(admission_failure)
+                row_failures.append(admission_failure)
                 continue
             try:
                 lifecycle.admit()
+                instrumentation_admitted_count += 1
                 from r2f.campaign.triage import attribute
                 diagnostic={"verdict":"fail","forbidden_residuals":[]}
                 triage=attribute(evidence,evidence["typed_facts"],diagnostic)
                 lifecycle.triage(TriageResult(*(triage[key] for key in ("triage_disposition","responsibility_layer","reason_code"))))
             except ValueError as exc:
                 admission_error=str(exc)
+                if lifecycle.candidate_status == "observed":
+                    failure={"cell_id":row["cell_id"],"run_id":row["run_id"],"candidate_source":"instrumentation",
+                             "intake_index":index,"reason_code":"instrumentation_lifecycle_admission_failed","detail":admission_error,
+                             "lifecycle":lifecycle.to_dict(),"evidence":evidence}
+                    failures.append(failure)
+                    instrumentation_admission_failures.append(failure)
+                    row_failures.append(failure)
+                    continue
             candidates.append(dict(lifecycle.to_dict(),cell_id=row["cell_id"],observation_kind="internal_contract",admission_error=admission_error))
+        observation_record["lifecycle_accounting"]={
+            "qualified_intake_count":len(intake),
+            "admitted_count":instrumentation_admitted_count-admitted_before,
+            "status":"admission_failed" if row_failures else "completed",
+            "admission_failures":row_failures}
     natural = [c for c in candidates if c.get("responsibility_layer") == "sut" and c.get("triage_disposition") == "candidate"]
-    instrumentation_status, instrumentation_count = "not_run", None
+    instrumentation_status = "not_run"
     instrumented=[o for o in observations if o.get("observation_mode")=="instrumentation"]
     if instrumented:
-        complete=all(o.get("qualification")=="qualified" for o in instrumented)
+        counts=[]
+        complete=True
+        for observation in instrumented:
+            intake=observation.get("qualified_intake")
+            count=observation.get("admissible_count")
+            if (observation.get("qualification")!="qualified" or not isinstance(intake,list)
+                    or type(count) is not int or count<0 or count!=len(intake)):
+                complete=False
+            else:
+                counts.append(len(intake))
         instrumentation_status="completed" if complete else "incomplete"
-        instrumentation_count=sum(o["admissible_count"] for o in instrumented) if complete else None
+        instrumentation_qualified_count=sum(counts) if complete else None
     if instrumentation_summary is not None:
         expected_runs = {r["run_id"] for r in rows}
         expected_sources = [r.get("source_manifest") for r in rows if r.get("source_manifest")]
@@ -89,10 +164,17 @@ def candidate_ledger(rows, instrumentation_summary=None):
             raise ValueError("instrumentation summary must reference actual same-run/source evidence")
         from r2f.core.evidence import verify_raw
         verify_raw(instrumentation_summary["raw_path"], instrumentation_summary["raw_sha256"])
-        if not instrumented or instrumentation_status != "completed" or instrumentation_summary["candidate_count"] != instrumentation_count:
+        if not instrumented or instrumentation_status != "completed" or instrumentation_summary["candidate_count"] != instrumentation_qualified_count:
             raise ValueError("instrumentation summary needs independently qualified per-execution observations")
     return {"schema_version": 1, "candidates": candidates, "failures": failures, "controls": controls,
-            "instrumentation_status": instrumentation_status, "instrumentation_candidates": instrumentation_count,
+            "instrumentation_status": instrumentation_status,
+            "instrumentation_candidates": instrumentation_admitted_count if instrumented else None,
+            "instrumentation_admitted_count": instrumentation_admitted_count if instrumented else None,
+            "instrumentation_qualified_intake_count": instrumentation_qualified_count if instrumented else None,
+            "instrumentation_lifecycle_status": (
+                "not_run" if not instrumented else "incomplete" if instrumentation_status != "completed" else
+                "admission_failed" if instrumentation_admission_failures else "completed"),
+            "instrumentation_admission_failures": instrumentation_admission_failures,
             "instrumentation_linkage": observation_links(rows) if observations else "not_linked_to_this_blackbox_run",
             "instrumentation_observations":observations,
             "instrumentation_intake_count":sum(o["intake_count"] for o in instrumented) if instrumented and all(o.get("intake_count") is not None for o in instrumented) else None,

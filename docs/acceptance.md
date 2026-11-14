@@ -6,7 +6,7 @@
 
 原规格 §2 的旧 HEAD `e18e93b1`、Batch-02 计数和 confirmed candidate=0 均是交接历史，不是本仓库实测；本轮不复用旧未提交代码、旧 raw 作为新运行，或旧 seal。§3 的目录树是建议布局，验收以统一接口和真实证据为准，不以空文件数量代替能力。
 
-最新证据账（2026-11-15T00:32:53+08:00，Asia/Shanghai）：[完整S1逐项验收账](s1-acceptance-ledger.md)与[正式证据快照](formal-target-snapshots-2026-11-15.md)记录first/second各18+6及四control在11ec76c source上通过独立seal；first失败与second domain181阻断历史保留。主agent已解冻third开发，后续source改变需最终source冻结后rerun，不能沿用当前成熟声明；Phase2/4/F07/第三第四target缺口未因两个seal而消失。
+最新证据账更新（2026-11-15）：[完整S1逐项验收账](s1-acceptance-ledger.md)与[正式证据快照](formal-target-snapshots-2026-11-15.md)记录first/second各18+6及四control仅在11ec76c source上通过独立seal；first失败与second domain181阻断历史保留。当前third v4有两RMW development runtime+ingest（drop计数614/162，restore后seq 2–7送达），但输入为`reconstructed_input`且`capsule_execution=null`；D015正式18+6/control/seal未验收。Fourth run有24行：17 required pass、1 unknown、6 fault fail，transparency 5/6、seal=false；unknown/失败保留，D014正式18+6/control/seal未验收。第三/第四均为not mature，72格分母不变；first/second旧seal不适用于后续source。
 
 目标口径更新（2026-11-15T00:45:07+08:00，Asia/Shanghai；来源：本轮用户明确指令）：当前用户目标为“S1模块完全成熟且有2–3个真实SUT候选”。已记录的真实自然候选为0，因此候选数量目标尚未达成。自然数量无法预先保证，只能由真实运行产生；负控、工具错误和合成案例不得凑数。原taskbook允许zero-candidate推进Phase，不代表用户完整目标完成；可以交中间报告，但不能据此将整个goal标记complete。
 
@@ -78,10 +78,10 @@ primary rule 唯一固定为 `discovery.late_endpoint.match_and_receive_after_jo
 | ---: | --- | --- | --- |
 | 1 | `discovery.late_endpoint` | `late_joiner` | §9 第一 slice 的完整 18-cell 和四类 control |
 | 2 | `discovery.late_join_delivery` | `late_joiner` | Phase 5A 同样 18-cell；独立 primary rule 与 expected effect，不把第一 target 改名复用 |
-| 3 | `discovery.interruption_recovery` | `discovery_drop` + `restore_after_discovery_interruption` | Phase 5B 同样 18-cell 和独立 fault；真实 endpoint-attached 发现中断、恢复及逐层 receipt；停发用户数据不算 discovery_drop |
-| 4 | `builtin.discovery_projection_reconciliation` | `endpoint_qos_variation` | 独立 builtin + graph 对账；graph 自比较不合格；旧 Fast/Cyclone 表达面须真实检查 |
+| 3 | `discovery.interruption_recovery` | `discovery_drop` + `restore_after_discovery_interruption` | Phase 5B 同样 18-cell 和独立 fault；已有third v4两RMW development runtime/restore证据，但非capsule-driven正式验收；仍需D015、18+6/control/seal；停发用户数据不算discovery_drop |
+| 4 | `builtin.discovery_projection_reconciliation` | `endpoint_qos_variation` | 独立wire/builtin + graph对账，禁止graph自比较；已有24行run，17 required pass、1 unknown、6 fault fail、seal=false；保留unknown/失败，D014正式验收未完成 |
 
-第四target字段合同（D014，主agent工程裁定）：GUID/role/topic/type/reliability/durability/deadline/liveliness及lease必需；history/depth只作supporting diagnostic，缺失明确为`not_applicable_by_endpoint_schema`，禁止配置补值。generation由独立capture和进程生命周期关联，不是虚构wire字段。原taskbook未枚举depth，旧catalog不能强行将超标准字段继承为全部RMW必需。此为revision0首次模型定义，尚未正式执行/封存，不删已失败rule、不改18/72分母。规范缺省推导、capture完整性、raw/provenance及两源独立性仍须逐项验证。
+第四target字段合同（D014，主agent工程裁定）：GUID/role/topic/type/reliability/durability/deadline/liveliness及lease必需；history/depth只作supporting diagnostic，缺失明确为`not_applicable_by_endpoint_schema`，禁止配置补值。generation由独立capture和进程生命周期关联，不是虚构wire字段。原taskbook未枚举depth，旧catalog不能强行将超标准字段继承为全部RMW必需。revision0已有24行实际run：17 required pass、FastDDS `transparent.0` 1 unknown、6 fault fail，transparency 5/6、seal=false；unknown与失败保留。D014正式验收及18+6/control/seal仍未完成，不删已失败rule、不改18/72分母；任何配置值不得补wire字段。
 
 每个 target 都要登记四类 control 和 per-target disposition/seal。若四个 target 全部按两个 RMW 的 18-cell 执行，计划为 72 条 required 和 24 条独立 fault，共至少 96 条唯一执行行；这是全 scope 计划计数，不是已运行数量，也不是无条件完成承诺。
 
@@ -221,9 +221,9 @@ reason code 至少覆盖：`environment_or_process`、`reach_or_planning`、`mut
 
 第二次冻结前更新（2026-11-15T00:14:58+08:00，Asia/Shanghai）：主agent独立全仓144 tests / 37.032s / OK、diff --check及ACK逻辑审查通过，并给本次第二commit最终GO。此为工具时序修复的合同验证，不更改首次formal失败记录；第二次提交后的真实矩阵尚未由本记录证明。D014保持待实施。
 
-## D015第三target附加验收条件（尚未实现/验证）
+## D015第三target附加验收条件（development evidence exists；正式验收未完成）
 
-2026-11-15T00:26:18+08:00（Asia/Shanghai），主agent工程裁定：wire_proxy标识保留、implementation=isolated_netns_nft_discovery_udp_drop；仅mutated真装drop，其他arm审计neutral，negative独立omit中间postrestore seq。要求matched前置、真实本pair discovery counter>0（合成UDP不计）、规则删除与恢复观察分开；允许match continuity retained，但必须restore后身份关联discovery＋fresh双向count/graph＋postrestore delivery。父进程锁持有到整个netns子树清理。此项保持scope/72分母，不能以计划或non-DDS控制替代真实矩阵。
+2026-11-15T00:26:18+08:00（Asia/Shanghai），主agent工程裁定：wire_proxy标识保留、implementation=isolated_netns_nft_discovery_udp_drop；仅mutated真装drop，其他arm审计neutral，negative独立omit中间postrestore seq。要求matched前置、真实本pair discovery counter>0（合成UDP不计）、规则删除与恢复观察分开；允许match continuity retained，但必须restore后身份关联discovery＋fresh双向count/graph＋postrestore delivery。父进程锁持有到整个netns子树清理。third v4已有两RMW开发runtime/ingest，drop计数614/162且restore后seq 2–7送达；其`reconstructed_input`与`capsule_execution=null`限制意味着正式D015及18+6/control/seal仍未验收。此项保持scope/72分母。
 
 ## 已seal模型与新target合同兼容
 

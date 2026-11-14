@@ -24,15 +24,15 @@
 
 F06按主agent裁定，真实zero-ledger/control排除/原始失败保留证明零候选路径执行；自然admission/triage未获真实异常证据。F07两次第一target共48份capsule的replay_attempts/execution_history/non_replayable均0；下一phase需真实健康及受控工具失败重放，原run独立保留。Phase4仍缺明确instrumentation linkage及bounded blackbox处置；当前ledger的instrumentation_candidates=null不能写成0。
 
-D014第四target字段定义和D015第三targetdrop/restore合同均待实施/验证；当前工程未知不等于先验不可解，18/72分母不变。没有新增需要用户确认事项。下方历史待GO/待冻结等记录保留当时语境，以本节和证据账为准。
+D015第三target已有两RMW真实development runtime+ingest，D014第四target已有24行run；当前状态是development evidence / not mature，不再沿用旧`blocked:*`能力结论。third输入为`reconstructed_input`且`capsule_execution=null`，正式18+6/control/seal未验收；fourth为17 required pass+1 unknown、6 fault fail、seal=false，D014及正式18+6/control/seal未验收。失败与unknown保留，完整72 required分母不变。没有新增需要用户确认事项。下方历史待GO/待冻结等记录保留当时语境，以本节和证据账为准。
 
 ## 1. 工程未知
 
 | ID | 事项、来源与现有证据边界 | 下一项可验证动作 / 所需证据 | 协调人 / 状态 |
 | --- | --- | --- | --- |
-| O001 | builtin target 原合同需独立 builtin + graph 对账；主agent核对发现旧 Fast DDS 公共 API 面 blocked。文档子agent未对新实现/本机复验，不直接继承旧 blocked 结论 | 定位旧 catalog/rule 的独立性、字段和身份合同；检查当前 Fast DDS 公共入口能否产生独立 builtin receipt，对应 graph snapshot/raw/hash；若只有 graph，明确缺少第二来源 | 主agent协调 vendor内部观察/runtime；待真实双源合同核查 |
+| O001 | 第四target已有24行实际run；17 required pass、FastDDS `transparent.0` 1 unknown、6 fault fail，seal=false。unknown原始raw/hash保留；main重算指出graph快照时没有对应writer GUID（wire parse仅见reader SEDP），不据此判pass | 保留unknown及raw/pcap，修复或定位该writer SEDP缺失/解析覆盖问题；继续完成D014正式18+6/control/seal，不补配置字段，不减分母 | development/run evidence exists；not mature；主agent协调 |
 | O002 | 主agent核对发现 Cyclone 旧 native probe 与本任务 no-native participant 约束冲突 | 核查旧 probe 是否创建 native participant、当前 ROS2 公共/endpoint-attached 只观察路径能否提供合同事实；保留 source identity、participant/endpoint provenance；不得把两个 graph 调用作为两个独立来源 | 主agent协调 runtime；待真实检查，不先验判定不可解 |
-| O003 | 第三 target 的 discovery_drop 必须有真实 endpoint-attached carrier；主agent明确不能停发数据伪装发现中断 | 核查实际 discovery/metatraffic 的附着、命中、限定范围、restore 释放及恢复窗口；两 RMW 分别有 carrier admission/逐层 receipt/raw。当前执行边界是否容纳所需 carrier 由主agent明确 | 主agent协调网络隔离载体/runtime/campaign；D008及真实non-DDS控制已证明环境/载体可行，真实DDS发现附着与恢复待核查 |
+| O003 | third v4已有两RMW真实development运行：FastDDS drop 614包、Cyclone drop 162包，restore后seq 2–7均发收；但ingest为`reconstructed_input`、`capsule_execution=null`，仅开发证据 | 保留本次raw/hash；仍需capsule-driven neutral/fault、真实D015和完整18+6/control/seal证据。non-DDS控制及该开发run均不能替代正式验收 | development evidence exists；not mature；正式D015验收待主agent安排 |
 | O004 | 原 Phase 2 要内部事件/源码插装，Phase 4 要有界发现性验证；主agent当前执行声明限正常公共 API 验证和证据工具 | 主agent逐项声明当前实现内容与原要求的差距；核查能否在当前边界内达到必要观察；不能用 graph 观察冒充内部插装或自动把 bounded 正常验证称为原 fuzz maturity | 主agent；待工程裁定和证据 |
 | O005 | 第一target独立六条negative已真实完成并按预期primary fail；其余target的fault contract仍须分别审查 | 保留D009闭合证据、D012 raw-backed fault receipt和harness归因；后续target明确施加层与独立primary oracle，不能冒充SUT故障 | 第一份正式报告fault6/6；不等于整体seal通过 |
 | O006 | first/second在11ec76c上独立per-target seal通过；third开发已由主agent解冻 | 不改已seal revision0 target manifest；core精确legacy兼容，新target声明receipt_kind/window/projection schema；后续source变化须最终source rerun | 四方独立写集开发；文档不commit，旧seal只支持旧source |
@@ -45,10 +45,10 @@ D014第四target字段定义和D015第三targetdrop/restore合同均待实施/�
 | O012 | 原规格没有正式定义候选去重键、状态更新审计格式和证据保留策略 | 固定 stable identity、更新历史、重复 raw 的归并规则；保留 rejected/deferred/replay failure，不能靠去重或裁剪抹掉责任证据 | 主agent协调 core/campaign；待接口审查 |
 | O013 | first与second r2/domain80正式report/独立verify均rc0；旧first及second domain181 rc1保留 | 验收账逐项保留Phase2/4/F07缺口；两个target通过不等于完整S1或最终新source通过 | 11ec76c版本两target已封存，后续source rerun仍必要 |
 | O015 | D013 ACK补丁已提交，当前第一target rerun18 pass+6预期fail、四control6/6、unknown0、独立seal=true | 首次FastDDS transparent.1工具unknown/raw保持immutable；后续代码变化须按新source身份重跑 | 本次竞态纠错已有当前正式证据，旧失败不删除 |
-| O016 | D014已固定第四target标准必需字段与history/depth N/A；16个本地source hash匹配，第四target未正式执行 | 实现独立capture+graph及GUID/生命周期关联；缺deadline/liveliness/lease仍unknown；协议默认省略派生和fault施加层分别明确，不能配置填值 | 主agent已裁定，无需用户确认；工程实施稍后 |
+| O016 | D014字段合同已固定，且第四target已有24行run：17 required pass、1 unknown、6 fault fail；seal=false。FastDDS `transparent.0` unknown及原始证据保留，history/depth仍为`not_applicable_by_endpoint_schema` | 针对缺失writer GUID/unknown继续核查独立wire与graph证据；协议默认值必须保留精确来源，不能配置补值；完成正式18+6/control/seal | 已有run evidence；not mature；D014正式验收未完成 |
 | O017 | F07两次第一target48份capsule的replay_attempts/execution_history/non_replayable均0；首跑失败不是replay failure | 下一phase真实健康重放＋可控工具失败真实重放，独立产物、attempt/failure与原输入关联，不改原run | 主agent已裁定后续验收要求；尚缺真实replay证据 |
 | O018 | Phase2内部事件开发证据存在，但当前ledger instrumentation_candidates=null/status=not_run/linkage=not_linked；Phase4未闭环 | 无候选时明确Phase2结论、执行具名bounded blackbox并记录instrumentation_candidates=0及完整disposition；不能拿required矩阵自动替代 | 主agent工程协调，无需用户确认 |
-| O019 | D015第三target新工程裁定尚未实现/验证；non-DDS probe不能证明真实drop hit | 本pair discovery counter、restore后真实discovery/fresh双向count+graph/delivery及netns子树清理前持续持锁；neutral/fault不得伪drop | 网络/runtime/campaign后续实现；scope/72分母不变 |
+| O019 | third v4已观察到真实pair drop计数（FastDDS 614、Cyclone 162）及restore后seq 2–7交付；这是development run，输入重建且capsule execution为空 | 完整验证D015 capsule-driven neutral/fault、drop前置/恢复活动和fresh双向快照、锁至netns子树清理，并完成18+6/control/seal；失败证据保留 | development evidence exists；not mature；scope/72分母不变 |
 | O020 | second r1/domain181 runtime port preflight阻断，adapter另有step-count错误；r2/domain80已18+6和四control通过 | domain181历史及raw保持，不推断该域已无冲突；不把工具ingestion错误当已真实执行后的语义不兼容 | 采用新域的正式尝试通过；阻断历史不删，最终source仍须rerun |
 | O021 | main发现domains.scan_processes用旧repo substring误判新v2绝对脚本路径共享前缀；runtime正修真实路径边界 | 覆盖旧repo本身/真实子路径、v2相邻前缀、argv与cwd边界及保守owner检查；不放宽旧repo只读/锁保护，不将此误判直接归为domain181端口冲突根因 | runtime负责修复/回归；文档只读见边界判断代码，未验证完成 |
 

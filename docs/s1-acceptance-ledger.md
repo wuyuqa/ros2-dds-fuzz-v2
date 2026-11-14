@@ -8,7 +8,8 @@
 
 记录时间：2026-11-15T01:09:04+08:00（Asia/Shanghai）。来源：main最新工程进展及独立测试报告，由本轮消息提供；文档子agent未复跑测试或运行ROS，未取得本条消息对应的新增产物路径，不补造路径/hash。
 
-- third v4 两RMW runtime+ingest 已报告 judged/pass，但 `capsule_execution=null`，输入为 `reconstructed_input`；仅为development证据，不能写成真实capsule驱动或capsule执行链已贯通，更不能替代正式18+6/control/seal。下一步仍需真实capsule-driven neutral/fault执行及其独立raw、输入/执行身份、receipt和归因证据。
+- third v4 两RMW真实development runtime+ingest均为 `judged/pass`：domain173的FastDDS/Cyclone分别观察到614/162个drop packet，restore后seq 2–7均发送并接收；但输入是 `reconstructed_input`、`capsule_execution=null`，因此只记开发证据。正式D015与18+6/control/seal仍未验收；后续仍需capsule-driven neutral/fault及完整正式矩阵。
+- fourth已实际产生24行run：17 required pass、FastDDS `transparent.0` 1 unknown、6 fault行fail，transparency control 5/6，seal=false。该unknown及失败保持原样，不升级为成熟证据；D014和正式18+6/control/seal仍未验收。
 - main独立新增20项replay测试、31项third runtime/campaign测试通过；这些是离线测试结果，尚未取得真实replay证据。F07真实健康重放与可控工具失败重放仍待验收，原始run保持不变。
 - Phase2 bridge正在新增；接口或合同实现不能替代真实trace、lifecycle及blackbox对照，Phase2→Phase4闭环仍有缺口。
 - 当前用户2–3个真实SUT候选目标仍未达成：实测自然候选0，不以control、工具错误或开发pass充数；72格成熟分母不变，旧source seal仍只支持旧source。
@@ -39,6 +40,9 @@
 | E07 离线合同与实现 | [core测试](../tests/test_core_contracts.py)、[audit测试](../tests/test_contract_audit.py)、[campaign合同](../tests/test_campaign_contracts.py)、[evidence测试](../tests/test_campaign_evidence.py)、[snapshot回归](../tests/test_runtime_match_snapshot.py)、[S1合同](../tests/test_s1_contracts.py)、[instrumentation合同](../tests/test_instrumentation.py)、[验证快照](verification-snapshot-2026-11-14.md) | 主agent独立144 tests/37.032s/OK；历史131/112分别保留。文档子agent未复跑，未获该次单独日志/source digest，不编造。测试文件存在及总数通过不替代逐项真实证据 |
 | E08 second已冻结版本通过 | [report](../results/s1/late-join-delivery-r2-20261114T162346Z-2642f6ef/report.json)、[manifest](../results/s1/late-join-delivery-r2-20261114T162346Z-2642f6ef/manifest.json)、[ledger](../results/s1/late-join-delivery-r2-20261114T162346Z-2642f6ef/candidate_ledger.json)、[独立verify记录](../results/s1/late-join-delivery-r2-20261114T162346Z-2642f6ef.verify.execution.json) | domain80、revision0、source11ec76c；18 judged pass+6 negative judged fail，四control6/6、unknown0、seal=true/verify rc0；24份raw hash核对一致。原domain181阻断不覆盖 |
 | E09 被动SEDP attempt2开发成功 | [总report](../results/instrumentation-feasibility/sedp-probe-20261115/attempt2/probe-report.json)、[Cyclone netns](../results/instrumentation-feasibility/sedp-probe-20261115/attempt2/184-rmw_cyclonedds_cpp/netns-report.json)/[wire](../results/instrumentation-feasibility/sedp-probe-20261115/attempt2/184-rmw_cyclonedds_cpp/wire-observation.json)、[FastDDS netns](../results/instrumentation-feasibility/sedp-probe-20261115/attempt2/185-rmw_fastrtps_cpp/netns-report.json)/[wire](../results/instrumentation-feasibility/sedp-probe-20261115/attempt2/185-rmw_fastrtps_cpp/wire-observation.json) | netns status=ok；parsed events56/48、errors=[]；pcap hash已核对。development_only、default policy pending、sealed=false/candidate_admission=not_performed；不计四target成熟或候选，E06前次失败不覆盖 |
+| E10 third/fourth当前run证据 | [third v4 summary](../results/runtime-smoke/third-development-v4/summary.json)、[FastDDS ingest](../results/runtime-smoke/third-development-v4/fastdds-ingest-development.json)、[Cyclone ingest](../results/runtime-smoke/third-development-v4/cyclone-ingest-development.json)；[fourth report](../results/s1/builtin-projection-r0-20261115T050653+0800/report.json)、[manifest](../results/s1/builtin-projection-r0-20261115T050653+0800/manifest.json) | third两RMW真实development运行及restore交付观察存在，但ingest为`reconstructed_input`且`capsule_execution=null`，不能证明正式D015验收。fourth 24行中17 required pass、1 unknown（FastDDS `transparent.0`，原始记录保留；main重算为缺少graph快照对应writer GUID）、6 fault fail；transparency 5/6、seal=false。两者均是not mature状态，不改变72 required分母或first/second旧source边界 |
+
+本次状态同步（2026-11-15，来源：用户最新指令及本地只读文件核对）：third summary字节SHA-256=`52d7ab0a8c87ae279c2c26d533a9d7a7df6c2b815d3d04651b3f7ba793800f77`；fourth report字节SHA-256=`73487d00d4ca9393712089544cc197443e41a21d5c0ede4e3628a77f26fe86b2`。main重算unknown为`no_live_wire_endpoint_at_graph_snapshot:010f7f01b56a3f980000000000000603`；不覆盖原report/raw/pcap，不把观察缺口作为自然candidate。
 
 E01文件字节SHA-256：report=`3d1556ff3a78285b54b3c88cb185a5c3c7fba36f1d786fb15b180d0da5deaf4c`；manifest=`b55e127f9aba78d1974df4ec418a076c4fcea4bac33314b2ff30a56548481f2b`；ledger=`c712dec3857183a6d04fc39f3f1ca9a72439c01341a04c3dc6e7f1e15e094322`。E03 report字节hash为`844d064b88b826022d0c5982fea80aefa59910848c0027cc5be4e6653110c272`。E04 report字节hash为`dcffe78ebf7074a531682b7b0cef397123e1468609b83c08d3ae8bb9cf704200`。文件字节hash与report内部规范化摘要分开。
 
@@ -51,7 +55,7 @@ E01文件字节SHA-256：report=`3d1556ff3a78285b54b3c88cb185a5c3c7fba36f1d786fb
 | F01 module/target注册 | E01 manifest.catalog/target；[runner](../src/r2f/campaign/runner.py)与[registry](../src/r2f/core/registry.py)；E07 test_registry_is_generic_and_rejects_duplicate | E01/E08在11ec76c上证明first/second统一注册路径贯通 | 四target注册不代表第三/第四target真实carrier可执行；后续各自run不能绕开registry |
 | F02 SemanticTarget→scenario | E01 manifest.target/rule；E02 capsule.input、report中state_steps；[scenario](../src/r2f/core/scenario.py)；E07 target/scenario与参数拒绝合同 | E01/E08已证明first/second编译结果在11ec76c上真实使用 | 第三/第四target仍须各自状态/slot/expected effect/receipt映射；E04不用于判定模型不兼容，第二target已由E08补充真实证据；最终source须重跑 |
 | F03 requires/state receipts | E02 precondition_receipts和observation_receipts/raw；E01逐行stage_history；E07 steps/forged_reach/ACK回归 | E01/E08 first/second真实writer前置及后置观察已执行于11ec76c | 其他target各自时序仍待验证；第三targetmatched-before-drop不可套用late_joiner writer-only前置 |
-| F04 carrier/mutation/effect | E01六mutated行及各raw；E02七项嵌套mutation receipt全true；E07 receipt/hash/neutral合同；[S1模块](../src/r2f/modules/s1/module.py) | late_joiner实际提交/命中/effect及neutral不伪hit已由当前正式run覆盖 | D015 third v4两RMW runtime+ingest已报告judged/pass，但capsule_execution=null/reconstructed_input，仅development；真实capsule-driven neutral/fault与正式hit/restore验收证据仍缺；D014 endpoint_qos_variation真实两源字段变化未证明；不能用non-DDS探针替代 |
+| F04 carrier/mutation/effect | E01六mutated行及各raw；E02七项嵌套mutation receipt全true；E07 receipt/hash/neutral合同；[S1模块](../src/r2f/modules/s1/module.py) | late_joiner实际提交/命中/effect及neutral不伪hit已由当前正式run覆盖 | third v4两RMW development runtime/ingest观察到drop及restore后delivery，但输入重建且capsule execution为空，正式D015仍待验收；fourth endpoint_qos_variation已有24行、17 pass+1 unknown、6 fault fail且seal=false；两者均不替代正式target验收 |
 | F05 raw→typed facts→primary oracle | E01 rows.typed_facts/oracle及24份raw/hash；[facts](../src/r2f/modules/s1/facts.py)、[oracles](../src/r2f/modules/s1/oracles.py)；E07 residual/unknown/闭合合同 | E01/E08各18 pass及6已知harness fail检出；原tool unknown保留E03 | 第三/四target独立primary/闭合/适用性仍待；first/second不得用旧source结果支持最终新source。control fail不证明自然SUT缺陷 |
 | F06 candidate lifecycle与审计 | E01/E08真实zero-ledger、各六control candidate_eligible=false；E03原始失败保留；[lifecycle](../src/r2f/core/candidate.py)、[ledger](../src/r2f/reports/candidate_report.py)；E07 admission/triage/排除合同 | 按主agent工程裁定，零自然候选分支的真实审计路径已执行；不凑候选 | 自然candidate admission/triage仍未获真实异常证据；若未来出现须完整记录转换、raw/provenance、责任与处置，不能拿合成测试或control充数 |
 | F07 capsule与真实replay | E01/E03共48份正式capsule；当前run24份input/execution齐备；[replay](../src/r2f/core/replay.py)；E07 fail保留、异常签名比较、fresh domain合同 | input/execution持久化已证明；真实replay验收未完成 | 48份capsule合计replay_attempts=0、execution_history=0、non_replayable=0。下一phase需真实健康重放＋可控工具失败真实重放，独立产物与attempt/failure记录，不改原capsule/raw。E03首跑失败≠replay failure |
@@ -68,8 +72,8 @@ E01文件字节SHA-256：report=`3d1556ff3a78285b54b3c88cb185a5c3c7fba36f1d786fb
 | Phase4 有instrumentation candidate | 当前未有该类候选；E05仅真实内部观察 | 若发现候选，需同输入两个RMW×3repeat black-box validation，原candidate不因replay失败删除，补责任/原因/disposition |
 | Phase4 无instrumentation candidate的bounded blackbox | E01是真实公开API required矩阵，ledger明确未链接instrumentation；E05对照任务未运行 | **不能自动把E01当Phase4已完成。** 下一步需具名bounded campaign的输入/范围/次数或时间上限、隔离blackbox环境、与Phase2关联、明确instrumentation_candidates=0及完整zero-candidate/blackbox disposition |
 | Phase5A 第二target | E08 domain80已正式18+6/四control通过，独立seal=true；E04 domain181阻断历史保留 | 通过仅属于11ec76c；不推断181已无冲突，最终source改变后须重跑；不强抢域/旧owner |
-| Phase5B 第三target | E06 non-DDS控制、D015工程裁定、当前registry能力blocked处置 | D015尚未实现/验证，需真实endpoint-attached discovery drop/restore链和18+6；非先验不可解 |
-| Phase6/7 第四target与各target seal | D014字段定义、E05/E06及E09被动捕获开发证据、当前registry独立观察处置 | 第四target未正式执行/封存；先完成两源事实/控制，按固定顺序推进。每个target单独同revision/current source重跑18+6及seal |
+| Phase5B 第三target | E06 non-DDS控制、E10 third v4真实development runtime+ingest、D015工程裁定 | endpoint-attached drop/restore已有开发运行证据；但capsule execution为空且输入重建，正式D015及18+6/control/seal仍待验收 |
+| Phase6/7 第四target与各target seal | D014字段定义、E09被动SEDP开发证据、E10第四target 24行report | 已执行run但17 required pass+1 unknown、6 fault fail、seal=false；保留unknown/失败，需完成D014正式18+6/control/seal。各target仍按72分母，不删格 |
 | Phase8 S2入口 | 无完整S1全部稳定证据 | 不以第一target成功提前宣称S1成熟或进入S2 |
 
 ## 四 target 固定分母与控制账
@@ -80,8 +84,8 @@ E01文件字节SHA-256：report=`3d1556ff3a78285b54b3c88cb185a5c3c7fba36f1d786fb
 | --- | --- | --- | --- | --- |
 | discovery.late_endpoint | E01 report，domain180；E03保留历史失败 | 18/18 judged pass；6/6 negative judged fail | 6/6 / 6/6 / 6/6 / 6/6 | 11ec76c版本per-target seal=true，unknown0；E03仍false |
 | discovery.late_join_delivery | E08 report/domain80；E04 report/domain181保留 | 18/18 judged pass；6/6 negative judged fail | 6/6 / 6/6 / 6/6 / 6/6 | seal=true仅对11ec76c版本；E04仍false，原始preflight及后续step-count错误保留 |
-| discovery.interruption_recovery | [scope](../config/s1_scope.json)、E01 scope_dispositions、E06与D015 | 尚无此target正式18+6报告 | 均待正式证据 | 当前能力处置blocked:awaiting_endpoint_attached_discovery_capability；D015待实施，不删18格 |
-| builtin.discovery_projection_reconciliation | [scope](../config/s1_scope.json)、E01 scope_dispositions、E05/E06/E09与D014 | 尚无此target正式18+6报告 | 均待正式证据 | 当前能力处置blocked:no_independent_builtin_observation；D014字段定义不等于可运行，不删18格 |
+| discovery.interruption_recovery | E10 third v4 [summary](../results/runtime-smoke/third-development-v4/summary.json)与双RMW ingest；D015 | 两RMW development runtime/ingest均judged/pass；输入为`reconstructed_input`、`capsule_execution=null`，非正式18+6 | 正式四control均待验收 | development evidence / not mature；正式D015、18+6/control/seal待验收，不删18格，72分母不变 |
+| builtin.discovery_projection_reconciliation | E09被动SEDP及E10 [24行report](../results/s1/builtin-projection-r0-20261115T050653+0800/report.json) | 17 required pass、1 unknown；6 fault fail | 开发run：6/6 / 6/6 / 6/6 / 5/6，非正式验收通过 | 当前run `seal=false`；FastDDS `transparent.0` unknown及原始证据保留，正式D014与18+6/control/seal未验收，不删18格，72分母不变 |
 
 11ec76c版本已有first/second各18格的per-target seal支持，共36个required格，不是72/72。主agent已解冻后续开发；最终source一旦变化，这36格不能自动转作新版本通过，须最终冻结后rerun。不得通过历史attempt累加、blocked排除或control复用伪造完整成熟。
 
@@ -97,14 +101,14 @@ E01文件字节SHA-256：report=`3d1556ff3a78285b54b3c88cb185a5c3c7fba36f1d786fb
 | locks/隔离与清理 | E01环境/locks receipts；E04域端口preflight阻断；E06探针owner阻断记录 | 不能强抢域或清除旧repo owner。D015父进程须持锁直到整个netns子树清理；该分支尚未验证 |
 | replay/失败保留 | E01/E03共48份capsule及E08另24份的replay_attempts、execution_history、non_replayable均0（分别只读复核） | F07健康真实重放及受控工具失败重放均缺；保留独立输入/执行/attempt/failure/provenance。原fail后新pass不确认原异常 |
 | candidate/2–3真实候选 | E01/E08自然candidate=0、confirmed=0；E03也为0；E05未admission | **当前用户目标为2–3个真实SUT候选；实测0，该项目未达成。** 自然数量不能预先保证，只能真实运行产生；negative、tool failure、开发projection或合成合同case不得凑数。zero-candidate可支持原taskbook的Phase推进和中间报告，不能等价完整目标完成或据此标记整个goal complete |
-| D014字段适用性 | 决策与第四target计划；16个本地source hash核对 | 必需GUID/role/topic/type/reliability/durability/deadline/liveliness及lease；history/depth缺失仅supporting N/A，不配置补值；其余缺失仍unknown。尚未实施/正式验收 |
-| D015第三target恢复合同 | 主agent新工程裁定；仅E06非DDS载体可行性 | wire_proxy标识＋显式implementation；只有mutated真drop，hit需本pair真实discovery counter>0；restore删规则≠恢复；恢复需身份关联discovery＋fresh双向count/graph＋postrestore delivery。独立fault中间omit，不伪drop/applied |
+| D014字段适用性 | 决策与第四target计划、E09、E10第四target report | 必需GUID/role/topic/type/reliability/durability/deadline/liveliness及lease；history/depth缺失仅supporting `not_applicable_by_endpoint_schema`，禁止配置补值。实际24行run有17 required pass、1 unknown、6 fault fail，seal=false；unknown与失败保留，正式验收未完成 |
+| D015第三target恢复合同 | 主agent工程裁定、E10 third v4 runtime/ingest | 两RMW development运行观察到真实drop与restore后交付，但输入重建且无capsule execution，正式D015及18+6/control/seal未验收。原合同不变：wire_proxy＋显式implementation；仅mutated真drop，hit需本pair真实discovery counter>0；删规则不等于恢复，恢复需身份关联discovery＋fresh双向count/graph＋postrestore delivery；独立fault中间omit，不伪drop/applied；72分母不变 |
 
 ## 下一份需要的证据
 
 1. F07健康真实重放和可控工具失败真实重放，独立产物不改原run；当前已有48份capsule不能代替两条真实replay路径。
 2. 明确Phase2→Phase4 linkage；无自然instrumentation候选时，真实bounded blackbox及具名zero-candidate disposition，不能用null默认为0。
-3. 保留第二target domain181 blocked及domain80通过两份报告；第三/第四target依D015/D014实施、离线验证、冻结和正式18+6矩阵。first/second已seal revision0 manifest保持不变，core精确legacy fault兼容；新target显式receipt_kind/window及projection schema。
+3. 保留第二target domain181 blocked及domain80通过两份报告；third v4与fourth 24行run作为当前开发/执行证据保留，但third仍缺真实capsule execution及正式D015验收，fourth保留1 unknown和6 fault fail且seal=false；两者仍需按原18+6/control合同完成。first/second已seal revision0 manifest只适用于11ec76c source，最终source仍须重跑；72分母不变。
 4. 后续每次source更新都重新评估哪些证据可用于新seal，不回填旧receipt/hash，不减少72分母，不保证候选数量。
 
 以上由主agent日常工程协调，无新增需用户确认事项。此账不是运行调度授权，文档子agent不启动任何campaign。

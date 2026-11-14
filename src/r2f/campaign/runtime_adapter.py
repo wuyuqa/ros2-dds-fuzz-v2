@@ -348,11 +348,12 @@ def ingest_execution(scenario, config, runtime, capsule):
             record.abort(str(exc))
         audit["ingestion_error"] = str(exc)
     row = record.to_dict()
-    row.update(audit, typed_facts=facts, oracle=oracle, oracle_verdict=oracle["verdict"], rule_id=oracle["rule_id"],
+    row.update(audit, domain_id=config["domain_id"], typed_facts=facts, oracle=oracle,
+               oracle_verdict=oracle["verdict"], rule_id=oracle["rule_id"],
                raw_path=runtime.get("raw_path"), raw_sha256=runtime.get("raw_sha256"),
                runtime_execution_metadata=runtime.get("execution_metadata") or runtime.get("execution"),
                observation_receipts=runtime.get("observation_receipts", []), environment=runtime.get("environment", {}))
     if "observation" in runtime:
         from .observations import qualify_observation
-        row["instrumentation_observation"] = qualify_observation(row, runtime, config)
+        row["instrumentation_observation"] = qualify_observation(row, runtime, config, capsule=capsule)
     return row

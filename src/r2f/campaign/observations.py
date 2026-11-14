@@ -7,11 +7,15 @@ from copy import deepcopy
 import json
 import xml.etree.ElementTree as ET
 from pathlib import Path
+from r2f.core._json import sha256_digest
 from r2f.core.evidence import canonical_hash, verify_raw
+from r2f.core.replay import ReplayCapsule, validate_replay_input
 from r2f.instrumentation.cyclonedds import TraceConfig, collect_trace, normalize_guid
 from r2f.instrumentation.projection import reconcile_projection
 
 CONTRACT = 'cyclonedds.received_sedp.identity_role_reliability_durability/v1'
+_INPUT_IDENTITY = ('target_id', 'target_revision', 'rmw', 'arm', 'repeat')
+_EXECUTION_IDENTITY = ('run_id', *_INPUT_IDENTITY, 'domain_id')
 
 
 def _read(ref):
@@ -19,7 +23,124 @@ def _read(ref):
     return json.loads(Path(ref['raw_path']).read_text())
 
 
-def qualify_observation(row, runtime, config):
+def _bind_input(row, runtime, config, observation, execution, capsule):
+    """Bind the capsule-derived canonical row to the actual execution and sidecar.
+
+    ingest_execution supplies the canonical hash from its validated capsule. An
+    explicit capsule (or a persisted row's replay_path) additionally revalidates
+    the complete input here; older runtime/sidecar schemas have no top-level hash.
+    A hash present anywhere is never ignored, including in either metadata alias.
+    """
+    digest = sha256_digest(row.get('effective_input_sha256'), 'canonical effective_input_sha256')
+    if config.get('effective_input_sha256') != digest:
+        raise ValueError('config effective input hash differs from canonical capsule hash')
+    for key in _EXECUTION_IDENTITY:
+        if key not in config or config[key] is None:
+            raise ValueError('runtime config identity missing:' + key)
+        if key not in row or row[key] != config[key]:
+            raise ValueError('canonical execution identity differs:' + key)
+        if execution.get(key) != config[key]:
+            raise ValueError('runtime execution identity differs:' + key)
+
+    # The runtime's execution / execution_metadata objects are aliases of the
+    # same required identity record. That contract has execution identity and
+    # raw refs, but no effective-input hash; the hash is independently bound by
+    # capsule -> config -> canonical row -> sidecar same_input below.
+    execution_alias = runtime.get('execution')
+    execution_metadata = runtime.get('execution_metadata')
+    if execution_alias is None and execution_metadata is None:
+        raise ValueError('runtime execution metadata missing')
+    if execution_alias is not None and execution_metadata is not None:
+        if canonical_hash(execution_alias) != canonical_hash(execution_metadata):
+            raise ValueError('runtime execution aliases differ')
+
+    # Top-level runtime identity fields are not part of the run_pair result
+    # contract. When supplied, they must agree; its raw refs are mandatory and
+    # bind the actual raw to the required execution metadata identity above.
+    records = [('runtime', runtime), ('execution', execution_alias),
+               ('execution_metadata', execution_metadata), ('observation', observation)]
+    for name, record in records:
+        if record is None:
+            continue
+        for key in _EXECUTION_IDENTITY:
+            if name in ('execution', 'execution_metadata') and key not in record:
+                raise ValueError(name + ' identity missing:' + key)
+            if key in record and record[key] != config[key]:
+                raise ValueError(name + ' input/execution identity differs:' + key)
+        # Runtime and sidecar schemas do not carry this field at their top
+        # levels. Any occurrence is still checked; capsule/config/same_input
+        # form the required effective-input binding chain.
+        if 'effective_input_sha256' in record and record['effective_input_sha256'] != digest:
+            raise ValueError(name + ' input/execution identity differs:effective_input_sha256')
+        for key in ('raw_path', 'raw_sha256'):
+            if record.get(key) != row.get(key):
+                raise ValueError(name + ' raw identity differs:' + key)
+    final_input = config.get('final_input')
+    if not isinstance(final_input, dict) or not final_input:
+        raise ValueError('final submitted input missing')
+    for key, value in final_input.items():
+        if key not in config or config[key] != value:
+            raise ValueError('submitted input differs from runtime config:' + key)
+    capsules = []
+    if capsule is not None:
+        capsules.append(capsule.input if isinstance(capsule, ReplayCapsule) else capsule['input'] if 'input' in capsule else capsule)
+    if row.get('replay_path'):
+        capsules.append(json.loads(Path(row['replay_path']).read_text())['input'])
+    if not capsules:
+        raise ValueError('validated replay capsule required for observation qualification')
+    for data in capsules:
+        validate_replay_input(data)
+        if data['effective_input_sha256'] != digest:
+            raise ValueError('capsule effective input hash differs')
+        for key in _INPUT_IDENTITY:
+            if data[key] != row[key] or data[key] != config[key]:
+                raise ValueError('capsule input identity differs:' + key)
+        if data['source_manifest'] != row.get('source_manifest'):
+            raise ValueError('capsule source differs from canonical source')
+        if data['effective_input']['final_input'] != final_input:
+            raise ValueError('capsule final input differs from runtime config')
+        if 'scenario' in config and config['scenario'] != data['scenario']:
+            raise ValueError('capsule scenario differs from runtime config')
+        if 'input_layer_receipts' in config and config['input_layer_receipts'] != data['effective_input']['input_layer_receipts']:
+            raise ValueError('capsule input layer receipts differ')
+    if 'source_manifest' in config and config['source_manifest'] != row.get('source_manifest'):
+        raise ValueError('config source differs from canonical capsule source')
+    return {'effective_input_sha256': digest,
+            'execution_identity': {k: config[k] for k in _EXECUTION_IDENTITY},
+            'capsule_validation': 'verified',
+            'runtime_binding': 'execution_metadata_identity_plus_verified_raw_sha256',
+            'sidecar_binding': 'blackbox_task_same_input_plus_prepared_domain_and_verified_raw_sha256'}
+
+
+def _semantic_profiles(qualification, domain):
+    """Normalize formatting and this execution's Domain binding, nothing else."""
+    if type(domain) is not int or not 0 <= domain <= 231:
+        raise ValueError('transport profile execution domain missing or invalid')
+    profiles = qualification.get('non_tracing_profiles')
+    if not isinstance(profiles, dict) or set(profiles) != {'writer', 'reader'}:
+        raise ValueError('two non-Tracing transport profiles required')
+    values = []
+    for role, profile in sorted(profiles.items()):
+        root = ET.fromstring(profile['xml'])
+        tag = lambda e: e.tag.rsplit('}', 1)[-1]
+        if tag(root) != 'CycloneDDS' or any(tag(e) == 'Tracing' for e in root.iter()):
+            raise ValueError('transport profile invalid or enables Tracing')
+        domains = [e for e in root if tag(e) == 'Domain']
+        if len(domains) != 1:
+            raise ValueError('one transport profile Domain required')
+        section = domains[0]
+        bindings = [section.attrib[k] for k in ('Id', 'id') if k in section.attrib]
+        if len(bindings) > 1 or (bindings and bindings[0] not in ('any', str(domain))):
+            raise ValueError('transport profile bound to another execution domain')
+        for key in ('Id', 'id'):
+            section.attrib.pop(key, None)
+        def node(e):
+            return [e.tag, sorted(e.attrib.items()), (e.text or '').strip(), [node(c) for c in e]]
+        values.append([role, node(root)])
+    return values
+
+
+def qualify_observation(row, runtime, config, *, capsule=None):
     observation = runtime.get('observation')
     result = {'schema':'r2f.campaign-observation-intake/v1', 'observation_status':'not_run',
               'qualification':'not_evaluated', 'intake_count':None, 'admissible_count':None,
@@ -43,6 +164,7 @@ def qualify_observation(row, runtime, config):
             if observation.get(key) != row.get(key) or observation.get(key) != runtime.get(key,config.get(key)):
                 raise ValueError('observation execution identity differs:'+key)
         execution = runtime.get('execution_metadata') or runtime.get('execution') or {}
+        input_binding = _bind_input(row, runtime, config, observation, execution, capsule)
         if observation.get('source_manifest') != execution.get('source'):
             raise ValueError('observation runtime source differs')
         source = row.get('source_manifest') or {}
@@ -58,6 +180,9 @@ def qualify_observation(row, runtime, config):
         for key in ('run_id','domain_id','rmw'):
             if prepared.get(key) != config.get(key):
                 raise ValueError('prepared identity differs:'+key)
+        if prepared.get('observation_mode') != observation.get('observation_mode') or observation.get('observation_mode') != config.get('observation_mode', 'blackbox'):
+            raise ValueError('observation execution mode differs')
+        _semantic_profiles({'non_tracing_profiles': prepared.get('profiles')}, config['domain_id'])
         if prepared.get('observer_source_sha256') != observation.get('observer_source_sha256') or not observation.get('observer_source_sha256'):
             raise ValueError('observer source provenance missing')
         workers, processes = {}, {}
@@ -110,19 +235,20 @@ def qualify_observation(row, runtime, config):
                     raise ValueError('blackbox process enables tracing')
                 if proof.get('trace_fd_attached') or any(under(p) for p in audit.get('fd_targets',[]) if p.startswith('/')):
                     raise ValueError('blackbox process attached instrumentation fd')
+        task=observation.get('blackbox_task')
+        if not isinstance(task,dict) or task.get('status')!='not_run' or task.get('executed_by_bridge') is not False or task.get('origin_run_id')!=config['run_id']:
+            raise ValueError('same-input blackbox task lacks not-run provenance')
+        same_input=task.get('same_input')
+        if not isinstance(same_input,dict) or any(same_input.get(k)!=config.get(k) for k in ('target_id','target_revision','rmw','arm','repeat','seed','topic','final_input','effective_input_sha256')):
+            raise ValueError('blackbox task effective input differs')
         if observation.get('observation_mode')!='instrumentation':
             # A verified clean blackbox observation is linkage evidence, never an
             # instrumented zero or automatic confirmation of another execution.
             if observation.get('blackbox_observer',{}).get('status')!='verified':
                 raise ValueError('blackbox clean observer not verified')
-            result.update(qualification='blackbox_observed', provenance_verified=True, non_tracing_profiles=deepcopy(prepared['profiles']))
+            result.update(qualification='blackbox_observed', provenance_verified=True, input_binding=input_binding,
+                          non_tracing_profiles=deepcopy(prepared['profiles']))
             return result
-        task=observation.get('blackbox_task') or {}
-        if task.get('status')!='not_run' or task.get('executed_by_bridge') is not False or task.get('origin_run_id')!=config['run_id']:
-            raise ValueError('same-input blackbox task lacks not-run provenance')
-        same_input=task.get('same_input',{})
-        if any(same_input.get(k)!=config.get(k) for k in ('target_id','target_revision','rmw','arm','repeat','final_input','effective_input_sha256')):
-            raise ValueError('blackbox task effective input differs')
         traces=observation.get('traces',[])
         if len(traces)!=2:
             raise ValueError('two independent closed traces required')
@@ -214,7 +340,7 @@ def qualify_observation(row, runtime, config):
                     raise ValueError('instrumentation witness not bound to trace')
         result.update(qualification='qualified',provenance_verified=True,limited_contract=CONTRACT,
                       admissible_count=len(intake),qualified_intake=deepcopy(intake),zero_candidate=not intake and not excluded,
-                      observation_verdict=verdict, non_tracing_profiles=deepcopy(prepared['profiles']))
+                      observation_verdict=verdict, input_binding=input_binding, non_tracing_profiles=deepcopy(prepared['profiles']))
     except (KeyError,ValueError,TypeError,OSError,IndexError,AttributeError) as exc:
         result['errors'].append(str(exc))
     return result
@@ -222,6 +348,10 @@ def qualify_observation(row, runtime, config):
 
 def instrumentation_evidence(row, item):
     """Enrich an intake with its validated canonical row; core owns admission."""
+    sha256_digest(row.get('effective_input_sha256'), 'canonical effective_input_sha256')
+    for key in ('run_id', *_INPUT_IDENTITY, 'effective_input_sha256', 'raw_path', 'raw_sha256'):
+        if key not in row or key not in item or item[key] != row[key]:
+            raise ValueError('intake differs from canonical identity:' + key)
     evidence=deepcopy(row)
     for key in ('candidate_source','evidence_tier','instrumentation_identity','internal_contract','timestamp','provenance','observed_effect'):
         evidence[key]=deepcopy(item[key])
@@ -234,29 +364,34 @@ def instrumentation_evidence(row, item):
 
 def observation_links(rows):
     """Link executed same-input blackbox rows without rewriting planned tasks."""
-    def semantic_profiles(qualification):
-        values=[]
-        for role,profile in sorted(qualification.get('non_tracing_profiles',{}).items()):
-            root=ET.fromstring(profile['xml'])
-            for element in root.iter():
-                if element.tag.rsplit('}',1)[-1]=='Domain':
-                    element.attrib.pop('Id',None);element.attrib.pop('id',None)
-            def node(e):return [e.tag,sorted(e.attrib.items()),(e.text or '').strip(),[node(c) for c in e]]
-            values.append([role,node(root)])
-        return values
     rows=list(rows); links=[]
     for row in rows:
         qualified=row.get("instrumentation_observation",{})
         if qualified.get("qualification")!="qualified":continue
-        matches=[]
+        matches=[]; rejected=[]
         for other in rows:
             if other.get("instrumentation_observation",{}).get("qualification")!="blackbox_observed":continue
             if other.get("execution_stage")!="judged" or other.get("actual_run") is not True:continue
             keys=("effective_input_sha256","target_id","target_revision","rmw","arm","repeat","source_manifest")
             if all(row.get(k)==other.get(k) for k in keys) and row.get("run_id")!=other.get("run_id") and row.get("domain_id")!=other.get("domain_id") and row.get("raw_path")!=other.get("raw_path"):
+                try:
+                    if _semantic_profiles(qualified, row.get('domain_id')) != _semantic_profiles(other['instrumentation_observation'], other.get('domain_id')):
+                        raise ValueError('non_tracing_transport_profile_mismatch')
+                except (ValueError, KeyError, TypeError, AttributeError, ET.ParseError) as exc:
+                    rejected.append({'run_id': other.get('run_id'), 'cell_id': other.get('cell_id'),
+                                     'reason': str(exc)})
+                    continue
                 matches.append(other)
+        status = ('executed' if len(matches)==1 else 'ambiguous' if len(matches)>1 else
+                  'profile_mismatch' if rejected else 'not_run')
+        reason = ('same_input_and_non_tracing_profiles_verified' if status=='executed' else
+                  'multiple_same_input_blackbox_executions' if status=='ambiguous' else
+                  'non_tracing_transport_profile_rejected' if status=='profile_mismatch' else
+                  'same_input_blackbox_not_run')
         links.append({"origin_run_id":row["run_id"],"origin_cell_id":row["cell_id"],
-                      "status":"executed" if len(matches)==1 else "not_run" if not matches else "ambiguous",
+                      "status":status,
+                      "reason":reason,
+                      "rejected_blackbox_executions":rejected,
                       "effective_input_sha256":row.get("effective_input_sha256"),
                       "blackbox_executions":[{k:o.get(k) for k in ("run_id","cell_id","domain_id","raw_path","raw_sha256","oracle_verdict")} for o in matches],
                       "candidate_confirmation":"not_performed", "planned_task_unchanged":True})

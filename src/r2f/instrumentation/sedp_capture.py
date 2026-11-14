@@ -18,12 +18,19 @@ import struct
 import threading
 import time
 
-from .rtps import discovery_activity, udp_frame
+from .rtps import discovery_activity, rtps_submessages, udp_frame
 
 SCHEMA = 'r2f.passive-sedp-capture/v1'
 DEFAULT_LIMITS = {'timeout_sec': 120, 'max_bytes': 64 * 1024 * 1024, 'max_packets': 100000,
                   'snaplen': 65535, 'recv_buffer_bytes': 4 * 1024 * 1024,
                   'activity_limit': 4096}
+SUBMESSAGE_NAMES = {
+    0x01: 'PAD', 0x06: 'ACKNACK', 0x07: 'HEARTBEAT', 0x08: 'GAP',
+    0x09: 'INFO_TS', 0x0c: 'INFO_SRC', 0x0d: 'INFO_REPLY_IP4',
+    0x0e: 'INFO_DST', 0x0f: 'INFO_REPLY', 0x12: 'NACK_FRAG',
+    0x13: 'HEARTBEAT_FRAG', 0x14: 'DATA', 0x15: 'DATA',
+    0x16: 'DATA_FRAG', 0x17: 'DATA_FRAG',
+}
 
 
 def _canonical(value):
@@ -145,6 +152,11 @@ class PassiveSedpObserver:
         self._lock = threading.RLock()
         self._stop_event = threading.Event()
         self._events = deque(maxlen=spec['limits']['activity_limit'])
+        # Filtered-frame metadata is bounded by the capture packet limit. It is
+        # intentionally separate from the retained pcap and never stores payloads.
+        self._filtered = []
+        self._target_prefixes = set()
+        self._filtered_overflow = 0
         self._counters = Counter()
         self._diagnostics = Counter()
         self._thread = self._socket = self._raw = self._index = None
@@ -153,6 +165,7 @@ class PassiveSedpObserver:
         self._first_activity_evicted_ns = None
         self._raw_digest = hashlib.sha256()
         self._index_digest = hashlib.sha256()
+        self._filtered_digest = hashlib.sha256()
 
     def start(self):
         if self._ready is not None or self._stopped is not None:
@@ -162,6 +175,7 @@ class PassiveSedpObserver:
         try:
             self._raw = (self.output / 'normal-rtps.pcap').open('xb')
             self._index = (self.output / 'packet-index.jsonl').open('xb')
+            self._filtered_index = (self.output / 'filtered-rtps-index.jsonl').open('xb')
             header = struct.pack('<IHHIIII', 0xa1b23c4d, 2, 4, 0, 0, self.spec['limits']['snaplen'], 1)
             self._raw.write(header)
             self._raw_digest.update(header)
@@ -183,7 +197,7 @@ class PassiveSedpObserver:
             self._thread.start()
             return copy.deepcopy(self._ready)
         except BaseException:
-            for obj in (self._socket, self._raw, self._index):
+            for obj in (self._socket, self._raw, self._index, getattr(self, '_filtered_index', None)):
                 if obj is not None:
                     obj.close()
             raise
@@ -223,6 +237,10 @@ class PassiveSedpObserver:
                         lo, hi = self.spec['port_range']
                         if udp['payload'][:4] != b'RTPS' or not ({udp['source_port'], udp['destination_port']} & set(self.spec['discovery_ports'])):
                             self._counters['frames_skipped'] += 1
+                            if udp['payload'][:4] == b'RTPS':
+                                self._record_filtered_rtps(frame, udp, timestamp, clock,
+                                                           received['monotonic_ns'], address[2],
+                                                           truncated=bool(flags & socket.MSG_TRUNC))
                             continue
                     elif not diagnostic:
                         self._counters['frames_skipped'] += 1
@@ -277,8 +295,71 @@ class PassiveSedpObserver:
             reasons.append('timestamp_fallback')
         if self._diagnostics:
             reasons.append('unsupported_or_invalid_framing')
+        related = [record for record in self._filtered
+                   if self._record_may_match_target(record, self._target_prefixes)]
+        if related:
+            reasons.append('filtered_target_related_rtps')
+        if self._filtered_overflow:
+            reasons.append('filtered_rtps_metadata_overflow')
         return {'status': 'degraded' if reasons else 'ok', 'reasons': reasons,
-                'kernel_drop_status': 'known_at_stop' if self._stopped is not None else 'pending_stop'}
+                'kernel_drop_status': 'known_at_stop' if self._stopped is not None else 'pending_stop',
+                'filtered_rtps_completeness': 'incomplete' if related or self._filtered_overflow else 'complete_for_known_target_prefixes',
+                'filtered_rtps_count': self._counters['filtered_rtps'],
+                'filtered_rtps_target_related_count': len(related),
+                'filtered_rtps_metadata_overflow': self._filtered_overflow}
+
+    @staticmethod
+    def _record_may_match_target(record, prefixes):
+        if record.get('parse_diagnostics'):
+            # A malformed filtered RTPS datagram cannot be safely attributed,
+            # even when its UDP ports sit outside this domain's usual block.
+            return True
+        candidates = {*record.get('source_participant_prefixes', []),
+                      record.get('source_participant_prefix'), *record.get('destination_participant_prefixes', [])}
+        candidates.discard(None)
+        return bool(candidates & prefixes)
+
+    def _record_filtered_rtps(self, frame, udp, timestamp, clock, received_monotonic_ns,
+                              packet_type, *, truncated):
+        payload = udp['payload']
+        source_prefix = payload[8:20].hex() if len(payload) >= 20 and payload[:4] == b'RTPS' else None
+        submessages, parse_diagnostics = rtps_submessages(payload)
+        sources = sorted({item['source_guid_prefix'] for item in submessages
+                          if item.get('source_guid_prefix')})
+        destinations = sorted({item['destination_guid_prefix'] for item in submessages
+                               if item.get('destination_guid_prefix')})
+        port_start, port_end = self.spec['port_range']
+        ports = (udp['source_port'], udp['destination_port'])
+        record = {'unix_ns': timestamp, 'clock': clock,
+                  'received_monotonic_ns': received_monotonic_ns,
+                  'frame_sha256': hashlib.sha256(frame).hexdigest(),
+                  'captured_length': len(frame), 'truncated': bool(truncated),
+                  'packet_type': packet_type, 'ip_version': udp.get('ip_version'),
+                  'source_address': udp.get('source_address'),
+                  'destination_address': udp.get('destination_address'),
+                  'source_port': udp['source_port'], 'destination_port': udp['destination_port'],
+                  'domain_id': self.spec['domain_id'],
+                  'domain_relation': 'domain_port_block' if any(port_start <= p <= port_end for p in ports) else 'outside_domain_port_block',
+                  'source_participant_prefix': source_prefix,
+                  'source_participant_prefixes': sources,
+                  'destination_participant_prefixes': destinations,
+                  'submessage_kinds': [SUBMESSAGE_NAMES.get(item['kind'], f'UNKNOWN_0x{item["kind"]:02x}') for item in submessages],
+                  'parse_diagnostics': parse_diagnostics,
+                  'filter_reason': 'rtps_ports_outside_standard_discovery_set'}
+        self._counters['filtered_rtps'] += 1
+        self._counters['filtered_rtps_by_domain_relation:' + record['domain_relation']] += 1
+        for kind in record['submessage_kinds']:
+            self._counters['filtered_rtps_submessage:' + kind] += 1
+        if self._record_may_match_target(record, self._target_prefixes):
+            self._counters['filtered_rtps_target_related'] += 1
+        line = _canonical(record) + b'\n'
+        if len(self._filtered) < self.spec['limits']['max_packets']:
+            self._filtered.append(record)
+            self._filtered_index.write(line)
+            self._filtered_digest.update(line)
+        else:
+            self._filtered_overflow += 1
+            self._counters['filtered_rtps_metadata_overflow'] += 1
 
     def snapshot_activity(self, *, since_ns, participant_prefixes):
         """Positive observed activity only. Empty window is unknown, never absence."""
@@ -291,9 +372,11 @@ class PassiveSedpObserver:
             raise ValueError('explicit observed 12-byte participant prefixes required')
         wanted = {p.lower() for p in prefixes}
         with self._lock:
+            self._target_prefixes.update(wanted)
             if self._raw is not None and not self._raw.closed:
                 self._raw.flush()
                 self._index.flush()
+                self._filtered_index.flush()
             end = time.time_ns()
             matches = [copy.deepcopy(e) for e in self._events
                        if since_ns <= e['unix_ns'] <= end and e['source_guid_prefix'] in wanted]
@@ -305,9 +388,15 @@ class PassiveSedpObserver:
                     unique.append(e)
                     seen.add(key)
             covered = since_ns >= self._ready['unix_ns'] and (self._first_activity_evicted_ns is None or since_ns > self._first_activity_evicted_ns)
+            health = self._health()
+            incomplete_filtered = health['filtered_rtps_completeness'] == 'incomplete'
             return {'schema': SCHEMA, 'kind': 'bounded_discovery_activity',
-                    'status': 'observed' if unique else 'unknown', 'activity_observed': bool(unique),
-                    'reason': None if unique else 'no_attributed_activity_in_finite_window',
+                    'status': 'unknown' if incomplete_filtered or health['status'] != 'ok' or not unique else 'observed',
+                    'activity_observed': bool(unique),
+                    'observation_completeness': 'incomplete' if health['status'] != 'ok' else 'complete_for_known_target_prefixes',
+                    'reason': ('capture_incomplete_filtered_target_related_rtps' if incomplete_filtered else
+                               'capture_health_degraded' if health['status'] != 'ok' else
+                               None if unique else 'no_attributed_activity_in_finite_window'),
                     'since_ns': since_ns, 'until_ns': end, 'clock': 'unix_ns_realtime',
                     'monotonic_ns': time.monotonic_ns(),
                     'counts_by_participant': dict(Counter(e['source_guid_prefix'] for e in unique)),
@@ -316,7 +405,13 @@ class PassiveSedpObserver:
                     'participant_prefixes': sorted(wanted), 'events': unique,
                     'counts_by_kind': dict(Counter(e['kind'] for e in unique)),
                     'packet_event_copies': len(matches), 'deduplicated_event_count': len(unique),
-                    'window_buffer_retained': covered, 'health': self._health(),
+                    'window_buffer_retained': covered, 'health': health,
+                    'filtered_rtps': {'count': sum(1 for record in self._filtered if since_ns <= record['unix_ns'] <= end),
+                        'target_related': [copy.deepcopy(record) for record in self._filtered
+                            if since_ns <= record['unix_ns'] <= end and self._record_may_match_target(record, wanted)],
+                        'metadata_overflow': self._filtered_overflow,
+                        'metadata_complete': self._filtered_overflow == 0,
+                        'completeness': 'incomplete' if incomplete_filtered else 'complete_for_known_target_prefixes'},
                     'raw_prefix': {'path': str(self.output / 'normal-rtps.pcap'),
                                    'sha256': self._raw_digest.hexdigest(),
                                    'size': self._raw.tell() if self._raw is not None and not self._raw.closed else (self._stopped or {}).get('raw', {}).get('size'),
@@ -341,7 +436,7 @@ class PassiveSedpObserver:
             except OSError as exc:
                 self._error = (self._error + ';' if self._error else '') + 'packet_statistics:' + str(exc)
             self._socket.close()
-            for f in (self._raw, self._index):
+            for f in (self._raw, self._index, self._filtered_index):
                 f.flush()
                 os.fsync(f.fileno())
                 f.close()
@@ -350,6 +445,9 @@ class PassiveSedpObserver:
             self._stopped = {'schema': SCHEMA, 'status': 'stopped', **_now(), 'spec': copy.deepcopy(self.spec),
                              'ready': copy.deepcopy(self._ready), 'raw': raw,
                              'index': {'path': str(self.output / 'packet-index.jsonl'), 'sha256': self._index_digest.hexdigest()},
+                             'filtered_rtps_index': {'path': str(self.output / 'filtered-rtps-index.jsonl'),
+                                 'sha256': self._filtered_digest.hexdigest(),
+                                 'records': len(self._filtered), 'overflow': self._filtered_overflow},
                              'counters': dict(self._counters), 'diagnostics': dict(self._diagnostics),
                              'error': self._error, 'limit_reason': self._limit_reason,
                              'thread_stopped': True, 'socket_closed': True,

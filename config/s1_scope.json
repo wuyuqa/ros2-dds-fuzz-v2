@@ -15,8 +15,18 @@
   "independent_fault_controls_per_target": 6,
   "first_slice": {"target_id": "discovery.late_endpoint", "mutation_kind": "late_joiner"},
   "policy": {"normal_public_ros2_api_only": true, "native_dds_participant": false, "auto_vulnerability_search": false, "adaptive_attacks": false, "malicious_wire_payloads": false, "exploit_reproduction": false},
-  "blocked": {
-    "discovery.interruption_recovery": "no_endpoint_attached_discovery_drop_restore_carrier",
-    "builtin.discovery_projection_reconciliation": "no_independent_public_builtin_read_surface; graph alone cannot satisfy reconciliation"
+  "development_status": {
+    "discovery.interruption_recovery": "development_ingest_only_judged_pass_without_capsule_execution",
+    "builtin.discovery_projection_reconciliation": "development_matrix_executed_24_rows_with_17_pass_1_unknown_and_6_fault_failures"
+  },
+  "maturity_status": {
+    "discovery.interruption_recovery": "not_mature_formal_18_required_plus_6_controls_and_seal_not_established",
+    "builtin.discovery_projection_reconciliation": "not_mature_unknown_gate_and_transparency_control_failed_seal_false"
+  },
+  "formal_acceptance": {
+    "required_cells_per_target": 18,
+    "independent_fault_controls_per_target": 6,
+    "target_maturity_requires_all_required_controls_and_seal": true,
+    "full_scope_required_cells": 72
   }
 }
