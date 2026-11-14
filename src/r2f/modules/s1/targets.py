@@ -22,8 +22,8 @@ RULES = {
 DISPOSITIONS = {
     EXECUTION_ORDER[0]: {"status": "expressible", "reason": "public ROS2 writer/reader creation; evidence pending"},
     EXECUTION_ORDER[1]: {"status": "registered", "reason": "later slice; reliable volatile post-match delivery, no prejoin delivery obligation"},
-    EXECUTION_ORDER[2]: {"status": "blocked:awaiting_endpoint_attached_discovery_capability", "reason": "requires real discovery_drop and restore on endpoint-attached discovery path; stopping publication is not discovery interruption"},
-    EXECUTION_ORDER[3]: {"status": "blocked:no_independent_builtin_observation", "reason": "requires independent builtin + graph field-by-field reconciliation; graph alone insufficient; no native DDS participant permitted"},
+    EXECUTION_ORDER[2]: {"status": "expressible", "reason": "reviewed namespace discovery-drop pipeline; live namespace, packet observer and pair-binding admission required; execution and per-target seal remain unestablished"},
+    EXECUTION_ORDER[3]: {"status": "expressible", "reason": "passive independent builtin SEDP + public graph projection pipeline; namespace/observer/raw field admission and execution remain required; no per-target acceptance established"},
 }
 
 
@@ -70,14 +70,51 @@ def target_declarations():
             "evidence_policy": {"raw_required": True, "raw_identity_required": True, "execution_metadata_required": True, "independent_builtin_required": builtin},
         }
         if interruption:
-            data["state_steps"] = [{"step_id": action, "action": action, "requires": [], "parameters": {}} for action in ("create_endpoints", "establish_match", "apply_discovery_drop", "observe_interruption", "restore_discovery", "observe_rediscovery", "publish_postrestore", "close_observation")]
-            data["state_preconditions"] = [{"condition_id": "matched_before_drop", "fact": "matched_before_drop", "expected": True}]
-            data["control_contract"]["fault"]["fault_id"] = "post_restore_delivery_omission"
-            data["expected_effect_set"].update(mutation_kind="discovery_drop", carrier="wire_proxy", effect_id="discovery_interruption_then_restore", window="discovery_interruption", allowed_observations=["discovery_temporarily_unavailable", "discovery_restored"], forbidden_residuals=["post_restore_discovery_inconsistency", "post_match_delivery_loss", "wrong_endpoint_match", "identity_generation_mixup"])
+            before_drop = (("create_endpoints", ["environment_ok", "locks_held", "namespace_ready"]),
+                           ("establish_match", ["create_endpoints"]),
+                           ("verify_namespace_bindings", ["establish_match"]))
+            data["state_steps"] = [
+                {"step_id": name, "action": name,
+                 "requires": [{"condition_id": dep, "fact": dep, "expected": True} for dep in deps], "parameters": {}}
+                for name, deps in before_drop]
+            data["state_preconditions"] = [{"condition_id": name, "fact": name, "expected": True} for name, _ in before_drop]
+            data["observation_contract"].update(
+                schema="s1.discovery_recovery.v1",
+                sources=["endpoint_tokens", "namespace_bindings", "discovery_drop_counter", "independent_discovery_activity", "graph_snapshot", "delivery_tokens"],
+                recovery="verified rule deletion plus post-boundary identity-correlated discovery activity, fresh dual count/graph and delivery; retained match continuity is allowed",
+                post_mutation_receipts=["discovery_drop_begin", "discovery_drop_end", "discovery_recovery_confirmed"],
+                finite_recovery_timeout="unknown")
+            data["control_contract"]["fault"].update(
+                fault_id="post_restore_delivery_omission", receipt_kind="delivery_omission", window="post_restore_delivery",
+                omission="one intermediate postrestore sequence followed by delivered sentinel; neutral discovery carrier")
+            data["expected_effect_set"].update(
+                mutation_kind="discovery_drop", carrier="wire_proxy", effect_id="discovery_interruption_then_restore",
+                window="discovery_interruption", allowed_observations=["discovery_temporarily_unavailable", "discovery_restored"],
+                forbidden_residuals=["post_restore_discovery_inconsistency", "post_restore_delivery_loss", "wrong_endpoint_match", "identity_generation_mixup", "delivery_order_violation"],
+                fact_sources=["endpoint_tokens", "namespace_bindings", "discovery_drop_counter", "independent_discovery_activity", "graph_snapshot", "delivery_tokens"])
         if builtin:
-            data["state_steps"] = [{"step_id": action, "action": action, "requires": [], "parameters": {}} for action in ("configure_endpoint_qos", "create_endpoints", "observe_graph", "observe_independent_builtin", "reconcile_identity_topic_type_qos")]
-            data["state_preconditions"] = [{"condition_id": "independent_builtin_available", "fact": "independent_builtin_available", "expected": True}]
-            data["control_contract"]["fault"]["fault_id"] = "controlled_projection_field_mismatch"
-            data["expected_effect_set"].update(mutation_kind="endpoint_qos_variation", effect_id="public_qos_configuration", window="endpoint_creation", allowed_observations=["expected_qos_projection"], forbidden_residuals=["builtin_graph_field_mismatch"])
+            # Initial revision0 contract, before first seal: only real pre-create
+            # admission belongs in core state steps (D010/D014).
+            before_create = (("namespace_ready", ["environment_ok", "locks_held"]),
+                             ("observer_ready", ["namespace_ready"]))
+            data["state_steps"] = [{"step_id": name, "action": name,
+                "requires": [{"condition_id": dep, "fact": dep, "expected": True} for dep in deps], "parameters": {}}
+                for name, deps in before_create]
+            data["state_preconditions"] = [{"condition_id": name, "fact": name, "expected": True} for name, _ in before_create]
+            data["observation_contract"] = {
+                "schema": "s1.independent_projection.v1", "sources": ["passive_rtps_wire", "ros_graph", "endpoint_create_lifecycle"],
+                "required_fields": ["endpoint_guid", "role", "topic", "type", "reliability", "durability", "deadline", "liveliness.kind", "liveliness.lease_duration"],
+                "history_depth": "not_applicable_by_endpoint_schema", "rmw_applicability": list(RMWS),
+                "generation": "independent create-call begin/return bound to process identity; never a wire field",
+                "post_mutation_receipts": ["endpoint_create_begin", "endpoint_created", "projection_observation"],
+                "matching": "offered_requested and actual_match are diagnostics only; finite no-match does not prove violation"}
+            data["rule_contract"] = {"primary_rule": RULES[target_id], "applicability": {"rmws": list(RMWS)},
+                "primary": "independent wire_graph_field_equality", "missing_or_unqualified_observation": "unknown"}
+            data["control_contract"]["fault"].update(fault_id="controlled_projection_field_mismatch", receipt_kind="projection_field_mismatch",
+                expected="primary_fail", original_sources="both immutable wire and graph preserved; alter one derived comparison only")
+            data["control_contract"]["fault"].pop("omission")
+            data["expected_effect_set"].update(mutation_kind="endpoint_qos_variation", effect_id="public_qos_configuration", window="endpoint_creation",
+                allowed_observations=["expected_qos_projection"], forbidden_residuals=["builtin_graph_field_mismatch"],
+                fact_sources=["passive_rtps_wire", "ros_graph", "endpoint_create_lifecycle"])
         targets[target_id] = SemanticTarget.from_dict(data)
     return targets

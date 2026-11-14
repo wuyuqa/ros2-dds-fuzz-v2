@@ -2,6 +2,7 @@
 from __future__ import annotations
 import json
 import os
+from pathlib import Path
 import select
 import sys
 import time
@@ -24,6 +25,31 @@ def emit_snapshot(endpoint, role, command_id, endpoint_gid, graph, emit):
     emit('graph_snapshot', command_id=command_id, **graph())
 
 
+def extended_graph_qos(qos, enabled=False):
+    """Additional public graph fields are opt-in; first two target tokens stay stable."""
+    if not enabled:
+        return {}
+    return {'history': qos.history.name.lower(),
+            'deadline_ns': qos.deadline.nanoseconds,
+            'liveliness': qos.liveliness.name.lower(),
+            'liveliness_lease_duration_ns': qos.liveliness_lease_duration.nanoseconds}
+
+
+def create_public_qos(q):
+    """Construct only public rclpy policies, retaining integer-nanosecond durations."""
+    from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPolicy, LivelinessPolicy
+    from rclpy.duration import Duration
+    kwargs = {'depth': q['depth'], 'history': HistoryPolicy.KEEP_LAST,
+              'reliability': getattr(ReliabilityPolicy, q['reliability'].upper()),
+              'durability': getattr(DurabilityPolicy, q['durability'].upper())}
+    for key, policy in (('deadline_ns', 'deadline'), ('liveliness_lease_duration_ns', 'liveliness_lease_duration')):
+        if key in q:
+            kwargs[policy] = Duration(nanoseconds=q[key])
+    if 'liveliness' in q:
+        kwargs['liveliness'] = getattr(LivelinessPolicy, q['liveliness'].upper())
+    return QoSProfile(**kwargs)
+
+
 def main():
     config = json.loads(sys.argv[1])
     role = sys.argv[2]
@@ -38,6 +64,7 @@ def main():
     rclpy.init(context=context)
     rmw = rclpy.get_rmw_implementation_identifier()
     generation = uuid.uuid4().hex
+    process_start_ticks = int(Path('/proc/self/stat').read_text().rsplit(')', 1)[1].split()[19])
     name = f'r2f_{role}_{generation[:12]}'
     node = Node(name, context=context, enable_rosout=False, start_parameter_services=False)
     executor = SingleThreadedExecutor(context=context)
@@ -49,14 +76,13 @@ def main():
         value = {'event': event, 'time_ns': time.time_ns(), 'monotonic_ns': time.monotonic_ns(),
                  'role': role, 'pid': os.getpid(), 'pgid': os.getpgrp(), 'run_id': config['run_id'],
                  'domain_id': config['domain_id'], 'rmw_identifier': rmw,
-                 'endpoint_generation': generation, 'node_name': name}
+                 'endpoint_generation': generation, 'node_name': name, 'process_start_ticks': process_start_ticks}
         value.update(fields)
         print(json.dumps(value, sort_keys=True), flush=True)
+        return value
 
     q = config.get(role + '_qos', config['qos'])
-    qos = QoSProfile(depth=q['depth'], history=HistoryPolicy.KEEP_LAST,
-                     reliability=getattr(ReliabilityPolicy, q['reliability'].upper()),
-                     durability=getattr(DurabilityPolicy, q['durability'].upper()))
+    qos = create_public_qos(q)
 
     def gid(value):
         return bytes(value).hex() if value is not None else None
@@ -83,6 +109,7 @@ def main():
              identity_basis='message_info_gid' if get_info('publisher_gid') is not None else 'endpoint_correlated',
              message_info=metadata)
 
+    create_begin = emit('endpoint_create_begin', topic=config['topic'], qos=q, message_type='std_msgs/msg/String')
     endpoint = node.create_publisher(String, config['topic'], qos) if role == 'writer' else node.create_subscription(String, config['topic'], receive, qos)
     created_ns = time.monotonic_ns()
 
@@ -93,7 +120,8 @@ def main():
                     'topic_type': info.topic_type, 'endpoint_gid': gid(info.endpoint_gid),
                     'qos': {'reliability': info.qos_profile.reliability.name.lower(),
                             'durability': info.qos_profile.durability.name.lower(),
-                            'depth': info.qos_profile.depth}}
+                            'depth': info.qos_profile.depth,
+                            **extended_graph_qos(info.qos_profile, config.get('observe_extended_qos', False))}}
         publishers = [entry(x) for x in node.get_publishers_info_by_topic(config['topic'])]
         subscriptions = [entry(x) for x in node.get_subscriptions_info_by_topic(config['topic'])]
         for item in publishers if role == 'writer' else subscriptions:
@@ -107,6 +135,7 @@ def main():
         executor.spin_once(timeout_sec=0.02)
         initial_graph = graph()
     emit('endpoint_created', endpoint_gid=local_gid, created_monotonic_ns=created_ns,
+         create_begin_monotonic_ns=create_begin['monotonic_ns'], create_begin_time_ns=create_begin['time_ns'],
          topic=config['topic'], qos=q, message_type='std_msgs/msg/String')
     emit('graph_snapshot', **initial_graph)
     input_buffer = b''
@@ -147,7 +176,7 @@ def main():
                 phase = command['phase']
                 if command.get('omit', False):
                     emit('harness_omission', send_sequence=sequence, phase=phase,
-                         fault_id='late_endpoint_delivery_omission', responsibility_layer='harness',
+                         fault_id=config.get('fault_id') or 'late_endpoint_delivery_omission', responsibility_layer='harness',
                          candidate_eligible=False, omission_layer='before_public_publish_call')
                 else:
                     payload = {'run_id': config['run_id'], 'send_sequence': sequence, 'phase': phase}

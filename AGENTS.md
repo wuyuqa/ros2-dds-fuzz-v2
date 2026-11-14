@@ -39,6 +39,14 @@ D013：reader创建返回后采集新鲜双向match snapshots，必须等两端�
 
 D014：第四target标准endpoint必需GUID/role/topic/type/reliability/durability/deadline/liveliness及lease；history/depth仅supporting diagnostic，缺失记not_applicable_by_endpoint_schema，禁止配置补值。generation由独立capture和进程生命周期关联，不伪造wire字段。主agent已裁定revision0首次模型定义，无第四target执行/seal，不改18/72分母。
 
+D015（待实施/验证）：第三target沿用wire_proxy，implementation=isolated_netns_nft_discovery_udp_drop。仅mutated真装drop，其余arm审计neutral；negative独立omit中间postrestore seq，不伪造drop/hit。hit须本次pair真实discovery counter>0，合成UDP不计；删规则不等于恢复。允许match continuity retained，但恢复必须有restore后身份关联discovery活动＋fresh双向count/graph＋postrestore delivery；缓存graph/data单独不足。父进程锁持有至netns整个子树清理，不改scope/72分母。
+
+当前用户目标为S1模块完全成熟且有2–3个真实SUT候选。实测自然候选为0，候选数量目标未达成；数量只能由真实运行产生，不能预先保证或用负控/工具错误凑数。原taskbook允许zero-candidate推进Phase，可交中间报告，但不能据此将整个goal标记complete。
+
+F06/F07：零自然候选时真实zero-ledger/control排除/原始失败保留可证明F06零分支执行，不声称自然admission/triage获真实异常验证。首跑失败不是replay failure；F07仍需真实健康重放和可控工具失败重放，独立产物不改原run。完整逐项证据与缺口见docs/s1-acceptance-ledger.md。
+
+已seal合同兼容（主agent工程裁定）：first/second的revision0 target manifest保持不变，core仅精确兼容其既有legacy fault合同；第三/第四新target显式声明receipt_kind/window及projection schema。首次seal前初版合同修正不等于新rule已完成。first/second在11ec76c source上的per-target seal只支持该版本；后续source改变必须最终冻结后rerun，不沿用旧成熟声明。third开发已由主agent解冻并分配独立写集，文档子agent仍不改代码、不commit。
+
 ## 真实证据与验收
 
 - 注册、计划、合成测试、离线 capsule、真实执行、effect、oracle、candidate、seal 各有独立证据门槛，不能互相替代。

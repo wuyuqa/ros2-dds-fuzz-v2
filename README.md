@@ -4,9 +4,13 @@
 
 主agent转述的用户最新范围覆盖完整 S1，第一条切片固定为 `discovery.late_endpoint + late_joiner`，随后按 late_join_delivery、interruption_recovery、builtin reconciliation 的顺序推进。主agent声明当前执行只涉及 ROS2 公共 API 的正常互操作、可靠性与证据工具，不实施自动漏洞搜寻、恶意 wire payload 或漏洞复现。原规格的额外能力和证据差距仍逐项登记。
 
-当前进展（记录于2026-11-15T00:01:03+08:00，Asia/Shanghai）：首份正式矩阵为`discovery.late_endpoint` revision0，domain180，24条真实运行完成；18条required中17 pass、1 unknown，六条fault按预期fail。health/mutation/fault各6/6，transparency 5/6，**seal=false**。唯一unknown是FastDDS transparent.1的工具匹配时序误判，实际post-match数据完整交付；D013要求reader创建后重新采集双向match snapshots，等两端各自唯一、命令关联的command_done ACK后才打开post_match_delivery窗口；ACK缺失/重复/提前不能放行。原报告保持immutable，修复后按新源码身份重跑。详见 [首次正式矩阵记录](docs/first-formal-matrix-2026-11-14.md)。
+当前进展（2026-11-15T00:32:53+08:00，Asia/Shanghai）：first r1/domain180与second r2/domain80已在source `11ec76c249cb75605fd70c5d7efb5610e70514b1`上分别完成18 required judged pass、6 negative judged fail、四control6/6、unknown0，独立verify rc0、per-target seal=true。r1/r2仅attempt名，target_revision均为0；首跑时序失败和second domain181预检阻断历史保留。
 
-第四target字段适用性已由主agent按D014裁定，仍未正式执行/封存；旧开发instrumentation的limited pass/extended unknown仅作带来源的开发证据，见验证快照。
+主agent已解冻third开发。上述seal只属于11ec76c版本，后续source改变后必须在最终source冻结后rerun，不能沿用为新版本成熟声明。first/second已seal revision0 target manifest保持不变，core精确兼容legacy fault合同；第三/第四新target显式声明receipt_kind/window及projection schema，首次seal前合同修正不等于new rule完成。
+
+完整S1仍缺Phase2→Phase4关联、bounded blackbox、F07真实健康/工具失败重放及第三/第四target正式证据。F06零候选审计路径已有真实执行，自然admission/triage未获真实异常证据。当前用户目标包含2–3个真实SUT候选，实测0，该项未达成；数量不能预先保证，zero-candidate允许阶段推进但不代表完整目标完成。见[完整S1验收账](docs/s1-acceptance-ledger.md)与[正式证据快照](docs/formal-target-snapshots-2026-11-15.md)。
+
+最新开发进度（2026-11-15T01:09:04+08:00）：main报告third v4两RMW runtime+ingest judged/pass，但`capsule_execution=null`且使用`reconstructed_input`，仅development，真实capsule-driven neutral/fault仍待执行。新增20项replay、31项third runtime/campaign离线测试通过不等于真实replay；Phase2 bridge新增不替代真实trace/lifecycle/blackbox对照。文档本轮freeze-ready，不commit，停止轮询与自动追加，等待main下一里程碑派遣。
 
 文档导航：
 

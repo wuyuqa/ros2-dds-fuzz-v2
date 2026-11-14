@@ -6,6 +6,7 @@ import fcntl
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 import socket
 import time
@@ -53,7 +54,10 @@ def scan_processes(old_repo: Path, domain_id: int | None = None, proc_root=Path(
                     continue
                 raise
             args = [x.decode(errors='replace') for x in argv if x]
-            old = any(str(old_repo) in a for a in args)
+            # Match a path component boundary, including --repo=/path and
+            # quoted shell arguments; the sibling ros2-dds-fuzz-v2 is not old.
+            old_path = re.compile(r'(?<![\w./-])' + re.escape(str(old_repo)) + r"(?=$|/|[\s\"':;,])")
+            old = any(old_path.search(a) for a in args)
             try:
                 cwd = (entry / 'cwd').resolve(strict=True)
                 old = old or cwd == old_repo or old_repo in cwd.parents

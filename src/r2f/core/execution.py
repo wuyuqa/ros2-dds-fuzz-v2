@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 
 from ._json import integer, nonempty, sha256_digest, snapshot
-from .evidence import verify_raw
+from .evidence import canonical_hash, verify_raw
 from .mutation import MutationReceipt
 from .state_machine import StateCondition, utc_now
 
@@ -41,12 +41,80 @@ def validate_neutral(record):
     return True
 
 
-def validate_fault_control_execution(record):
-    """Validate the negative-arm harness receipt, separately from mutation hit.
+_LEGACY_FAULT_TARGETS = frozenset({"discovery.late_endpoint", "discovery.late_join_delivery"})
+_FAULT_RECEIPT_SCHEMA = "r2f.fault-control-receipt/v1"
 
-    raw_event_ref accepts the runtime events' nonnegative integer index, or a
-    nonempty textual raw event reference. Raw identity is checked by the
-    cumulative execution gate; the runtime adapter binds the referenced event.
+
+def _validate_raw_ref(value, field):
+    if type(value) is int:
+        integer(value, field)
+    else:
+        nonempty(value, field)
+
+
+def _declared_fault_contract(record):
+    target = record.get("target")
+    if not isinstance(target, dict):
+        raise ValueError("fault-control execution requires a target manifest")
+    nonempty(target.get("target_id"), "target.target_id")
+    if record.get("target_id") != target["target_id"]:
+        raise ValueError("fault-control target identity differs from manifest")
+    controls = target.get("control_contract", {})
+    if not isinstance(controls, dict):
+        raise ValueError("target.control_contract must be a dict")
+    contract = controls.get("fault", {})
+    if not isinstance(contract, dict):
+        raise ValueError("target.control_contract.fault must be a dict")
+    return target, contract
+
+
+def _validate_delivery_fault(receipt, contract):
+    window = nonempty(contract.get("window"), "control_contract.fault.window")
+    if receipt.get("window") != window:
+        raise ValueError("fault receipt window differs from target declaration")
+    integer(receipt.get("omitted_sequence"), "fault_control_receipt.omitted_sequence")
+    refs = receipt.get("window_refs")
+    if not isinstance(refs, dict):
+        raise ValueError("delivery fault requires window_refs")
+    opening, closing = refs.get("open_event_ref"), refs.get("close_event_ref")
+    _validate_raw_ref(opening, "window_refs.open_event_ref")
+    _validate_raw_ref(closing, "window_refs.close_event_ref")
+    if type(opening) is int and type(closing) is int and opening >= closing:
+        raise ValueError("delivery window open event must precede close event")
+
+
+def _validate_projection_fault(receipt):
+    nonempty(receipt.get("field_path"), "fault_control_receipt.field_path")
+    source = receipt.get("projection_source")
+    if not isinstance(source, str) or source not in {"builtin", "graph"}:
+        raise ValueError("projection_source must identify builtin or graph")
+    if "before" not in receipt or "after" not in receipt:
+        raise ValueError("projection fault requires before and after values")
+    if canonical_hash(receipt["before"]) == canonical_hash(receipt["after"]):
+        raise ValueError("projection fault before and after must differ as typed JSON values")
+    sources = receipt.get("original_sources")
+    if not isinstance(sources, dict):
+        raise ValueError("projection fault requires both original sources")
+    for source in ("builtin", "graph"):
+        original = sources.get(source)
+        if not isinstance(original, dict):
+            raise ValueError(f"original_sources.{source} is required")
+        sha256_digest(original.get("raw_sha256"), f"original_sources.{source}.raw_sha256")
+        _validate_raw_ref(original.get("raw_ref"), f"original_sources.{source}.raw_ref")
+    _validate_raw_ref(receipt.get("controlled_projection_ref"), "controlled_projection_ref")
+
+
+def validate_fault_control_execution(record):
+    """Validate a negative harness receipt against its target's exact contract.
+
+    Declared v1 receipts require fault_id/receipt_kind, plus a delivery window or
+    the original projection-source references. Schema validation does not read
+    source artifacts: the runtime adapter verifies hashes, event binding,
+    chronology, closure and independent sources against unchanged original raw.
+
+    The first two revision-0 targets retain their existing no-kind v0 receipt.
+    They must explicitly declare the original fault id; this compatibility never
+    accepts a missing declaration, different target, fault id or new receipt kind.
     """
     if record.get("arm") != "negative" or record.get("control_kind") != "fault":
         raise ValueError("fault-control execution requires negative arm and fault control_kind")
@@ -55,21 +123,41 @@ def validate_fault_control_execution(record):
     receipt = record.get("fault_control_receipt")
     if not isinstance(receipt, dict):
         raise ValueError("fault_control_receipt is required")
-    if receipt.get("fault_id") != "late_endpoint_delivery_omission":
-        raise ValueError("unsupported fault_control_receipt.fault_id")
     if receipt.get("applied") is not True:
         raise ValueError("fault control requires applied=true")
-    integer(receipt.get("omitted_sequence"), "fault_control_receipt.omitted_sequence")
-    reference = receipt.get("raw_event_ref")
-    if type(reference) is int:
-        integer(reference, "fault_control_receipt.raw_event_ref")
-    else:
-        nonempty(reference, "fault_control_receipt.raw_event_ref")
+    _validate_raw_ref(receipt.get("raw_event_ref"), "fault_control_receipt.raw_event_ref")
     if receipt.get("responsibility_layer") != "harness" or receipt.get("candidate_eligible") is not False:
         raise ValueError("fault control must declare harness responsibility and candidate_eligible=false")
     mutation = MutationReceipt.from_record(record)
     if mutation.applied or mutation.hit or mutation.effect_observed:
         raise ValueError("fault control must not claim mutation applied/hit/effect_observed")
+
+    target, contract = _declared_fault_contract(record)
+    if "receipt_kind" not in contract:
+        legacy_id = "late_endpoint_delivery_omission"
+        if (target["target_id"] not in _LEGACY_FAULT_TARGETS
+                or type(target.get("target_revision")) is not int or target["target_revision"] != 0
+                or contract.get("fault_id") != legacy_id
+                or receipt.get("fault_id") != legacy_id
+                or "receipt_kind" in receipt or "schema" in receipt):
+            raise ValueError("legacy fault receipt is limited to the original two revision-0 target contracts")
+        integer(receipt.get("omitted_sequence"), "fault_control_receipt.omitted_sequence")
+        return True
+
+    fault_id = nonempty(contract.get("fault_id"), "control_contract.fault.fault_id")
+    kind = contract["receipt_kind"]
+    if not isinstance(kind, str) or kind not in {"delivery_omission", "projection_field_mismatch"}:
+        raise ValueError("unsupported declared fault receipt_kind")
+    if contract.get("arm") != "negative" or contract.get("candidate_eligible") is not False:
+        raise ValueError("declared fault control must be negative and candidate-ineligible")
+    if receipt.get("schema") != _FAULT_RECEIPT_SCHEMA:
+        raise ValueError("unsupported fault receipt schema")
+    if receipt.get("fault_id") != fault_id or receipt.get("receipt_kind") != kind:
+        raise ValueError("fault receipt id/kind differs from target declaration")
+    if kind == "delivery_omission":
+        _validate_delivery_fault(receipt, contract)
+    else:
+        _validate_projection_fault(receipt)
     return True
 
 

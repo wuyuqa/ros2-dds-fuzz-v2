@@ -11,15 +11,17 @@ import time
 
 
 class WorkerPool:
-    def __init__(self, config, environment, output_dir, emit):
+    def __init__(self, config, environment, output_dir, emit, *, role_environments=None):
         self.config, self.environment, self.output_dir, self.emit = config, environment, Path(output_dir), emit
         self.selector = selectors.DefaultSelector()
         self.workers, self.buffers, self.stderr_handles = {}, {}, []
+        self.role_environments = role_environments or {}
         self.command_serial = 0
         self.metadata = []
 
     def start(self, role):
         env = dict(self.environment)
+        env.update(self.role_environments.get(role, {}))
         env.update(ROS_DOMAIN_ID=str(self.config['domain_id']), RMW_IMPLEMENTATION=self.config['rmw'],
                    ROS_LOCALHOST_ONLY='1', ROS_LOG_DIR=str(self.output_dir / 'ros_logs'),
                    PYTHONDONTWRITEBYTECODE='1', PYTHONUNBUFFERED='1')

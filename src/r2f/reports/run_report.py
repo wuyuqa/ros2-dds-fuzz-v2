@@ -86,7 +86,7 @@ def audit_report(report_path):
         rows = report["rows"]
         if not isinstance(rows, list):
             raise ValueError("rows must be a list")
-        expected = first_slice_cells()
+        expected = first_slice_cells(target_id)
         expected_by_id = {r["cell_id"]: r for r in expected}
         if Counter(r.get("cell_id") for r in rows) != Counter(expected_by_id.keys()):
             errors.append("matrix_missing_duplicate_or_extra_cell")
@@ -152,13 +152,14 @@ def audit_report(report_path):
                 for key, value in submitted.items():
                     if config.get(key) != value:
                         raise ValueError("submitted_input_runtime_config_mismatch:" + key)
-                actual_delay = config["reader_delay_sec"] if row["arm"] == "mutated" else config["baseline_reader_delay_sec"]
-                if actual_delay != submitted["reader_delay_sec"]:
-                    raise ValueError("submitted_delay_not_executed")
+                if target_id in EXECUTION_ORDER[:2]:
+                    actual_delay = config["reader_delay_sec"] if row["arm"] == "mutated" else config["baseline_reader_delay_sec"]
+                    if actual_delay != submitted["reader_delay_sec"]:
+                        raise ValueError("submitted_delay_not_executed")
                 if canonical_hash(submitted) != row.get("actual_submitted_payload_sha256"):
                     raise ValueError("submitted_payload_hash_mismatch")
                 reconstructed = ingest_execution(Scenario.from_dict(capsule.input["scenario"]), config, runtime, capsule)
-                for key in ("execution_stage", "precondition_receipts", "mutation_receipt", "typed_facts", "oracle", "oracle_verdict", "raw_sha256", "rule_id", "fault_control_receipt"):
+                for key in ("execution_stage", "precondition_receipts", "mutation_receipt", "typed_facts", "oracle", "oracle_verdict", "raw_sha256", "rule_id", "fault_control_receipt", "instrumentation_observation"):
                     if reconstructed.get(key) != row.get(key):
                         raise ValueError("raw_recomputed_cell_mismatch:" + key)
                 validate_execution(row)
@@ -198,19 +199,24 @@ def audit_report(report_path):
         if canonical_hash(ledger) != report.get("candidate_ledger_sha256"):
             errors.append("candidate_ledger_hash_mismatch")
         actual_anomalies = {r["cell_id"] for r in rows if r.get("oracle_verdict") == "fail" and r.get("arm") != "negative" and not r.get("control_kind")}
-        if {c.get("cell_id") for c in ledger["candidates"]} != actual_anomalies:
+        if {c.get("cell_id") for c in ledger["candidates"] if c.get("observation_kind", "primary") == "primary"} != actual_anomalies:
             errors.append("candidate_ledger_dropped_or_invented_anomaly")
         if not ledger["candidates"] and not ledger.get("zero_candidate_explanation"):
             errors.append("zero_candidate_explanation_missing")
         from r2f.reports.candidate_report import candidate_ledger, audit_projection
         reconstructed_ledger = candidate_ledger(rows)
-        expected_candidates = {c["cell_id"]: c for c in reconstructed_ledger["candidates"]}
+        expected_candidates = {c["candidate_id"]: c for c in reconstructed_ledger["candidates"]}
+        if Counter(c.get("candidate_id") for c in ledger["candidates"]) != Counter(expected_candidates.keys()):
+            errors.append("candidate_ledger_dropped_or_invented_instrumentation")
+        for key in ("instrumentation_status", "instrumentation_candidates", "instrumentation_intake_count", "instrumentation_qualification", "instrumentation_linkage", "instrumentation_observations"):
+            if ledger.get(key) != reconstructed_ledger.get(key):
+                errors.append("instrumentation_ledger_not_bound_to_qualified_observation:" + key)
         if ledger.get("confirmed_candidates") != sum(c.get("candidate_status") == "confirmed" for c in ledger["candidates"]):
             errors.append("confirmed_count_not_derived_from_ledger")
         if ledger.get("instrumentation_status") == "not_run" and ledger.get("instrumentation_candidates") is not None:
             errors.append("unexecuted_instrumentation_count_must_be_null")
         for candidate in ledger["candidates"]:
-            expected_candidate = expected_candidates.get(candidate.get("cell_id"))
+            expected_candidate = expected_candidates.get(candidate.get("candidate_id"))
             if expected_candidate is None or audit_projection(candidate) != audit_projection(expected_candidate):
                 errors.append("candidate_evidence_or_lifecycle_not_bound_to_verified_cell")
             if candidate.get("evidence", {}).get("arm") == "negative" or candidate.get("candidate_source") == "control":

@@ -6,17 +6,17 @@ The runtime records facts, not oracle verdicts or campaign lifecycle decisions.
 """
 from __future__ import annotations
 import hashlib
-import importlib
 import json
 import math
 import os
 from pathlib import Path
 import re
+import shutil
 import time
 import uuid
 
 from .domains import IsolationError, LeaseSet
-from .environment import REPO, RMW_NAMES, activated_environment, check_environment, source_identity
+from .environment import REPO, RMW_NAMES, activated_environment, check_environment
 from .process import WorkerPool
 
 RECEIPT_KEYS = ('planned', 'submitted', 'carrier_admitted', 'configured', 'applied', 'hit', 'effect_observed')
@@ -69,7 +69,7 @@ def normalize_config(config):
             raise ValueError('invalid_count:' + key)
     if c['post_match_count'] < 3 or c['pre_match_count'] < 1:
         raise ValueError('need at least one prejoin and three postmatch samples')
-    default_qos = {'reliability': 'reliable', 'durability': 'volatile', 'depth': 32}
+    default_qos = {'reliability': 'reliable', 'durability': 'volatile', 'depth': 64 if c['target_id'] == 'builtin.discovery_projection_reconciliation' else 32}
     c['qos'] = {**default_qos, **c.get('qos', {})}
     for role in ('writer', 'reader'):
         c[role + '_qos'] = {**c['qos'], **c.get(role + '_qos', {})}
@@ -78,8 +78,10 @@ def normalize_config(config):
             raise ValueError('unsupported_qos_policy')
         if isinstance(q['depth'], bool) or not isinstance(q['depth'], int) or not 1 <= q['depth'] <= 10000:
             raise ValueError('invalid_qos_depth')
-    c.setdefault('fault_id', 'late_endpoint_delivery_omission' if c['arm'] == 'negative' else None)
-    if c['fault_id'] not in (None, 'late_endpoint_delivery_omission'):
+    fault_name = {'discovery.interruption_recovery': 'post_restore_delivery_omission',
+                  'builtin.discovery_projection_reconciliation': 'controlled_projection_field_mismatch'}.get(c['target_id'], 'late_endpoint_delivery_omission')
+    c.setdefault('fault_id', fault_name if c['arm'] == 'negative' else None)
+    if c['fault_id'] not in (None, fault_name):
         raise ValueError('unsupported_fault_id')
     if c['fault_id'] and c['arm'] != 'negative':
         raise ValueError('fault_requires_negative_arm')
@@ -97,23 +99,22 @@ def normalize_config(config):
 
 
 def runtime_capabilities():
-    """A network adapter advertises separately from the available endpoint path.
-
-    discovery_network.py is independently owned. Integration may provide
-    capabilities() -> dict and run_pair(config, output_dir) -> the same contract;
-    runtime never substitutes pause-publishing for discovery drop.
-    """
-    result = {'public_endpoint_pair': True, 'independent_worker_processes': True,
-              'transient_local_api': True, 'builtin_independent_projection': False,
-              'discovery_network': {'available': False, 'reason': 'adapter_not_integrated'}}
-    try:
-        module = importlib.import_module('r2f.runtime.discovery_network')
-        capability = getattr(module, 'capabilities', None)
-        result['discovery_network'] = capability() if callable(capability) else {
-            'available': False, 'reason': 'adapter_contract_pending', 'module_present': True}
-    except ImportError:
-        pass
-    return result
+    """Implementation and dependency discovery are not live run admission."""
+    tools = {name: shutil.which(name) is not None for name in ('unshare', 'ip', 'nft')}
+    dependencies = all(tools.values())
+    return {'public_endpoint_pair': True, 'independent_worker_processes': True,
+            'transient_local_api': True, 'builtin_independent_projection': True,
+            'projection_observation': {'implemented': True, 'available': None, 'admitted': False,
+                'admission_requires_live_preflight': True, 'independent_sources': ['passive_rtps_wire', 'ros_graph']},
+            'discovery_network': {
+                'implemented': True, 'available': None if dependencies else False,
+                'availability_status': 'requires_live_preflight' if dependencies else 'missing_dependency',
+                'dependency_check': {'available': dependencies, 'tools': tools},
+                'admitted': False, 'admission_requires_live_preflight': True,
+                'implementation': 'isolated_netns_nft_discovery_udp_drop',
+                'carrier': 'wire_proxy', 'target_id': 'discovery.interruption_recovery',
+                'reason': 'implementation_present; namespace, locks, ports, observer and pair binding require this run admission',
+                'execution_evidence': False}}
 
 
 def summarize_events(events):
@@ -237,6 +238,51 @@ def wait_for_fresh_match(pool, events, reader_created_ns, timeout, emit=None):
             raise TimeoutError('fresh_match_snapshot_deadline')
 
 
+def query_acknowledged_graphs(pool, events, timeout, emit=None, capture_graph=None):
+    """Query once per role and wait for its unique snapshot -> graph -> ACK chain.
+
+    Periodic or previous-command graph tokens never satisfy this query. These
+    commands replace existing graph queries; they add no new DDS entities.
+    """
+    requests = {}
+    for role in ('writer', 'reader'):
+        requested_ns = time.monotonic_ns()
+        command_id = pool.command(role, 'snapshot')
+        requests[role] = (command_id, requested_ns)
+        if emit is not None:
+            emit('graph_snapshot_requested', role=role, command_id=command_id,
+                 requested_monotonic_ns=requested_ns)
+
+    def completed():
+        proof = {}
+        for role, (command_id, requested_ns) in requests.items():
+            responses = {kind: [] for kind in ('match_snapshot', 'graph_snapshot', 'command_done')}
+            for index, event in enumerate(events):
+                kind = event.get('event')
+                if (kind in responses and event.get('role') == role
+                        and type(event.get('command_id')) is int and event['command_id'] == command_id):
+                    responses[kind].append((index, event))
+            if any(len(items) != 1 for items in responses.values()):
+                continue
+            si, snapshot = responses['match_snapshot'][0]
+            gi, graph = responses['graph_snapshot'][0]
+            ai, ack = responses['command_done'][0]
+            stamps = [snapshot.get('sampled_monotonic_ns'), snapshot.get('monotonic_ns'),
+                      graph.get('monotonic_ns'), ack.get('monotonic_ns')]
+            if (all(type(stamp) is int for stamp in stamps)
+                    and requested_ns <= stamps[0] <= stamps[1] <= stamps[2] <= stamps[3]
+                    and si < gi < ai):
+                proof[role] = {'snapshot': snapshot, 'graph': graph, 'ack': ack}
+        return proof
+
+    pool.wait(lambda: len(completed()) == 2, timeout, 'acknowledged_graph_query')
+    proof = completed()
+    if capture_graph is not None:
+        for role in ('writer', 'reader'):
+            capture_graph(proof[role]['graph'], proof[role]['ack'])
+    return proof
+
+
 def run_pair(config: dict, output_dir: Path) -> dict:
     output_dir = Path(output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -251,18 +297,17 @@ def run_pair(config: dict, output_dir: Path) -> dict:
         result['reason'] = 'blocked:invalid_config:' + str(exc)
         return result
     if c['target_id'] == 'discovery.interruption_recovery':
-        try:
-            adapter = importlib.import_module('r2f.runtime.discovery_network')
-            entry = getattr(adapter, 'run_pair', None)
-            if callable(entry) and result['capabilities']['discovery_network'].get('available'):
-                return entry(c, output_dir)
-        except ImportError:
-            pass
-        result['reason'] = 'blocked:discovery_network_adapter_not_integrated'
-        return result
+        if c['carrier'] != 'wire_proxy' or c['mutation_kind'] != 'discovery_drop':
+            result['reason'] = 'blocked:discovery_drop_requires_wire_proxy_contract'
+            return result
+        from .namespace_pair import run_discovery_pair
+        return run_discovery_pair(c, output_dir, result)
     if c['target_id'] == 'builtin.discovery_projection_reconciliation':
-        result['reason'] = 'blocked:independent_builtin_projection_not_available'
-        return result
+        if c['carrier'] != 'ros2_endpoint' or c['mutation_kind'] != 'endpoint_qos_variation':
+            result['reason'] = 'blocked:projection_requires_public_endpoint_qos_contract'
+            return result
+        from .namespace_pair import run_discovery_pair
+        return run_discovery_pair(c, output_dir, result)
     if c['target_id'] not in ('discovery.late_endpoint', 'discovery.late_join_delivery'):
         result['reason'] = 'blocked:target_not_supported'
         return result
@@ -285,7 +330,11 @@ def run_pair(config: dict, output_dir: Path) -> dict:
     events = result['events']
     pool = None
     lease = None
-    before_source = source_identity()
+    from .namespace_pair import execution_chain_identity, same_source
+    from .instrumentation_bridge import prepare
+    observation = None
+    observation_errors = []
+    before_source = execution_chain_identity()
     started_ns = time.monotonic_ns()
 
     def emit(event, **fields):
@@ -298,6 +347,20 @@ def run_pair(config: dict, output_dir: Path) -> dict:
         raw.write(json.dumps(value, sort_keys=True) + '\n')
         if event == 'endpoint_created':
             result['real_execution'] = True
+
+    def observe(method, *args):
+        # Observation errors are sidecar diagnostics, not primary SUT failures.
+        try:
+            response = getattr(observation, method)(*args)
+            if isinstance(response, dict) and response.get('accepted') is False:
+                observation_errors.append({'hook': method, 'reason': response.get('reason', 'rejected')})
+            return response
+        except (OSError, ValueError, TypeError, RuntimeError) as exc:
+            observation_errors.append({'hook': method, 'reason': type(exc).__name__})
+            return None
+
+    def capture_graph(graph, ack):
+        return observe('capture_graph', graph, ack)
 
     def has(event, role=None, **fields):
         return any(e['event'] == event and (role is None or e.get('role') == role) and all(e.get(k) == v for k, v in fields.items()) for e in events)
@@ -331,13 +394,18 @@ def run_pair(config: dict, output_dir: Path) -> dict:
         if not environment['ok']:
             raise IsolationError(environment.get('reason', 'environment_preflight_failed'))
         _, child_environment = activated_environment(c)
-        pool = WorkerPool(c, child_environment, output_dir, emit)
+        # prepare must succeed before worker creation: never fall back to an
+        # unsanitized environment after a blackbox preparation failure.
+        observation = prepare(c, output_dir, child_environment)
+        pool = WorkerPool(c, observation.base_env, output_dir, emit,
+                          role_environments=observation.role_env)
         emit('window_open', window='before_reader_match')
         step('writer_created', lambda: has('endpoint_created', 'writer'), lambda: pool.start('writer'),
              c['startup_timeout_sec'], ['environment_ok', 'locks_held'])
         writer_token = next(e for e in events if e['event'] == 'endpoint_created' and e['role'] == 'writer')
         if writer_token['rmw_identifier'] != c['rmw'] or not writer_token.get('endpoint_gid'):
             raise RuntimeError('writer_identity_or_rmw_incomplete')
+        observe('capture_worker', 'writer', writer_token['pid'], writer_token)
         step('writer_prejoin_published', lambda: sum(e['event'] == 'send' and e.get('phase') == 'prejoin' for e in events) == c['pre_match_count'],
              lambda: [publish(i, 'prejoin') for i in range(c['pre_match_count'])], c['startup_timeout_sec'], ['writer_created'])
         preconditions_ok = len(receipts) == 2 and all(r['satisfied'] for r in receipts)
@@ -364,6 +432,7 @@ def run_pair(config: dict, output_dir: Path) -> dict:
         reader_token = next(e for e in events if e['event'] == 'endpoint_created' and e['role'] == 'reader')
         if reader_token['rmw_identifier'] != c['rmw'] or not reader_token.get('endpoint_gid') or reader_token['pid'] == writer_token['pid']:
             raise RuntimeError('reader_identity_or_process_isolation_incomplete')
+        observe('capture_worker', 'reader', reader_token['pid'], reader_token)
         actual_delay = reader_token['created_monotonic_ns'] - writer_token['created_monotonic_ns']
         if actual_delay <= 0:
             raise RuntimeError('reader_not_created_after_writer')
@@ -381,21 +450,21 @@ def run_pair(config: dict, output_dir: Path) -> dict:
                 pool, events, reader_token['created_monotonic_ns'], c['match_timeout_sec'], emit))
         step('endpoints_matched', lambda: set(fresh_matches) == {'writer', 'reader'},
              observe_fresh_matches, c['match_timeout_sec'], ['reader_created', 'writer_created'], observation=True)
-        # Check both observed endpoint GIDs in both graph projections.
+        # Check only the newly requested, fully acknowledged graph projections.
+        graph_proof = {}
         def graph_expected():
             for role in ('writer', 'reader'):
-                snapshots = [e for e in events if e['event'] == 'graph_snapshot' and e.get('role') == role]
-                if not snapshots:
+                if role not in graph_proof:
                     return False
-                snapshot = snapshots[-1]
+                snapshot = graph_proof[role]['graph']
                 if {p['endpoint_gid'] for p in snapshot['publishers']} != {writer_token['endpoint_gid']}:
                     return False
                 if {p['endpoint_gid'] for p in snapshot['subscriptions']} != {reader_token['endpoint_gid']}:
                     return False
             return True
-        for role in ('writer', 'reader'):
-            pool.command(role, 'snapshot')
-        step('graph_identity_verified', graph_expected, lambda: None, c['match_timeout_sec'], ['endpoints_matched'], observation=True)
+        def observe_graph():
+            graph_proof.update(query_acknowledged_graphs(pool, events, c['match_timeout_sec'], emit, capture_graph))
+        step('graph_identity_verified', graph_expected, observe_graph, c['match_timeout_sec'], ['endpoints_matched'], observation=True)
         emit('window_close', window='before_reader_match')
         expected = list(range(c['pre_match_count'], c['pre_match_count'] + c['post_match_count']))
         omitted = expected[len(expected) // 2] if c['fault_id'] else None
@@ -418,10 +487,7 @@ def run_pair(config: dict, output_dir: Path) -> dict:
             delivery_timed_out = True
         emit('window_close', window='post_match_delivery', deadline_expired=delivery_timed_out,
              intended_missing_includes_omission=True)
-        final_graph_commands = [(role, pool.command(role, 'snapshot')) for role in ('writer', 'reader')]
-        for role, command_id in final_graph_commands:
-            pool.wait(lambda role=role, command_id=command_id: has('command_done', role, command_id=command_id),
-                      c['startup_timeout_sec'], 'final_graph_snapshot')
+        query_acknowledged_graphs(pool, events, c['startup_timeout_sec'], emit, capture_graph)
         identity_facts = summarize_events(events)
         emit('identity_observation', identity_basis=identity_facts['identity_basis'], graph_boundary_check=True,
              publisher_gid_status=identity_facts['publisher_gid_status'],
@@ -432,8 +498,8 @@ def run_pair(config: dict, output_dir: Path) -> dict:
             emit('fault_control_receipt', fault_id=c['fault_id'], omitted_sequence=omitted,
                  applied=has('harness_omission', 'writer', send_sequence=omitted),
                  responsibility_layer='harness', candidate_eligible=False)
-        after_source = source_identity()
-        if any(before_source[k] != after_source[k] for k in ('head', 'runtime_source_sha256')):
+        after_source = execution_chain_identity()
+        if not same_source(before_source, after_source):
             raise RuntimeError('source_identity_changed_during_execution')
         result.update(runtime_status='completed', status='completed', reason=None)
     except (IsolationError, OSError, RuntimeError, TimeoutError, ValueError) as exc:
@@ -450,14 +516,12 @@ def run_pair(config: dict, output_dir: Path) -> dict:
             # A failed shutdown invalidates process health even if messages arrived.
             if any(m.get('returncode') != 0 for m in pool.metadata) and result['runtime_status'] == 'completed':
                 result.update(runtime_status='failed', status='failed', reason='worker_shutdown_failed')
-        final_source = source_identity()
-        if any(before_source[k] != final_source[k] for k in ('head', 'runtime_source_sha256')):
+        final_source = execution_chain_identity()
+        if not same_source(before_source, final_source):
             result.update(runtime_status='failed' if result['real_execution'] else 'blocked',
                           status='failed' if result['real_execution'] else 'blocked',
                           reason='source_identity_changed_during_execution')
             emit('runtime_abort', reason=result['reason'])
-        if lease is not None:
-            lease.__exit__(None, None, None)
         result['facts'] = summarize_events(events)
         if result['real_execution']:
             result['execution'] = {'real_execution': True, 'run_id': c['run_id'], 'target_id': c['target_id'],
@@ -474,8 +538,26 @@ def run_pair(config: dict, output_dir: Path) -> dict:
         os.fsync(raw.fileno())
         raw.close()
         result['raw_sha256'] = hashlib.sha256(raw_path.read_bytes()).hexdigest()
-        if result['execution'] is not None:
-            result['execution'].update(raw_path=str(raw_path), raw_sha256=result['raw_sha256'])
-            (output_dir / 'execution.json').write_text(json.dumps(result['execution'], sort_keys=True, indent=2) + '\n')
-        (output_dir / 'runtime_result.json').write_text(json.dumps(result, sort_keys=True, indent=2) + '\n')
+        try:
+            if result['execution'] is not None:
+                result['execution'].update(raw_path=str(raw_path), raw_sha256=result['raw_sha256'])
+            if observation is not None:
+                sidecar = observe('collect', result)
+                if not isinstance(sidecar, dict):
+                    sidecar = {'schema': 'r2f.runtime-instrumentation/v1',
+                               'observation_mode': c.get('observation_mode', 'blackbox'),
+                               'status': 'incomplete', 'verdict': 'unknown',
+                               'intake': [], 'candidate_count': 0}
+                if observation_errors:
+                    sidecar.update(status='incomplete', verdict='unknown', intake=[], candidate_count=0,
+                                   hook_diagnostics=list(observation_errors))
+                result['observation'] = sidecar
+                if result['execution'] is not None:
+                    result['execution']['observation'] = sidecar
+            if result['execution'] is not None:
+                (output_dir / 'execution.json').write_text(json.dumps(result['execution'], sort_keys=True, indent=2) + '\n')
+            (output_dir / 'runtime_result.json').write_text(json.dumps(result, sort_keys=True, indent=2) + '\n')
+        finally:
+            if lease is not None:
+                lease.__exit__(None, None, None)
     return result

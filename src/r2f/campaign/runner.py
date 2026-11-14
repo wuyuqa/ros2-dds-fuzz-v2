@@ -28,7 +28,7 @@ def plan_campaign(output_dir, *, repo=None, run_id=None, domain_id=173, seed=0,
     run_id = run_id or "s1-" + uuid.uuid4().hex
     if not re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", run_id):
         raise ValueError("invalid run_id")
-    if target_id not in EXECUTION_ORDER[:2]:
+    if target_id not in EXECUTION_ORDER:
         raise ValueError("target requires capability activation and a reviewed target-specific pipeline")
     registry = Registry()
     module = register(registry)
@@ -42,21 +42,29 @@ def plan_campaign(output_dir, *, repo=None, run_id=None, domain_id=173, seed=0,
     identity = identity_hashes(manifest)
     write_json(output_dir / "manifest.json", manifest)
     rows = []
-    for cell in first_slice_cells():
+    for cell in first_slice_cells(target_id):
         cell = dict(cell, target_id=target_id)
-        submitted = semantic_input(cell["arm"], parameters)
+        submitted = semantic_input(cell["arm"], parameters, target_id=target_id)
+        recovery = target_id == EXECUTION_ORDER[2]
+        projection = target_id == EXECUTION_ORDER[3]
+        mutation_kind = "discovery_drop" if recovery else "endpoint_qos_variation" if projection else "late_joiner"
+        carrier = "wire_proxy" if recovery else "ros2_endpoint"
+        mutation_parameters = ({key: submitted[key] for key in ("drop_duration_sec", "recovery_timeout_sec", "counter_interval_sec")}
+                               if recovery else {"baseline_qos":submitted["baseline_qos"], "submitted_qos":submitted["qos"]} if projection else {"reader_delay_sec": submitted["reader_delay_sec"]})
+        layer_receipts = ([{"layer": carrier, "declared_mutation": mutation_kind,
+                            "implementation": "isolated_netns_nft_discovery_udp_drop", "parameters": mutation_parameters}]
+                          if recovery else [{"layer":carrier, "declared_mutation":mutation_kind, "parameters":mutation_parameters}] if projection else [{"layer": carrier, "declared_mutation": mutation_kind, "submitted_reader_delay_sec": submitted["reader_delay_sec"]}])
         scenario = compile_scenario(target, cell["rmw"], cell["arm"], cell["repeat"], seed,
-                                    {"mutation_kind": "late_joiner", "carrier": "ros2_endpoint",
-                                     "mutation_parameters": {"reader_delay_sec": submitted["reader_delay_sec"]}})
+                                    {"mutation_kind": mutation_kind, "carrier": carrier, "mutation_parameters": mutation_parameters})
         capsule = ReplayCapsule.from_scenario(scenario, source_manifest=manifest["source_manifest"],
                                              final_input=submitted,
-                                             input_layer_receipts=[{"layer": "ros2_endpoint", "declared_mutation": "late_joiner", "submitted_reader_delay_sec": submitted["reader_delay_sec"]}],
+                                             input_layer_receipts=layer_receipts,
                                              origin_domain=domain_id)
         config = runtime_config(submitted, run_id=run_id, campaign_id=run_id,
                                 cell_id=cell["cell_id"], target_id=target_id,
                                 target_revision=target.target_revision, campaign_kind=cell["campaign_kind"],
                                 rmw=cell["rmw"], arm=cell["arm"], repeat=cell["repeat"], seed=seed,
-                                mutation_kind="late_joiner", carrier="ros2_endpoint",
+                                mutation_kind=mutation_kind, carrier=carrier,
                                 scenario=scenario.to_dict(), domain_id=domain_id,
                                 environment_mode="ros_overlay", source_repo=str(repo),
                                 expected_head=manifest["source_manifest"]["head"],
@@ -148,7 +156,7 @@ def run_campaign(output_dir, *, runtime=None, execute=False, **options):
         row = dict(planned, **execution)
         row["actual_submitted_payload_sha256"] = canonical_hash(capsule.input["effective_input"]["final_input"])
         row["replay_status"] = "not_run"
-        row["provenance"] = {"source_manifest": manifest["source_manifest"], "runtime_execution": row.get("runtime_execution_metadata"), "raw_sha256": row.get("raw_sha256"), "observation_path": "public_rclpy_graph_and_message_info"}
+        row["provenance"] = {"source_manifest": manifest["source_manifest"], "runtime_execution": row.get("runtime_execution_metadata"), "raw_sha256": row.get("raw_sha256"), "observation_path": "isolated_discovery_activity_and_public_pair" if report["target_id"] == EXECUTION_ORDER[2] else "independent_passive_sedp_and_public_graph" if report["target_id"] == EXECUTION_ORDER[3] else "public_rclpy_graph_and_message_info"}
         row.update(attribute(row, row["typed_facts"], row["oracle"]))
         if row.get("actual_run"):
             try:

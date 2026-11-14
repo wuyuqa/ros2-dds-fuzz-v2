@@ -10,3 +10,9 @@ __all__ = [
     'capture_process_provenance', 'collect_trace', 'parse_trace', 'normalize_guid',
     'reconcile_projection',
 ]
+
+from .sedp import PassiveSedpObserver, build_capture_spec, parse_sedp_capture
+__all__ += ['PassiveSedpObserver', 'build_capture_spec', 'parse_sedp_capture']
+
+from .sedp import reconcile_discovery_projection, check_offered_requested
+__all__ += ['reconcile_discovery_projection', 'check_offered_requested']

@@ -15,7 +15,7 @@ def main():
     parser.add_argument("--domain-id", type=int, default=173)
     parser.add_argument("--run-id")
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--target", dest="target_id", choices=("discovery.late_endpoint", "discovery.late_join_delivery"), default="discovery.late_endpoint")
+    parser.add_argument("--target", dest="target_id", choices=("discovery.late_endpoint", "discovery.late_join_delivery", "discovery.interruption_recovery", "builtin.discovery_projection_reconciliation"), default="discovery.late_endpoint")
     parser.add_argument("--parameters-json", type=Path)
     args = vars(parser.parse_args())
     parameters_path = args.pop("parameters_json")

@@ -9,7 +9,7 @@
 - 用户最新范围（主agent转述）：本轮继续完整 S1 的四个 scope target，不能把原文“第一轮到 Phase 3”当成本轮停止边界。第一条 slice 仍先完成，后续按原规格固定顺序推进。
 - 主agent声明的执行边界：当前实际工作只实施 ROS2 公共 API 的正常互操作、可靠性测试和证据工具；不实施自动漏洞搜寻、恶意 wire payload 或漏洞复现。
 - 原规格中的 instrumentation、bounded campaign、wire carrier、replay、candidate、seal 要逐项区分合同实现、真实运行、范围兼容性和证据缺口。保留原要求并核查，不用模拟结果充当真实运行。
-- 原 S1 全部成熟和“2–3 个真实 SUT candidate”不得预先承诺。候选数量取决于真实观察，零候选是可如实报告的结果，不等于已证明无缺陷或全部成熟。任务书本身没有必须产出 2–3 个候选的配额。
+- 当前用户目标为 S1 模块完全成熟且有 2–3 个真实 SUT candidate（本轮用户明确纠正目标口径）。实测自然候选为0，候选数量目标未达成；自然数量不能预先保证，只能由真实运行产生。原taskbook未设硬配额、允许零候选推进Phase，均不能降低当前用户目标，也不能据此宣称整个goal complete；可以如实交付中间报告。
 - health/fault/mutation/transparency 只用于校准。control 不进入自然 SUT candidate，不能为了凑数改 source、伪造 hit、放宽 primary rule 或把工具问题归为 SUT。
 - 旧参考中的 S1–S5、组合变异、native 路径和旧成熟数字不是新仓库的自动新增范围。
 
@@ -176,6 +176,44 @@ D013 ACK补充及第二次GO（2026-11-15T00:14:58+08:00，Asia/Shanghai）：
 - GUID generation由独立capture与进程/endpoint生命周期关联：明确GUID、进程身份、创建receipt和观察窗口。不得编造不存在的wire generation字段，也不把capture到公告自动当成对端已经处理该公告的内部证据。
 - 这是第四target revision0的首次模型定义；尚未执行或封存该target，不是删除已失败rule，不改第一target18或完整S1 72分母。原taskbook未枚举depth，旧catalog不能把超出标准endpoint schema的字段强行继承为全部RMW必需。
 - 该计划的“待owner批准”、建议revision0→1及旧N/A命名属于提议时点；本裁定在上述字段/代际边界内取代这些提议，使用revision0及精确状态 `not_applicable_by_endpoint_schema`。其余capture实现、默认省略推导、control施加层仍须实现与验证，不能把字段裁定扩写为整份方案已实现/已验收。
+
+## D015：第三target的真实发现drop/restore与netns生命周期
+
+记录时间：2026-11-15T00:26:18+08:00（Asia/Shanghai）。来源：主agent工程裁定/派遣消息。状态：**尚未实现/验证**；既有scope、四target及完整S1 72 required分母不变，不据此宣称第三target已expressible或通过。
+
+- 沿用既有carrier标识 `wire_proxy`，implementation显式记录为 `isolated_netns_nft_discovery_udp_drop`，不能隐去实际实现路径或把名称当能力证据。
+- 只有mutated arm真正安装drop规则；baseline、transparent、negative走受审计neutral路径。negative独立omit中间postrestore seq，记录harness fault provenance、闭合证据并排除candidate。不能实际装drop却声明applied=false，也不能把negative omission伪造为discovery mutation hit。
+- drop前置为本pair已matched。hit只接受本次真实ROS2 pair的discovery counter>0及关联raw，不得用合成UDP探针增加计数来证明DDS discovery命中；既有non-DDS控制只说明载体可行性。
+- restore删除规则只证明恢复动作执行，**不等于恢复已经观测**。不要求必须出现unmatched/rematch，可以保持match continuity retained。
+- 恢复须同时有restore后与本pair身份关联的真实discovery活动、新鲜双向count/graph以及postrestore delivery。仅有缓存graph或数据交付不够；不可用cached match冒充真实恢复观察。保留counter、规则安装/删除、活动、快照、数据及原始时间顺序。
+- 父进程持有相关campaign/domain/state-directory锁，直到整个netns子树清理完成；不能以单个worker退出或先释放锁来宣称资源已回收。具体实现及异常清理路径须后续真实验证。
+
+## F06/F07验收补充：零候选路径与真实重放缺口
+
+记录时间：2026-11-15T00:26:18+08:00（Asia/Shanghai）。来源：主agent工程裁定/独立验收消息；详细证据账见 [完整S1逐项验收账](s1-acceptance-ledger.md)。
+
+- 主agent确认第一target rerun在当前HEAD的独立verify：sealed=true/errors=[]、18 required judged pass、6 negative judged fail、四control6/6、unknown0。r1仅attempt名，同target_revision0；首次失败不覆盖。第二target已获执行GO，但完成状态必须以实际报告为准。
+- F06在零自然候选时，可以真实zero-ledger、control排除及原始失败保留证明该审计路径已经执行；自然admission/triage仍没有真实异常证据，不为补验收而制造候选。此裁定仅涉及零候选审计路径，不能替代当前用户2–3个真实SUT候选目标；实测0，该目标未达成。
+- core只读审计及文档子agent本轮复核：两次第一target正式run共48份capsule，replay_attempts、execution_history、non_replayable全部为0。首跑失败留存不等于replay failure；新attempt矩阵不自动等于core replay。
+- F07下一phase必须分别有真实健康重放和可控工具失败真实重放；生成独立产物并记录attempt/failure及来源关联，不改原run/capsule/raw。健康pass不用于确认原异常；原fail后新pass不能据此宣称异常已复现。
+- 现无需要用户确认事项；日常排程、环境冲突处置和验收由主agent协调。
+
+## 已seal revision0合同兼容与开发解冻（主agent工程裁定）
+
+记录时间：2026-11-15T00:30:42+08:00（Asia/Shanghai）。来源：主agent独立验收/工程派遣消息，文档子agent已只读核对。[正式证据快照](formal-target-snapshots-2026-11-15.md)列明四次attempt和hash。
+
+- second r2/domain80独立verify通过，first/second都在source HEAD `11ec76c249cb75605fd70c5d7efb5610e70514b1`上达到per-target seal：各18 required judged pass、6negative judged fail、四control6/6、unknown0。domain181预检阻断、旧first时序失败全部保留。r1/r2均非target revision。
+- 主agent已解冻third开发，runtime/campaign/core/instrumentation四方按独立写集推进；文档子agent仍仅写docs/README/AGENTS，不commit。后续source变化后上述通过只作原版本证据，须最终source冻结后rerun，不沿用为当前成熟声明。
+- 不改first/second已seal revision0 target manifest。core为其精确legacy fault合同兼容，不把兼容扩成任意旧格式/缺receipt的通用放行；快照保存各target_sha256及完整legacy fault字段。
+- 第三/第四新target显式声明receipt_kind/window及projection schema；首次seal前修正初版合同不等于新rule已完成或通过。D014/D015仍须真实实现、合同检查和18+6/control验收，不改scope/72分母。
+
+## 主agent后续只读核查补记
+
+记录时间：2026-11-15T00:38:53+08:00（Asia/Shanghai）。来源：主agent工程核查消息；probe产物另由文档子agent只读核对，见[验证快照](verification-snapshot-2026-11-14.md)。
+
+- 当前开发中的first/second target.to_dict()与两份11ec76c正式manifest逐字段比较true，这是主agent报告的检查，不冒称本子agent复跑。target未变不等于source冻结；source dirty时原seal仍仅支持原版本。
+- domains.scan_processes旧repo substring前缀误判新v2绝对脚本路径，runtime正在按真实路径边界修复。旧repo只读、真实子路径/进程/owner/锁保护不放宽；不能把修复解释成忽略旧仓库扫描或强抢资源。
+- 两RMW被动SEDP attempt2的netns status=ok，parsed events为56/48且errors=[]；development_only/default policy pending，不计正式四target成熟或SUTcandidate。前次失败、原始raw和不同分析版本均保留；不把计划/解析器通过升级为rule或seal完成。
 
 ## 参考来源和阅读范围
 

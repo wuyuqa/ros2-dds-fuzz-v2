@@ -52,33 +52,53 @@ def source_manifest(repo):
             "dirty_behavior_paths": sorted(set(dirty))}
 
 
-def semantic_input(arm, parameters=None):
+def semantic_input(arm, parameters=None, *, target_id="discovery.late_endpoint"):
     p = dict(parameters or {})
+    if target_id == "builtin.discovery_projection_reconciliation":
+        return projection_input(arm, p)
     supported = {"topic", "qos", "pre_match_count", "post_match_count", "reader_delay_sec", "baseline_reader_delay_sec", "match_timeout_sec", "delivery_timeout_sec", "startup_timeout_sec", "publish_interval_sec"}
+    recovery = target_id == "discovery.interruption_recovery"
+    discovery_defaults = {"drop_duration_sec": 3.0, "recovery_timeout_sec": 8.0, "counter_interval_sec": 0.25}
+    if recovery:
+        supported |= set(discovery_defaults)
     if set(p) - supported:
         raise ValueError("unknown semantic parameter(s): " + ",".join(sorted(set(p) - supported)))
     base_delay = p.get("baseline_reader_delay_sec", 0.02)
     result = {
-        "topic": p.get("topic", "/r2f/s1/late_endpoint"), "message_type": "std_msgs/msg/String",
+        "topic": p.get("topic", "/r2f/s1/discovery_recovery" if recovery else "/r2f/s1/late_endpoint"), "message_type": "std_msgs/msg/String",
         "qos": p.get("qos", {"reliability": "reliable", "durability": "volatile", "depth": 64}),
         "pre_match_count": p.get("pre_match_count", 2), "post_match_count": p.get("post_match_count", 6),
-        "reader_delay_sec": p.get("reader_delay_sec", 0.15) if arm == "mutated" else base_delay,
+        "reader_delay_sec": p.get("reader_delay_sec", base_delay if recovery else 0.15) if arm == "mutated" else base_delay,
         "match_timeout_sec": p.get("match_timeout_sec", 8.0),
         "delivery_timeout_sec": p.get("delivery_timeout_sec", 5.0),
         "startup_timeout_sec": p.get("startup_timeout_sec", 10.0),
         "publish_interval_sec": p.get("publish_interval_sec", 0.03),
-        "fault_id": "late_endpoint_delivery_omission" if arm == "negative" else None,
+        "fault_id": ("post_restore_delivery_omission" if recovery else "late_endpoint_delivery_omission") if arm == "negative" else None,
     }
     if result["qos"].get("reliability") != "reliable" or result["qos"].get("durability") != "volatile":
         raise ValueError("late-reader contract requires reliable volatile QoS")
     if type(result["post_match_count"]) is not int or result["post_match_count"] < 3:
         raise ValueError("post_match_count requires an intermediate omission and a later sentinel")
+    if recovery:
+        result.update({key: p.get(key, default) for key, default in discovery_defaults.items()})
     reject_execution_identity(result)
     return result
 
 
 def runtime_config(submitted_input, **execution):
     final_input = submitted_input
+    if execution.get("target_id") == "builtin.discovery_projection_reconciliation":
+        reject_execution_identity(final_input)
+        config = dict(execution, **final_input)
+        config["mutation_parameters"] = {"baseline_qos":final_input["baseline_qos"], "submitted_qos":final_input["qos"]}
+        from r2f.runtime.ros2_pair import normalize_config
+        normalized = normalize_config(config)
+        from r2f.runtime.projection_pair import normalize_projection_config
+        normalized = normalize_projection_config(normalized)
+        for key, value in final_input.items():
+            if normalized.get(key) != value:
+                raise ValueError(f"runtime normalized away submitted projection {key}")
+        return normalized
     """The capsule's exact submitted values reach normalized runtime config.
 
     The runtime selects baseline_reader_delay_sec for every non-mutated arm;
@@ -88,9 +108,14 @@ def runtime_config(submitted_input, **execution):
     reject_execution_identity(final_input)
     config = dict(execution, **final_input)
     config["baseline_reader_delay_sec"] = final_input["reader_delay_sec"]
-    config["mutation_parameters"] = {"reader_delay_sec": final_input["reader_delay_sec"]}
+    recovery = execution.get("target_id") == "discovery.interruption_recovery"
+    config["mutation_parameters"] = ({key: final_input[key] for key in ("drop_duration_sec", "recovery_timeout_sec", "counter_interval_sec")}
+                                     if recovery else {"reader_delay_sec": final_input["reader_delay_sec"]})
     from r2f.runtime.ros2_pair import normalize_config
     normalized = normalize_config(config)
+    if recovery:
+        from r2f.runtime.namespace_pair import normalize_discovery_config
+        normalized = normalize_discovery_config(normalized)
     for key, value in final_input.items():
         if normalized.get(key) != value:
             raise ValueError(f"runtime normalized away submitted {key}")
@@ -99,3 +124,25 @@ def runtime_config(submitted_input, **execution):
     if delay != final_input["reader_delay_sec"]:
         raise ValueError("runtime effective reader delay mismatch")
     return normalized
+
+
+def projection_input(arm, parameters=None):
+    """Initial fourth-target payload; no execution/source paths enter identity."""
+    from copy import deepcopy
+    p = dict(parameters or {})
+    supported = {"topic", "baseline_qos", "variant_qos", "match_timeout_sec", "startup_timeout_sec", "projection_timeout_sec"}
+    if set(p) - supported:
+        raise ValueError("unknown projection parameters: " + ",".join(sorted(set(p) - supported)))
+    baseline = deepcopy(p.get("baseline_qos", {"reliability": "reliable", "durability": "volatile", "depth": 64,
+        "deadline_ns": 9223372036854775807, "liveliness": "automatic", "liveliness_lease_duration_ns": 9223372036854775807}))
+    variant = deepcopy(p.get("variant_qos", dict(baseline, deadline_ns=1250000000)))
+    if baseline == variant:
+        raise ValueError("endpoint QoS variant must actually differ from baseline")
+    selected = deepcopy(variant if arm == "mutated" else baseline)
+    result = {"topic": p.get("topic", "/r2f/s1/discovery_projection"), "message_type": "std_msgs/msg/String",
+              "baseline_qos": baseline, "qos": selected, "reader_qos": deepcopy(selected),
+              "match_timeout_sec": p.get("match_timeout_sec", 8.0), "startup_timeout_sec": p.get("startup_timeout_sec", 10.0),
+              "projection_timeout_sec": p.get("projection_timeout_sec", 8.0),
+              "fault_id": "controlled_projection_field_mismatch" if arm == "negative" else None}
+    reject_execution_identity(result)
+    return result

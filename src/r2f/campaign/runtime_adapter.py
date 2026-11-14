@@ -69,9 +69,12 @@ def endpoint_identity_proof(events, runtime, config, tokens, opening, closing):
             "limitations": ["Public callback does not expose publisher_gid; identity is correlated through unique bounded endpoint graph, independent process, run payload and sequence receipts."]}
 
 
-def fresh_match_proof(events, tokens, opening):
+def fresh_match_proof(events, tokens, opening, *, anchor_ns=None):
     """Bind the latest paired public count queries to raw request/snapshot/ack."""
     requests = [e for e in events if e.get("event") == "match_snapshot_requested"]
+    if anchor_ns is not None:
+        requests = [e for e in requests if e.get("requested_monotonic_ns", -1) >= anchor_ns
+                    and e["event_index"] < opening["event_index"]]
     if len(requests) < 2 or len(requests) % 2:
         raise ValueError("match_snapshot request pair incomplete")
     # Controller issues writer then reader on every polling round. Do not combine rounds.
@@ -82,12 +85,13 @@ def fresh_match_proof(events, tokens, opening):
     if selected[0].get("command_id") == selected[1].get("command_id"):
         raise ValueError("match_snapshot command ids are not independent")
     proof, completed = {}, []
-    anchor = tokens["reader"]["created_monotonic_ns"]
+    reader_created = tokens["reader"]["created_monotonic_ns"]
+    anchor = reader_created if anchor_ns is None else max(reader_created, anchor_ns)
     for request in selected:
         role, command_id = request["role"], request.get("command_id")
         requested_ns = request.get("requested_monotonic_ns")
         if (type(command_id) is not int or type(requested_ns) is not int
-                or request.get("reader_created_monotonic_ns") != anchor
+                or request.get("reader_created_monotonic_ns") != reader_created
                 or not anchor <= requested_ns <= request["monotonic_ns"]
                 or request["event_index"] <= tokens["reader"]["event_index"]):
             raise ValueError("match_snapshot request is not after reader creation")
@@ -116,6 +120,12 @@ def fresh_match_proof(events, tokens, opening):
 
 def facts_from_events(events, runtime, config):
     """Only raw tokens produce primary facts; summaries cannot substitute."""
+    if config.get("target_id") == "builtin.discovery_projection_reconciliation":
+        from .projection_adapter import projection_facts
+        return projection_facts(events, runtime, config)
+    if config.get("target_id") == "discovery.interruption_recovery":
+        from .recovery_adapter import recovery_facts
+        return recovery_facts(events, runtime, config)
     facts = {"schema_version": 1, "environment_healthy": runtime.get("environment", {}).get("ok") is True,
              "process_healthy": False, "preconditions_reached": False,
              "endpoint_identity_complete": False, "observed_effects": [], "sent": [], "received": []}
@@ -199,6 +209,12 @@ def facts_from_events(events, runtime, config):
 
 def canonical_receipts(scenario, runtime, events):
     """Exact 1:1 runtime step mapping; raw before/after events are mandatory."""
+    if scenario.target_id == "builtin.discovery_projection_reconciliation":
+        from .projection_adapter import projection_receipts
+        return projection_receipts(scenario, runtime, events)
+    if scenario.target_id == "discovery.interruption_recovery":
+        from .recovery_adapter import recovery_receipts
+        return recovery_receipts(scenario, runtime, events)
     receipts, state = [], {}
     env = _one(events, "environment_preflight")
     locks = _one(events, "isolation_locks_acquired")
@@ -248,6 +264,33 @@ def ingest_execution(scenario, config, runtime, capsule):
              "source_manifest": capsule.input["source_manifest"], "effective_input_sha256": capsule.input["effective_input_sha256"]}
     events = []
     facts = {}
+    if runtime.get("real_execution") is not True and runtime.get("runtime_status") == "blocked":
+        # Preflight never owes endpoint state receipts. Retain its cause even when
+        # environment evidence is absent or damaged; report artifact health separately.
+        raw_audit = {"available": bool(runtime.get("raw_path") and runtime.get("raw_sha256")), "verified": False}
+        try:
+            if raw_audit["available"]:
+                verify_raw(runtime["raw_path"], runtime["raw_sha256"])
+                events = read_events(runtime["raw_path"])
+                if runtime.get("events") != events or any(
+                        type(e.get("event_index")) is not int or e["event_index"] != i
+                        or e.get("run_id") != config["run_id"] or e.get("domain_id") != config["domain_id"]
+                        for i, e in enumerate(events)):
+                    raise ValueError("blocked environment raw identity/events mismatch")
+                ending = _one(events, "runtime_end")
+                if ending.get("reason") != runtime.get("reason") or ending.get("real_execution") is not False:
+                    raise ValueError("blocked runtime reason not bound to raw")
+                raw_audit["verified"] = True
+        except (ValueError, KeyError, TypeError, OSError) as exc:
+            raw_audit["error"] = str(exc)
+        record.abort(runtime.get("reason") or "runtime_preflight_blocked")
+        facts = {"runtime_blocked": True, "environment_healthy": False, "process_healthy": False}
+        oracle = evaluate_primary(facts, scenario.target_id)
+        return dict(record.to_dict(), **audit, typed_facts=facts, oracle=oracle,
+                    oracle_verdict=oracle["verdict"], rule_id=oracle["rule_id"],
+                    raw_path=runtime.get("raw_path"), raw_sha256=runtime.get("raw_sha256"),
+                    runtime_execution_metadata=None, environment=runtime.get("environment", {}),
+                    observation_receipts=runtime.get("observation_receipts", []), environment_raw_evidence=raw_audit)
     try:
         verify_raw(runtime["raw_path"], runtime["raw_sha256"])
         events = read_events(runtime["raw_path"])
@@ -278,6 +321,12 @@ def ingest_execution(scenario, config, runtime, capsule):
             fault_control = {key: actual_fault.get(key) for key in (
                 "fault_id", "applied", "omitted_sequence", "responsibility_layer", "candidate_eligible")}
             fault_control["raw_event_ref"] = actual_fault["event_index"]
+            if scenario.target_id == "discovery.interruption_recovery":
+                from .recovery_adapter import recovery_fault_receipt
+                fault_control = recovery_fault_receipt(events, config)
+            elif scenario.target_id == "builtin.discovery_projection_reconciliation":
+                from .projection_adapter import projection_fault_receipt
+                fault_control = projection_fault_receipt(events, config, runtime["discovery_projection"])
         else:
             record.advance(ExecutionStage.MUTATION_APPLIED, mutation_receipt=receipt.to_dict())
         if facts.get("evidence_error"):
@@ -303,4 +352,7 @@ def ingest_execution(scenario, config, runtime, capsule):
                raw_path=runtime.get("raw_path"), raw_sha256=runtime.get("raw_sha256"),
                runtime_execution_metadata=runtime.get("execution_metadata") or runtime.get("execution"),
                observation_receipts=runtime.get("observation_receipts", []), environment=runtime.get("environment", {}))
+    if "observation" in runtime:
+        from .observations import qualify_observation
+        row["instrumentation_observation"] = qualify_observation(row, runtime, config)
     return row

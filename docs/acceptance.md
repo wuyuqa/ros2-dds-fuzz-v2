@@ -6,20 +6,24 @@
 
 原规格 §2 的旧 HEAD `e18e93b1`、Batch-02 计数和 confirmed candidate=0 均是交接历史，不是本仓库实测；本轮不复用旧未提交代码、旧 raw 作为新运行，或旧 seal。§3 的目录树是建议布局，验收以统一接口和真实证据为准，不以空文件数量代替能力。
 
+最新证据账（2026-11-15T00:32:53+08:00，Asia/Shanghai）：[完整S1逐项验收账](s1-acceptance-ledger.md)与[正式证据快照](formal-target-snapshots-2026-11-15.md)记录first/second各18+6及四control在11ec76c source上通过独立seal；first失败与second domain181阻断历史保留。主agent已解冻third开发，后续source改变需最终source冻结后rerun，不能沿用当前成熟声明；Phase2/4/F07/第三第四target缺口未因两个seal而消失。
+
+目标口径更新（2026-11-15T00:45:07+08:00，Asia/Shanghai；来源：本轮用户明确指令）：当前用户目标为“S1模块完全成熟且有2–3个真实SUT候选”。已记录的真实自然候选为0，因此候选数量目标尚未达成。自然数量无法预先保证，只能由真实运行产生；负控、工具错误和合成案例不得凑数。原taskbook允许zero-candidate推进Phase，不代表用户完整目标完成；可以交中间报告，但不能据此将整个goal标记complete。
+
 ## 1. 八项主框架能力
 
 统一接口包括 `Module`、`TargetProvider`、`MutationProvider`、`Carrier`、`FactProducer`、`Oracle`、`CandidateLifecycle`。S1 通过 registry 注册，复用主 runner、状态机、candidate 和报告系统，不另建业务独立 runner。
 
 | ID | 能力 / 原文位置 | 离线合同测试必须证明 | 真实运行证据必须证明 | 当前证据状态 |
 | --- | --- | --- | --- | --- |
-| F01 | 注册 module/target；§3 | 重复/未知注册处理，S1 可由统一 registry 取得 | 至少一个真实 ROS2 pair 从 registry 路径进入 | 待验证 |
-| F02 | SemanticTarget 编译 scenario；§3–4 | 九个必要字段、step 依赖、requires、参数及不支持项不被静默丢弃 | 至少一个真实 pair 使用编译结果，而非单独硬编码绕过 target | 待验证 |
-| F03 | 带前置条件的真实 state steps；§3–4、7.4 | 合法阶段、缺 receipt/前置未达的拒绝；neutral 分支见 D002 | 至少一个真实 pair 每 step 有 before/after receipt，真实 requires 求值 | 待验证 |
-| F04 | 统一 carrier 应用 mutation 并验 effect；§3、7 | 嵌套 receipt、层顺序、hit gate、input hash、neutral 不伪造 hit | 至少一个真实 pair 的 mutated 输入实际提交/配置/命中，effect 可回到 raw | 待验证 |
-| F05 | raw → typed facts → oracle；§3、9 | 四态 verdict、缺事实不当 pass、primary 与 diagnostic 分离、residual 优先 | 至少一个真实 pair 有 raw/hash、typed facts、指定 primary rule verdict | 待验证 |
-| F06 | candidate lifecycle 创建/更新/审计；§3、7–8 | admission、合法状态转换、来源/归因完整、control 排除、失败不删候选 | 至少一个真实 pair 的候选审计路径；无自然候选时如实 zero-candidate，不能造 SUT candidate 来凑集成测试 | 待验证；无候选时集成验收形式待主agent明确 |
-| F07 | replay capsule 与尝试；§3、8.2 | 离线 input metadata、hash 确定性、失败分类和保留 | 真实 execution metadata 写入；replay failure 可保留且可审计，不以生成 capsule 冒充重放 | 待验证 |
-| F08 | 完整 run report；§3、14 | 必要字段/缺口、计数与证据引用、拒绝不一致 identity | 至少一个真实 pair 产出的 report 能反查 raw、manifest、capsule 和 verdict | 待验证 |
+| F01 | 注册 module/target；§3 | 重复/未知注册处理，S1 可由统一 registry 取得 | 至少一个真实 ROS2 pair 从 registry 路径进入 | first/second在11ec76c的真实映射见验收账；不代替最终source或新target |
+| F02 | SemanticTarget 编译 scenario；§3–4 | 九个必要字段、step 依赖、requires、参数及不支持项不被静默丢弃 | 至少一个真实 pair 使用编译结果，而非单独硬编码绕过 target | first/second在11ec76c的真实映射见验收账；不代替最终source或新target |
+| F03 | 带前置条件的真实 state steps；§3–4、7.4 | 合法阶段、缺 receipt/前置未达的拒绝；neutral 分支见 D002 | 至少一个真实 pair 每 step 有 before/after receipt，真实 requires 求值 | first/second在11ec76c的真实映射见验收账；不代替最终source或新target |
+| F04 | 统一 carrier 应用 mutation 并验 effect；§3、7 | 嵌套 receipt、层顺序、hit gate、input hash、neutral 不伪造 hit | 至少一个真实 pair 的 mutated 输入实际提交/配置/命中，effect 可回到 raw | first/second在11ec76c的真实映射见验收账；不代替最终source或新target |
+| F05 | raw → typed facts → oracle；§3、9 | 四态 verdict、缺事实不当 pass、primary 与 diagnostic 分离、residual 优先 | 至少一个真实 pair 有 raw/hash、typed facts、指定 primary rule verdict | first/second在11ec76c的真实映射见验收账；不代替最终source或新target |
+| F06 | candidate lifecycle 创建/更新/审计；§3、7–8 | admission、合法状态转换、来源/归因完整、control 排除、失败不删候选 | 至少一个真实 pair 的候选审计路径；无自然候选时如实 zero-candidate，不能造 SUT candidate 来凑集成测试 | 主agent裁定零候选审计路径已真实执行；自然admission/triage仍缺真实异常证据 |
+| F07 | replay capsule 与尝试；§3、8.2 | 离线 input metadata、hash 确定性、失败分类和保留 | 真实 execution metadata 写入；replay failure 可保留且可审计，不以生成 capsule 冒充重放 | input/真实execution已有；48份正式capsule无replay attempt，健康及工具失败真实重放待下一phase |
+| F08 | 完整 run report；§3、14 | 必要字段/缺口、计数与证据引用、拒绝不一致 identity | 至少一个真实 pair 产出的 report 能反查 raw、manifest、capsule 和 verdict | first/second在11ec76c的真实映射见验收账；不代替最终source或新target |
 
 八项全部要求离线合同测试。F01–F06、F08 各要求至少一个真实 pair 集成测试；可由同一条贯通测试覆盖多项，但必须逐项给证据映射。F07 另外同时覆盖离线 input、真实 execution metadata、replay failure 保留。
 
@@ -90,7 +94,7 @@ primary rule 唯一固定为 `discovery.late_endpoint.match_and_receive_after_jo
 | 0 | 初始化、registry、identity、环境 manifest、pair、锁和最小测试 | 初始化及合同实现已有开发记录；实际 source HEAD 见 git log 及运行 manifest，真实执行与冻结检查以证据为准 |
 | 1 | SemanticTarget/Condition/Step/Slot、状态、receipt、oracle、candidate/replay 合同 | fake runner 至少覆盖 pass、unknown、not_applicable、mutation_ineffective、tool_error、deferred、rejected；fake 不计真实矩阵 |
 | 2 | 至少一个 RMW 源码/内部事件观察、候选账本、provenance、black-box task | 与当前公共 API 执行边界的关系待主agent明确；不能以普通 graph 观察冒充内部插装，也不能制造候选 |
-| 3 | 第一 18-cell + 四类各六个 control + capsule/execution/raw/report | 首份24条真实完成，required17 pass+1 unknown，fault6/6，transparency5/6，seal=false；D013修复重跑后再验收 |
+| 3 | 第一 18-cell + 四类各六个 control + capsule/execution/raw/report | 当前HEAD重跑18 pass+6预期fault fail、四control6/6、unknown0、独立seal=true；首跑false/raw不覆盖 |
 | 4 | instrumentation candidate 有则同输入两 RMW × 三 repeat black-box validation；无则 bounded black-box campaign 与零候选报告 | 无候选不阻塞后续 scope；当前仅按主agent边界做正常 API 有界验证，是否满足原发现性要求须独立判断 |
 | 5A / 5B | 第二 target，再第三 target | 按固定顺序，分别完整矩阵，不以第一 target 的 receipt 替代 |
 | 6 | per-target seal，同 revision 完整重跑 required matrix 和全部 gate | 只在证据齐全时封存；第四 target 也需同等核查 |
@@ -216,3 +220,11 @@ reason code 至少覆盖：`environment_or_process`、`reach_or_planning`、`mut
 [首次矩阵记录](first-formal-matrix-2026-11-14.md)保存报告路径、字节hash、manifest source、异常raw事件和精确时差。主agent独立verify rc1；24条runtime completed不等于24条judged，required的1条unknown和transparency5/6使seal=false。原报告immutable，D013修复后不能覆盖旧结果。D014字段定义见上文，不将旧开发instrumentation的limited pass/extended unknown提升为第四target正式证据。
 
 第二次冻结前更新（2026-11-15T00:14:58+08:00，Asia/Shanghai）：主agent独立全仓144 tests / 37.032s / OK、diff --check及ACK逻辑审查通过，并给本次第二commit最终GO。此为工具时序修复的合同验证，不更改首次formal失败记录；第二次提交后的真实矩阵尚未由本记录证明。D014保持待实施。
+
+## D015第三target附加验收条件（尚未实现/验证）
+
+2026-11-15T00:26:18+08:00（Asia/Shanghai），主agent工程裁定：wire_proxy标识保留、implementation=isolated_netns_nft_discovery_udp_drop；仅mutated真装drop，其他arm审计neutral，negative独立omit中间postrestore seq。要求matched前置、真实本pair discovery counter>0（合成UDP不计）、规则删除与恢复观察分开；允许match continuity retained，但必须restore后身份关联discovery＋fresh双向count/graph＋postrestore delivery。父进程锁持有到整个netns子树清理。此项保持scope/72分母，不能以计划或non-DDS控制替代真实矩阵。
+
+## 已seal模型与新target合同兼容
+
+2026-11-15T00:32:53+08:00（Asia/Shanghai），主agent裁定：first/second已seal revision0 manifest保持不变，core精确兼容其legacy fault合同；第三/第四新target显式receipt_kind/window及projection schema。必须核对保存的target_sha256及fault字段，不能用shared helper升级悄悄改写已seal manifest。初次seal前合同修正不等于new rule完成；target manifest不变也不能豁免全局source变化后的最终rerun。

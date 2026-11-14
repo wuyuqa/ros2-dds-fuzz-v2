@@ -2,7 +2,19 @@
 
 日期：2026-11-14。来源：主agent独立验证/派遣消息；文档子agent只读核对现有产物，不重新执行测试、网络控制、ROS 或 campaign。以下是开发阶段快照，不表示完整 S1 或 per-target seal 已通过。
 
-## 当前正式运行进展
+## First / second在11ec76c版本上的正式通过
+
+2026-11-15T00:32:53+08:00（Asia/Shanghai）：[正式证据快照](formal-target-snapshots-2026-11-15.md)完整保留四次attempt。first r1/domain180、second r2/domain80各18 required judged pass、6 negative judged fail、四control6/6、unknown0，独立verify sealed=true/errors=[]/rc0；source为11ec76c，target_revision均0。两次通过run共48份raw hash均按各report核对。
+
+旧first false和second domain181 preflight blocked不改。second r2另24份capsule的replay_attempts/execution_history/non_replayable亦全0，不因矩阵成功而补出F07 replay。主agent已解冻third开发：后续source改变后以上seal只能支持原版本，最终source须rerun。first/second target manifest保持不变，精确legacy兼容不豁免source校验；第三/第四初版schema声明与合同修正未证明new rule完成。
+
+## 前一时点的first rerun验收账更新
+
+2026-11-15T00:27:18+08:00（Asia/Shanghai）：见 [完整S1逐项验收账](s1-acceptance-ledger.md)。主agent确认且文档子agent只读核对first rerun report/verify记录：当前HEAD `11ec76c249cb75605fd70c5d7efb5610e70514b1`、revision0，18 required judged pass、6 negative judged fail、四control6/6、unknown0、独立sealed=true/errors=[]/rc0。文档子agent未运行verify或ROS；24份raw hash逐一匹配report。首次失败历史以下保留，不覆盖。
+
+第二target domain181尝试已有独立report及run/verify rc1，24行runtime端口preflight blocked/real_execution=false，不能计完成。F06零候选审计路径由主agent认可已执行，自然admission/triage仍未获真实异常；两次第一target48份capsule的replay_attempts、execution_history、non_replayable均0，已只读复核。F07健康及受控工具失败真实重放仍缺，不能把首跑失败保留当成replay failure。
+
+## 首次正式运行历史进展
 
 本次记录时间：2026-11-15T00:01:03+08:00（Asia/Shanghai，TZ=Asia/Shanghai date --iso-8601=seconds实测）。
 
@@ -82,3 +94,30 @@ PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python3 -m unittest discover -s tests -
 - `control_task.status=not_run`，candidate_admission=not_performed，sealed=false，target_maturity=not_evaluated。blackbox清理检查不等于blackbox pair已运行。
 
 该开发证据不计第四target正式执行或seal。Cyclone effective trace中的history/depth不证明wire PID presence；D014首次字段适用性定义不追改旧extended unknown为pass。计划及16个本地source hash的只读核对见D014。
+
+## 被动SEDP attempt2开发探针与主agent补充核查
+
+记录时间：2026-11-15T00:38:53+08:00（Asia/Shanghai）。主agent报告、文档子agent只读核对既有JSON与pcap hash；未重新运行probe/parser、ROS或测试。
+
+| RMW / domain | 实际证据 | 结果与字节hash |
+| --- | --- | --- |
+| Cyclone / 184 | [netns report](../results/instrumentation-feasibility/sedp-probe-20261115/attempt2/184-rmw_cyclonedds_cpp/netns-report.json)、[wire observation](../results/instrumentation-feasibility/sedp-probe-20261115/attempt2/184-rmw_cyclonedds_cpp/wire-observation.json)、[pcap](../results/instrumentation-feasibility/sedp-probe-20261115/attempt2/184-rmw_cyclonedds_cpp/normal-rtps.pcap) | status=ok；56 parsed events、errors=[]；wire JSON SHA-256 `2a2741a982f9a9f4d604cd778fdbe3801a8d79dc30cd6847b4b396d314756212`；pcap `03dc53bb45b1a05462e35a9310cdada8a45f839acbc8019a1cde805495e2cbb0` |
+| FastDDS / 185 | [netns report](../results/instrumentation-feasibility/sedp-probe-20261115/attempt2/185-rmw_fastrtps_cpp/netns-report.json)、[wire observation](../results/instrumentation-feasibility/sedp-probe-20261115/attempt2/185-rmw_fastrtps_cpp/wire-observation.json)、[pcap](../results/instrumentation-feasibility/sedp-probe-20261115/attempt2/185-rmw_fastrtps_cpp/normal-rtps.pcap) | status=ok；48 parsed events、errors=[]；wire JSON SHA-256 `60a722403ade1332d8024c71f2c49ed5b69e7ae78a13b3453719cf0e1d2469c8`；pcap `3bb6c0d7f5a53f63d13a01d5dbacfce0bfe078a42269bab2ed46cb7275dbc275` |
+
+[总probe report](../results/instrumentation-feasibility/sedp-probe-20261115/attempt2/probe-report.json) SHA-256 `f711951e0b6e9984581a49d164b72d0f29275d803c4a5b738bccf22abc72b0e8`；development_only=true、sealed=false、candidate_admission=not_performed；两run退出码均0。default policy仍待主agent后续裁定，不能用配置补缺失字段。56/48是该解析产物event数量，不当作去重后的endpoint数量、24/72 required格或mutation hit计数。
+
+该结果证明本次正常被动SEDP捕获/解析可行；wire公告不等于对端vendor已接收安装，缺省省略、完整projection/controls、replay及正式seal仍须独立证明。不计四target成熟或SUT candidate。原attempt1的JSON序列化失败与owner preflight阻断继续保留，不以attempt2覆盖。
+
+主agent另报告只读逐字段Python比较：开发开始后的当前S1Module first/second target.to_dict()与两份11ec76c正式manifest完全一致（true）；这是主agent的核查结果，文档子agent未重跑该比较。source已dirty，target相同不豁免source身份变化后的最终rerun，也不允许沿用旧seal作当前成熟声明。
+
+main定位domains.scan_processes原来将旧repo字符串当substring，误判共享路径前缀的新v2绝对脚本路径；runtime正在修真实路径边界。本轮只读已见参数路径边界匹配及cwd父子关系判断代码，但未复跑其回归，不宣称修复已完成。旧repo真实子路径、cwd/owner/locks保护不放宽；也不把该路径误判直接当成domain181端口阻断的已证根因。
+
+## 本轮文档 freeze-ready 收束
+
+记录时间：2026-11-15T01:09:04+08:00（Asia/Shanghai）。来源：main最新工程进展及独立测试报告，由本轮消息提供；文档子agent未复跑测试或运行ROS，未取得本条消息对应的新增产物路径，不补造路径/hash。
+
+- third v4 两RMW runtime+ingest 已报告 judged/pass，但 `capsule_execution=null`，输入为 `reconstructed_input`；仅为development证据，不能写成真实capsule驱动或capsule执行链已贯通，更不能替代正式18+6/control/seal。下一步仍需真实capsule-driven neutral/fault执行及其独立raw、输入/执行身份、receipt和归因证据。
+- main独立新增20项replay测试、31项third runtime/campaign测试通过；这些是离线测试结果，尚未取得真实replay证据。F07真实健康重放与可控工具失败重放仍待验收，原始run保持不变。
+- Phase2 bridge正在新增；接口或合同实现不能替代真实trace、lifecycle及blackbox对照，Phase2→Phase4闭环仍有缺口。
+- 当前用户2–3个真实SUT候选目标仍未达成：实测自然候选0，不以control、工具错误或开发pass充数；72格成熟分母不变，旧source seal仍只支持旧source。
+- 本轮文档已整理为freeze-ready，含义仅为可交main审阅；不代表源码已冻结或S1已成熟。本次不暂存/commit。交付后停止文档轮询和自动追加，等待main下一里程碑明确派遣。

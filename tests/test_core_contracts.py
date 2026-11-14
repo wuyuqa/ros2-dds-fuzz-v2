@@ -24,6 +24,12 @@ def target():
                              "forbidden_residuals": ["post_match_delivery_loss"]},
         rule_contract={"primary_rule": "discovery.late_endpoint.match_and_receive_after_join"},
         evidence_policy={"raw_required": True},
+        control_contract={"fault": {
+            "arm": "negative", "fault_id": "late_endpoint_delivery_omission",
+            "expected": "primary_fail",
+            "omission": "one intermediate postmatch sequence followed by delivered sentinel",
+            "candidate_eligible": False,
+        }},
     )
 
 

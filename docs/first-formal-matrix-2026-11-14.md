@@ -44,3 +44,5 @@ D013 要求 reader 创建返回之后重新采集新鲜的双向 match snapshots
 runtime/campaign 补丁由相应agent完成；文档子agent本轮不暂存、不提交。主agent第二次 GO 后才可按新派遣提交；新 source identity 下重新运行所需矩阵，原 report/raw/ledger 保持 immutable，不能覆盖为新结果。不改 SUT rule、target revision 或 18/72 分母；旧报告仍为未封存历史。
 
 ACK修复进展（2026-11-15T00:14:58+08:00，Asia/Shanghai）：reader创建返回后发出本轮snapshot请求；两端各有唯一、命令关联的新鲜match_snapshot及command_done ACK，且matched_count为整数1，才可打开post_match_delivery窗口。此ACK是snapshot命令完成回执，不是DDS交付ACK。raw须满足request→snapshot→ACK→window_open的事件顺序，以及reader创建/请求≤采样≤snapshot≤ACK≤窗口开启的单调时间关系；核对角色、API、command_id、GID/generation及worker身份。snapshot和ACK分两次stdout读取也必须等齐；缺失、重复、提前ACK或不匹配不得放行，不得退回旧match事件。 主agent独立144 tests / 37.032s / OK、diff --check和ACK逻辑审查通过，已授权本次第二commit。实际新HEAD见git log及source_manifest；本文原始run身份、unknown、seal=false及证据hash保持不变，不能由修复后的离线pass追认原run通过。
+
+后续重跑关联（2026-11-15T00:27:18+08:00，Asia/Shanghai）：新HEAD `11ec76c249cb75605fd70c5d7efb5610e70514b1`上的attempt `late-endpoint-r1-20261114T161459Z-7094038e`同target_revision0，已独立seal=true、18 required pass及6negative预期fail；见[完整S1验收账](s1-acceptance-ledger.md)。本文原run的unknown/seal=false不变；新矩阵不是记录了replay attempt的证明，首次失败也不是replay failure。

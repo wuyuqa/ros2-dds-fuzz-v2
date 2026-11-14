@@ -6,10 +6,27 @@ import unittest
 from unittest.mock import patch
 
 from r2f.runtime.domains import IsolationError, LeaseSet, probe_rtps_ports, scan_processes
-from r2f.runtime.ros2_pair import normalize_config, run_pair, summarize_events
+from r2f.runtime.ros2_pair import normalize_config, run_pair, summarize_events, runtime_capabilities
 
 
 class RuntimeContract(unittest.TestCase):
+    def test_static_network_implementation_is_not_live_admission(self):
+        with patch('r2f.runtime.ros2_pair.shutil.which', return_value='/tool'):
+            capability = runtime_capabilities()['discovery_network']
+        self.assertTrue(capability['implemented'])
+        self.assertIsNone(capability['available'])
+        self.assertFalse(capability['admitted'])
+        self.assertTrue(capability['admission_requires_live_preflight'])
+        self.assertTrue(capability['dependency_check']['available'])
+        self.assertFalse(capability['execution_evidence'])
+
+    def test_missing_network_tool_keeps_implementation_but_not_availability(self):
+        with patch('r2f.runtime.ros2_pair.shutil.which', return_value=None):
+            capability = runtime_capabilities()['discovery_network']
+        self.assertTrue(capability['implemented'])
+        self.assertFalse(capability['available'])
+        self.assertEqual(capability['availability_status'], 'missing_dependency')
+
     def test_default_contract_is_volatile(self):
         c = normalize_config({'domain_id': 173, 'run_id': 'offline'})
         self.assertEqual(c['qos']['durability'], 'volatile')

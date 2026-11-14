@@ -27,7 +27,7 @@ class S1Contracts(unittest.TestCase):
         self.assertEqual(module.id, "s1")
         self.assertEqual(len(module.targets), 4)
         self.assertEqual(module.execution_order[0], "discovery.late_endpoint")
-        self.assertIn("blocked", module.dispositions["discovery.interruption_recovery"]["status"])
+        self.assertEqual(module.dispositions["discovery.interruption_recovery"]["status"], "expressible")
         self.assertIn("builtin", module.dispositions["builtin.discovery_projection_reconciliation"]["reason"])
         late = module.targets["discovery.late_join_delivery"].to_dict()
         self.assertIn("volatile", str(late))

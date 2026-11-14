@@ -3,14 +3,44 @@
 An unreceived tail has no finite failure proof. A later delivered sequence closes
 only intermediate omissions. Prejoin volatile samples carry no obligation.
 """
-from .facts import FactError, PrimaryFacts
+from .facts import FactError, PrimaryFacts, RecoveryFacts, ProjectionFacts
 from .targets import RULES, EXECUTION_ORDER
 
 
 def evaluate_primary(facts: dict, target_id=EXECUTION_ORDER[0]) -> dict:
     result = {"rule_id": RULES[target_id], "rule_role": "primary", "verdict": "unknown",
               "reason_codes": [], "forbidden_residuals": [], "closure": {"kind": "delivered_later_sequence", "proven_gaps": [], "tail_inflight": []}}
-    if target_id not in EXECUTION_ORDER[:2]:
+    if target_id == EXECUTION_ORDER[3]:
+        result["closure"] = {"kind": "independent_wire_graph_field_coverage"}
+        try:
+            if facts.get("evidence_error"):
+                raise FactError(facts["evidence_error"])
+            projection = ProjectionFacts.parse(facts)
+        except (KeyError, TypeError, ValueError, AttributeError) as exc:
+            result["reason_codes"] = [f"unknown_projection_evidence:{exc}"]
+            return result
+        result.update(verdict="fail" if projection.differences else "pass",
+                      reason_codes=["builtin_graph_field_mismatch"] if projection.differences else ["independent_projection_fields_agree"],
+                      forbidden_residuals=["builtin_graph_field_mismatch"] if projection.differences else [])
+        return result
+    if target_id == EXECUTION_ORDER[2]:
+        try:
+            recovery = RecoveryFacts.parse(facts)
+        except (KeyError, TypeError, FactError, AttributeError) as exc:
+            result["reason_codes"] = [f"unknown_recovery_evidence:{exc}"]
+            return result
+        result = _delivery_primary(facts, target_id, require_late=False)
+        if not recovery.identity_stable:
+            result["forbidden_residuals"].append("post_restore_discovery_inconsistency")
+            result.update(verdict="fail", reason_codes=list(result["forbidden_residuals"]))
+        return result
+    return _delivery_primary(facts, target_id)
+
+
+def _delivery_primary(facts, target_id, require_late=True):
+    result = {"rule_id": RULES[target_id], "rule_role": "primary", "verdict": "unknown",
+              "reason_codes": [], "forbidden_residuals": [], "closure": {"kind": "delivered_later_sequence", "proven_gaps": [], "tail_inflight": []}}
+    if target_id not in EXECUTION_ORDER[:3]:
         result["reason_codes"] = ["blocked:no_implemented_primary_observation_contract"]
         return result
     try:
@@ -21,7 +51,7 @@ def evaluate_primary(facts: dict, target_id=EXECUTION_ORDER[0]) -> dict:
     if not f.window_complete:
         result["reason_codes"] = ["window_incomplete"]
         return result
-    if f.reader.created_ns <= f.writer.created_ns:
+    if require_late and f.reader.created_ns <= f.writer.created_ns:
         result["reason_codes"] = ["reach_or_planning:reader_not_late"]
         return result
     sent = [x for x in f.sent if x.at_ns > f.matched_ns and x.at_ns >= f.window_start_ns]
@@ -58,12 +88,12 @@ def evaluate_primary(facts: dict, target_id=EXECUTION_ORDER[0]) -> dict:
     tail = [seq for seq in missing if seq >= max_delivered]
     result["closure"].update(proven_gaps=proven, tail_inflight=tail, sentinel_sequence=max_delivered if sequences else None)
     if proven:
-        residuals.append("post_match_delivery_loss")
+        residuals.append("post_restore_delivery_loss" if target_id == EXECUTION_ORDER[2] else "post_match_delivery_loss")
     result["forbidden_residuals"] = residuals
     if residuals:
         result.update(verdict="fail", reason_codes=residuals)
     elif tail:
         result["reason_codes"] = ["tail_inflight"]
     else:
-        result.update(verdict="pass", reason_codes=["matched_postjoin_delivery_contract_satisfied"])
+        result.update(verdict="pass", reason_codes=["postrestore_delivery_contract_satisfied" if target_id == EXECUTION_ORDER[2] else "matched_postjoin_delivery_contract_satisfied"])
     return result
