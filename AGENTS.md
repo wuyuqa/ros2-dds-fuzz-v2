@@ -35,6 +35,10 @@ D011：首次冻结需 source_frozen=true（有HEAD且行为文件已跟踪、�
 
 D012：negative fault是省略post-match中间delivery，不是late_joiner mutation，不伪造late_joiner hit。仅negative+fault且有raw-backed fault_control_receipt时，可reached→effect_observed→judged，跳过mutation_applied。receipt含fault_id/applied/omitted_sequence/raw_event_ref、harness归因、candidate_eligible=false；candidate admission无条件排除negative。真实mutated gate不变，不增scope/分母。
 
+D013：reader创建返回后采集新鲜双向match snapshots，必须等两端各自唯一且命令绑定的command_done ACK后才打开post_match_delivery窗口；ACK为snapshot命令完成回执，不是DDS交付ACK。验证raw中的request→snapshot→ACK→window_open顺序及endpoint/worker身份；不能倒填早期match或用交付结果补造receipt。首份formal report的工具unknown/seal=false保持immutable。修复不改SUT rule/revision/分母；新source提交须等主agent新的GO，再冻结重跑。
+
+D014：第四target标准endpoint必需GUID/role/topic/type/reliability/durability/deadline/liveliness及lease；history/depth仅supporting diagnostic，缺失记not_applicable_by_endpoint_schema，禁止配置补值。generation由独立capture和进程生命周期关联，不伪造wire字段。主agent已裁定revision0首次模型定义，无第四target执行/seal，不改18/72分母。
+
 ## 真实证据与验收
 
 - 注册、计划、合成测试、离线 capsule、真实执行、effect、oracle、candidate、seal 各有独立证据门槛，不能互相替代。

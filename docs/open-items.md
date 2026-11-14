@@ -4,6 +4,16 @@
 
 记录规则：每次更新附检查命令或调用入口、时间、source/target revision、RMW、run_id（若有）、退出码/结果、raw path/hash。未运行写“未运行”，不能虚构证据。只有真实证据证明某条路径当前不满足条件时才记具名 `blocked:*`；保留失败尝试、可继续的路径及下一步。blocked 不能静默减少冻结成熟分母。
 
+## 当前进展与最近待办
+
+本次记录时间：2026-11-15T00:01:03+08:00（Asia/Shanghai，TZ=Asia/Shanghai date --iso-8601=seconds实测）。
+
+首份formal report与raw已只读核对：[首次矩阵记录](first-formal-matrix-2026-11-14.md)。24条真实运行完成，17 required pass+1 unknown、六条fault按预期fail；health/mutation/fault为6/6，transparency为5/6，seal=false，主agent独立verify rc1。报告保存source HEAD为 `21f0e2679703e366463c35e6d01c2be30fcec919`，domain180，revision0，18/72分母不变。
+
+下一项是D013工具时序补丁：reader创建后新鲜双向match snapshots。runtime ACK补丁已freeze-ready，主agent已独立验证144项通过并给本次第二commit最终GO；提交精确范围见本页末尾，不改旧report/raw。之后在新source身份下重跑，不能追改首份unknown。
+
+D014第四target字段适用性已由owner主agent裁定，不需要用户再次确认；16个本地来源hash核对一致，实际capture/完整字段采集/控制仍待实施。旧开发instrumentation已实测limited pass/extended unknown，其来源与边界见[验证快照](verification-snapshot-2026-11-14.md)，不记第四target已执行或成熟。下方历史记录中的待GO/待首次冻结保留时点语境，以本节当前进展为准。
+
 ## 1. 工程未知
 
 | ID | 事项、来源与现有证据边界 | 下一项可验证动作 / 所需证据 | 协调人 / 状态 |
@@ -12,8 +22,8 @@
 | O002 | 主agent核对发现 Cyclone 旧 native probe 与本任务 no-native participant 约束冲突 | 核查旧 probe 是否创建 native participant、当前 ROS2 公共/endpoint-attached 只观察路径能否提供合同事实；保留 source identity、participant/endpoint provenance；不得把两个 graph 调用作为两个独立来源 | 主agent协调 runtime；待真实检查，不先验判定不可解 |
 | O003 | 第三 target 的 discovery_drop 必须有真实 endpoint-attached carrier；主agent明确不能停发数据伪装发现中断 | 核查实际 discovery/metatraffic 的附着、命中、限定范围、restore 释放及恢复窗口；两 RMW 分别有 carrier admission/逐层 receipt/raw。当前执行边界是否容纳所需 carrier 由主agent明确 | 主agent协调网络隔离载体/runtime/campaign；D008及真实non-DDS控制已证明环境/载体可行，真实DDS发现附着与恢复待核查 |
 | O004 | 原 Phase 2 要内部事件/源码插装，Phase 4 要有界发现性验证；主agent当前执行声明限正常公共 API 验证和证据工具 | 主agent逐项声明当前实现内容与原要求的差距；核查能否在当前边界内达到必要观察；不能用 graph 观察冒充内部插装或自动把 bounded 正常验证称为原 fuzz maturity | 主agent；待工程裁定和证据 |
-| O005 | 第一 fault_id 固定，但“省略一个 post-match delivery”施加点未定义；其他三个 target 的 fault contract 尚待审查 | 按 D009 固定中间 omit seq、harness provenance、match 前置及更晚 sentinel/ACK 闭合；说明发送/交付/观察施加层，独立 primary oracle 检出已知遗漏；故障注入本身不能伪装 SUT 违约 | 主agent协调 core/campaign/runtime；D009/D012已裁定，主agent报告negative集成已通过，raw事件绑定及真实六行仍按各自产物验收 |
-| O006 | source_frozen 检查已实现、依赖锁及源码overlay已有；主agent最终GO已确认代码freeze，实际HEAD见git log及运行manifest | 按已收到的最终GO及D011单次自动化身份显式staging/commit，再核对HEAD及相关行为文件与HEAD一致，旧开发evidence只保留历史 | 主agent；待冻结，不假设当前已阻塞 |
+| O005 | 第一target独立六条negative已真实完成并按预期primary fail；其余target的fault contract仍须分别审查 | 保留D009闭合证据、D012 raw-backed fault receipt和harness归因；后续target明确施加层与独立primary oracle，不能冒充SUT故障 | 第一份正式报告fault6/6；不等于整体seal通过 |
+| O006 | 首次commit及formal manifest已核实HEAD 21f0e2679703e366463c35e6d01c2be30fcec919，运行时source_frozen=true/dirty=[]；首份seal=false | D013补丁完成后等主agent新的GO再提交；重新只读确认source_manifest并按新身份重跑，旧证据保留原身份 | 主agent协调runtime/campaign；首次冻结已完成，修复后的本次第二commit GO已收到，实际提交状态见git log |
 | O007 | 四 target 的双 RMW 表达性、环境可用性和 applicability 不能靠安装清单推定 | 两 RMW 分别检查真实 endpoint creation、rule applicability 与 carrier receipt；不可用具名记录并保留原 18 格预期缺口，不删分母 | 主agent协调 runtime；待真实检查 |
 | O014 | runtime核实本机 Jazzy MessageInfo 无 publisher_gid，direct per-sample GID 未达成；smoke 使用 endpoint_correlated | 保留 unavailable_api/null 与关联依据，按 target/rule 裁定 identity/generation 证据充分性；不能判 SUT mismatch，也不能伪称直接 GID | 主agent协调 runtime/campaign；观察限制已确认，验收影响待按规则核查 |
 | O008 | registry/domain/state-dir 三锁与旧仓库 owner 排除、derived port probe 还未由文档审计 | 使用真实 owner payload、端口 bind/probe、活动进程的 domain/run/state/source 身份交叉检查；不确定必须 domain_conflict/abort，记录失败而非绕过 | 主agent协调 runtime；待真实检查；本子agent不启动 ROS |
@@ -21,7 +31,9 @@
 | O010 | 第二/三/四 target 的 primary rule、expected effect、observation/control contract 和 window 参数不能只替换 target 名 | 核对每 target 语义、message/QoS、post-match/recovery 窗口、身份/代际、两个独立源等字段，提供合同测试与真实 receipts 映射 | 主agent协调 campaign；待逐 target 核查 |
 | O011 | zero-candidate 情况下 F06 真实 pair 生命周期集成如何满足尚需定义 | 区分离线合成生命周期合同与真实 run 的零候选审计；主agent确定证据连接方式，不将 control/fake 作为自然 SUT candidate | 主agent协调 core/campaign；待工程裁定 |
 | O012 | 原规格没有正式定义候选去重键、状态更新审计格式和证据保留策略 | 固定 stable identity、更新历史、重复 raw 的归并规则；保留 rejected/deferred/replay failure，不能靠去重或裁剪抹掉责任证据 | 主agent协调 core/campaign；待接口审查 |
-| O013 | 现有run_s1.py/verify_s1.py及源码overlay已可定位，两个help已验证；自动replay CLI未声明 | README已按当前脚本参数更新；首次冻结后由主agent协调真实运行并报告结果，不能把help成功等同矩阵通过 | 主agent协调所有代码agent；入口文档已更新，冻结/真实矩阵待证据 |
+| O013 | 已有真实first matrix和主agent独立verify rc1；入口成功不等于seal | 按D013修复后在新source identity下运行并保留新报告，不覆盖旧report；自动replay CLI未据此声明 | 主agent协调campaign；首次矩阵已执行但未封存 |
+| O015 | first formal FastDDS transparent.1：writer match早于reader返回锚点0.747061ms，实际六条post-match均接收；工具unknown，非SUT违约 | D013双向新鲜快照与raw chronology检查、相关合同验证、新source冻结后矩阵重跑；旧unknown/report不变 | runtime ACK补丁freeze-ready；144项独立通过，本次第二commit GO已收到 |
+| O016 | D014已固定第四target标准必需字段与history/depth N/A；16个本地source hash匹配，第四target未正式执行 | 实现独立capture+graph及GUID/生命周期关联；缺deadline/liveliness/lease仍unknown；协议默认省略派生和fault施加层分别明确，不能配置填值 | 主agent已裁定，无需用户确认；工程实施稍后 |
 
 D008 的环境检查仅为主agent报告：uid1000、CapEff=0；`unshare --user --map-root-user --net sh -c 'ip link set lo up && ip -brief link show lo'` 返回 rc0、lo UP。未提供 raw 路径/hash，不计 ROS evidence。网络隔离载体与 vendor内部观察已有专属agent，本页不将“它们尚在实现”重复列作新增验收缺口。
 
@@ -70,3 +82,7 @@ D012更新：negative+fault的独立审计路径已由主agent裁定；故意omi
 首次 matrix 的 HEAD 约定（主agent工程派遣补充）：最终 GO 仍未收到，当前不暂存/提交。首次提交后不因文档更新立即第二次 commit；正式 matrix 期间文档可工作树更新，HEAD 保持不变。后续 phase 实现统一新提交并重跑相关矩阵，旧 evidence 保留原身份。该约定记录于 D011 和 AGENTS，不代表当前两项接口小修已经完成冻结。
 
 最终 GO 更新：主agent独立验收报告全仓 131 tests / 13.485s / OK、negative+identity 集成通过，所有代码agent明确 freeze；前述“待 GO/正小修”属于当时快照。首次提交由文档子agent按已授权路径执行；实际 HEAD、提交状态和 source_frozen 以 git log、只读 source_manifest 检查及运行 manifest 为准。历史 112 项及审阅反例保留，不能用离线测试结果代替真实矩阵。首次正式 matrix 期间不追加文档 commit。
+
+第二次提交准备（2026-11-15T00:01:03+08:00（Asia/Shanghai，TZ=Asia/Shanghai date --iso-8601=seconds实测））：主agent说明行为源码修复仅为match snapshots/runtime adapter及对应回归tests；D014目前只记录待实施，不修改第四target实现。等待代码agent明确freeze及全仓测试后的新GO，届时才执行本次单独授权的自动化身份commit；本轮不暂存/提交，历史first run的UTC目录不重命名。
+
+第二次提交最终GO（2026-11-15T00:14:58+08:00，Asia/Shanghai）：主agent独立全仓144 tests / 37.032s / OK，diff --check与ACK逻辑审查通过；本次单独授权已收到。ACK前不得打开post_match_delivery窗口，验收细节见D013/S03c。显式staging仅五个已审查runtime/adapter/回归测试文件及当前docs/README/AGENTS；results排除。D014仍待实施。实际提交及冻结状态以git log/source_manifest为准；此更新覆盖前文待GO状态，不改变首份matrix失败记录。

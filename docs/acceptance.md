@@ -77,6 +77,8 @@ primary rule 唯一固定为 `discovery.late_endpoint.match_and_receive_after_jo
 | 3 | `discovery.interruption_recovery` | `discovery_drop` + `restore_after_discovery_interruption` | Phase 5B 同样 18-cell 和独立 fault；真实 endpoint-attached 发现中断、恢复及逐层 receipt；停发用户数据不算 discovery_drop |
 | 4 | `builtin.discovery_projection_reconciliation` | `endpoint_qos_variation` | 独立 builtin + graph 对账；graph 自比较不合格；旧 Fast/Cyclone 表达面须真实检查 |
 
+第四target字段合同（D014，主agent工程裁定）：GUID/role/topic/type/reliability/durability/deadline/liveliness及lease必需；history/depth只作supporting diagnostic，缺失明确为`not_applicable_by_endpoint_schema`，禁止配置补值。generation由独立capture和进程生命周期关联，不是虚构wire字段。原taskbook未枚举depth，旧catalog不能强行将超标准字段继承为全部RMW必需。此为revision0首次模型定义，尚未正式执行/封存，不删已失败rule、不改18/72分母。规范缺省推导、capture完整性、raw/provenance及两源独立性仍须逐项验证。
+
 每个 target 都要登记四类 control 和 per-target disposition/seal。若四个 target 全部按两个 RMW 的 18-cell 执行，计划为 72 条 required 和 24 条独立 fault，共至少 96 条唯一执行行；这是全 scope 计划计数，不是已运行数量，也不是无条件完成承诺。
 
 不在初始 scope：`discovery_delay`、`discovery_reorder`、`discovery_duplicate`、lease expiry/renewal、endpoint remove/recreate。新增前须 owner escalation，更新 scope、semantic model/rule、成熟分母与 run identity。不得从旧仓库 taxonomy 隐式导入。
@@ -88,7 +90,7 @@ primary rule 唯一固定为 `discovery.late_endpoint.match_and_receive_after_jo
 | 0 | 初始化、registry、identity、环境 manifest、pair、锁和最小测试 | 初始化及合同实现已有开发记录；实际 source HEAD 见 git log 及运行 manifest，真实执行与冻结检查以证据为准 |
 | 1 | SemanticTarget/Condition/Step/Slot、状态、receipt、oracle、candidate/replay 合同 | fake runner 至少覆盖 pass、unknown、not_applicable、mutation_ineffective、tool_error、deferred、rejected；fake 不计真实矩阵 |
 | 2 | 至少一个 RMW 源码/内部事件观察、候选账本、provenance、black-box task | 与当前公共 API 执行边界的关系待主agent明确；不能以普通 graph 观察冒充内部插装，也不能制造候选 |
-| 3 | 第一 18-cell + 四类各六个 control + capsule/execution/raw/report | 第一里程碑；证据完整后再进入 Phase 4 |
+| 3 | 第一 18-cell + 四类各六个 control + capsule/execution/raw/report | 首份24条真实完成，required17 pass+1 unknown，fault6/6，transparency5/6，seal=false；D013修复重跑后再验收 |
 | 4 | instrumentation candidate 有则同输入两 RMW × 三 repeat black-box validation；无则 bounded black-box campaign 与零候选报告 | 无候选不阻塞后续 scope；当前仅按主agent边界做正常 API 有界验证，是否满足原发现性要求须独立判断 |
 | 5A / 5B | 第二 target，再第三 target | 按固定顺序，分别完整矩阵，不以第一 target 的 receipt 替代 |
 | 6 | per-target seal，同 revision 完整重跑 required matrix 和全部 gate | 只在证据齐全时封存；第四 target 也需同等核查 |
@@ -105,7 +107,8 @@ primary rule 唯一固定为 `discovery.late_endpoint.match_and_receive_after_jo
 | S02 / §4、7.4 | 唯一 `execution_stage`：modelled → expressible → planned → precondition_executed → reached → mutation_applied → effect_observed → judged；未完成终态 aborted | 逐转换日志；neutral 跳过 mutation_applied 依 D002；negative fault分支依 D012；待验证 |
 | S03 / §4 | plan 仅计划；每前置 step before/after receipt、requires 求值；未达到前置不得 mutation | 失败注入合同与真实 step receipt；待验证 |
 | S03a / D010 | raw 的 writer 前置完成及 snapshot 先于 mutation_begin/delay/create reader；reader/match/graph receipt 只作后续观察。discovery_drop 则须先 matched 再 drop | 必查原始事件索引、时间与操作依赖，不能只查 receipt 存在；初次 seal 前 revision0 纠错，分母不变；待逐路径验证 |
-| S03b / D012 | negative+fault 可 reached→effect_observed→judged，不经mutation_applied；不伪造late_joiner hit | 必须raw-backed fault_control_receipt含fault_id/applied=true/omitted_sequence/raw_event_ref、responsibility_layer=harness、candidate_eligible=false；核原始时序；主agent报告 negative 集成通过，真实矩阵仍待证据 |
+| S03b / D012 | negative+fault 可 reached→effect_observed→judged，不经mutation_applied；不伪造late_joiner hit | 必须raw-backed fault_control_receipt含fault_id/applied=true/omitted_sequence/raw_event_ref、responsibility_layer=harness、candidate_eligible=false；核原始时序；首份formal六条negative均按预期fail；完整target seal仍false |
+| S03c / D013 | reader创建后双向新鲜snapshot及各自唯一command_done ACK齐备才可open post_match_delivery；按role/command_id/API/GID/generation/worker绑定 | request→snapshot→ACK→window_open，创建/请求≤采样≤snapshot≤ACK≤窗口；分批stdout须等ACK，缺失/重复/提前ACK不能放行或回退旧match；首次unknown保持，不改rule/revision/分母 |
 | S04 / §7.4 | modelled 有 manifest/revision；expressible 被 carrier/RMW/runtime 接受；planned 编译 scenario/steps；reached 全前置 true | 不以静态 facts 代 runtime；待验证 |
 | S05 / §7.2、7.4 | mutation receipt 只准嵌套七字段：planned/submitted/carrier_admitted/configured/applied/hit/effect_observed；真实 mutation_applied 要 carrier_admitted/configured/applied/hit 四项全 true | 不支持平铺混用；hit=true 且 configured/applied=false 要 abort；待验证 |
 | S06 / §7.4 | effect_observed 有 expected/residual 的 raw observation；judged 有四态 oracle；aborted 有 abort_reason 且不能继续 | neutral 也必须有真实观察，不自动升级阶段；待验证 |
@@ -202,6 +205,14 @@ reason code 至少覆盖：`environment_or_process`、`reach_or_planning`、`mut
 
 ## 12. 已报告的开发验证快照
 
-[验证记录](verification-snapshot-2026-11-14.md) 分别记录主agent报告的最新 131 tests / 13.485s / OK（negative+identity 集成通过）、历史 112 tests / 4.232s / OK、真实 non-DDS carrier control 的 33 packets drop 与 70/70 恢复，以及只读核对的双 RMW contract-smoke raw/hash。三类验证不互换：离线测试数不计真实矩阵，non-DDS control 不计 discovery/S1 evidence，smoke 不等于完整 18-cell/四类 6/6 或 seal。MessageInfo 无 publisher_gid 作为观察限制保留，不判 SUT mismatch。
+[验证记录](verification-snapshot-2026-11-14.md) 分别记录主agent报告的最新 144 tests / 37.032s / OK（主agent独立验收、ACK逻辑审查通过）、历史 131 tests / 13.485s / OK（negative+identity 集成通过）及 112 tests / 4.232s / OK、真实 non-DDS carrier control 的 33 packets drop 与 70/70 恢复，以及只读核对的双 RMW contract-smoke raw/hash。三类验证不互换：离线测试数不计真实矩阵，non-DDS control 不计 discovery/S1 evidence，smoke 不等于完整 18-cell/四类 6/6 或 seal。MessageInfo 无 publisher_gid 作为观察限制保留，不判 SUT mismatch。
 
 首次冻结前更新：现有runner和独立audit已检查source_frozen/dirty_behavior_paths及当前source identity，候选ledger投影重建路径已补入，历史review保留并注明进展。主agent最终GO已确认代码freeze并派遣首次提交，实际HEAD见git log及运行manifest；源码冻结后的旧开发evidence保持历史，不通过首次commit追认。D011指定单次自动化提交身份，不修改用户Git配置；results不提交且保留可见untracked。
+
+## 首份正式矩阵与字段裁定更新
+
+本次记录时间：2026-11-15T00:01:03+08:00（Asia/Shanghai，TZ=Asia/Shanghai date --iso-8601=seconds实测）。
+
+[首次矩阵记录](first-formal-matrix-2026-11-14.md)保存报告路径、字节hash、manifest source、异常raw事件和精确时差。主agent独立verify rc1；24条runtime completed不等于24条judged，required的1条unknown和transparency5/6使seal=false。原报告immutable，D013修复后不能覆盖旧结果。D014字段定义见上文，不将旧开发instrumentation的limited pass/extended unknown提升为第四target正式证据。
+
+第二次冻结前更新（2026-11-15T00:14:58+08:00，Asia/Shanghai）：主agent独立全仓144 tests / 37.032s / OK、diff --check及ACK逻辑审查通过，并给本次第二commit最终GO。此为工具时序修复的合同验证，不更改首次formal失败记录；第二次提交后的真实矩阵尚未由本记录证明。D014保持待实施。

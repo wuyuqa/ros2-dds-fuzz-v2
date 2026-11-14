@@ -9,6 +9,21 @@ import traceback
 import uuid
 
 
+def emit_snapshot(endpoint, role, command_id, endpoint_gid, graph, emit):
+    """Read public match count afresh for every requested snapshot.
+
+    Discovery can notify the writer before create_subscription() returns in the
+    reader process. A later explicit query establishes a comparable observation
+    without changing the original count-transition timestamp.
+    """
+    api = 'get_subscription_count' if role == 'writer' else 'get_publisher_count'
+    sampled_ns = time.monotonic_ns()
+    count = getattr(endpoint, api)()
+    emit('match_snapshot', command_id=command_id, matched_count=count,
+         endpoint_gid=endpoint_gid, sampled_monotonic_ns=sampled_ns, count_api=api)
+    emit('graph_snapshot', command_id=command_id, **graph())
+
+
 def main():
     config = json.loads(sys.argv[1])
     role = sys.argv[2]
@@ -125,7 +140,7 @@ def main():
                 emit('worker_stopping')
                 break
             if command['command'] == 'snapshot':
-                emit('graph_snapshot', **graph())
+                emit_snapshot(endpoint, role, command['command_id'], local_gid, graph, emit)
                 emit('command_done', command_id=command['command_id'])
             elif command['command'] == 'publish' and role == 'writer':
                 sequence = command['send_sequence']

@@ -152,7 +152,10 @@ def summarize_events(events):
                                       'after_index': after[0].get('event_index') if after else None, 'stable': valid}
     correlated = bool(graph_stable and delivery_tokens and writer.get('pid') != reader.get('pid')
                       and all(e.get('payload_run_id') == writer.get('run_id') for e in delivery_tokens))
-    matches = {role: any(e['event'] == 'match' and e.get('role') == role and e.get('matched_count') == 1 for e in events) for role in ('writer', 'reader')}
+    match_kind = 'match_snapshot' if any(e['event'] == 'match_snapshot' for e in events) else 'match'
+    matches = {role: any(e['event'] == match_kind and e.get('role') == role and e.get('matched_count') == 1
+                        and (match_kind == 'match' or e.get('sampled_monotonic_ns', -1) >= reader.get('created_monotonic_ns', 0))
+                        for e in events) for role in ('writer', 'reader')}
     return {'expected_post_match_sequences': expected, 'post_match_sent_sequences': sent,
             'post_match_received_sequences': received,
             'prejoin_sent_sequences': [e['send_sequence'] for e in events if e['event'] == 'send' and e.get('phase') == 'prejoin'],
@@ -179,6 +182,59 @@ def summarize_events(events):
             'window_complete': any(e['event'] == 'window_close' and e.get('window') == 'post_match_delivery' for e in events),
             'observation_provenance': 'public_rclpy_graph_and_message_info',
             'independent_builtin_projection': False}
+
+
+def wait_for_fresh_match(pool, events, reader_created_ns, timeout, emit=None):
+    """Require command-correlated counts queried after the reader create return.
+
+    Keep count-transition events as historical evidence. This live gate has no
+    fallback to those events, including when an old transition says count=1.
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        requests = {}
+        for role in ('writer', 'reader'):
+            requested_ns = time.monotonic_ns()
+            command_id = pool.command(role, 'snapshot')
+            requests[role] = (command_id, requested_ns)
+            if emit is not None:
+                emit('match_snapshot_requested', role=role, command_id=command_id,
+                     requested_monotonic_ns=requested_ns, reader_created_monotonic_ns=reader_created_ns)
+
+        def snapshots():
+            # A snapshot and its ACK can arrive in separate stdout chunks.
+            # Only completed, unambiguous commands can release the live gate.
+            responses = {role: {'match_snapshot': [], 'command_done': []} for role in requests}
+            for index, event in enumerate(events):
+                role, kind = event.get('role'), event.get('event')
+                if role not in requests or kind not in responses[role]:
+                    continue
+                if (type(event.get('command_id')) is int
+                        and event['command_id'] == requests[role][0]):
+                    responses[role][kind].append((index, event))
+            found = {}
+            for role, response in responses.items():
+                if len(response['match_snapshot']) != 1 or len(response['command_done']) != 1:
+                    continue
+                snapshot_index, event = response['match_snapshot'][0]
+                ack_index, ack = response['command_done'][0]
+                sampled_ns = event.get('sampled_monotonic_ns')
+                snapshot_ns, ack_ns = event.get('monotonic_ns'), ack.get('monotonic_ns')
+                if (all(type(value) is int for value in (sampled_ns, snapshot_ns, ack_ns))
+                        and max(reader_created_ns, requests[role][1]) <= sampled_ns <= snapshot_ns <= ack_ns
+                        and snapshot_index < ack_index):
+                    found[role] = event
+            return found
+
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError('fresh_match_snapshot_deadline')
+        pool.wait(lambda: len(snapshots()) == 2, remaining, 'fresh_match_snapshot_response')
+        proof = snapshots()
+        if all(type(e.get('matched_count')) is int and e['matched_count'] == 1 for e in proof.values()):
+            return proof
+        if time.monotonic() >= deadline:
+            raise TimeoutError('fresh_match_snapshot_deadline')
 
 
 def run_pair(config: dict, output_dir: Path) -> dict:
@@ -319,9 +375,12 @@ def run_pair(config: dict, output_dir: Path) -> dict:
         elif c['arm'] == 'transparent':
             emit('transparency_control', declaration={'mutation_kind': c['mutation_kind'], 'parameters': c['mutation_parameters']},
                  applied_input_equal_to_baseline=True, effective_reader_delay_sec=delay, mutation_hit=False)
-        def matched():
-            return all(has('match', role, matched_count=1) for role in ('writer', 'reader'))
-        step('endpoints_matched', matched, lambda: None, c['match_timeout_sec'], ['reader_created', 'writer_created'], observation=True)
+        fresh_matches = {}
+        def observe_fresh_matches():
+            fresh_matches.update(wait_for_fresh_match(
+                pool, events, reader_token['created_monotonic_ns'], c['match_timeout_sec'], emit))
+        step('endpoints_matched', lambda: set(fresh_matches) == {'writer', 'reader'},
+             observe_fresh_matches, c['match_timeout_sec'], ['reader_created', 'writer_created'], observation=True)
         # Check both observed endpoint GIDs in both graph projections.
         def graph_expected():
             for role in ('writer', 'reader'):

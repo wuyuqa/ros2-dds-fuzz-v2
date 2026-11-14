@@ -14,7 +14,7 @@ from r2f.core.scenario import Scenario
 from r2f.reports.run_report import audit_report, report_digest, write_json
 
 
-def fixture_pair(config, directory):
+def fixture_pair(config, directory, *, fresh_matches=False):
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
     events, pre, post = [], [], []
@@ -68,7 +68,20 @@ def fixture_pair(config, directory):
         emit("transparency_control", applied_input_equal_to_baseline=True, effective_reader_delay_sec=config["reader_delay_sec"], mutation_hit=False)
     def match():
         for role in ("writer", "reader"):
-            emit("match", role, matched_count=1, endpoint_gid=gids[role])
+            event = emit("match", role, matched_count=1, endpoint_gid=gids[role])
+            if fresh_matches and role == "writer":
+                reader = next(e for e in events if e["event"] == "endpoint_created" and e["role"] == "reader")
+                event["monotonic_ns"] = reader["created_monotonic_ns"] - 747061
+        if fresh_matches:
+            anchor = next(e["created_monotonic_ns"] for e in events if e["event"] == "endpoint_created" and e["role"] == "reader")
+            for command, role in enumerate(("writer", "reader"), 41):
+                emit("match_snapshot_requested", role, command_id=command,
+                     requested_monotonic_ns=tick, reader_created_monotonic_ns=anchor)
+            for command, role in enumerate(("writer", "reader"), 41):
+                emit("match_snapshot", role, command_id=command, sampled_monotonic_ns=tick,
+                     matched_count=1, endpoint_gid=gids[role],
+                     count_api="get_subscription_count" if role == "writer" else "get_publisher_count")
+                emit("command_done", role, command_id=command)
     step("endpoints_matched", ["reader_created", "writer_created"], match, True)
     def graph():
         for role in ("writer", "reader"):
@@ -110,6 +123,90 @@ class EvidenceGates(unittest.TestCase):
         capsule = ReplayCapsule.from_dict(json.loads(Path(row["replay_path"]).read_text()))
         runtime = fixture_pair(config, Path(directory) / "runtime-fixture")
         return row, config, capsule, runtime
+
+    def test_fresh_snapshots_close_pre_return_match_race(self):
+        with tempfile.TemporaryDirectory() as temp:
+            _, config, capsule, _ = self.setup_cell(temp)
+            runtime = fixture_pair(config, Path(temp) / "fresh", fresh_matches=True)
+            original = copy.deepcopy(runtime["events"])
+            row = ingest_execution(Scenario.from_dict(capsule.input["scenario"]), config, runtime, capsule)
+            self.assertEqual(row["execution_stage"], "judged", row.get("abort_reason"))
+            self.assertEqual(row["oracle_verdict"], "pass")
+            proof = row["typed_facts"]["match_snapshot_proof"]
+            for role in ("writer", "reader"):
+                self.assertEqual(runtime["events"][proof[role]["request_index"]]["event"], "match_snapshot_requested")
+                self.assertEqual(runtime["events"][proof[role]["ack_index"]]["event"], "command_done")
+            self.assertEqual(runtime["events"], original)
+
+    def test_latest_complete_snapshot_pair_follows_zero_count_poll(self):
+        with tempfile.TemporaryDirectory() as temp:
+            _, config, capsule, _ = self.setup_cell(temp)
+            runtime = fixture_pair(config, Path(temp) / "fresh", fresh_matches=True)
+            events = runtime["events"]
+            start = next(i for i, e in enumerate(events) if e["event"] == "match_snapshot_requested")
+            earlier = copy.deepcopy(events[start:start + 6])
+            for event in earlier:
+                event["command_id"] -= 10
+                if event["event"] == "match_snapshot": event["matched_count"] = 0
+            events[start:start] = earlier
+            for index, event in enumerate(events): event["event_index"] = index
+            Path(runtime["raw_path"]).write_text("".join(json.dumps(e) + "\n" for e in events))
+            runtime["raw_sha256"] = raw_sha256(runtime["raw_path"])
+            row = ingest_execution(Scenario.from_dict(capsule.input["scenario"]), config, runtime, capsule)
+            self.assertEqual(row["execution_stage"], "judged", row.get("abort_reason"))
+            self.assertEqual({r["command_id"] for r in row["typed_facts"]["match_snapshot_proof"].values()}, {41, 42})
+
+    def test_no_snapshot_preserves_legacy_pre_return_unknown(self):
+        with tempfile.TemporaryDirectory() as temp:
+            _, config, capsule, runtime = self.setup_cell(temp)
+            anchor = next(e["created_monotonic_ns"] for e in runtime["events"] if e["event"] == "endpoint_created" and e["role"] == "reader")
+            next(e for e in runtime["events"] if e["event"] == "match" and e["role"] == "writer")["monotonic_ns"] = anchor - 747061
+            Path(runtime["raw_path"]).write_text("".join(json.dumps(e) + "\n" for e in runtime["events"]))
+            runtime["raw_sha256"] = raw_sha256(runtime["raw_path"])
+            row = ingest_execution(Scenario.from_dict(capsule.input["scenario"]), config, runtime, capsule)
+            self.assertEqual(row["execution_stage"], "aborted")
+            self.assertEqual(row["oracle_verdict"], "unknown")
+            self.assertEqual(row["abort_reason"], "match_not_observed")
+
+    def test_rehashed_snapshot_tampering_cannot_fall_back_to_legacy_matches(self):
+        modes = ("stale_sample", "wrong_command", "missing_request", "missing_ack", "wrong_api",
+                 "wrong_gid", "wrong_generation", "wrong_pid", "wrong_anchor", "zero_count",
+                 "bool_count", "after_opening", "duplicate_snapshot", "missing_reader")
+        for mode in modes:
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as temp:
+                _, config, capsule, _ = self.setup_cell(temp)
+                runtime = fixture_pair(config, Path(temp) / "fresh", fresh_matches=True)
+                events = runtime["events"]
+                snapshot = next(e for e in events if e["event"] == "match_snapshot" and e["role"] == "writer")
+                request = next(e for e in events if e["event"] == "match_snapshot_requested" and e["role"] == "writer")
+                anchor = request["reader_created_monotonic_ns"]
+                if mode == "stale_sample": snapshot["sampled_monotonic_ns"] = anchor - 1
+                elif mode == "wrong_command": snapshot["command_id"] += 100
+                elif mode == "missing_request": request["event"] = "diagnostic"
+                elif mode == "missing_ack":
+                    next(e for e in events if e["event"] == "command_done" and e["role"] == "writer")["event"] = "diagnostic"
+                elif mode == "wrong_api": snapshot["count_api"] = "get_publisher_count"
+                elif mode == "wrong_gid": snapshot["endpoint_gid"] = "other"
+                elif mode == "wrong_generation": snapshot["endpoint_generation"] = "other"
+                elif mode == "wrong_pid": snapshot["pid"] += 10
+                elif mode == "wrong_anchor": request["reader_created_monotonic_ns"] -= 1
+                elif mode == "zero_count": snapshot["matched_count"] = 0
+                elif mode == "bool_count": snapshot["matched_count"] = True
+                elif mode == "after_opening":
+                    snapshot["monotonic_ns"] = next(e["monotonic_ns"] for e in events if e["event"] == "window_open") + 1
+                elif mode == "duplicate_snapshot": events.append(copy.deepcopy(snapshot))
+                else:
+                    next(e for e in events if e["event"] == "match_snapshot" and e["role"] == "reader")["event"] = "diagnostic"
+                # Legacy matches are deliberately valid; malformed new evidence must not use them.
+                for event in events:
+                    if event["event"] == "match": event["monotonic_ns"] = anchor + 1
+                for index, event in enumerate(events): event["event_index"] = index
+                Path(runtime["raw_path"]).write_text("".join(json.dumps(e) + "\n" for e in events))
+                runtime["raw_sha256"] = raw_sha256(runtime["raw_path"])
+                row = ingest_execution(Scenario.from_dict(capsule.input["scenario"]), config, runtime, capsule)
+                self.assertEqual(row["execution_stage"], "aborted")
+                self.assertEqual(row["oracle_verdict"], "unknown")
+                self.assertIn("match_snapshot", row["abort_reason"])
 
     def test_raw_receipts_reach_core_judged_gate(self):
         with tempfile.TemporaryDirectory() as temp:

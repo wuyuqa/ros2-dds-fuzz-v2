@@ -2,6 +2,12 @@
 
 日期：2026-11-14。来源：主agent独立验证/派遣消息；文档子agent只读核对现有产物，不重新执行测试、网络控制、ROS 或 campaign。以下是开发阶段快照，不表示完整 S1 或 per-target seal 已通过。
 
+## 当前正式运行进展
+
+本次记录时间：2026-11-15T00:01:03+08:00（Asia/Shanghai，TZ=Asia/Shanghai date --iso-8601=seconds实测）。
+
+第一份正式 report 已产生，详见 [首次正式矩阵记录](first-formal-matrix-2026-11-14.md)：domain180、target revision0、source HEAD `21f0e2679703e366463c35e6d01c2be30fcec919`；24条真实运行完成，required 17 pass+1 unknown，六条fault按预期fail，controls为health6/mutation6/fault6/transparency5，seal=false。主agent独立verify rc1。原报告immutable；D013工具时序修复待新GO提交/冻结并重跑，不改原结果。下文离线测试与开发smoke保留各自历史身份，不能混入本次正式计数。
+
 ## 离线合同测试
 
 主agent报告执行：
@@ -12,7 +18,9 @@ PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python3 -m unittest discover -s tests -
 
 历史快照：工作目录 `/home/wuyuqa/ros2-dds-fuzz-v2`；结果 **112 tests / 4.232s / OK**。文档子agent未复跑，也未获得该次测试的独立日志路径或测试时源码 digest；不编造。此数字仅为该次离线合同总数，不是 112 次真实 ROS 执行，不证明 18-cell、四类各六 control 或完整 S1 达成。代码继续开发后，其他测试总数或耗时应另记新快照。
 
-最新快照：主agent在最终冻结前独立验收报告 **131 tests / 13.485s / OK**，并明确 negative+identity 集成已通过。文档子agent未复跑；该次独立日志路径与测试时 source digest 未随消息提供，不补造。上面的命令保留为已知离线测试入口，131 项结果按本次派遣消息记录。此结果仅证明报告范围内的离线合同/集成检查，不计真实 S1 required/control matrix 或 seal 完成。历史 112 项结果保留，不能把两次数量相加。
+首次冻结前历史快照：主agent独立验收报告 **131 tests / 13.485s / OK**，并明确 negative+identity 集成已通过。文档子agent未复跑；该次独立日志路径与测试时 source digest 未随消息提供，不补造。上面的命令保留为已知离线测试入口，131 项结果按本次派遣消息记录。此结果仅证明报告范围内的离线合同/集成检查，不计真实 S1 required/control matrix 或 seal 完成。历史 112 项结果保留，不能把两次数量相加。
+
+第二次冻结前最新快照（2026-11-15T00:14:58+08:00，Asia/Shanghai）：主agent独立全仓 **144 tests / 37.032s / OK**，diff --check通过、ACK逻辑审查通过，已下达本次第二commit最终GO。runtime已报告ACK补丁freeze-ready；文档子agent只读核对 `wait_for_fresh_match()`、worker snapshot响应及adapter的request/snapshot/ACK/window绑定，没有复跑测试。独立测试日志路径与测试时完整source digest未随消息提供，不补造。144项仅为离线合同/回归验证，不能改写首份formal的unknown/seal=false，不能替代修复后新HEAD的真实矩阵。
 
 ## 真实 non-DDS 网络载体控制
 
@@ -60,3 +68,17 @@ PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python3 -m unittest discover -s tests -
 ## 首次冻结前的工程更新
 
 `source_frozen` 和当前完整 source identity 比较已有实现。主agent最终 GO 已确认所有代码agent freeze、131 项测试通过，并派遣文档子agent执行首次显式 staging/commit。实际提交状态与 source HEAD 见 `git log` 及运行 manifest；本页在提交前编写，不提前宣称提交或 source_frozen 检查成功。现有 smoke 来自提交前开发快照，保存为历史，不能仅靠首次 commit 为其补出冻结来源身份或直接用于新 HEAD seal。首次提交采用 D011 指定的单次自动化身份；首次正式 matrix 期间固定 HEAD，文档不追加 commit。
+
+## 旧开发 instrumentation：有限字段 pass，扩展字段 unknown
+
+本次记录时间：2026-11-15T00:01:03+08:00（Asia/Shanghai，TZ=Asia/Shanghai date --iso-8601=seconds实测）。
+
+来源为真实已有开发run与其追加分析，文档子agent只读核对文件内容/hash，未重跑pair：
+
+- 原run：`vendor-dev-20261114T153207-7cc731c0`，`rmw_cyclonedds_cpp`，domain174。[原report](../results/instrumentation-smoke/vendor-dev-20261114T153207-7cc731c0/report.json) SHA-256：`68bb6e9bd34d3d285333b7b5bd69668a7680e626961c7cfb1ff7d3349000f6d7`。
+- [追加分析report](../results/instrumentation-smoke/analysis-20261114T153447-8816dc33/report.json) SHA-256：`a9810955d65c06458a09ce9560233b6e80c424f94368c28981448a421f4bfc77`；`reexecuted_pair=false`，`development_only=true`，`internal_event_witness=true`，vendor_event_count=18。
+- `limited_projection.verdict=pass`：GUID/role及reliability、durability限定字段对账；`extended_projection.verdict=unknown`：两端graph的deadline/liveliness缺失，共四项unknown，mismatches为空。不能把limited pass写成完整QoS对账通过。
+- 原collector把atime变化误判为文件变化，漏收writer；原report保留collection_errors，追加分析只重读保留raw，不覆盖原结果。工具采集失败不归因SUT。
+- `control_task.status=not_run`，candidate_admission=not_performed，sealed=false，target_maturity=not_evaluated。blackbox清理检查不等于blackbox pair已运行。
+
+该开发证据不计第四target正式执行或seal。Cyclone effective trace中的history/depth不证明wire PID presence；D014首次字段适用性定义不追改旧extended unknown为pass。计划及16个本地source hash的只读核对见D014。

@@ -69,6 +69,51 @@ def endpoint_identity_proof(events, runtime, config, tokens, opening, closing):
             "limitations": ["Public callback does not expose publisher_gid; identity is correlated through unique bounded endpoint graph, independent process, run payload and sequence receipts."]}
 
 
+def fresh_match_proof(events, tokens, opening):
+    """Bind the latest paired public count queries to raw request/snapshot/ack."""
+    requests = [e for e in events if e.get("event") == "match_snapshot_requested"]
+    if len(requests) < 2 or len(requests) % 2:
+        raise ValueError("match_snapshot request pair incomplete")
+    # Controller issues writer then reader on every polling round. Do not combine rounds.
+    for writer_request, reader_request in zip(requests[::2], requests[1::2]):
+        if (writer_request.get("role"), reader_request.get("role")) != ("writer", "reader"):
+            raise ValueError("match_snapshot request roles differ from paired query")
+    selected = requests[-2:]
+    if selected[0].get("command_id") == selected[1].get("command_id"):
+        raise ValueError("match_snapshot command ids are not independent")
+    proof, completed = {}, []
+    anchor = tokens["reader"]["created_monotonic_ns"]
+    for request in selected:
+        role, command_id = request["role"], request.get("command_id")
+        requested_ns = request.get("requested_monotonic_ns")
+        if (type(command_id) is not int or type(requested_ns) is not int
+                or request.get("reader_created_monotonic_ns") != anchor
+                or not anchor <= requested_ns <= request["monotonic_ns"]
+                or request["event_index"] <= tokens["reader"]["event_index"]):
+            raise ValueError("match_snapshot request is not after reader creation")
+        try:
+            snapshot = _one(events, "match_snapshot", role=role, command_id=command_id)
+            ack = _one(events, "command_done", role=role, command_id=command_id)
+        except ValueError as exc:
+            raise ValueError(f"match_snapshot command binding: {exc}") from exc
+        sampled_ns = snapshot.get("sampled_monotonic_ns")
+        if (type(sampled_ns) is not int or not requested_ns <= sampled_ns <= snapshot["monotonic_ns"]
+                or not snapshot["monotonic_ns"] <= ack["monotonic_ns"] <= opening["monotonic_ns"]
+                or not request["event_index"] < snapshot["event_index"] < ack["event_index"] < opening["event_index"]
+                or type(snapshot.get("matched_count")) is not int or snapshot["matched_count"] != 1
+                or snapshot.get("count_api") != ("get_subscription_count" if role == "writer" else "get_publisher_count")
+                or snapshot.get("endpoint_gid") != tokens[role]["endpoint_gid"]):
+            raise ValueError("match_snapshot count/API/time/command proof invalid")
+        for event in (snapshot, ack):
+            if any(event.get(key) != tokens[role].get(key) for key in ("pid", "endpoint_generation", "rmw_identifier")):
+                raise ValueError("match_snapshot worker identity differs from endpoint")
+        proof[role] = {"command_id": command_id, "request_index": request["event_index"],
+                       "snapshot_index": snapshot["event_index"], "ack_index": ack["event_index"],
+                       "sampled_monotonic_ns": sampled_ns, "count_api": snapshot["count_api"]}
+        completed.append(ack["monotonic_ns"])
+    return max(completed), proof
+
+
 def facts_from_events(events, runtime, config):
     """Only raw tokens produce primary facts; summaries cannot substitute."""
     facts = {"schema_version": 1, "environment_healthy": runtime.get("environment", {}).get("ok") is True,
@@ -86,12 +131,16 @@ def facts_from_events(events, runtime, config):
                 raise ValueError("endpoint identity or RMW missing")
             facts[role] = {"id": token["endpoint_gid"], "generation": token["endpoint_generation"], "created_ns": token["created_monotonic_ns"]}
         writer, reader = facts["writer"], facts["reader"]
-        matches = {role: [e for e in events if e.get("event") == "match" and e.get("role") == role and e.get("matched_count") == 1 and e["monotonic_ns"] >= reader["created_ns"]] for role in tokens}
-        if not all(matches.values()):
-            raise ValueError("match_not_observed")
-        match_ns = max(matches[role][0]["monotonic_ns"] for role in matches)
-        facts["match"] = {"writer_id": writer["id"], "reader_id": reader["id"], "at_ns": match_ns}
         opening = _one(events, "window_open", window="post_match_delivery")
+        if any(e.get("event") in {"match_snapshot", "match_snapshot_requested"} for e in events):
+            match_ns, facts["match_snapshot_proof"] = fresh_match_proof(events, tokens, opening)
+        else:
+            # Historical raw without the snapshot schema retains its original chronology.
+            matches = {role: [e for e in events if e.get("event") == "match" and e.get("role") == role and e.get("matched_count") == 1 and e["monotonic_ns"] >= reader["created_ns"]] for role in tokens}
+            if not all(matches.values()):
+                raise ValueError("match_not_observed")
+            match_ns = max(matches[role][0]["monotonic_ns"] for role in matches)
+        facts["match"] = {"writer_id": writer["id"], "reader_id": reader["id"], "at_ns": match_ns}
         closing = _one(events, "window_close", window="post_match_delivery")
         facts["window"] = {"start_ns": opening["monotonic_ns"], "end_ns": closing["monotonic_ns"], "complete": True}
         contract = _one(events, "delivery_contract")

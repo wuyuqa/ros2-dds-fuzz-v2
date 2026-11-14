@@ -142,6 +142,41 @@ scope 外 target/rule/slot/carrier、成熟分母变化、已 seal revision 修�
 - mutated 的严格 mutation_applied gate 不变；fault 分支不能成为真实 mutation 无 hit 时的通用豁免。health/baseline、transparent 的 neutral/no-op 分支仍按 D002。
 - 此项解决 negative 独立控制与严格 mutation 阶段的合同冲突，不新增 scope、不改变成熟分母；fault 仍独立六行，预期 primary fail，只证明检测通道。
 
+## D013：reader 创建后重新采集双向 match，纠正工具时序误判
+
+本次记录时间：2026-11-15T00:01:03+08:00（Asia/Shanghai，TZ=Asia/Shanghai date --iso-8601=seconds实测）。
+
+来源：主agent工程裁定/派遣消息；原始报告及时间锚点由文档子agent只读核对，见 [首次正式矩阵记录](first-formal-matrix-2026-11-14.md)。状态：runtime ACK补丁freeze-ready；本次第二commit最终GO已收到，独立验收及精确提交范围见本节后补记录。
+
+- 首份正式报告24条真实完成，但18条required为17 pass+1 unknown；六条fault按预期fail，health/mutation/fault各6/6、transparency 5/6，seal=false。主agent独立verify rc1。
+- FastDDS transparent.1 的 writer match=1 早于 reader create_subscription 返回锚点747,061ns，六条post-match delivery完整。该工具采样/锚点误判不能变成SUT mismatch、自然candidate或真实delivery loss。
+- reader创建返回后必须请求/采集**新鲜双向 match snapshots**：writer侧和reader侧各自实际观察，绑定本run、endpoint identity/generation、raw事件引用和时间。校验快照产生在reader创建之后，不能只证明receipt字段存在。
+- 原来的早期match保留为历史事件，不篡改时间、不倒填reached、不用最终交付推造match。D010 writer-only mutation前置保持；匹配仍属于late_joiner的mutation后观察，不能倒置为前置。
+- 第二次提交的行为修改范围由主agent限定为match snapshots/runtime adapter及对应回归tests；D014仅文档记录待实施，不随本次补丁修改第四target实现。须等代码agentfreeze与全仓测试后的新GO，届时按新的单次授权使用自动化身份提交。
+- 这是工具时序纠错，不改SUT rule、target revision或18/72成熟分母。补丁改变source身份，按D011新提交/冻结后重跑；原正式report/raw/ledger immutable，unknown与seal=false保留。
+
+D013 ACK补充及第二次GO（2026-11-15T00:14:58+08:00，Asia/Shanghai）：
+
+- reader创建返回后发出本轮snapshot请求；两端各有唯一、命令关联的新鲜match_snapshot及command_done ACK，且matched_count为整数1，才可打开post_match_delivery窗口。此ACK是snapshot命令完成回执，不是DDS交付ACK。raw须满足request→snapshot→ACK→window_open的事件顺序，以及reader创建/请求≤采样≤snapshot≤ACK≤窗口开启的单调时间关系；核对角色、API、command_id、GID/generation及worker身份。snapshot和ACK分两次stdout读取也必须等齐；缺失、重复、提前ACK或不匹配不得放行，不得退回旧match事件。
+- 主agent已独立验收全仓 **144 tests / 37.032s / OK**，diff --check通过、ACK逻辑审查通过；文档子agent只读检查上述实现，没有复跑测试。112项、131项结果保留为历史，不累计为真实矩阵计数。
+- 本次第二commit最终GO已下达，范围仅为 `src/r2f/runtime/worker.py`、`src/r2f/runtime/ros2_pair.py`、`src/r2f/campaign/runtime_adapter.py`、`tests/test_campaign_evidence.py`、`tests/test_runtime_match_snapshot.py` 及当前docs/README/AGENTS更新；排除results。仅本次commit命令使用 `Codex Agent <codex-agent@localhost>`，不改Git配置，提交信息为 `Fix fresh match snapshot acknowledgement race`。
+- 实际提交HEAD与冻结结果见git log及只读source_manifest；本段在提交前写入，不预先宣称提交成功。提交后不因文档追加commit，不运行ROS。首次失败report/raw保持immutable，D014只记录待实施，不随本次补丁修改第四target实现或分母。
+
+## D014：第四 target 标准 endpoint 字段适用性与 generation 依据
+
+本次记录时间：2026-11-15T00:01:03+08:00（Asia/Shanghai，TZ=Asia/Shanghai date --iso-8601=seconds实测）。
+
+来源：主agent工程裁定/派遣消息；依据 [第四target可行性计划](../results/instrumentation-feasibility/fourth-target-plan.md)，文件SHA-256 `809cf69673d621126390ba305b2d109b1a1eaa1a8ab7d357cf56aa117314ea90`。文档子agent只读复核该计划列出的16个本地source hash，16/16匹配；未重新访问其外部引用。状态：owner主agent已裁定字段合同，实施稍后，第四target尚未正式执行/封存，无需用户另行确认。
+
+复核补记（2026-11-15T00:02:39+08:00，Asia/Shanghai）：上述计划在并行工作期间追加了§11；现文件SHA-256为 `ec937a7e69c708415677671e6d9c231ef88b56f52e0918e259745e1f1e3f4c9d`。最初读取的28,628字节仍是逐字节一致的前缀，旧hash作为历史来源保留；16个本地source hash仍全部匹配。计划的接口提议不视为已实施，也不据此扩大本次match补丁范围。
+
+- 必需对账字段：GUID、role、topic、type、reliability、durability、deadline、liveliness及lease。两来源独立，不能graph自比较或用测试配置反填独立观察。
+- 按该计划核查的标准endpoint builtin schema，history/depth不作为Publication/Subscription endpoint的必需字段；PID_HISTORY对应Topic。history/depth仅作supporting diagnostic，缺失明确标记 `not_applicable_by_endpoint_schema`，禁止用配置填值。已真实观察到的vendor扩展保留其raw/basis，不能冒称跨RMW标准保证。
+- history/depth的字段级不适用不能推广到deadline、liveliness或lease；必需字段缺失/解析不足仍记unknown，不能借N/A掩盖采集缺口。durability_service.history_depth也不能替代endpoint history.depth。
+- GUID generation由独立capture与进程/endpoint生命周期关联：明确GUID、进程身份、创建receipt和观察窗口。不得编造不存在的wire generation字段，也不把capture到公告自动当成对端已经处理该公告的内部证据。
+- 这是第四target revision0的首次模型定义；尚未执行或封存该target，不是删除已失败rule，不改第一target18或完整S1 72分母。原taskbook未枚举depth，旧catalog不能把超出标准endpoint schema的字段强行继承为全部RMW必需。
+- 该计划的“待owner批准”、建议revision0→1及旧N/A命名属于提议时点；本裁定在上述字段/代际边界内取代这些提议，使用revision0及精确状态 `not_applicable_by_endpoint_schema`。其余capture实现、默认省略推导、control施加层仍须实现与验证，不能把字段裁定扩写为整份方案已实现/已验收。
+
 ## 参考来源和阅读范围
 
 以下四份旧仓库文档已完整阅读，仅作只读设计/证据参考；它们不是对新仓库完成情况的证明，也不递归导入其中的旧执行命令。
