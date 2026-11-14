@@ -1,0 +1,160 @@
+"""Fresh-process public rclpy endpoint; stdin commands, stdout JSONL tokens only."""
+from __future__ import annotations
+import json
+import os
+import select
+import sys
+import time
+import traceback
+import uuid
+
+
+def main():
+    config = json.loads(sys.argv[1])
+    role = sys.argv[2]
+    # Imports are deliberately confined to this fresh child.
+    import rclpy
+    from rclpy.context import Context
+    from rclpy.executors import SingleThreadedExecutor
+    from rclpy.node import Node
+    from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPolicy
+    from std_msgs.msg import String
+    context = Context()
+    rclpy.init(context=context)
+    rmw = rclpy.get_rmw_implementation_identifier()
+    generation = uuid.uuid4().hex
+    name = f'r2f_{role}_{generation[:12]}'
+    node = Node(name, context=context, enable_rosout=False, start_parameter_services=False)
+    executor = SingleThreadedExecutor(context=context)
+    executor.add_node(node)
+    receive_sequence = 0
+    local_gid = None
+
+    def emit(event, **fields):
+        value = {'event': event, 'time_ns': time.time_ns(), 'monotonic_ns': time.monotonic_ns(),
+                 'role': role, 'pid': os.getpid(), 'pgid': os.getpgrp(), 'run_id': config['run_id'],
+                 'domain_id': config['domain_id'], 'rmw_identifier': rmw,
+                 'endpoint_generation': generation, 'node_name': name}
+        value.update(fields)
+        print(json.dumps(value, sort_keys=True), flush=True)
+
+    q = config.get(role + '_qos', config['qos'])
+    qos = QoSProfile(depth=q['depth'], history=HistoryPolicy.KEEP_LAST,
+                     reliability=getattr(ReliabilityPolicy, q['reliability'].upper()),
+                     durability=getattr(DurabilityPolicy, q['durability'].upper()))
+
+    def gid(value):
+        return bytes(value).hex() if value is not None else None
+
+    def receive(message, info):
+        nonlocal receive_sequence
+        receive_sequence += 1
+        try:
+            body = json.loads(message.data)
+        except (ValueError, TypeError):
+            emit('receive_invalid_payload', receive_sequence=receive_sequence)
+            return
+        get_info = info.get if isinstance(info, dict) else lambda key: getattr(info, key, None)
+        metadata = {}
+        for key in ('source_timestamp', 'received_timestamp', 'publication_sequence_number', 'reception_sequence_number'):
+            value = get_info(key)
+            metadata[key] = value if isinstance(value, (int, str, bool, type(None))) else str(value)
+        emit('receive', send_sequence=body.get('send_sequence'), receive_sequence=receive_sequence,
+             phase=body.get('phase'), payload_run_id=body.get('run_id'),
+             publisher_gid=gid(get_info('publisher_gid')), reader_gid=local_gid,
+             message_info_type=type(info).__name__,
+             message_info_fields=sorted(info) if isinstance(info, dict) else [],
+             publisher_gid_status='available' if get_info('publisher_gid') is not None else 'unavailable_api',
+             identity_basis='message_info_gid' if get_info('publisher_gid') is not None else 'endpoint_correlated',
+             message_info=metadata)
+
+    endpoint = node.create_publisher(String, config['topic'], qos) if role == 'writer' else node.create_subscription(String, config['topic'], receive, qos)
+    created_ns = time.monotonic_ns()
+
+    def graph():
+        nonlocal local_gid
+        def entry(info):
+            return {'node_name': info.node_name, 'node_namespace': info.node_namespace,
+                    'topic_type': info.topic_type, 'endpoint_gid': gid(info.endpoint_gid),
+                    'qos': {'reliability': info.qos_profile.reliability.name.lower(),
+                            'durability': info.qos_profile.durability.name.lower(),
+                            'depth': info.qos_profile.depth}}
+        publishers = [entry(x) for x in node.get_publishers_info_by_topic(config['topic'])]
+        subscriptions = [entry(x) for x in node.get_subscriptions_info_by_topic(config['topic'])]
+        for item in publishers if role == 'writer' else subscriptions:
+            if item['node_name'] == name:
+                local_gid = item['endpoint_gid']
+        return {'publishers': publishers, 'subscriptions': subscriptions}
+
+    initial_graph = graph()
+    identity_deadline = time.monotonic() + config['startup_timeout_sec']
+    while local_gid is None and time.monotonic() < identity_deadline:
+        executor.spin_once(timeout_sec=0.02)
+        initial_graph = graph()
+    emit('endpoint_created', endpoint_gid=local_gid, created_monotonic_ns=created_ns,
+         topic=config['topic'], qos=q, message_type='std_msgs/msg/String')
+    emit('graph_snapshot', **initial_graph)
+    input_buffer = b''
+    pending_commands = []
+    last_count = None
+    last_graph_ns = 0
+    try:
+        while True:
+            executor.spin_once(timeout_sec=0.02)
+            now = time.monotonic_ns()
+            count = endpoint.get_subscription_count() if role == 'writer' else endpoint.get_publisher_count()
+            if count != last_count:
+                emit('match', matched_count=count, endpoint_gid=local_gid)
+                emit('graph_snapshot', **graph())
+                last_count = count
+            if now - last_graph_ns > 500_000_000:
+                emit('graph_snapshot', **graph())
+                last_graph_ns = now
+            if select.select([sys.stdin], [], [], 0)[0]:
+                chunk = os.read(sys.stdin.fileno(), 65536)
+                if not chunk:
+                    break
+                input_buffer += chunk
+                while b'\n' in input_buffer:
+                    line, input_buffer = input_buffer.split(b'\n', 1)
+                    pending_commands.append(line)
+            if not pending_commands:
+                continue
+            command = json.loads(pending_commands.pop(0))
+            if command['command'] == 'stop':
+                emit('worker_stopping')
+                break
+            if command['command'] == 'snapshot':
+                emit('graph_snapshot', **graph())
+                emit('command_done', command_id=command['command_id'])
+            elif command['command'] == 'publish' and role == 'writer':
+                sequence = command['send_sequence']
+                phase = command['phase']
+                if command.get('omit', False):
+                    emit('harness_omission', send_sequence=sequence, phase=phase,
+                         fault_id='late_endpoint_delivery_omission', responsibility_layer='harness',
+                         candidate_eligible=False, omission_layer='before_public_publish_call')
+                else:
+                    payload = {'run_id': config['run_id'], 'send_sequence': sequence, 'phase': phase}
+                    message = String()
+                    message.data = json.dumps(payload, sort_keys=True)
+                    endpoint.publish(message)
+                    emit('send', send_sequence=sequence, phase=phase, writer_gid=local_gid,
+                         publish_returned=True, payload_sha256=__import__('hashlib').sha256(message.data.encode()).hexdigest())
+                emit('command_done', command_id=command['command_id'])
+    finally:
+        executor.shutdown()
+        node.destroy_node()
+        context.shutdown()
+        emit('worker_shutdown')
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except BaseException as exc:
+        print(json.dumps({'event': 'worker_error', 'pid': os.getpid(), 'pgid': os.getpgrp(),
+                          'time_ns': time.time_ns(), 'monotonic_ns': time.monotonic_ns(),
+                          'error': type(exc).__name__ + ':' + str(exc),
+                          'traceback': traceback.format_exc()}), flush=True)
+        sys.exit(1)

@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "module": "s1",
+  "target_revision": {"discovery.late_endpoint": 0, "discovery.late_join_delivery": 0, "discovery.interruption_recovery": 0, "builtin.discovery_projection_reconciliation": 0},
+  "targets": ["discovery.late_endpoint", "discovery.late_join_delivery", "discovery.interruption_recovery", "builtin.discovery_projection_reconciliation"],
+  "execution_order": ["discovery.late_endpoint", "discovery.late_join_delivery", "discovery.interruption_recovery", "builtin.discovery_projection_reconciliation"],
+  "mutations": ["late_joiner", "endpoint_qos_variation", "discovery_drop", "restore_after_discovery_interruption"],
+  "excluded": ["discovery_delay", "discovery_reorder", "discovery_duplicate", "lease_expiry", "lease_renewal", "endpoint_remove_recreate"],
+  "rmws": ["rmw_cyclonedds_cpp", "rmw_fastrtps_cpp"],
+  "required_arms": ["baseline", "transparent", "mutated"],
+  "repeats": [0, 1, 2],
+  "required_cells_per_target": 18,
+  "full_scope_required_cells": 72,
+  "first_delivery_required_cells": 18,
+  "independent_fault_controls_per_target": 6,
+  "first_slice": {"target_id": "discovery.late_endpoint", "mutation_kind": "late_joiner"},
+  "policy": {"normal_public_ros2_api_only": true, "native_dds_participant": false, "auto_vulnerability_search": false, "adaptive_attacks": false, "malicious_wire_payloads": false, "exploit_reproduction": false},
+  "blocked": {
+    "discovery.interruption_recovery": "no_endpoint_attached_discovery_drop_restore_carrier",
+    "builtin.discovery_projection_reconciliation": "no_independent_public_builtin_read_surface; graph alone cannot satisfy reconciliation"
+  }
+}

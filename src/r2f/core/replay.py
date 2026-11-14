@@ -1,0 +1,303 @@
+"""Replay audit capsules and an injected normal public-API conformance runner.
+
+No exploit, wire-payload or vulnerability reproduction machinery is provided.
+Input metadata can be constructed offline. Execution metadata is accepted only
+with runtime origin, matching identity and verified raw evidence; it is not a
+cryptographic attestation that the callback actually ran a ROS2 process.
+"""
+
+from dataclasses import dataclass, field
+from enum import Enum
+
+from ._json import integer, nonempty, sha256_digest, snapshot
+from .evidence import INPUT_SCHEMA, canonical_hash, effective_input_hash
+from .execution import validate_execution
+from .scenario import Scenario
+from .oracle import _effect_names
+from .state_machine import utc_now
+
+CAPSULE_SCHEMA = "r2f.conformance-capsule/v1"
+
+
+class ReplayStatus(str, Enum):
+    NOT_RUN = "not_run"
+    PASS = "pass"
+    FAIL_TIMING = "fail_timing"
+    FAIL_ENVIRONMENT = "fail_environment"
+    FAIL_ARTIFACT = "fail_artifact"
+    INCONCLUSIVE = "inconclusive"
+
+
+def validate_replay_input(data):
+    if not isinstance(data, dict) or data.get("input_identity_schema") != INPUT_SCHEMA:
+        raise ValueError("unsupported replay input identity schema")
+    effective = data.get("effective_input")
+    digest = effective_input_hash(effective)
+    if data.get("effective_input_sha256") != digest:
+        raise ValueError("replay effective input SHA256 mismatch")
+    scenario = Scenario.from_dict(data["scenario"])
+    if scenario.target.to_dict() != data.get("target"):
+        raise ValueError("replay target manifest mismatch")
+    if canonical_hash(data["target"]) != effective.get("target_sha256"):
+        raise ValueError("replay effective target manifest hash mismatch")
+    for key in ("target_id", "target_revision", "seed", "rmw", "arm", "repeat", "mutation_kind", "carrier"):
+        if data.get(key) != effective.get(key) or data.get(key) != scenario.to_dict().get(key):
+            raise ValueError(f"replay input metadata mismatch: {key}")
+    if data.get("state_steps") != effective.get("state_steps") or data.get("state_steps") != scenario.to_dict()["state_steps"]:
+        raise ValueError("replay state plan mismatch")
+    if data.get("mutation_parameters") != effective.get("mutation_parameters") or data.get("mutation_parameters") != scenario.mutation_parameters:
+        raise ValueError("replay mutation parameters mismatch")
+    if not isinstance(data.get("source_manifest"), dict) or not data["source_manifest"]:
+        raise ValueError("replay source_manifest must be nonempty")
+    if data["source_manifest"] != effective.get("source_manifest"):
+        raise ValueError("replay source_manifest mismatch")
+    for key in ("topic", "message_type"):
+        nonempty(data.get(key), key)
+    if not isinstance(data.get("qos"), dict):
+        raise ValueError("replay qos must be a dict")
+    submitted = effective["final_input"]
+    if not isinstance(submitted, dict):
+        raise ValueError("normal conformance final_input must be a config dict")
+    for key in ("topic", "message_type", "qos"):
+        if key in submitted and data[key] != submitted[key]:
+            raise ValueError(f"replay {key} differs from final submitted config")
+    if data.get("origin_domain") is not None:
+        integer(data["origin_domain"], "origin_domain")
+    return True
+
+
+def conformance_signature(metadata):
+    """Return a typed, stable normal-conformance outcome signature, or None.
+
+    For a failed oracle the adapter should supply typed_anomaly_signature (dict
+    or list), or one of the documented typed failure summaries below. Raw event
+    times, domain numbers and endpoint instance ids are never a signature.
+    Merely observing the same verdict=fail without typed failure facts is
+    insufficient to establish consistency.
+    """
+    verdict = metadata.get("oracle_verdict")
+    if verdict not in {"pass", "fail"}:
+        return None
+    facts = metadata.get("typed_facts", {})
+    if not isinstance(facts, dict):
+        return None
+    target = metadata.get("target", {})
+    rule = metadata.get("rule_id") or target.get("rule_contract", {}).get("primary_rule")
+    if not isinstance(rule, str) or not rule:
+        return None
+    explicit = metadata.get("typed_anomaly_signature", facts.get("anomaly_signature"))
+    if explicit is not None:
+        if not isinstance(explicit, (dict, list)) or not explicit:
+            return None
+        anomaly = snapshot(explicit)
+    else:
+        summary_keys = ("missing_sequences", "missing_postmatch_sequences", "forbidden_residuals",
+                        "violations", "reason_codes", "identity_mismatches", "order_violation",
+                        "delivery_order_violation")
+        anomaly = {key: snapshot(facts[key]) for key in summary_keys if facts.get(key)}
+        if facts.get("matched") is False:
+            anomaly["matched"] = False
+        # Typed delivery records can establish an intermediate omission: a later
+        # received sequence closes that gap; a missing tail does not suffice.
+        sent, received = facts.get("sent"), facts.get("received")
+        if isinstance(sent, list) and isinstance(received, list):
+            sent_seq = {v["sequence"] for v in sent if isinstance(v, dict) and type(v.get("sequence")) is int}
+            received_seq = [v["sequence"] for v in received if isinstance(v, dict) and type(v.get("sequence")) is int]
+            match_time = facts.get("match", {}).get("at_ns") if isinstance(facts.get("match"), dict) else None
+            if type(match_time) is int:
+                sent_seq = {v["sequence"] for v in sent if isinstance(v, dict)
+                            and type(v.get("sequence")) is int and type(v.get("at_ns")) is int
+                            and v["at_ns"] >= match_time}
+            if received_seq:
+                missing = sorted(v for v in sent_seq - set(received_seq) if v < max(received_seq))
+                if missing:
+                    anomaly["missing_postmatch_sequences"] = missing
+                if received_seq != sorted(received_seq):
+                    anomaly["delivery_order_violation"] = True
+        residuals = _effect_names(metadata.get("observed_effect")).intersection(
+            target.get("expected_effect_set", {}).get("forbidden_residuals", []))
+        if residuals:
+            anomaly["observed_forbidden_residuals"] = sorted(residuals)
+        if verdict == "fail" and not anomaly:
+            return None
+    return {"schema": "r2f.conformance-signature/v1", "rule_id": rule,
+            "oracle_verdict": verdict, "typed_anomaly_signature": anomaly}
+
+
+def validate_replay_attempt(attempt):
+    if not isinstance(attempt, dict):
+        raise ValueError("replay attempt must be a dict")
+    status = ReplayStatus(attempt.get("status"))
+    if status == ReplayStatus.NOT_RUN:
+        raise ValueError("not_run is not a replay attempt")
+    nonempty(attempt.get("attempt_id"), "attempt_id")
+    nonempty(attempt.get("timestamp"), "timestamp")
+    if status != ReplayStatus.PASS:
+        nonempty(attempt.get("failure_reason"), "failure_reason")
+    return True
+
+
+@dataclass
+class ReplayCapsule:
+    input: dict
+    execution: dict | None = None
+    replay_attempts: list = field(default_factory=list)
+    non_replayable: dict | None = None
+    execution_history: list = field(default_factory=list)
+
+    def __post_init__(self):
+        self.input = snapshot(self.input)
+        validate_replay_input(self.input)
+        initial = self.execution
+        self.execution = None
+        if initial is not None:
+            self.record_execution(initial)
+        self.replay_attempts = snapshot(self.replay_attempts)
+        for attempt in self.replay_attempts:
+            validate_replay_attempt(attempt)
+
+    @classmethod
+    def from_scenario(cls, scenario, *, source_manifest, final_input=None,
+                      input_layer_receipts=None, origin_domain=None):
+        submitted = snapshot(scenario.parameters if final_input is None else final_input)
+        if not isinstance(submitted, dict):
+            raise ValueError("normal conformance config must be a dict")
+        # Endpoint defaults are explicit in the final submitted configuration.
+        submitted.setdefault("topic", "/r2f/conformance")
+        submitted.setdefault("message_type", "std_msgs/msg/String")
+        submitted.setdefault("qos", {})
+        effective = scenario.effective_input(final_input=submitted, input_layer_receipts=input_layer_receipts,
+                                             source_manifest=source_manifest)
+        input_data = {"input_identity_schema": INPUT_SCHEMA, "scenario": scenario.to_dict(),
+                      "target": scenario.target.to_dict(), "target_id": scenario.target_id,
+                      "target_revision": scenario.target_revision, "seed": scenario.seed, "rmw": scenario.rmw,
+                      "arm": scenario.arm, "repeat": scenario.repeat, "mutation_kind": scenario.mutation_kind,
+                      "carrier": scenario.carrier, "mutation_parameters": scenario.mutation_parameters,
+                      "state_steps": [s.to_dict() for s in scenario.state_steps],
+                      "source_manifest": snapshot(source_manifest), "effective_input": effective,
+                      "effective_input_sha256": effective_input_hash(effective), "origin_domain": origin_domain,
+                      **{key: submitted[key] for key in ("topic", "message_type", "qos")}}
+        return cls(input_data)
+
+    def record_execution(self, metadata):
+        validate_replay_input(self.input)
+        data = snapshot(metadata)
+        if data.get("actual_run") is not True or data.get("execution_source") != "ros2_public_api":
+            raise ValueError("execution metadata must originate in an actual public ROS2 API run")
+        for key in ("target_id", "target_revision", "seed", "rmw", "arm", "repeat", "mutation_kind", "carrier"):
+            if data.get(key) != self.input[key]:
+                raise ValueError(f"replay execution identity mismatch: {key}")
+        if data.get("target") != self.input["target"]:
+            raise ValueError("execution target manifest mismatch")
+        if data.get("effective_input_sha256") != self.input["effective_input_sha256"]:
+            raise ValueError("execution must reference the sealed effective input SHA256")
+        if data.get("source_manifest") != self.input["source_manifest"]:
+            raise ValueError("execution source_manifest mismatch")
+        validate_execution(data)
+        if data["execution_stage"] not in {"effect_observed", "judged", "aborted"}:
+            raise ValueError("execution metadata must contain an observation or a terminal failure")
+        if data["execution_stage"] == "aborted":
+            nonempty(data.get("abort_reason"), "abort_reason")
+        else:
+            nonempty(data.get("raw_path"), "raw_path")
+            sha256_digest(data.get("raw_sha256"), "raw_sha256")
+        if self.execution is None:
+            self.execution = data
+        else:
+            # The first actual execution remains the comparison baseline.
+            self.execution_history.append(data)
+        return snapshot(data)
+
+    def record_attempt(self, status, *, failure_reason="", **metadata):
+        attempt = snapshot(metadata)
+        attempt.update(status=ReplayStatus(status).value, failure_reason=failure_reason,
+                       attempt_id=f"attempt-{len(self.replay_attempts) + 1}", timestamp=utc_now())
+        validate_replay_attempt(attempt)
+        self.replay_attempts.append(attempt)
+        return snapshot(attempt)
+
+    def mark_non_replayable(self, disposition, reason):
+        nonempty(disposition, "non_replayable.disposition")
+        nonempty(reason, "non_replayable.reason")
+        self.non_replayable = {"disposition": disposition, "reason": reason, "timestamp": utc_now()}
+
+    def to_dict(self):
+        return {"schema": CAPSULE_SCHEMA, "input": snapshot(self.input), "execution": snapshot(self.execution),
+                "execution_history": snapshot(self.execution_history), "replay_attempts": snapshot(self.replay_attempts),
+                "non_replayable": snapshot(self.non_replayable)}
+
+    @classmethod
+    def from_dict(cls, data):
+        if data.get("schema") != CAPSULE_SCHEMA:
+            raise ValueError("unsupported replay capsule schema")
+        result = cls(data["input"], replay_attempts=data.get("replay_attempts", []))
+        if data.get("execution") is not None:
+            result.record_execution(data["execution"])
+        for execution in data.get("execution_history", []):
+            result.record_execution(execution)
+        disposition = data.get("non_replayable")
+        if disposition is not None:
+            nonempty(disposition.get("disposition"), "non_replayable.disposition")
+            nonempty(disposition.get("reason"), "non_replayable.reason")
+            nonempty(disposition.get("timestamp"), "non_replayable.timestamp")
+            result.non_replayable = snapshot(disposition)
+        return result
+
+
+def rerun_conformance(capsule, runner, *, domain):
+    """runner(scenario, domain) runs the normal scene and returns execution metadata.
+
+    The compiled scenario's final_input/input_layer_receipts/source_manifest fields
+    are available as properties for the adapter to submit and bind its receipt.
+    """
+    try:
+        validate_replay_input(capsule.input)
+    except (ValueError, KeyError, TypeError) as exc:
+        return capsule.record_attempt("fail_artifact", failure_reason=f"{type(exc).__name__}: {exc}", domain=domain)
+    integer(domain, "domain")
+    if domain == capsule.input.get("origin_domain"):
+        raise ValueError("conformance rerun requires a new isolated domain")
+    scenario = Scenario.from_dict(capsule.input["scenario"])
+    scenario.final_input = snapshot(capsule.input["effective_input"]["final_input"])
+    scenario.input_layer_receipts = snapshot(capsule.input["effective_input"]["input_layer_receipts"])
+    scenario.source_manifest = snapshot(capsule.input["source_manifest"])
+    scenario.effective_input_sha256 = capsule.input["effective_input_sha256"]
+    original = snapshot(capsule.execution)
+    try:
+        metadata = runner(scenario, domain)
+    except Exception as exc:
+        status = "fail_timing" if isinstance(exc, TimeoutError) else "fail_environment"
+        return capsule.record_attempt(status, failure_reason=f"{type(exc).__name__}: {exc}", domain=domain)
+    try:
+        if metadata.get("domain") != domain:
+            raise ValueError("runner did not record the fresh isolated domain")
+        capsule.record_execution(metadata)
+    except (ValueError, KeyError, TypeError, OSError, AttributeError) as exc:
+        try:
+            retained = snapshot(metadata)
+        except (ValueError, TypeError):
+            retained = {"unserializable_type": type(metadata).__name__}
+        return capsule.record_attempt("fail_artifact", failure_reason=f"{type(exc).__name__}: {exc}", domain=domain,
+                                      execution_metadata=retained)
+    if metadata["execution_stage"] == "aborted":
+        return capsule.record_attempt("fail_environment", failure_reason=metadata["abort_reason"], domain=domain,
+                                      execution_metadata=metadata)
+    if original is None:
+        # This verifies only that an ordinary execution completed. It provides no
+        # claim that a previously observed anomaly has been matched.
+        completed = metadata["execution_stage"] == "judged"
+        return capsule.record_attempt("pass" if completed else "inconclusive", domain=domain,
+                                      failure_reason="" if completed else "execution was not judged",
+                                      execution_metadata=metadata, comparison_basis="execution_success_only",
+                                      comparison_matches_original=False)
+    original_signature = conformance_signature(original)
+    replay_signature = conformance_signature(metadata)
+    consistent = (original_signature is not None and replay_signature is not None
+                  and canonical_hash(original_signature) == canonical_hash(replay_signature))
+    original_identity = {key: original.get(key) for key in (
+        "run_id", "target_id", "target_revision", "rmw", "arm", "repeat", "raw_sha256", "effective_input_sha256")}
+    return capsule.record_attempt("pass" if consistent else "inconclusive", domain=domain,
+                                  failure_reason="" if consistent else "original oracle/typed anomaly signature did not match",
+                                  execution_metadata=metadata, comparison_basis="original_execution_signature",
+                                  comparison_matches_original=consistent, original_signature=original_signature,
+                                  replay_signature=replay_signature, original_execution_identity=original_identity)

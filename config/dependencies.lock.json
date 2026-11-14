@@ -1,0 +1,39 @@
+{
+  "environment_mode": "ros_overlay",
+  "identity_basis": "installed package.xml and loaded RMW shared object SHA256; no dependency installation",
+  "packages": {
+    "rclpy": {
+      "package_xml_sha256": "6367e8f5f30e81867b246a8750ee900d7276f1f52253ba5140c188e360e6cb0f",
+      "prefix": "/opt/ros/jazzy",
+      "version": "7.1.12"
+    },
+    "rmw_cyclonedds_cpp": {
+      "availability_basis": "shared_library_load_without_context",
+      "available": true,
+      "library": "/opt/ros/jazzy/lib/librmw_cyclonedds_cpp.so",
+      "library_sha256": "f2d6769e70e18b01d928b49e316efecadec543b536abe6c6563c81fbf6912397",
+      "package_xml_sha256": "5f7ab2c25a7fdbe3abca10b47392d216d0d00ccbecaa57b08123fd0b7bdd233a",
+      "prefix": "/opt/ros/jazzy",
+      "version": "2.2.4"
+    },
+    "rmw_fastrtps_cpp": {
+      "availability_basis": "shared_library_load_without_context",
+      "available": true,
+      "library": "/opt/ros/jazzy/lib/librmw_fastrtps_cpp.so",
+      "library_sha256": "7b59ab082ef48bd12d5e2d598fed9b4cc5a1c6668493902c6a03f617acbd021f",
+      "package_xml_sha256": "a83647c331cfb0a82192aec8f7205448f80aab1445fbbc93e683cf419855afe9",
+      "prefix": "/opt/ros/jazzy",
+      "version": "8.4.4"
+    },
+    "std_msgs": {
+      "package_xml_sha256": "a34587c4319cab814f6e092a4f2d30f96e8de0325c81f69c2701a9545383da23",
+      "prefix": "/opt/ros/jazzy",
+      "version": "5.3.8"
+    }
+  },
+  "python_executable": "/usr/bin/python3",
+  "python_version": "3.12.3",
+  "ros_distro": "jazzy",
+  "ros_setup": "/opt/ros/jazzy/setup.bash",
+  "schema_version": 1
+}
