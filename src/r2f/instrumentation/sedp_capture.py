@@ -18,7 +18,7 @@ import struct
 import threading
 import time
 
-from .rtps import discovery_activity, rtps_submessages, udp_frame
+from .rtps import BUILTIN_WRITERS, discovery_activity, rtps_submessages, udp_frame
 
 SCHEMA = 'r2f.passive-sedp-capture/v1'
 DEFAULT_LIMITS = {'timeout_sec': 120, 'max_bytes': 64 * 1024 * 1024, 'max_packets': 100000,
@@ -31,6 +31,126 @@ SUBMESSAGE_NAMES = {
     0x13: 'HEARTBEAT_FRAG', 0x14: 'DATA', 0x15: 'DATA',
     0x16: 'DATA_FRAG', 0x17: 'DATA_FRAG',
 }
+
+
+def _filtered_submessage_entities(payload, submessages):
+    """Prove ordinary user traffic only from decoded routing and body framing.
+
+    Unknown kinds/entities and malformed bodies stay potentially discovery-related.
+    Auxiliary identity messages carry context, never discovery activity themselves.
+    """
+    entities, diagnostics = [], []
+    for sm in submessages:
+        kind = sm['kind']
+        body = payload[sm['offset'] + 4:sm['end']]
+        entry = {key: sm[key] for key in ('offset', 'source_guid_prefix', 'destination_guid_prefix')}
+        entry.update(kind=SUBMESSAGE_NAMES.get(kind, f'UNKNOWN_0x{kind:02x}'),
+                     reader_entity_id=None, writer_entity_id=None,
+                     classification='unknown', reason='unsupported_submessage')
+        malformed = None
+        if kind in (0x01, 0x09, 0x0c, 0x0e):
+            expected = {0x09: 0 if sm['flags'] & 2 else 8, 0x0c: 20, 0x0e: 12}
+            if kind != 0x01 and len(body) != expected[kind]:
+                malformed = 'invalid_auxiliary_length'
+            else:
+                entry.update(classification='auxiliary', reason='context_only')
+        elif kind in (0x15, 0x16, 0x06, 0x07, 0x08, 0x12, 0x13):
+            data = kind in (0x15, 0x16)
+            entity_offset = 4 if data else 0
+            if len(body) >= entity_offset + 8:
+                reader = body[entity_offset:entity_offset + 4].hex()
+                writer = body[entity_offset + 4:entity_offset + 8].hex()
+                entry.update(reader_entity_id=reader, writer_entity_id=writer)
+            minimum = {0x15: 20, 0x16: 32, 0x06: 24, 0x07: 28,
+                       0x08: 28, 0x12: 28, 0x13: 24}[kind]
+            if len(body) < minimum:
+                malformed = 'truncated_entity_submessage'
+            elif data:
+                inline_offset = 4 + struct.unpack_from(sm['endian'] + 'H', body, 2)[0]
+                payload_offset = inline_offset
+                if not minimum <= inline_offset <= len(body) or inline_offset % 4:
+                    malformed = 'invalid_inline_qos_offset'
+                elif sm['flags'] & 2:
+                    # Inline QoS is a terminated, aligned ParameterList. A missing
+                    # sentinel cannot become proof of an unrelated user packet.
+                    cursor = inline_offset
+                    while True:
+                        if cursor + 4 > len(body):
+                            malformed = 'truncated_inline_qos'
+                            break
+                        pid, size = struct.unpack_from(sm['endian'] + 'HH', body, cursor)
+                        cursor += 4
+                        if pid == 1:
+                            payload_offset = cursor
+                            break
+                        cursor += (size + 3) & ~3
+                if kind == 0x16 and malformed is None:
+                    start, count, fragment_size, sample_size = struct.unpack_from(sm['endian'] + 'IHHI', body, 20)
+                    if not start or not count or not fragment_size or not sample_size:
+                        malformed = 'invalid_fragment_header'
+                    elif start + count - 1 > (sample_size + fragment_size - 1) // fragment_size:
+                        malformed = 'invalid_fragment_range'
+                    else:
+                        required = min((start + count - 1) * fragment_size, sample_size) - (start - 1) * fragment_size
+                        if not required <= len(body) - payload_offset <= required + 3:
+                            malformed = 'invalid_fragment_payload_length'
+                elif kind == 0x15 and malformed is None:
+                    if sm['flags'] & 12 == 12 or (sm['flags'] & 12 and len(body) - payload_offset < 4):
+                        malformed = 'invalid_DATA_payload'
+            else:
+                # ACKNACK/GAP/NACK_FRAG contain variable bitmaps. Checking just
+                # the fixed entity bytes would silently accept truncated control.
+                bitmap_offset = {0x06: 16, 0x08: 24, 0x12: 20}.get(kind)
+                expected_length = minimum
+                if bitmap_offset is not None:
+                    bits = struct.unpack_from(sm['endian'] + 'I', body, bitmap_offset)[0]
+                    expected_length += 4 * ((bits + 31) // 32)
+                    if bits > 256:
+                        malformed = 'invalid_control_bitmap'
+                if len(body) != expected_length:
+                    malformed = 'invalid_control_length'
+            if malformed is None:
+                # Reader routing matters too, including conflicting identities.
+                # Other builtin/extension identities stay unknown below.
+                if writer in BUILTIN_WRITERS or reader in ('000100c7', '000003c7', '000004c7'):
+                    entry.update(classification='discovery', reason='builtin_entity')
+                elif writer[-2:] in ('02', '03') and (reader == '00000000' or reader[-2:] in ('04', '07')):
+                    entry.update(classification='user', reason='ordinary_user_entities')
+                else:
+                    entry['reason'] = 'unknown_entity'
+        if entry['classification'] in ('user', 'discovery') and entry['source_guid_prefix'] == '0' * 24:
+            entry.update(classification='unknown', reason='unassignable_source_prefix')
+        if malformed:
+            entry['reason'] = malformed
+            diagnostics.append(f'{malformed}@{sm["offset"]}')
+        entities.append(entry)
+    return entities, diagnostics
+
+
+def _rtps_metadata(udp, *, truncated):
+    """Read-only classification shared by retention and filtered-frame auditing."""
+    payload = udp['payload']
+    submessages, diagnostics = rtps_submessages(payload)
+    entities, entity_diagnostics = _filtered_submessage_entities(payload, submessages)
+    diagnostics.extend(entity_diagnostics)
+    for item in entities:
+        if item['classification'] == 'unknown':
+            diagnostic = f'{item["reason"]}@{item["offset"]}'
+            if diagnostic not in diagnostics:
+                diagnostics.append(diagnostic)
+    classification = ('unknown' if truncated or diagnostics else
+                      'discovery' if any(item['classification'] == 'discovery' for item in entities) else
+                      'proven_no_discovery')
+    return {'source_port': udp['source_port'], 'destination_port': udp['destination_port'],
+            'source_participant_prefix': payload[8:20].hex() if len(payload) >= 20 else None,
+            'source_participant_prefixes': sorted({item['source_guid_prefix'] for item in submessages
+                                                   if item.get('source_guid_prefix')}),
+            'destination_participant_prefixes': sorted({item['destination_guid_prefix'] for item in submessages
+                                                        if item.get('destination_guid_prefix')}),
+            'submessage_kinds': [SUBMESSAGE_NAMES.get(item['kind'], f'UNKNOWN_0x{item["kind"]:02x}')
+                                 for item in submessages],
+            'submessage_entities': entities, 'classification': classification,
+            'parse_diagnostics': diagnostics}
 
 
 def _canonical(value):
@@ -233,14 +353,22 @@ class PassiveSedpObserver:
                     udp, diagnostic = udp_frame(frame)
                     if diagnostic:
                         self._diagnostics[diagnostic] += 1
+                    rtps_metadata = None
                     if udp is not None:
-                        lo, hi = self.spec['port_range']
-                        if udp['payload'][:4] != b'RTPS' or not ({udp['source_port'], udp['destination_port']} & set(self.spec['discovery_ports'])):
+                        if udp['payload'][:4] != b'RTPS':
+                            if not flags & socket.MSG_TRUNC:
+                                self._counters['frames_skipped'] += 1
+                                continue
+                        else:
+                            rtps_metadata = _rtps_metadata(udp, truncated=bool(flags & socket.MSG_TRUNC))
+                        standard_port = bool({udp['source_port'], udp['destination_port']} & set(self.spec['discovery_ports']))
+                        # Port numbers are only a hint. Retain every potentially
+                        # discovery-related frame in this already validated netns.
+                        if not standard_port and rtps_metadata is not None and rtps_metadata['classification'] == 'proven_no_discovery':
                             self._counters['frames_skipped'] += 1
-                            if udp['payload'][:4] == b'RTPS':
-                                self._record_filtered_rtps(frame, udp, timestamp, clock,
-                                                           received['monotonic_ns'], address[2],
-                                                           truncated=bool(flags & socket.MSG_TRUNC))
+                            self._record_filtered_rtps(frame, udp, timestamp, clock,
+                                                       received['monotonic_ns'], address[2],
+                                                       truncated=False, metadata=rtps_metadata)
                             continue
                     elif not diagnostic:
                         self._counters['frames_skipped'] += 1
@@ -261,11 +389,14 @@ class PassiveSedpObserver:
                                'captured_length': len(frame), 'original_length': None if flags & socket.MSG_TRUNC else len(frame),
                                'frame_sha256': hashlib.sha256(frame).hexdigest()}
                     activities, errors = discovery_activity(frame)
+                    if rtps_metadata is not None:
+                        errors = list(dict.fromkeys(errors + rtps_metadata['parse_diagnostics']))
                     self._diagnostics.update(errors)
                     entry = {'packet_index': index, 'unix_ns': timestamp, 'clock': clock,
                              'received_monotonic_ns': received['monotonic_ns'],
                              'packet_type': address[2], 'truncated': bool(flags & socket.MSG_TRUNC),
-                             'raw_ref': raw_ref, 'activity': activities, 'diagnostics': errors}
+                             'raw_ref': raw_ref, 'activity': activities, 'diagnostics': errors,
+                             'rtps_metadata': rtps_metadata}
                     line = _canonical(entry) + b'\n'
                     self._index.write(line)
                     self._index_digest.update(line)
@@ -310,24 +441,16 @@ class PassiveSedpObserver:
 
     @staticmethod
     def _record_may_match_target(record, prefixes):
-        if record.get('parse_diagnostics'):
-            # A malformed filtered RTPS datagram cannot be safely attributed,
+        if record.get('truncated') or record.get('parse_diagnostics') or record.get('classification') == 'unknown':
+            # Incomplete or unsupported decoding cannot prove a datagram unrelated,
             # even when its UDP ports sit outside this domain's usual block.
             return True
-        candidates = {*record.get('source_participant_prefixes', []),
-                      record.get('source_participant_prefix'), *record.get('destination_participant_prefixes', [])}
-        candidates.discard(None)
-        return bool(candidates & prefixes)
+        return any(item['classification'] == 'discovery' and
+                   {item['source_guid_prefix'], item['destination_guid_prefix']} & prefixes
+                   for item in record['submessage_entities'])
 
     def _record_filtered_rtps(self, frame, udp, timestamp, clock, received_monotonic_ns,
-                              packet_type, *, truncated):
-        payload = udp['payload']
-        source_prefix = payload[8:20].hex() if len(payload) >= 20 and payload[:4] == b'RTPS' else None
-        submessages, parse_diagnostics = rtps_submessages(payload)
-        sources = sorted({item['source_guid_prefix'] for item in submessages
-                          if item.get('source_guid_prefix')})
-        destinations = sorted({item['destination_guid_prefix'] for item in submessages
-                               if item.get('destination_guid_prefix')})
+                              packet_type, *, truncated, metadata):
         port_start, port_end = self.spec['port_range']
         ports = (udp['source_port'], udp['destination_port'])
         record = {'unix_ns': timestamp, 'clock': clock,
@@ -340,12 +463,8 @@ class PassiveSedpObserver:
                   'source_port': udp['source_port'], 'destination_port': udp['destination_port'],
                   'domain_id': self.spec['domain_id'],
                   'domain_relation': 'domain_port_block' if any(port_start <= p <= port_end for p in ports) else 'outside_domain_port_block',
-                  'source_participant_prefix': source_prefix,
-                  'source_participant_prefixes': sources,
-                  'destination_participant_prefixes': destinations,
-                  'submessage_kinds': [SUBMESSAGE_NAMES.get(item['kind'], f'UNKNOWN_0x{item["kind"]:02x}') for item in submessages],
-                  'parse_diagnostics': parse_diagnostics,
-                  'filter_reason': 'rtps_ports_outside_standard_discovery_set'}
+                  **metadata,
+                  'filter_reason': 'proven_no_discovery_outside_standard_discovery_ports'}
         self._counters['filtered_rtps'] += 1
         self._counters['filtered_rtps_by_domain_relation:' + record['domain_relation']] += 1
         for kind in record['submessage_kinds']:

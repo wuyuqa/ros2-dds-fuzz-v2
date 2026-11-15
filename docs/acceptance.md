@@ -228,3 +228,28 @@ reason code 至少覆盖：`environment_or_process`、`reach_or_planning`、`mut
 ## 已seal模型与新target合同兼容
 
 2026-11-15T00:32:53+08:00（Asia/Shanghai），主agent裁定：first/second已seal revision0 manifest保持不变，core精确兼容其legacy fault合同；第三/第四新target显式receipt_kind/window及projection schema。必须核对保存的target_sha256及fault字段，不能用shared helper升级悄悄改写已seal manifest。初次seal前合同修正不等于new rule完成；target manifest不变也不能豁免全局source变化后的最终rerun。
+
+
+## 本轮冻结前修复状态补充（2026-11-15T08:42:44+08:00，Asia/Shanghai；尚未冻结）
+
+来源：主agent本轮派遣与工程报告。本节仅追加当前验收状态，不改写前文历史结果，不把主agent报告冒称本执行员实测或原任务书字面要求。
+
+| 项目 | 本轮状态 | 后续验收边界 |
+| --- | --- | --- |
+| scope 与成熟状态 | scope 从随 run 更新的动态状态改为静态 capability；成熟证据由各次 per-run report 及独立 per-target audit 提供 | capability 声明不等于实际执行、hit、oracle pass 或 seal；不改变四 target 顺序及 18/72 required 分母 |
+| capture 分类与原始证据 | 主agent报告：非标准端口的 potential discovery RTPS 已保留 raw，普通 user-only DATA 已有安全分类 | 不能把普通 user DATA 计作 discovery hit；potential discovery 的 raw 留存不自动补足身份/解析缺口或提升 unknown；第三/第四 target 仍需新 source 真实验收 |
+| execution_input 与 blackbox | execution_input 绑定及真实 Cyclone/FastDDS blackbox 兼容修复进行中 | maps 多 segment 与污染 trace 回归尚待 Ptolemy 关闭；不得写成修复完成、资格化通过或最终 freeze |
+| 离线检查 | 主agent报告 capture/projection/recovery 89 tests / 5.557s / OK；此前完整 334 tests / 48.376s / OK 属更早工作树 | 本执行员未复跑；上述报告均不等于最终修复树的完整测试或真实 ROS 验收；待 Ptolemy 最终 freeze 后追加确切结果 |
+
+本次只读观察 HEAD 为 `e5a1a73921b176e60bba14cb41b9ed7f18c0a538`，行为文件仍有未提交改动，当前 source 未 freeze；新的冻结 HEAD/behavior SHA-256 未给定。正式四 target、F07 健康/可控工具失败重放、Phase2 同 input instrumentation/clean-blackbox 与 Phase4 bounded campaign 均未在新 source 验收。历史 source 的 seal、失败与 unknown 保留原判，不能用于新 source seal，也不回填旧 receipt/raw/hash。自然 SUT candidate 仍为 0，2–3 候选目标未达成；完整 S1 required 分母仍为 72，独立 negative 不计自然候选或重复成熟计数。本补充不授予运行、staging 或 commit GO。
+
+
+### 最终修复树离线验证与代码 owner freeze ACK 补记（2026-11-15T08:49:44+08:00，Asia/Shanghai）
+
+来源：主agent最终独立审查报告及 Ptolemy 最终 freeze ACK 的转述；本执行员只读核对审计文件，不冒称自己复跑业务测试。[review.json](../results/main-review/freeze-audit-20261115T084636-3cacc8cd/review.json) 记录命令 `python3 -m unittest discover -s tests -q`、returncode=0、diff_check_rc=0，source_before/source_after 及 files_before/files_after 分别一致；[unittest.stderr.log](../results/main-review/freeze-audit-20261115T084636-3cacc8cd/unittest.stderr.log) 实载 **349 tests / 52.658s / OK**（review 的外层命令耗时约 52.898s，与测试器耗时分开）。本执行员追加前核对审计所列非文档 changed 文件 hash 仍一致。syntax/json 解析 OK、首两 target manifest 逐字段精确不变为主agent报告，不冒称 review.json 另有这些字段或本执行员重跑了对应检查。
+
+审查树 behavior SHA-256 为 `75855d72ac9dbc8f36c4cfbab4fd718ce616b012373da09815a24be730227af0`；审计记录的 HEAD 仍为 `e5a1a73921b176e60bba14cb41b9ed7f18c0a538`，`source_frozen=false`，行为文件尚未提交。代码 owner 的 freeze ACK 表示停止源码修改，不等于 Git/runner 的正式 source freeze；唯一新提交 HEAD 及其 `source_frozen=true` 仍须主agent后续明确 staging/commit 指令及实际身份核验，不能预填。此次文档追加会改变三份文档 hash，不回写原审计 files_before/files_after，也不影响其所记录的测试时间点。
+
+最新主agent报告：Ptolemy 的 execution_input / 真实 Cyclone/FastDDS blackbox 兼容、多 segment maps 与污染 trace 回归修复已落盘，最终 freeze ACK 已收到并关闭。其短命 loader probe rc=0：source Jazzy 后仅通过 ctypes 加载 `librmw_fastrtps_cpp`，**无 participant**；rmw/FastDDS/FastCDR 各 5 段 maps，identity_verified、逐段 path/inode/device 均 true，required_groups_verified=true。该 probe 输出仅在 Ptolemy 会话，未另落 results；本执行员未直接复跑或取得独立 probe 文件/hash，不编造路径。这是库装载/映射身份检查，不是 ROS endpoint pair、clean-blackbox 真实运行或 Phase4 通过证据。
+
+本更新关闭前述“待 Ptolemy 最终 freeze ACK / maps 与污染 trace 离线回归关闭”的等待状态；89 项局部检查、334 项更早完整检查保留为历史，最新完整离线结果以上述 349 项审计为准。正式四 target、F07、Phase2 同 input instrumentation/clean-blackbox 与 Phase4 bounded campaign **仍未在新 source 验收**；旧 source seal、unknown 和失败保持原判及原始证据。自然 SUT candidate 仍为 **0**，完整 required 分母仍为 **72**；不据离线验证、loader probe 或 freeze ACK 声称整体目标完成。本执行员未启动 ROS、participant、campaign 或 replay，未 staging、未提交；正式执行及提交均待各自明确 GO。

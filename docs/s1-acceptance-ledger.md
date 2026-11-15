@@ -116,3 +116,32 @@ E01文件字节SHA-256：report=`3d1556ff3a78285b54b3c88cb185a5c3c7fba36f1d786fb
 最新兼容约束：first/second的target manifest不变不等于全局source身份不变；不得因shared helper增加字段而漂移既有target hash。第三/第四首次seal前初版合同修正不等于new rule已完成，不能提前标绿。精确target hash和legacy合同见正式证据快照。
 
 补充核查（2026-11-15T00:38:53+08:00，Asia/Shanghai）：main逐字段比较当前S1Module first/second target.to_dict()与两份11ec76c正式manifest均true；文档只记录来源，不声称复跑。source dirty仍使旧seal不能用于当前成熟声明。main发现scan_processes旧repo substring把v2共享前缀路径误判为旧repo，runtime修真实路径边界；旧repo真实路径/进程/锁保护不放宽，回归验证仍待代码owner。E09已证明正常被动SEDP开发捕获/解析，但默认值策略及完整projection/control/seal尚未完成。
+
+
+## 本轮冻结前证据账补充（2026-11-15T08:42:44+08:00，Asia/Shanghai；非最终验收）
+
+来源：主agent本轮派遣与工程报告；本执行员仅追加文档状态，未复跑所报业务测试、未启动 ROS、未运行 campaign/replay。此前各节作为各自时间点的历史快照保留，本节不把旧证据改绑到新 source。
+
+| 账项 | 当前记录 | 不能据此宣称 / 后续证据 |
+| --- | --- | --- |
+| scope / capability / maturity | scope 从 run 动态状态转为静态 capability，maturity 由 per-run report 和独立 per-target audit 给出 | 已注册/实现不等于已执行或成熟；四 target 顺序、每 target 18 required + 6 独立 negative、完整 required 分母 72 均不变 |
+| capture 修复 | 主agent报告非标准端口 potential discovery RTPS 现保留 raw；普通 user-only DATA 已安全分类 | 普通 user DATA 不是 discovery hit；此前 metadata-only unknown 保留。保存 raw 不等于已补齐未知字段、实际 drop/recovery 或 projection 合同已通过 |
+| observation / execution_input | execution_input 绑定与真实 Cyclone/FastDDS blackbox 兼容修复进行中 | maps 多 segment 和污染 trace 回归尚待 Ptolemy 关闭；不预记 pass、完成或最终 freeze |
+| 本轮局部离线验证 | 主agent报告 capture/projection/recovery 89 tests / 5.557s / OK | 仅为该组检查报告，不是最终完整源码、正式 matrix 或 SUT 成熟证据；本执行员未复跑，报告对应的确切命令/日志路径本条未提供 |
+| 更早完整离线验证 | 主agent此前报告 334 tests / 48.376s / OK，另报当时 syntax/json parse、diff-check 通过 | 来自更早工作树，不等于最终修复树通过；不沿用为最终 freeze 的证明 |
+| source identity | 当前观察 HEAD `e5a1a73921b176e60bba14cb41b9ed7f18c0a538`，行为文件 dirty，未 freeze | 唯一新冻结 HEAD/behavior SHA-256 尚未给定；待 Ptolemy 最终 freeze 及主agent独立审查后追加确切结果 |
+
+当前新 source 验收账：正式四 target **未验收**；F07 健康与可控工具失败重放 **未验收**；Phase2 同 input instrumentation/clean-blackbox pair 与 Phase4 bounded campaign **未验收**。Zeno 已获派准备 26-pair 路径仅记准备状态，不记实际 cell、raw、candidate 或运行 GO。正式四 target driver 已准备也不产生执行证据；无本轮真实 run_id/domain/RMW/raw/replay 可登记。
+
+历史 first/second per-target seal、第四 target unknown 及其他失败均保持原 source 身份与原判；旧 source 通过不进入新 source seal，旧失败不得被新 pass 覆盖。自然 SUT candidate 仍为 **0**，候选数量目标未达成；negative、tool failure、unknown 和合成检查不计自然候选。完整 required 成熟分母维持 **72**，不因 blocked/未运行/未知缩小，也不因 control 引用重复增计。本次不 staging、不 commit；代码 owner 最终 freeze 后再更新本补充的确切验证结果，正式运行仍等主agent明确 GO。
+
+
+### 最终离线证据补记（不计新 source 正式成熟）（2026-11-15T08:49:44+08:00，Asia/Shanghai）
+
+来源：主agent最终独立审查报告及 Ptolemy 最终 freeze ACK 的转述；本执行员只读核对审计文件，不冒称自己复跑业务测试。[review.json](../results/main-review/freeze-audit-20261115T084636-3cacc8cd/review.json) 记录命令 `python3 -m unittest discover -s tests -q`、returncode=0、diff_check_rc=0，source_before/source_after 及 files_before/files_after 分别一致；[unittest.stderr.log](../results/main-review/freeze-audit-20261115T084636-3cacc8cd/unittest.stderr.log) 实载 **349 tests / 52.658s / OK**（review 的外层命令耗时约 52.898s，与测试器耗时分开）。本执行员追加前核对审计所列非文档 changed 文件 hash 仍一致。syntax/json 解析 OK、首两 target manifest 逐字段精确不变为主agent报告，不冒称 review.json 另有这些字段或本执行员重跑了对应检查。
+
+审查树 behavior SHA-256 为 `75855d72ac9dbc8f36c4cfbab4fd718ce616b012373da09815a24be730227af0`；审计记录的 HEAD 仍为 `e5a1a73921b176e60bba14cb41b9ed7f18c0a538`，`source_frozen=false`，行为文件尚未提交。代码 owner 的 freeze ACK 表示停止源码修改，不等于 Git/runner 的正式 source freeze；唯一新提交 HEAD 及其 `source_frozen=true` 仍须主agent后续明确 staging/commit 指令及实际身份核验，不能预填。此次文档追加会改变三份文档 hash，不回写原审计 files_before/files_after，也不影响其所记录的测试时间点。
+
+最新主agent报告：Ptolemy 的 execution_input / 真实 Cyclone/FastDDS blackbox 兼容、多 segment maps 与污染 trace 回归修复已落盘，最终 freeze ACK 已收到并关闭。其短命 loader probe rc=0：source Jazzy 后仅通过 ctypes 加载 `librmw_fastrtps_cpp`，**无 participant**；rmw/FastDDS/FastCDR 各 5 段 maps，identity_verified、逐段 path/inode/device 均 true，required_groups_verified=true。该 probe 输出仅在 Ptolemy 会话，未另落 results；本执行员未直接复跑或取得独立 probe 文件/hash，不编造路径。这是库装载/映射身份检查，不是 ROS endpoint pair、clean-blackbox 真实运行或 Phase4 通过证据。
+
+本更新关闭前述“待 Ptolemy 最终 freeze ACK / maps 与污染 trace 离线回归关闭”的等待状态；89 项局部检查、334 项更早完整检查保留为历史，最新完整离线结果以上述 349 项审计为准。正式四 target、F07、Phase2 同 input instrumentation/clean-blackbox 与 Phase4 bounded campaign **仍未在新 source 验收**；旧 source seal、unknown 和失败保持原判及原始证据。自然 SUT candidate 仍为 **0**，完整 required 分母仍为 **72**；不据离线验证、loader probe 或 freeze ACK 声称整体目标完成。本执行员未启动 ROS、participant、campaign 或 replay，未 staging、未提交；正式执行及提交均待各自明确 GO。

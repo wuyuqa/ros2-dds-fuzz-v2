@@ -107,3 +107,31 @@ D012更新：negative+fault的独立审计路径已由主agent裁定；故意omi
 正式证据更新（2026-11-15T00:32:53+08:00，Asia/Shanghai）：second r2/domain80通过已核对；first/second精确target hash及legacy fault字段保存于正式快照。主agent已解冻第三target开发，首次seal前第三/第四初版合同修改不能写成new rule完成；当前无用户确认事项。
 
 最新开发证据（2026-11-15T00:38:53+08:00，Asia/Shanghai）：main逐字段核对first/second target.to_dict()与11ec76c正式manifest均true，但source已dirty，最终source rerun不豁免。被动SEDP attempt2两RMW netns status=ok、events56/48/errors=[]已只读核对；default policy pending、development_only，不能关闭第四target成熟缺口或新增SUTcandidate，详见完整验收账E09。
+
+
+## 本轮冻结前待核实项补充（2026-11-15T08:42:44+08:00，Asia/Shanghai）
+
+来源：主agent本轮明确派遣与工程报告；本节追加当前快照，不覆盖旧失败、unknown、seal 或历史待办，也不将工程解释冒称原任务书原话。
+
+| 待核实项 | 当前已知状态 | 关闭所需证据 / owner |
+| --- | --- | --- |
+| 静态 scope 与 per-run maturity 分离 | scope 已从 run 动态状态改为静态 capability；成熟状态按 per-run report 与独立 target audit 判断 | 最终冻结源码上的正式报告及独立 seal；静态 capability 不替代执行证据，分母仍为 72 |
+| 非标准端口 potential discovery 留证 | 主agent报告 capture 已保留相关 raw，普通 user-only DATA 已安全分类；此前仅 metadata 的保守 unknown 不升级 | 新 source 上真实 capture/identity/解析与第三/第四 target 证据；普通 user DATA 不算 discovery counter hit，raw 留存本身不证明成熟 |
+| execution_input / Cyclone / FastDDS blackbox | 绑定与真实 blackbox 兼容修复进行中 | Ptolemy 最终 freeze、maps 多 segment 与污染 trace 回归的确切结果；目前不标通过 |
+| 最终源码冻结与测试 | 当前 source 未 freeze；本次观察 HEAD 为 `e5a1a73921b176e60bba14cb41b9ed7f18c0a538` 且行为源码 dirty | 等代码 owner 最终 freeze、主agent独立审查及唯一新 HEAD/behavior SHA-256；文档稍后按实际结果更新，运行仍需明确 GO |
+| 新 source 真实证据 | 正式四 target、F07、Phase2–4 均未在新 source 验收；Zeno 已获派准备 26-pair 路径，不等于执行授权或执行完成 | 单一 owner 按派遣运行，保存 input/execution/raw/replay/provenance、独立 verify 与 cleanup；任何失败原样保留 |
+
+主agent当前报告 capture/projection/recovery 的 89 tests / 5.557s / OK；此前完整 334 tests / 48.376s / OK 来自更早工作树，不能作为最终修复通过证明。本执行员未复跑这些业务测试，未取得本条报告对应的完整命令、测试日志路径或 raw，相关字段保持未提供，不补造。待 Ptolemy 最终 freeze 后再追加实际结果；本次不先行关闭待办。
+
+自然 SUT candidate 仍为 0，用户 2–3 个真实候选目标未达成；72 required 分母不变。旧 source 的 seal 仅支持旧 source，历史 unknown/失败不删除或改判。当前无新增需用户决定的范围变化；工程协调由主agent处理，本节不是运行、staging 或 commit 授权。
+
+
+### 最终离线审查已完成；正式 source freeze 与运行仍待 GO（2026-11-15T08:49:44+08:00，Asia/Shanghai）
+
+来源：主agent最终独立审查报告及 Ptolemy 最终 freeze ACK 的转述；本执行员只读核对审计文件，不冒称自己复跑业务测试。[review.json](../results/main-review/freeze-audit-20261115T084636-3cacc8cd/review.json) 记录命令 `python3 -m unittest discover -s tests -q`、returncode=0、diff_check_rc=0，source_before/source_after 及 files_before/files_after 分别一致；[unittest.stderr.log](../results/main-review/freeze-audit-20261115T084636-3cacc8cd/unittest.stderr.log) 实载 **349 tests / 52.658s / OK**（review 的外层命令耗时约 52.898s，与测试器耗时分开）。本执行员追加前核对审计所列非文档 changed 文件 hash 仍一致。syntax/json 解析 OK、首两 target manifest 逐字段精确不变为主agent报告，不冒称 review.json 另有这些字段或本执行员重跑了对应检查。
+
+审查树 behavior SHA-256 为 `75855d72ac9dbc8f36c4cfbab4fd718ce616b012373da09815a24be730227af0`；审计记录的 HEAD 仍为 `e5a1a73921b176e60bba14cb41b9ed7f18c0a538`，`source_frozen=false`，行为文件尚未提交。代码 owner 的 freeze ACK 表示停止源码修改，不等于 Git/runner 的正式 source freeze；唯一新提交 HEAD 及其 `source_frozen=true` 仍须主agent后续明确 staging/commit 指令及实际身份核验，不能预填。此次文档追加会改变三份文档 hash，不回写原审计 files_before/files_after，也不影响其所记录的测试时间点。
+
+最新主agent报告：Ptolemy 的 execution_input / 真实 Cyclone/FastDDS blackbox 兼容、多 segment maps 与污染 trace 回归修复已落盘，最终 freeze ACK 已收到并关闭。其短命 loader probe rc=0：source Jazzy 后仅通过 ctypes 加载 `librmw_fastrtps_cpp`，**无 participant**；rmw/FastDDS/FastCDR 各 5 段 maps，identity_verified、逐段 path/inode/device 均 true，required_groups_verified=true。该 probe 输出仅在 Ptolemy 会话，未另落 results；本执行员未直接复跑或取得独立 probe 文件/hash，不编造路径。这是库装载/映射身份检查，不是 ROS endpoint pair、clean-blackbox 真实运行或 Phase4 通过证据。
+
+本更新关闭前述“待 Ptolemy 最终 freeze ACK / maps 与污染 trace 离线回归关闭”的等待状态；89 项局部检查、334 项更早完整检查保留为历史，最新完整离线结果以上述 349 项审计为准。正式四 target、F07、Phase2 同 input instrumentation/clean-blackbox 与 Phase4 bounded campaign **仍未在新 source 验收**；旧 source seal、unknown 和失败保持原判及原始证据。自然 SUT candidate 仍为 **0**，完整 required 分母仍为 **72**；不据离线验证、loader probe 或 freeze ACK 声称整体目标完成。本执行员未启动 ROS、participant、campaign 或 replay，未 staging、未提交；正式执行及提交均待各自明确 GO。

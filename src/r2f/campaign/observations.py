@@ -4,6 +4,7 @@ An empty intake and a completed, provenance-verified zero observation are distin
 No sidecar can replace canonical execution evidence or authorize a blackbox run.
 """
 from copy import deepcopy
+import hashlib
 import json
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -12,10 +13,16 @@ from r2f.core.evidence import canonical_hash, verify_raw
 from r2f.core.replay import ReplayCapsule, validate_replay_input
 from r2f.instrumentation.cyclonedds import TraceConfig, collect_trace, normalize_guid
 from r2f.instrumentation.projection import reconcile_projection
+from r2f.runtime.instrumentation_bridge import (
+    FASTDDS_RMW, FASTDDS_DEFAULT_XML, observation_policy, fastdds_environment_key,
+    fastdds_libraries_verified, mapped_library_identity_matches,
+)
 
 CONTRACT = 'cyclonedds.received_sedp.identity_role_reliability_durability/v1'
 _INPUT_IDENTITY = ('target_id', 'target_revision', 'rmw', 'arm', 'repeat')
 _EXECUTION_IDENTITY = ('run_id', *_INPUT_IDENTITY, 'domain_id')
+_OBSERVATION_INPUT = (*_EXECUTION_IDENTITY, 'seed', 'topic', 'message_type',
+                      'effective_input_sha256', 'final_input', 'input_layer_receipts')
 
 
 def _read(ref):
@@ -28,7 +35,7 @@ def _bind_input(row, runtime, config, observation, execution, capsule):
 
     ingest_execution supplies the canonical hash from its validated capsule. An
     explicit capsule (or a persisted row's replay_path) additionally revalidates
-    the complete input here; older runtime/sidecar schemas have no top-level hash.
+    the complete input here; prepared and summary bind the actual execution_input.
     A hash present anywhere is never ignored, including in either metadata alias.
     """
     digest = sha256_digest(row.get('effective_input_sha256'), 'canonical effective_input_sha256')
@@ -45,7 +52,7 @@ def _bind_input(row, runtime, config, observation, execution, capsule):
     # The runtime's execution / execution_metadata objects are aliases of the
     # same required identity record. That contract has execution identity and
     # raw refs, but no effective-input hash; the hash is independently bound by
-    # capsule -> config -> canonical row -> sidecar same_input below.
+    # capsule -> config -> canonical row -> sidecar execution_input below.
     execution_alias = runtime.get('execution')
     execution_metadata = runtime.get('execution_metadata')
     if execution_alias is None and execution_metadata is None:
@@ -68,7 +75,7 @@ def _bind_input(row, runtime, config, observation, execution, capsule):
             if key in record and record[key] != config[key]:
                 raise ValueError(name + ' input/execution identity differs:' + key)
         # Runtime and sidecar schemas do not carry this field at their top
-        # levels. Any occurrence is still checked; capsule/config/same_input
+        # levels. Any occurrence is still checked; capsule/config/execution_input
         # form the required effective-input binding chain.
         if 'effective_input_sha256' in record and record['effective_input_sha256'] != digest:
             raise ValueError(name + ' input/execution identity differs:effective_input_sha256')
@@ -92,8 +99,10 @@ def _bind_input(row, runtime, config, observation, execution, capsule):
         validate_replay_input(data)
         if data['effective_input_sha256'] != digest:
             raise ValueError('capsule effective input hash differs')
-        for key in _INPUT_IDENTITY:
-            if data[key] != row[key] or data[key] != config[key]:
+        for key in (*_INPUT_IDENTITY, 'seed', 'topic', 'message_type'):
+            if (canonical_hash(data[key]) != canonical_hash(config.get(key))
+                    or (key in row and canonical_hash(data[key]) != canonical_hash(row[key]))
+                    or (key == 'seed' and key not in row)):
                 raise ValueError('capsule input identity differs:' + key)
         if data['source_manifest'] != row.get('source_manifest'):
             raise ValueError('capsule source differs from canonical source')
@@ -105,11 +114,33 @@ def _bind_input(row, runtime, config, observation, execution, capsule):
             raise ValueError('capsule input layer receipts differ')
     if 'source_manifest' in config and config['source_manifest'] != row.get('source_manifest'):
         raise ValueError('config source differs from canonical capsule source')
+    submitted = observation.get('execution_input')
+    if not isinstance(submitted, dict) or submitted.get('schema') != 'r2f.observation-execution-input/v1':
+        raise ValueError('observation execution_input missing or unsupported')
+    for key in _OBSERVATION_INPUT:
+        if key not in submitted or key not in config or canonical_hash(submitted[key]) != canonical_hash(config[key]):
+            raise ValueError('observation execution_input differs:' + key)
+        if key in row and canonical_hash(submitted[key]) != canonical_hash(row[key]):
+            raise ValueError('observation execution_input differs from canonical row:' + key)
+        for name, record in (('runtime', runtime), ('execution', execution_alias),
+                             ('execution_metadata', execution_metadata)):
+            if record is not None and key in record and canonical_hash(record[key]) != canonical_hash(submitted[key]):
+                raise ValueError(name + ' execution_input differs:' + key)
     return {'effective_input_sha256': digest,
+            'execution_input_sha256': canonical_hash(submitted),
             'execution_identity': {k: config[k] for k in _EXECUTION_IDENTITY},
             'capsule_validation': 'verified',
             'runtime_binding': 'execution_metadata_identity_plus_verified_raw_sha256',
-            'sidecar_binding': 'blackbox_task_same_input_plus_prepared_domain_and_verified_raw_sha256'}
+            'sidecar_binding': 'execution_input_plus_prepared_and_verified_raw_sha256'}
+
+
+def _profile_node(element):
+    return [element.tag, sorted(element.attrib.items()), (element.text or '').strip(),
+            [_profile_node(child) for child in element]]
+
+
+def _profile_hash(root):
+    return hashlib.sha256(json.dumps(_profile_node(root), sort_keys=True).encode()).hexdigest()
 
 
 def _semantic_profiles(qualification, domain):
@@ -125,6 +156,8 @@ def _semantic_profiles(qualification, domain):
         tag = lambda e: e.tag.rsplit('}', 1)[-1]
         if tag(root) != 'CycloneDDS' or any(tag(e) == 'Tracing' for e in root.iter()):
             raise ValueError('transport profile invalid or enables Tracing')
+        if profile.get('non_tracing_sha256') != _profile_hash(root):
+            raise ValueError('transport profile semantic hash differs')
         domains = [e for e in root if tag(e) == 'Domain']
         if len(domains) != 1:
             raise ValueError('one transport profile Domain required')
@@ -134,9 +167,7 @@ def _semantic_profiles(qualification, domain):
             raise ValueError('transport profile bound to another execution domain')
         for key in ('Id', 'id'):
             section.attrib.pop(key, None)
-        def node(e):
-            return [e.tag, sorted(e.attrib.items()), (e.text or '').strip(), [node(c) for c in e]]
-        values.append([role, node(root)])
+        values.append([role, _profile_node(root)])
     return values
 
 
@@ -152,6 +183,7 @@ def qualify_observation(row, runtime, config, *, capsule=None):
                   observation_mode=observation.get('observation_mode'), artifact=observation.get('artifact'),
                   blackbox_task=deepcopy(observation.get('blackbox_task')))
     try:
+        policy = observation_policy(config.get('rmw'), config.get('observation_mode', 'blackbox'))
         stored = _read(observation['artifact'])
         if canonical_hash(stored) != canonical_hash({k:v for k,v in observation.items() if k!='artifact'}):
             raise ValueError('observation summary differs from hash-bound artifact')
@@ -180,9 +212,23 @@ def qualify_observation(row, runtime, config, *, capsule=None):
         for key in ('run_id','domain_id','rmw'):
             if prepared.get(key) != config.get(key):
                 raise ValueError('prepared identity differs:'+key)
+        if observation.get('observation_mode') not in ('instrumentation', 'blackbox'):
+            raise ValueError('unsupported observation mode')
         if prepared.get('observation_mode') != observation.get('observation_mode') or observation.get('observation_mode') != config.get('observation_mode', 'blackbox'):
             raise ValueError('observation execution mode differs')
-        _semantic_profiles({'non_tracing_profiles': prepared.get('profiles')}, config['domain_id'])
+        if canonical_hash(prepared.get('execution_input')) != canonical_hash(observation.get('execution_input')):
+            raise ValueError('prepared execution_input differs from observation')
+        if observation.get('profile_policy') != policy or prepared.get('profile_policy') != policy:
+            raise ValueError('observation profile applicability differs')
+        fastdds = config['rmw'] == FASTDDS_RMW
+        if fastdds:
+            if prepared.get('profiles') != {} or prepared.get('trace_configs') != {}:
+                raise ValueError('FastDDS Cyclone profiles and trace configs must be explicitly empty')
+            if observation.get('traces') != [] or observation.get('reconciliations') != []:
+                raise ValueError('FastDDS blackbox cannot carry Cyclone traces or projections')
+            profiles = None
+        else:
+            profiles = _semantic_profiles({'non_tracing_profiles': prepared.get('profiles')}, config['domain_id'])
         if prepared.get('observer_source_sha256') != observation.get('observer_source_sha256') or not observation.get('observer_source_sha256'):
             raise ValueError('observer source provenance missing')
         workers, processes = {}, {}
@@ -197,8 +243,8 @@ def qualify_observation(row, runtime, config, *, capsule=None):
                 raise ValueError('process provenance incomplete:'+role)
             if token not in events or token.get('event')!='endpoint_created' or token.get('role')!=role:
                 raise ValueError('worker endpoint not bound to raw:'+role)
-            for key in ('pid','run_id','domain_id'):
-                expected = config.get(key) if key!='pid' else worker['pid']
+            for key in ('pid','run_id','domain_id','rmw_identifier'):
+                expected = worker['pid'] if key=='pid' else config['rmw'] if key=='rmw_identifier' else config.get(key)
                 if token.get(key)!=expected:
                     raise ValueError('worker raw identity differs:'+role+':'+key)
             if not any(w.get('role')==role and w.get('pid')==worker['pid'] and w.get('pgid')==proof.get('process_group') and w.get('returncode')==0 for w in metadata_workers):
@@ -215,6 +261,7 @@ def qualify_observation(row, runtime, config, *, capsule=None):
         def under(path):
             resolved=Path(path).resolve()
             return any(resolved==r or r in resolved.parents for r in roots)
+        process_profiles = {}
         for role,worker in workers.items():
             proof=worker['process'];audit=worker['audit'];env=audit.get('environment',{})
             if any(k in ('LD_PRELOAD','LD_AUDIT') or k.startswith(('R2F_INSTRUMENT','CYCLONEDDS_TRACE')) for k in env):
@@ -227,28 +274,60 @@ def qualify_observation(row, runtime, config, *, capsule=None):
             if not proof.get('process_start_ticks') or str(proof['process_start_ticks'])!=str(worker['endpoint_event'].get('process_start_ticks',proof['process_start_ticks'])):
                 raise ValueError('process audit generation differs')
             for library in proof.get('loaded_libraries',[]):
-                if under(library['path']) or str(library['mapped_inode']) not in audit.get('maps',''):
+                if (under(library['path'])
+                        or not mapped_library_identity_matches(library, audit.get('maps', ''))):
                     raise ValueError('loaded binary differs from saved process maps')
+            if fastdds:
+                if any(fastdds_environment_key(k) for k in env):
+                    raise ValueError('unsupported FastDDS profile or trace environment')
+                if not fastdds_libraries_verified(proof.get('loaded_libraries',[])) or proof.get('vendor_loaded') is not True:
+                    raise ValueError('FastDDS loaded binary provenance incomplete')
+                defaults = audit.get('default_profile_files')
+                cwd = audit.get('cwd')
+                if (not isinstance(cwd,str) or not Path(cwd).is_absolute() or not isinstance(defaults,dict)
+                        or set(defaults) != set(FASTDDS_DEFAULT_XML)
+                        or any(defaults[name] != {'path': str(Path(cwd)/name), 'exists': False} for name in FASTDDS_DEFAULT_XML)):
+                    raise ValueError('FastDDS default profile absence unverified')
             if observation.get('observation_mode')=='blackbox':
                 xml=env.get('CYCLONEDDS_URI')
                 if xml and any(e.tag.rsplit('}',1)[-1]=='Tracing' for e in ET.fromstring(xml).iter()):
                     raise ValueError('blackbox process enables tracing')
-                if proof.get('trace_fd_attached') or any(under(p) for p in audit.get('fd_targets',[]) if p.startswith('/')):
+                directory = Path(observation['prepared']['raw_path']).resolve().parent
+                if proof.get('trace_fd_attached') or any(under(p) or Path(p).resolve().is_relative_to(directory) for p in audit.get('fd_targets',[]) if p.startswith('/')):
                     raise ValueError('blackbox process attached instrumentation fd')
+            if fastdds:
+                continue
+            root = ET.fromstring(env.get('CYCLONEDDS_URI') or
+                                 '<CycloneDDS><Domain Id="' + str(config['domain_id']) + '" /></CycloneDDS>')
+            if observation.get('observation_mode') == 'instrumentation':
+                for parent in (root, *list(root)):
+                    for child in list(parent):
+                        if child.tag.rsplit('}', 1)[-1] == 'Tracing':
+                            parent.remove(child)
+            process_profiles[role] = {'xml': ET.tostring(root, encoding='unicode'),
+                                      'non_tracing_sha256': _profile_hash(root)}
+        if not fastdds and _semantic_profiles({'non_tracing_profiles': process_profiles}, config['domain_id']) != profiles:
+            raise ValueError('prepared transport profiles differ from process environment')
         task=observation.get('blackbox_task')
-        if not isinstance(task,dict) or task.get('status')!='not_run' or task.get('executed_by_bridge') is not False or task.get('origin_run_id')!=config['run_id']:
-            raise ValueError('same-input blackbox task lacks not-run provenance')
-        same_input=task.get('same_input')
-        if not isinstance(same_input,dict) or any(same_input.get(k)!=config.get(k) for k in ('target_id','target_revision','rmw','arm','repeat','seed','topic','final_input','effective_input_sha256')):
-            raise ValueError('blackbox task effective input differs')
-        if observation.get('observation_mode')!='instrumentation':
+        if observation.get('observation_mode')=='blackbox':
+            if task is not None:
+                raise ValueError('blackbox execution must not carry a planned task')
             # A verified clean blackbox observation is linkage evidence, never an
             # instrumented zero or automatic confirmation of another execution.
             if observation.get('blackbox_observer',{}).get('status')!='verified':
                 raise ValueError('blackbox clean observer not verified')
             result.update(qualification='blackbox_observed', provenance_verified=True, input_binding=input_binding,
-                          non_tracing_profiles=deepcopy(prepared['profiles']))
+                          non_tracing_profiles=deepcopy(prepared['profiles']), profile_policy=deepcopy(policy))
             return result
+        if not isinstance(task,dict) or task.get('status')!='not_run' or task.get('executed_by_bridge') is not False or task.get('origin_run_id')!=config['run_id']:
+            raise ValueError('same-input blackbox task lacks not-run provenance')
+        same_input=task.get('same_input')
+        common_input = (*_INPUT_IDENTITY, 'seed', 'topic', 'message_type', 'final_input',
+                        'effective_input_sha256', 'input_layer_receipts')
+        if not isinstance(same_input,dict) or any(k not in same_input or canonical_hash(same_input[k])!=canonical_hash(config.get(k)) for k in common_input):
+            raise ValueError('blackbox task effective input differs')
+        if _semantic_profiles(task, config['domain_id']) != profiles:
+            raise ValueError('blackbox task transport profiles differ')
         traces=observation.get('traces',[])
         if len(traces)!=2:
             raise ValueError('two independent closed traces required')
@@ -340,8 +419,8 @@ def qualify_observation(row, runtime, config, *, capsule=None):
                     raise ValueError('instrumentation witness not bound to trace')
         result.update(qualification='qualified',provenance_verified=True,limited_contract=CONTRACT,
                       admissible_count=len(intake),qualified_intake=deepcopy(intake),zero_candidate=not intake and not excluded,
-                      observation_verdict=verdict, input_binding=input_binding, non_tracing_profiles=deepcopy(prepared['profiles']))
-    except (KeyError,ValueError,TypeError,OSError,IndexError,AttributeError) as exc:
+                      observation_verdict=verdict, input_binding=input_binding, non_tracing_profiles=deepcopy(prepared['profiles']), profile_policy=deepcopy(policy))
+    except (KeyError,ValueError,TypeError,OSError,IndexError,AttributeError,ET.ParseError) as exc:
         result['errors'].append(str(exc))
     return result
 

@@ -31,6 +31,79 @@ _PATH_KEYS = ('PATH', 'LD_LIBRARY_PATH', 'PYTHONPATH', 'AMENT_PREFIX_PATH',
               'CMAKE_PREFIX_PATH', 'COLCON_PREFIX_PATH')
 
 
+FASTDDS_RMW = 'rmw_fastrtps_cpp'
+_FASTDDS_LIBRARIES = (('librmw_fastrtps_cpp.so',), ('libfastrtps.so', 'libfastdds.so'), ('libfastcdr.so',))
+FASTDDS_DEFAULT_XML = ('DEFAULT_FASTRTPS_PROFILES.xml', 'DEFAULT_FASTDDS_PROFILES.xml')
+
+
+def observation_policy(rmw, mode):
+    if mode not in ('blackbox', 'instrumentation'):
+        raise ValueError('unsupported observation mode')
+    if rmw not in (RMW, FASTDDS_RMW):
+        raise ValueError('unsupported observation RMW')
+    if mode == 'instrumentation' and rmw != RMW:
+        raise ValueError('Cyclone vendor tracing requires rmw_cyclonedds_cpp')
+    return {'schema': 'r2f.observation-profile-policy/v1', 'rmw': rmw, 'observation_mode': mode,
+            'cyclonedds_profiles': 'required' if rmw == RMW else 'not_applicable',
+            'contract': 'cyclonedds.non_tracing_profiles/v1' if rmw == RMW else 'fastdds.default_blackbox_absence/v1'}
+
+
+def fastdds_environment_key(key):
+    # Non-default transport/profile/trace settings have no supported observer
+    # contract yet. Preserve their names in the audit and reject, even if empty.
+    return key == 'SKIP_DEFAULT_XML' or key.startswith((
+        'FASTDDS', 'FASTRTPS', 'RMW_FASTRTPS', 'CYCLONEDDS', 'ROS_TRACE', 'TRACETOOLS', 'R2F_INSTRUMENT'))
+
+
+def fastdds_libraries_verified(libraries):
+    return all(any(lib.get('identity_verified') is True and
+                   any(Path(lib['mapped_path']).name == name or Path(lib['mapped_path']).name.startswith(name + '.')
+                       for name in group) for lib in libraries) for group in _FASTDDS_LIBRARIES)
+
+
+def mapped_library_identity_matches(library, maps):
+    """Check every exact-path ELF segment against the verified on-disk identity."""
+    try:
+        mapped = Path(library['mapped_path'])
+        path = Path(library['path']).resolve(strict=True)
+        if not mapped.is_absolute() or mapped.resolve(strict=True) != path:
+            return False
+        stat = path.stat()
+        device = f'{os.major(stat.st_dev):02x}:{os.minor(stat.st_dev):02x}'
+        if (str(stat.st_ino) != str(library['mapped_inode'])
+                or library.get('mapped_device', device) != device):
+            return False
+        segments = [fields for line in maps.splitlines()
+                    if len(fields := line.split(maxsplit=5)) == 6 and fields[5] == str(mapped)]
+        return bool(segments) and all(fields[4] == str(stat.st_ino) and fields[3] == device
+                                      for fields in segments)
+    except (OSError, ValueError, TypeError, KeyError):
+        return False
+
+
+def _capture_fastdds_libraries(maps):
+    libraries, seen = [], set()
+    for line in maps.splitlines():
+        fields = line.split(maxsplit=5)
+        if len(fields) != 6 or fields[5] in seen:
+            continue
+        name = Path(fields[5]).name
+        if not any(name == prefix or name.startswith(prefix + '.') for group in _FASTDDS_LIBRARIES for prefix in group):
+            continue
+        seen.add(fields[5])
+        record = {'mapped_path': fields[5], 'mapped_inode': int(fields[4]), 'mapped_device': fields[3]}
+        try:
+            path = Path(fields[5]).resolve(strict=True)
+            before = path.stat()
+            record.update(path=str(path), sha256=_sha(_read(path)), size=before.st_size)
+            record['identity_verified'] = (before.st_ino == record['mapped_inode'] and _stat(before) == _stat(path.stat())
+                and f'{os.major(before.st_dev):02x}:{os.minor(before.st_dev):02x}' == fields[3])
+        except (OSError, ValueError) as exc:
+            record.update(identity_verified=False, error=type(exc).__name__)
+        libraries.append(record)
+    return libraries
+
+
 def _sha(data):
     return hashlib.sha256(data).hexdigest()
 
@@ -141,8 +214,7 @@ class ObservationContext:
         self.mode = config.get('observation_mode', 'blackbox')
         if self.mode not in ('blackbox', 'instrumentation'):
             raise ValueError('observation_mode must be blackbox or instrumentation')
-        if self.mode == 'instrumentation' and config.get('rmw') != RMW:
-            raise ValueError('Cyclone vendor tracing requires rmw_cyclonedds_cpp')
+        self.profile_policy = observation_policy(config.get('rmw'), self.mode)
         domain = config.get('domain_id')
         if type(domain) is not int or not 0 <= domain <= 231:
             raise ValueError('domain_id must be an integer in 0..231')
@@ -159,6 +231,8 @@ class ObservationContext:
         for role in _ROLES:
             original = dict(base_env)
             original.update((role_env or {}).get(role, {}))
+            if config['rmw'] == FASTDDS_RMW and any(fastdds_environment_key(k) for k in original):
+                raise ValueError('unsupported FastDDS profile or trace environment')
             env = environment_for_mode(original, mode='blackbox', instrumentation_roots=self.roots)
             if config['rmw'] == RMW:
                 clean, digest, source = _xml(original.get('CYCLONEDDS_URI'), domain)
@@ -176,6 +250,11 @@ class ObservationContext:
                 env.pop('CYCLONEDDS_URI', None)
             self.role_env[role] = env
         self.directory.mkdir(parents=True, exist_ok=False)
+        self.execution_input = {'schema': 'r2f.observation-execution-input/v1',
+            **{key: deepcopy(config[key]) for key in (
+                'run_id', 'domain_id', 'target_id', 'target_revision', 'rmw', 'arm', 'repeat',
+                'seed', 'topic', 'message_type', 'effective_input_sha256', 'final_input',
+                'input_layer_receipts') if key in config}}
         self.started_ns = time.time_ns()
         self.observer_sources = _observer_sources()
         self.workers, self.graphs, self.errors = {}, [], []
@@ -183,6 +262,7 @@ class ObservationContext:
         self.prepared = _write(self.directory / 'prepared.json', {
             'schema': 'r2f.runtime-observation-prepared/v1', 'observation_mode': self.mode,
             'run_id': config['run_id'], 'domain_id': domain, 'rmw': config['rmw'],
+            'execution_input': self.execution_input, 'profile_policy': self.profile_policy,
             'profiles': self.profiles, 'trace_configs': {k: v.to_dict() for k, v in self.trace_configs.items()},
             'execution_metadata_only': True, 'started_unix_ns': self.started_ns,
             'observer_source_sha256': self.observer_sources,
@@ -221,8 +301,27 @@ class ObservationContext:
             maps = (root / 'maps').read_text()
             env = dict(entry.split('=', 1) for entry in (root / 'environ').read_bytes().decode().split('\0') if '=' in entry)
             selected = {k: v for k, v in env.items() if k == 'CYCLONEDDS_URI' or _forbidden(k) or k in _PATH_KEYS
-                        or k in ('RMW_IMPLEMENTATION', 'ROS_DOMAIN_ID', 'R2F_DISCOVERY_NETNS_PROOF')}
+                        or k in ('RMW_IMPLEMENTATION', 'ROS_DOMAIN_ID', 'R2F_DISCOVERY_NETNS_PROOF')
+                        or (self.config['rmw'] == FASTDDS_RMW and fastdds_environment_key(k))}
             audit.update(maps=maps, environment=selected)
+            if self.config['rmw'] == FASTDDS_RMW:
+                proof['loaded_libraries'].extend(_capture_fastdds_libraries(maps))
+                proof['vendor_loaded'] = fastdds_libraries_verified(proof['loaded_libraries'])
+                if any(fastdds_environment_key(k) for k in env):
+                    audit['errors'].append('unsupported_fastdds_profile_or_trace_environment')
+                cwd = (root / 'cwd').resolve(strict=True)
+                audit['default_profile_files'] = {}
+                audit['cwd'] = str(cwd)
+                for filename in FASTDDS_DEFAULT_XML:
+                    path = cwd / filename
+                    try:
+                        path.stat()
+                        exists = True
+                    except FileNotFoundError:
+                        exists = False
+                    audit['default_profile_files'][filename] = {'path': str(path), 'exists': exists}
+                    if exists:
+                        audit['errors'].append('unsupported_fastdds_default_profile:' + filename)
             if any(_forbidden(k) for k in env):
                 audit['errors'].append('trace_or_loader_environment_present')
             for key in _PATH_KEYS:
@@ -233,7 +332,7 @@ class ObservationContext:
             expected = self.role_env[role].get('CYCLONEDDS_URI')
             if env.get('CYCLONEDDS_URI') != expected:
                 audit['errors'].append('worker_config_mismatch')
-            if self.mode == 'blackbox' and env.get('CYCLONEDDS_URI'):
+            if self.config['rmw'] == RMW and self.mode == 'blackbox' and env.get('CYCLONEDDS_URI'):
                 actual_xml = ET.fromstring(env['CYCLONEDDS_URI'])
                 if any(_tag(e) == 'Tracing' for e in actual_xml.iter()):
                     audit['errors'].append('blackbox_tracing_enabled')
@@ -241,6 +340,9 @@ class ObservationContext:
                     audit['errors'].append('blackbox_semantic_profile_changed')
             if env.get('R2F_DISCOVERY_NETNS_PROOF') != self.role_env[role].get('R2F_DISCOVERY_NETNS_PROOF'):
                 audit['errors'].append('namespace_proof_not_inherited')
+            for library in proof.get('loaded_libraries', []):
+                if not mapped_library_identity_matches(library, maps):
+                    audit['errors'].append('loaded_library_mapping_identity_mismatch')
             for line in maps.splitlines():
                 fields = line.split(maxsplit=5)
                 if len(fields) == 6 and fields[5].startswith('/') and _under(fields[5], self.roots):
@@ -267,7 +369,7 @@ class ObservationContext:
             audit['errors'].append('endpoint_process_binding_invalid')
         if not proof.get('process_identity_stable') or proof.get('unknown'):
             audit['errors'].append('process_provenance_incomplete')
-        if self.config['rmw'] == RMW and not proof.get('vendor_loaded'):
+        if not proof.get('vendor_loaded'):
             audit['errors'].append('vendor_library_identity_unverified')
         if trace and not all(proof.get(k) for k in ('config_matches', 'domain_matches', 'rmw_matches', 'trace_fd_attached')):
             audit['errors'].append('trace_not_attached_to_worker')
@@ -402,7 +504,7 @@ class ObservationContext:
         return {'schema': 'r2f.blackbox-observation-task/v1', 'status': 'not_run',
                 'origin_run_id': c['run_id'], 'observation_mode': 'blackbox',
                 'same_input': {k: deepcopy(c[k]) for k in ('target_id', 'target_revision', 'rmw', 'arm', 'repeat',
-                              'seed', 'topic', 'final_input', 'effective_input_sha256', 'input_layer_receipts') if k in c},
+                              'seed', 'topic', 'message_type', 'final_input', 'effective_input_sha256', 'input_layer_receipts') if k in c},
                 'precondition_receipts': deepcopy(result.get('precondition_receipts', [])),
                 'non_tracing_profiles': deepcopy(self.profiles),
                 'domain_rebinding': {'original_domain': c['domain_id'],
@@ -508,6 +610,8 @@ class ObservationContext:
                         or (result.get('execution') or {}).get('candidate_eligible') is False)
         summary = {'schema': 'r2f.runtime-instrumentation/v1', 'observation_mode': self.mode,
                    'execution_metadata_only': True, 'run_id': self.config['run_id'],
+                   'execution_input': deepcopy(self.execution_input),
+                   'profile_policy': deepcopy(self.profile_policy),
                    'actual_run': result.get('real_execution') is True,
                    'source_manifest': (result.get('execution') or {}).get('source'),
                    'status': 'incomplete' if errors else 'completed', 'verdict': verdict,
