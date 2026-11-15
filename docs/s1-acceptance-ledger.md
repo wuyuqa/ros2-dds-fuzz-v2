@@ -1,5 +1,7 @@
 # 完整 S1 逐项验收账
 
+最新快照指引（2026-11-15）：下文旧 source 的 seal、开发状态及待办均按各节历史身份解读；当前以[末尾 f576 历史矩阵与 capture 修复快照](#current-capture-snapshot)为准，修复树已通过独立离线审计，仍待提交冻结及新 source 实测。
+
 核对时间：2026-11-15T00:24:53+08:00（Asia/Shanghai）。来源：原任务书、主agent工程裁定/验收派遣消息、文档子agent只读核对的本地文件。仅更新文档工作树，不暂存/commit，不启动ROS/campaign；当前无需要用户确认的事项。
 
 目标口径纠正（2026-11-15T00:45:07+08:00，Asia/Shanghai；来源：本轮用户明确指令及主agent审阅意见）：当前用户目标为“S1模块完全成熟且有2–3个真实SUT候选”。已记录的真实自然候选为0，因此候选数量目标尚未达成。自然数量无法预先保证，只能由真实运行产生；负控、工具错误和合成案例不得凑数。原taskbook允许zero-candidate推进Phase，不代表用户完整目标完成；可以交中间报告，但不能据此将整个goal标记complete。
@@ -15,9 +17,9 @@
 - 当前用户2–3个真实SUT候选目标仍未达成：实测自然候选0，不以control、工具错误或开发pass充数；72格成熟分母不变，旧source seal仍只支持旧source。
 - 本轮文档已整理为freeze-ready，含义仅为可交main审阅；不代表源码已冻结或S1已成熟。本次不暂存/commit。交付后停止文档轮询和自动追加，等待main下一里程碑明确派遣。
 
-## 已验收source身份与当前开发边界
+## 历史已验收 source 身份与当时开发边界
 
-已验收基准HEAD：`11ec76c249cb75605fd70c5d7efb5610e70514b1`；behavior SHA-256：`c1daa3a066e69229f73c76a3d52123a8090173bca7abd4b56d951eb85539f72e`。相应运行manifest记录source_frozen=true/dirty=[]；主agent现已解冻third开发，四方在独立写集推进，不能把运行时冻结状态当成此后工作树始终冻结。文档不commit，HEAD未变也不免除行为内容校验。
+历史已验收基准HEAD：`11ec76c249cb75605fd70c5d7efb5610e70514b1`；behavior SHA-256：`c1daa3a066e69229f73c76a3d52123a8090173bca7abd4b56d951eb85539f72e`。相应运行manifest记录source_frozen=true/dirty=[]；主agent现已解冻third开发，四方在独立写集推进，不能把运行时冻结状态当成此后工作树始终冻结。文档不commit，HEAD未变也不免除行为内容校验。
 
 更新（2026-11-15T00:31:41+08:00，Asia/Shanghai）：first r1/domain180、second r2/domain80均在上述source上满足per-target seal：各18 required judged pass、6 negative judged fail、四control6/6、unknown0，独立verify rc0、sealed=true/errors=[]。旧first失败及second domain181预检阻断均保留。**这些通过只属于11ec76c版本，后续source变化须在最终source冻结后重跑；不作为新source的成熟声明，也不等于Phase2/4或完整S1完成。** 详细身份、hash及精确legacy合同见[正式证据快照](formal-target-snapshots-2026-11-15.md)。
 
@@ -158,3 +160,20 @@ E01文件字节SHA-256：report=`3d1556ff3a78285b54b3c88cb185a5c3c7fba36f1d786fb
 | [cleanup receipt](../results/final-validation/batch-20261115T005229Z-1884a215/01-discovery.late_endpoint/cleanup.json) | ok=true，无残留本 run 进程，44 workers rc0，26 runtime 锁及本地 driver 锁释放；未进入后续 target，旧 batch 不改写。 |
 
 Ptolemy 的 runner/replay receipt 透传修复已落盘；[主agent独立修复树审计](../results/main-review/receipt-wiring-audit-20261115T090035-30551b05/review.json)及测试日志记录 **352 tests / 95.387s OK**（含 96 plan / 96 replay receipt 检查），source 与 4 文件 hash 前后不变、diff-check=0；behavior=`0fd868f4bb14466efe0bf636e22cee6f2069a9cd46ed5920b27a868228524771`。该审计 source_frozen=false，提交、新 freeze 与真实重跑仍待各自 GO。正式四 target、F07、Phase2–4 在新 source 仍待验收，candidate **0**、required 分母 **72** 不变。本轮不提交、不启动 ROS。
+
+<a id="current-capture-snapshot"></a>
+
+### f576 历史矩阵与 capture 修复最新快照（2026-11-15）
+
+本轮 source HEAD=`f57656c4a11546ea88935d3eece176b6e80d1260`、behavior=`0fd868f4bb14466efe0bf636e22cee6f2069a9cd46ed5920b27a868228524771`，执行至 cleanup 身份保持冻结，domain80、两 RMW；[独立中止审计与逐格 raw/capture hashes](../results/final-validation/stop-review-20261115T011711Z-556e7e3a/executor-stop-audit.json)保留全部计数。
+
+| Target / receipt | 本 source 实际结果 |
+|---|---|
+| [late_endpoint summary](../results/final-validation/batch-20261115T010857Z-c33c6ff1/01-discovery.late_endpoint/summary.json) / [late_join_delivery summary](../results/final-validation/batch-20261115T010857Z-c33c6ff1/02-discovery.late_join_delivery/summary.json) | 各24格：18正常 pass + 6预期 negative fail；runner/独立 verify rc0、seal=true、artifact audit/cleanup=true；正常18格均 blackbox_observed、errors=[]。仅支持本 source。 |
+| [interruption_recovery cleanup](../results/final-validation/batch-20261115T010857Z-c33c6ff1/03-discovery.interruption_recovery/cleanup.json) | 7份 runtime/raw：Cyclone baseline/transparent 各3格真实执行失败（observer_final_health_incomplete）；mutated.0 中断 blocked、real_execution=false；其余17格未启动。driver/runner rc1/-2，verify rc1且中止，未形成 report/有效 seal；cleanup=true、12 workers rc0、26 runtime 锁与 driver 锁释放，无残留；第四 target 未启动。 |
+
+上述6格 capture health 均 degraded/unsupported_or_invalid_framing，filtered target-related=0、kernel drops=0；合法非 secure ParticipantMessage/TypeLookup builtin IDs 被误判 unknown_entity，后续另确认 FastDDS statistics footer `0x80` 兼容缺口，均属工具错误。Epicurus [owner freeze ACK](../results/capture-compatibility/fastdds-statistics-20261115T013420Z/freeze.json)保留 builtin 修复，并按[官方 Fast-DDS v2.14.7 header](../results/main-review/fastdds-0x80-source/Fast-DDS-2.14.7/src/cpp/statistics/rtps/messages/RTPSStatisticsMessages.hpp)及[本机 installed headers 编译 ABI](../results/capture-compatibility/fastdds-statistics-20261115T013420Z/abi.json)确认56字节布局；footer 仅接受 vendor `010f`、flags `0/1`、显式长度56、位于末尾且字段/padding合法，其他未知/畸形仍保守，不凭这些兼容消息增加 SPDP/SEDP activity/hit 或 SUT candidate。
+
+[离线重分析](../results/capture-compatibility/fastdds-statistics-20261115T013420Z/report.json)覆盖30 pcap、28,510 frames：known statistics gaps 15,097→0，留存样本剩余 unknown/malformed=0，28,922 typed activities 不变；[官方 decoder 逐字段对比](../results/capture-compatibility/fastdds-statistics-20261115T013420Z/official-decoder-comparison.json)15,097 footer、mismatch=0。[主agent独立历史审计](../results/main-review/statistics-history-audit-20261115T095247-6362cbe6/review.json)确认96旧 artifact hash 不变并核验官方 archive；旧 health/verdict/seal 不改。重分析仅覆盖留存数据，不能补回历史丢失 payload；无真实大端 footer 样本，大端仅有离线测试覆盖。
+
+[owner 测试](../results/capture-compatibility/fastdds-statistics-20261115T013420Z/validation.json)为 capture **44 / 1.545s**、projection/recovery **59 / 5.583s**、full **366 / 71.328s**，均 OK；[主agent独立最终审计](../results/main-review/statistics-final-audit-20261115T095221-e021ac1d/review.json)及[测试日志](../results/main-review/statistics-final-audit-20261115T095221-e021ac1d/unittest.stderr.log)记录 **366 tests / 69.843s OK**、source/两文件 hash 前后不变、diff-check=0、89 Python AST通过，四 target manifest hash 不变。当前 behavior=`8c87773b0e3c14c91e021e701d63fed7c9dd07df87681e202c581873d138e011`，HEAD 仍为 f576、`source_frozen=false`；owner ACK 与离线通过不等于提交冻结。待单独 commit GO、新 source 冻结及实测 GO；f576 first2 历史通过有效但不迁移至新 source，新 source 必须四 target 重跑。4-cell development smoke、正式矩阵、F07、Phase2–4 在新 source **均未验收**；辅助保持冻结，自然 candidate **0**、完整 required 分母 **72** 不变。

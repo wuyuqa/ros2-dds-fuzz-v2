@@ -30,7 +30,28 @@ SUBMESSAGE_NAMES = {
     0x0e: 'INFO_DST', 0x0f: 'INFO_REPLY', 0x12: 'NACK_FRAG',
     0x13: 'HEARTBEAT_FRAG', 0x14: 'DATA', 0x15: 'DATA',
     0x16: 'DATA_FRAG', 0x17: 'DATA_FRAG',
+    0x80: 'FASTDDS_STATISTICS_NETWORK_SUBMESSAGE',
 }
+
+
+# Non-secure pairs verified in the installed CycloneDDS q_rtps.h and
+# FastDDS fastdds/rtps/common/EntityId_t.hpp. These are retained wire evidence,
+# not SPDP/SEDP activity. Do not infer support from an entity-kind suffix.
+OTHER_BUILTIN_PAIRS = {
+    '000200c2': ('000200c7', 'participant_message'),
+    '000300c3': ('000300c4', 'typelookup_request'),
+    '000301c3': ('000301c4', 'typelookup_reply'),
+}
+OTHER_BUILTIN_READERS = frozenset(reader for reader, _ in OTHER_BUILTIN_PAIRS.values())
+OTHER_BUILTIN_VENDORS = frozenset(('010f', '0110'))
+
+
+# FastDDS v2.14.7 RTPSStatisticsMessages.hpp + installed headers, compiled on
+# x86_64: sizeof(StatisticsSubmessageData)=56, destination=0, ts=24, seq=32,
+# seq.bytes=40, seq.bytes_high=48. add_statistics_submessage clears the body;
+# transport writes those fields with memcpy, leaving bytes 50..55 zero.
+FASTDDS_STATISTICS_BODY_SIZE = 56
+FASTDDS_STATISTICS_FIELDS = 'iI16siIQQH'
 
 
 def _filtered_submessage_entities(payload, submessages):
@@ -54,6 +75,31 @@ def _filtered_submessage_entities(payload, submessages):
                 malformed = 'invalid_auxiliary_length'
             else:
                 entry.update(classification='auxiliary', reason='context_only')
+        elif kind == 0x80:
+            declared_length = struct.unpack_from(sm['endian'] + 'H', payload, sm['offset'] + 2)[0]
+            if sm['vendor_id'] != '010f':
+                malformed = 'unsupported_statistics_vendor'
+            elif sm['flags'] not in (0, 1):
+                malformed = 'invalid_statistics_flags'
+            elif declared_length != FASTDDS_STATISTICS_BODY_SIZE or len(body) != FASTDDS_STATISTICS_BODY_SIZE:
+                # Generic RTPS framing treats length=0 as the remaining payload;
+                # FastDDS requires the explicit sizeof body length instead.
+                malformed = 'invalid_statistics_length'
+            elif sm['end'] != len(payload):
+                malformed = 'statistics_not_final_submessage'
+            else:
+                field_end = struct.calcsize(sm['endian'] + FASTDDS_STATISTICS_FIELDS)
+                if any(body[field_end:]):
+                    malformed = 'nonzero_statistics_padding'
+                else:
+                    locator_kind, port, address, seconds, fraction, sequence, byte_count, bytes_high = struct.unpack_from(
+                        sm['endian'] + FASTDDS_STATISTICS_FIELDS, body)
+                    entry.update(classification='statistics', reason='fastdds_statistics_footer',
+                                 statistics={'body_size': len(body), 'declared_length': declared_length,
+                                             'destination': {'kind': locator_kind, 'port': port, 'address_hex': address.hex()},
+                                             'timestamp': {'seconds': seconds, 'fraction': fraction},
+                                             'sequence': {'sequence': sequence, 'bytes': byte_count, 'bytes_high': bytes_high},
+                                             'padding_hex': body[field_end:].hex()})
         elif kind in (0x15, 0x16, 0x06, 0x07, 0x08, 0x12, 0x13):
             data = kind in (0x15, 0x16)
             entity_offset = 4 if data else 0
@@ -111,14 +157,24 @@ def _filtered_submessage_entities(payload, submessages):
                     malformed = 'invalid_control_length'
             if malformed is None:
                 # Reader routing matters too, including conflicting identities.
-                # Other builtin/extension identities stay unknown below.
-                if writer in BUILTIN_WRITERS or reader in ('000100c7', '000003c7', '000004c7'):
+                if writer in OTHER_BUILTIN_PAIRS or reader in OTHER_BUILTIN_READERS:
+                    pair = OTHER_BUILTIN_PAIRS.get(writer)
+                    if sm['vendor_id'] not in OTHER_BUILTIN_VENDORS:
+                        entry['reason'] = 'unsupported_other_builtin_vendor'
+                    elif pair is None or (reader != pair[0] and
+                            not (reader == '00000000' and kind not in (0x06, 0x12))):
+                        # ACKNACK/NACK_FRAG identify the originating reader;
+                        # writer-originated traffic may address an unknown reader.
+                        entry['reason'] = 'unknown_other_builtin_counterpart'
+                    else:
+                        entry.update(classification='other_builtin', reason=pair[1] + '_entity_pair')
+                elif writer in BUILTIN_WRITERS or reader in ('000100c7', '000003c7', '000004c7'):
                     entry.update(classification='discovery', reason='builtin_entity')
                 elif writer[-2:] in ('02', '03') and (reader == '00000000' or reader[-2:] in ('04', '07')):
                     entry.update(classification='user', reason='ordinary_user_entities')
                 else:
                     entry['reason'] = 'unknown_entity'
-        if entry['classification'] in ('user', 'discovery') and entry['source_guid_prefix'] == '0' * 24:
+        if entry['classification'] in ('user', 'discovery', 'other_builtin') and entry['source_guid_prefix'] == '0' * 24:
             entry.update(classification='unknown', reason='unassignable_source_prefix')
         if malformed:
             entry['reason'] = malformed
@@ -140,6 +196,8 @@ def _rtps_metadata(udp, *, truncated):
                 diagnostics.append(diagnostic)
     classification = ('unknown' if truncated or diagnostics else
                       'discovery' if any(item['classification'] == 'discovery' for item in entities) else
+                      'other_builtin' if any(item['classification'] == 'other_builtin' for item in entities) else
+                      'statistics' if any(item['classification'] == 'statistics' for item in entities) else
                       'proven_no_discovery')
     return {'source_port': udp['source_port'], 'destination_port': udp['destination_port'],
             'source_participant_prefix': payload[8:20].hex() if len(payload) >= 20 else None,
