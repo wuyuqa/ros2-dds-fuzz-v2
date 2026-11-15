@@ -28,6 +28,63 @@ def _ancestors():
     return result
 
 
+def _process_state_and_start(entry, pid):
+    text = (entry / 'stat').read_text()
+    fields = text.rsplit(')', 1)[1].split()
+    start_ticks = int(fields[19])
+    if int(text.split(' ', 1)[0]) != pid or start_ticks <= 0:
+        raise ValueError('invalid process identity')
+    return fields[0], start_ticks
+
+
+def _exited_after_environ_denied(entry, pid, original_directory, original_start):
+    """Exclude only a directly observed disappearance or the same task's zombie.
+
+    Directory identity and start ticks guard the bounded recheck against PID
+    reuse. Missing/unreadable task files alone are not proof of disappearance.
+    """
+    def disappeared():
+        record = {'pid': pid, 'state': 'gone', 'reason': 'process_disappeared_after_environ_denied'}
+        if original_start is not None:
+            record['start_ticks'] = original_start
+        return record
+
+    def identity(value):
+        return value.st_dev, value.st_ino, value.st_uid
+
+    try:
+        current_directory = entry.stat()
+    except FileNotFoundError:
+        return disappeared()
+    except OSError:
+        return None
+    if identity(current_directory) != identity(original_directory) or original_start is None:
+        return None
+    try:
+        state, start_ticks = _process_state_and_start(entry, pid)
+        if state != 'Z' or start_ticks != original_start:
+            return None
+        status = dict(line.split(':', 1) for line in (entry / 'status').read_text().splitlines() if ':' in line)
+        if status.get('State', '').split()[:1] != ['Z'] or int(status.get('Pid', '-1')) != pid:
+            return None
+        if identity(entry.stat()) != identity(original_directory):
+            return None
+    except FileNotFoundError:
+        # A vanished stat/status file is insufficient while the PID directory
+        # still exists; only the directory's own ENOENT confirms disappearance.
+        try:
+            entry.stat()
+        except FileNotFoundError:
+            return disappeared()
+        except OSError:
+            pass
+        return None
+    except (OSError, ValueError, IndexError):
+        return None
+    return {'pid': pid, 'state': 'Z', 'start_ticks': start_ticks,
+            'reason': 'same_process_zombie_after_environ_denied'}
+
+
 def scan_processes(old_repo: Path, domain_id: int | None = None, proc_root=Path('/proc'), skip_pids=None):
     """Inspect only same-user processes; emit reasons and PIDs, never argv/env values."""
     skip_pids = _ancestors() if skip_pids is None else skip_pids
@@ -37,7 +94,8 @@ def scan_processes(old_repo: Path, domain_id: int | None = None, proc_root=Path(
         if pid in skip_pids:
             continue
         try:
-            if entry.stat().st_uid != os.getuid():
+            process_directory = entry.stat()
+            if process_directory.st_uid != os.getuid():
                 continue
             argv = (entry / 'cmdline').read_bytes().split(b'\0')
             status = (entry / 'status').read_text() if (entry / 'status').exists() else ''
@@ -45,10 +103,21 @@ def scan_processes(old_repo: Path, domain_id: int | None = None, proc_root=Path(
                 excluded.append({'pid': pid, 'reason': 'zombie_no_active_resources'})
                 continue
             try:
+                _, process_start = _process_state_and_start(entry, pid)
+            except (OSError, ValueError, IndexError):
+                process_start = None
+            try:
                 env = (entry / 'environ').read_bytes().split(b'\0')
             except PermissionError:
+                exit_record = _exited_after_environ_denied(entry, pid, process_directory, process_start)
+                if exit_record is not None:
+                    excluded.append(exit_record)
+                    continue
                 executable_path = argv[0].decode(errors='replace') if argv else ''
-                comm = (entry / 'comm').read_text().strip() if (entry / 'comm').exists() else ''
+                try:
+                    comm = (entry / 'comm').read_text().strip()
+                except OSError:
+                    comm = ''
                 if (executable_path, comm) in {('(sd-pam)', '(sd-pam)'), ('/usr/bin/vmtoolsd', 'vmtoolsd')}:
                     excluded.append({'pid': pid, 'reason': 'identified_os_session_helper', 'executable': executable_path, 'environment_readable': False})
                     continue
