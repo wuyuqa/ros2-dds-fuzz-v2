@@ -14,7 +14,7 @@ import uuid
 from r2f.core import ReplayCapsule, Scenario, canonical_hash, raw_sha256, rerun_conformance
 from r2f.core.replay import conformance_signature, validate_replay_attempt
 from r2f.core.state_machine import utc_now
-from r2f.modules.s1.module import S1Module
+from r2f.modules.s1.module import S1Module, resolve_services
 from .identity import runtime_config, source_manifest
 from .runtime_adapter import ingest_execution
 
@@ -229,9 +229,20 @@ def replay_cell(capsule_path, *, output_dir, domain_id, runtime=None) -> dict:
                 _write(output / 'runtime_config.json', config)
                 runtime_dir = output / 'runtime'
                 runtime_dir.mkdir()
-                report['runtime_invoked'] = True
+                services = resolve_services(scenario.target_id)
+                if not services.carrier.accepts(scenario):
+                    raise ValueError('registered carrier does not accept replay scenario')
+
+                def invoke(config, directory):
+                    # This flag records the actual runtime boundary, including
+                    # a runtime exception. Carrier refusal never sets it.
+                    report['runtime_invoked'] = True
+                    return runtime(config, directory)
+
                 try:
-                    result = runtime(_copy_json(config), runtime_dir)
+                    result = services.carrier.apply(scenario, _copy_json(capsule.input['effective_input']),
+                                                    execution={'config': config, 'output_dir': runtime_dir,
+                                                               'runtime': invoke})
                 except Exception as exc:
                     context['runtime_exception'] = type(exc).__name__
                     result = {'real_execution': False, 'runtime_status': 'tool_error',
@@ -257,7 +268,7 @@ def replay_cell(capsule_path, *, output_dir, domain_id, runtime=None) -> dict:
                     raise _Failure('fail_artifact', 'invalid_runtime_result', result['reason'], 'runtime')
                 if result.get('raw_path') and not Path(result['raw_path']).resolve().is_relative_to(runtime_dir):
                     raise _Failure('fail_artifact', 'runtime_raw_not_independent', 'runtime raw is outside replay output', 'runtime')
-                row = ingest_execution(scenario, config, result, capsule)
+                row = ingest_execution(scenario, config, result, capsule, services=services)
                 row.update(domain=domain, domain_id=domain)
                 context['row'] = row
                 _write(output / 'execution_metadata.json', row)

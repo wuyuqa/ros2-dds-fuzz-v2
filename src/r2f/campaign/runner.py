@@ -33,6 +33,7 @@ def plan_campaign(output_dir, *, repo=None, run_id=None, domain_id=173, seed=0,
     registry = Registry()
     module = register(registry)
     target = registry.get_target(target_id)
+    services = registry.get_services(target_id)
     scope = json.loads((repo / "config/s1_scope.json").read_text())
     manifest = {"schema_version": 1, "run_id": run_id, "target": target.to_dict(),
                 "catalog": module.to_dict(), "scope": scope, "rule": target.rule_contract,
@@ -51,11 +52,12 @@ def plan_campaign(output_dir, *, repo=None, run_id=None, domain_id=173, seed=0,
         carrier = "wire_proxy" if recovery else "ros2_endpoint"
         mutation_parameters = ({key: submitted[key] for key in ("drop_duration_sec", "recovery_timeout_sec", "counter_interval_sec")}
                                if recovery else {"baseline_qos":submitted["baseline_qos"], "submitted_qos":submitted["qos"]} if projection else {"reader_delay_sec": submitted["reader_delay_sec"]})
-        layer_receipts = ([{"layer": carrier, "declared_mutation": mutation_kind,
-                            "implementation": "isolated_netns_nft_discovery_udp_drop", "parameters": mutation_parameters}]
-                          if recovery else [{"layer":carrier, "declared_mutation":mutation_kind, "parameters":mutation_parameters}] if projection else [{"layer": carrier, "declared_mutation": mutation_kind, "submitted_reader_delay_sec": submitted["reader_delay_sec"]}])
         scenario = compile_scenario(target, cell["rmw"], cell["arm"], cell["repeat"], seed,
                                     {"mutation_kind": mutation_kind, "carrier": carrier, "mutation_parameters": mutation_parameters})
+        prepared = services.mutation_provider.prepare(scenario)
+        if not services.carrier.accepts(scenario):
+            raise ValueError("registered carrier does not accept planned scenario")
+        layer_receipts = prepared["input_layer_receipts"]
         capsule = ReplayCapsule.from_scenario(scenario, source_manifest=manifest["source_manifest"],
                                              final_input=submitted,
                                              input_layer_receipts=layer_receipts,
@@ -136,6 +138,9 @@ def run_campaign(output_dir, *, runtime=None, execute=False, **options):
     if runtime.__module__ == "r2f.runtime.ros2_pair" and manifest["source_manifest"].get("source_frozen") is not True:
         report["abort_reason"] = "source_behavior_not_tracked_and_clean_at_HEAD"
         return _persist(output_dir, report)
+    registry = Registry()
+    register(registry)
+    services = registry.get_services(report["target_id"])
     for index, planned in enumerate(report["rows"]):
         if source_manifest(repo) != manifest["source_manifest"]:
             report["abort_reason"] = "source_repo_HEAD_or_behavior_tree_changed"
@@ -147,13 +152,16 @@ def run_campaign(output_dir, *, runtime=None, execute=False, **options):
         runtime_dir = Path(planned["runtime_result_path"]).parent
         runtime_dir.mkdir(parents=True, exist_ok=True)
         try:
-            result = runtime(config, runtime_dir)
+            if not services.carrier.accepts(scenario):
+                raise ValueError("registered carrier does not accept execution scenario")
+            result = services.carrier.apply(scenario, capsule.input["effective_input"],
+                                            execution={"config": config, "output_dir": runtime_dir, "runtime": runtime})
         except Exception as exc:
             result = {"real_execution": False, "runtime_status": "tool_error", "reason": f"{type(exc).__name__}:{exc}"}
         # Preserve the result, including failures. run_pair already writes it; this
         # also gives injected contract runners the same artifact boundary.
         write_json(planned["runtime_result_path"], result)
-        execution = ingest_execution(scenario, config, result, capsule)
+        execution = ingest_execution(scenario, config, result, capsule, services=services)
         row = dict(planned, **execution)
         row["actual_submitted_payload_sha256"] = canonical_hash(capsule.input["effective_input"]["final_input"])
         row["replay_status"] = "not_run"

@@ -1,10 +1,10 @@
 """Small structural interfaces; implementations need no inheritance."""
 
+from dataclasses import dataclass
 from typing import Any, Mapping, Protocol
 
 from .semantic_target import SemanticTarget
 from .scenario import Scenario
-from .mutation import MutationReceipt
 
 
 class TargetProvider(Protocol):
@@ -21,7 +21,8 @@ class MutationProvider(Protocol):
 
 class Carrier(Protocol):
     def accepts(self, scenario: Scenario) -> bool: ...
-    def apply(self, scenario: Scenario, prepared: dict) -> MutationReceipt: ...
+    def apply(self, scenario: Scenario, prepared: dict, *,
+              execution: Mapping[str, Any]) -> dict: ...
 
 
 class FactProducer(Protocol):
@@ -30,3 +31,13 @@ class FactProducer(Protocol):
 
 class Oracle(Protocol):
     def evaluate(self, scenario: Scenario, facts: Mapping[str, Any]) -> dict: ...
+
+
+@dataclass(frozen=True)
+class ExecutionServices:
+    """Runtime service references; never serialized into a target or catalog."""
+
+    mutation_provider: MutationProvider
+    carrier: Carrier
+    fact_producer: FactProducer
+    oracle: Oracle

@@ -4,14 +4,15 @@ The runtime executes the public API actions. This module does not run a second
 state machine: each core receipt names its before/after raw token indexes and
 is admitted only after the corresponding runtime predicate and event proof.
 """
+from collections.abc import Mapping
 from datetime import datetime, timezone
 import json
 from pathlib import Path
+from r2f.core._json import snapshot
 from r2f.core.evidence import canonical_hash, verify_raw
 from r2f.core.execution import ExecutionRecord, ExecutionStage
 from r2f.core.mutation import MutationReceipt
 from r2f.core.state_machine import StepReceipt
-from r2f.modules.s1.oracles import evaluate_primary
 
 
 def read_events(path):
@@ -255,8 +256,64 @@ def canonical_receipts(scenario, runtime, events):
     return receipts
 
 
-def ingest_execution(scenario, config, runtime, capsule):
+def _produce_facts(services, evidence):
+    """Contain provider faults before facts can enter oracle or persistence."""
+    returned = False
+    result = None
+    try:
+        result = services.fact_producer.produce(evidence)
+        returned = True
+        if not isinstance(result, Mapping):
+            raise TypeError("fact producer result must be a mapping")
+        # Use the core JSON contract, including string keys and finite numbers,
+        # then detach the result so later persistence cannot invoke provider code.
+        return json.loads(json.dumps(snapshot(result), allow_nan=False)), None
+    except Exception as exc:
+        return {}, {"kind": "invalid_result" if returned else "exception",
+                    "exception_type": type(exc).__name__, "reason": str(exc),
+                    "returned_result_type": type(result).__name__ if returned else None}
+
+
+def _evaluate_oracle(services, scenario, facts):
+    """Contain an oracle tool failure without turning it into a SUT verdict."""
+    returned = False
+    result = None
+    try:
+        result = services.oracle.evaluate(scenario, facts)
+        returned = True
+        if (not isinstance(result, dict)
+                or result.get("rule_id") != scenario.target.rule_contract["primary_rule"]
+                or result.get("rule_role") != "primary"
+                or not isinstance(result.get("verdict"), str)
+                or result["verdict"] not in {"pass", "fail", "unknown", "not_applicable"}
+                or not isinstance(result.get("closure"), dict)):
+            raise ValueError("invalid primary oracle result identity/verdict/closure")
+        for key in ("reason_codes", "forbidden_residuals"):
+            if not isinstance(result.get(key), list) or any(not isinstance(v, str) for v in result[key]):
+                raise ValueError("invalid primary oracle result:" + key)
+        # Freeze only a JSON-serializable result; malformed extras cannot break
+        # the later row/report persistence boundary either.
+        result = json.loads(json.dumps(result, allow_nan=False))
+        return result, None
+    except Exception as exc:
+        diagnostic = {"kind": "invalid_result" if returned else "exception",
+                      "exception_type": type(exc).__name__, "reason": str(exc)}
+        if returned:
+            try:
+                diagnostic["returned_result"] = json.loads(json.dumps(result, allow_nan=False))
+            except (TypeError, ValueError, OverflowError, RecursionError):
+                diagnostic["unserializable_result_type"] = type(result).__name__
+        # This is an unavailable tool result, not another primary evaluation.
+        return {"rule_id": scenario.target.rule_contract["primary_rule"], "rule_role": "primary",
+                "verdict": "unknown", "reason_codes": ["oracle_tool_failure"],
+                "forbidden_residuals": [], "closure": {}}, diagnostic
+
+
+def ingest_execution(scenario, config, runtime, capsule, *, services=None):
     """Advance only through core gates; failures end as aborted with raw retained."""
+    if services is None:
+        from r2f.modules.s1.module import resolve_services
+        services = resolve_services(scenario.target_id)
     record = ExecutionRecord(config["run_id"], scenario)
     audit = {"runtime_status": runtime.get("runtime_status"), "runtime_reason": runtime.get("reason"),
              "actual_run": runtime.get("real_execution") is True,
@@ -264,6 +321,16 @@ def ingest_execution(scenario, config, runtime, capsule):
              "source_manifest": capsule.input["source_manifest"], "effective_input_sha256": capsule.input["effective_input_sha256"]}
     events = []
     facts = {}
+    oracle = None
+
+    def evaluate_once():
+        nonlocal oracle
+        if oracle is None:
+            oracle, failure = _evaluate_oracle(services, scenario, facts)
+            if failure is not None:
+                audit.update(tool_error=True, oracle_tool_failure=failure)
+        return oracle
+
     if runtime.get("real_execution") is not True and runtime.get("runtime_status") == "blocked":
         # Preflight never owes endpoint state receipts. Retain its cause even when
         # environment evidence is absent or damaged; report artifact health separately.
@@ -285,7 +352,7 @@ def ingest_execution(scenario, config, runtime, capsule):
             raw_audit["error"] = str(exc)
         record.abort(runtime.get("reason") or "runtime_preflight_blocked")
         facts = {"runtime_blocked": True, "environment_healthy": False, "process_healthy": False}
-        oracle = evaluate_primary(facts, scenario.target_id)
+        oracle = evaluate_once()
         return dict(record.to_dict(), **audit, typed_facts=facts, oracle=oracle,
                     oracle_verdict=oracle["verdict"], rule_id=oracle["rule_id"],
                     raw_path=runtime.get("raw_path"), raw_sha256=runtime.get("raw_sha256"),
@@ -304,8 +371,18 @@ def ingest_execution(scenario, config, runtime, capsule):
         receipt = MutationReceipt.from_dict(runtime["mutation_receipt"])
         if end.get("mutation_receipt") != receipt.to_dict():
             raise ValueError("raw mutation receipt differs from runtime metadata")
-        facts = facts_from_events(events, runtime, config)
-        oracle = evaluate_primary(facts, scenario.target_id)
+        facts, failure = _produce_facts(services, {"events": events, "runtime": runtime, "config": config})
+        if failure is not None:
+            audit.update(tool_error=True, fact_producer_tool_failure=failure)
+            # No primary evaluation is possible without valid producer output.
+            # Cache a tool unknown so the existing abort path cannot evaluate it.
+            oracle = {"rule_id": scenario.target.rule_contract["primary_rule"], "rule_role": "primary",
+                      "verdict": "unknown", "reason_codes": ["fact_producer_tool_failure"],
+                      "forbidden_residuals": [], "closure": {}}
+            raise ValueError("fact_producer_tool_failure:" + failure["reason"])
+        oracle = evaluate_once()
+        if audit.get("oracle_tool_failure"):
+            raise ValueError("oracle_tool_failure:" + audit["oracle_tool_failure"]["reason"])
         record.advance(ExecutionStage.EXPRESSIBLE, adapter_accepted=True)
         record.advance(ExecutionStage.PLANNED)
         receipts = canonical_receipts(scenario, runtime, events)
@@ -343,7 +420,7 @@ def ingest_execution(scenario, config, runtime, capsule):
         record.advance(ExecutionStage.EFFECT_OBSERVED, **evidence)
         record.advance(ExecutionStage.JUDGED, oracle_verdict=oracle["verdict"], rule_id=oracle["rule_id"])
     except (ValueError, KeyError, TypeError, OSError) as exc:
-        oracle = evaluate_primary(facts, scenario.target_id)
+        oracle = evaluate_once()
         if record.execution_stage not in (ExecutionStage.ABORTED, ExecutionStage.JUDGED):
             record.abort(str(exc))
         audit["ingestion_error"] = str(exc)
