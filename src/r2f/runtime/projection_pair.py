@@ -144,6 +144,141 @@ def controlled_graph(graph, capture, path):
                                  'graph': {'raw_ref': graph['raw']['path'], 'raw_sha256': graph['raw']['sha256']}}}
 
 
+def projection_live_budget(pool, deadline_ns):
+    """Check owner and workers even when a wait predicate succeeds immediately."""
+    if time.monotonic_ns() >= deadline_ns:
+        raise TimeoutError('projection_deadline_exceeded')
+    pool.pump(0)
+    failed = [(role, worker.returncode) for role, worker in pool.workers.items() if worker.poll() is not None]
+    if failed:
+        raise RuntimeError(f'projection_worker_exited:{failed}')
+    remaining = (deadline_ns - time.monotonic_ns()) / 10**9
+    if remaining <= 0:
+        raise TimeoutError('projection_deadline_exceeded')
+    return remaining
+
+
+def projection_witnesses(snapshot, decoded, endpoints, starts, since_ns):
+    """Select the latest actual endpoint state; QoS equality is never readiness."""
+    from r2f.instrumentation.sedp_fields import BASELINE_FIELDS
+    reasons, selected = [], {}
+    prefixes = sorted({e['endpoint_gid'][:24].lower() for e in endpoints.values()})
+    filtered = snapshot.get('filtered_rtps', {})
+    if (snapshot.get('health', {}).get('status') != 'ok'
+            or snapshot.get('window_buffer_retained') is not True
+            or filtered.get('metadata_complete') is not True or filtered.get('metadata_overflow') != 0
+            or filtered.get('target_related') != []
+            or filtered.get('completeness') != 'complete_for_known_target_prefixes'
+            or snapshot.get('observation_completeness') != 'complete_for_known_target_prefixes'):
+        reasons.append('capture_health_metadata_or_coverage_incomplete')
+    until = snapshot.get('until_ns')
+    if (snapshot.get('clock') != 'unix_ns_realtime' or snapshot.get('since_ns') != since_ns
+            or type(until) is not int or until < since_ns
+            or snapshot.get('participant_prefixes') != prefixes
+            or type(snapshot.get('monotonic_ns')) is not int
+            or type(snapshot.get('ready', {}).get('unix_ns')) is not int
+            or snapshot['ready']['unix_ns'] > since_ns):
+        reasons.append('snapshot_window_or_participant_identity_incomplete')
+    if snapshot.get('status') != 'observed' or snapshot.get('all_participants_observed') is not True:
+        reasons.append('attributed_activity_incomplete')
+    if (decoded.get('independent_source') != 'passive_rtps_wire_prefix'
+            or decoded.get('graph_or_config_field_input') is not False or decoded.get('diagnostics') != []
+            or decoded.get('raw') != {**snapshot['raw_prefix'], 'linktype': 1, 'timestamp_precision_ns':
+                                      decoded.get('raw', {}).get('timestamp_precision_ns')}):
+        reasons.append('wire_prefix_decode_incomplete')
+    for role in ('writer', 'reader'):
+        guid = endpoints[role]['endpoint_gid'][:32].lower()
+        matches = [(i, e) for i, e in enumerate(decoded.get('events', [])) if e.get('endpoint_guid') == guid]
+        # Do not discard a later inline-only dispose before choosing the latest state.
+        if not matches:
+            reasons.append(role + ':exact_endpoint_missing')
+            continue
+        if any(type(e.get('unix_ns')) is not int or type(e.get('raw_ref', {}).get('packet_index')) is not int
+               for _, e in matches):
+            reasons.append(role + ':event_metadata_incomplete')
+            continue
+        _, event = max(matches, key=lambda pair: (pair[1]['unix_ns'], pair[1]['raw_ref']['packet_index'], pair[0]))
+        selected[role] = event
+        if [e['unix_ns'] for _, e in matches] != sorted(e['unix_ns'] for _, e in matches):
+            reasons.append(role + ':endpoint_timestamp_order_inconsistent')
+        fields = event.get('fields', {})
+        if (event.get('lifecycle') != 'alive' or event.get('role') != role
+                or event.get('source_guid_prefix') != guid[:24]
+                or event.get('builtin_writer_id') != {'writer': '000003c2', 'reader': '000004c2'}[role]
+                or event.get('parameter_list', {}).get('complete') is not True
+                or any(fields.get(name, {}).get('status') != 'observed'
+                       or fields.get(name, {}).get('value') is None for name in BASELINE_FIELDS)
+                or fields.get('endpoint_guid', {}).get('value') != guid
+                or fields.get('endpoint_guid', {}).get('provenance') != 'wire_parameter'
+                or fields.get('role', {}).get('value') != role):
+            reasons.append(role + ':latest_endpoint_not_live_complete_or_identity_bound')
+        if (type(until) is not int or not max(since_ns, starts[role]['time_ns']) <= event['unix_ns'] <= until):
+            reasons.append(role + ':endpoint_event_outside_creation_window')
+    return selected, reasons
+
+
+def wait_projection_readiness(observer, pool, endpoints, starts, since_ns, policy, deadline_ns, emit):
+    from r2f.instrumentation.sedp import parse_sedp_capture_prefix
+    prefixes = sorted({e['endpoint_gid'][:24].lower() for e in endpoints.values()})
+    while True:
+        projection_live_budget(pool, deadline_ns)
+        requested = emit('projection_readiness_requested', since_ns=since_ns,
+                         participant_prefixes=prefixes, deadline_monotonic_ns=deadline_ns)
+        snapshot = observer.snapshot_activity(since_ns=since_ns, participant_prefixes=prefixes)
+        raw = emit('projection_readiness_snapshot', snapshot=snapshot, request_ref=requested['raw_event_ref'])
+        projection_live_budget(pool, deadline_ns)
+        try:
+            decoded = parse_sedp_capture_prefix(snapshot.get('raw_prefix'), field_policy=policy)
+        except (OSError, ValueError) as exc:
+            emit('projection_readiness_attempt', snapshot_ref=raw['raw_event_ref'], selected_events={},
+                 reasons=['wire_prefix_invalid:' + str(exc)], ready=False)
+            raise RuntimeError('projection_wire_prefix_invalid:' + str(exc)) from exc
+        selected, reasons = projection_witnesses(snapshot, decoded, endpoints, starts, since_ns)
+        if not requested['monotonic_ns'] <= snapshot.get('monotonic_ns', -1) <= raw['monotonic_ns']:
+            reasons.append('snapshot_request_chronology_incomplete')
+        if time.monotonic_ns() >= deadline_ns:
+            reasons.append('projection_deadline_exceeded')
+        attempt = emit('projection_readiness_attempt', snapshot_ref=raw['raw_event_ref'],
+                       wire_raw=decoded['raw'], selected_events=selected, diagnostics=decoded['diagnostics'],
+                       reasons=reasons, ready=not reasons)
+        projection_live_budget(pool, deadline_ns)
+        if not reasons:
+            return emit('projection_wire_ready', snapshot_ref=raw['raw_event_ref'],
+                        attempt_ref=attempt['raw_event_ref'], raw_prefix=snapshot['raw_prefix'],
+                        selected_events=selected, deadline_monotonic_ns=deadline_ns)
+        pool.pump(min(.05, projection_live_budget(pool, deadline_ns)))
+
+
+def validate_projection_graph_chronology(proof, events, readiness, deadline_ns):
+    for role, pair in proof.items():
+        requests = [e for e in events if e['event'] == 'graph_snapshot_requested' and e['role'] == role
+                    and e['command_id'] == pair['graph']['command_id']]
+        if (len(requests) != 1 or requests[0]['namespace_event_index'] <= readiness['namespace_event_index']
+                or not readiness['monotonic_ns'] <= requests[0]['requested_monotonic_ns']
+                <= requests[0]['monotonic_ns'] < deadline_ns
+                or any(not requests[0]['requested_monotonic_ns'] <= pair[kind]['monotonic_ns'] < deadline_ns
+                       for kind in ('snapshot', 'graph', 'ack'))):
+            raise RuntimeError('projection_graph_not_fresh_after_wire_readiness')
+
+
+def verify_projection_prefix_chain(capture, prefixes, policy):
+    """Reopen the inode-bound prefixes and independently validate the final pcap."""
+    from r2f.instrumentation.sedp import parse_sedp_capture, parse_sedp_capture_prefix
+    final = parse_sedp_capture(capture, field_policy=policy)
+    if final['diagnostics']:
+        raise RuntimeError('projection_final_wire_diagnostics')
+    verified = []
+    for prefix in prefixes:
+        if (Path(prefix['path']).resolve() != Path(final['raw']['path']).resolve()
+                or prefix['size'] > final['raw']['size']):
+            raise RuntimeError('projection_prefix_not_in_final_capture')
+        parsed = parse_sedp_capture_prefix(prefix, field_policy=policy)
+        if parsed['diagnostics']:
+            raise RuntimeError('projection_final_prefix_diagnostics')
+        verified.append({'raw_prefix': prefix, 'final_raw': final['raw'], 'verified': True})
+    return verified
+
+
 def namespace_body(request, owner_channel):
     from .namespace_pair import (OwnerCheckedPool, validate_host_leases, execution_chain_identity,
                                  same_source, probe_rtps_ports, write_profiles, CLOCK_GUARD_NS)
@@ -236,6 +371,9 @@ def namespace_body(request, owner_channel):
             endpoint = next(e for e in events if e['event'] == 'endpoint_created' and e['role'] == role)
             starts = [e for e in events if e['event'] == 'endpoint_create_begin' and e['role'] == role]
             if (len(starts) != 1 or endpoint['rmw_identifier'] != c['rmw'] or not endpoint.get('endpoint_gid')
+                    or type(starts[0].get('time_ns')) is not int
+                    or not re.fullmatch(r'[0-9a-fA-F]{32}(?:[0-9a-fA-F]{16})?', endpoint['endpoint_gid'])
+                    or any(starts[0].get(key) != endpoint.get(key) for key in ('pid', 'process_start_ticks', 'endpoint_generation'))
                     or not begin['monotonic_ns'] < starts[0]['monotonic_ns'] <= endpoint['monotonic_ns']
                     or endpoint['qos'] != c[role + '_qos']):
                 raise RuntimeError('projection_endpoint_identity_or_chronology_incomplete')
@@ -246,18 +384,30 @@ def namespace_body(request, owner_channel):
         receipt.update(applied=active, hit=active, effect_observed=active)
         emit('mutation_effect' if active else 'neutral_projection_control', effect_id='public_qos_configuration',
              mutation_receipt=dict(receipt), endpoint_refs={r: e['raw_event_ref'] for r, e in endpoints.items()})
-        deadline = time.monotonic() + c['projection_timeout_sec']
+        deadline_ns = time.monotonic_ns() + int(c['projection_timeout_sec'] * 10**9)
+        vendor = '0110' if c['rmw'] == 'rmw_cyclonedds_cpp' else '010f'
+        policy = {'protocol_defaults': True, 'vendor_versions': {'0110': '0.10.5', '010f': '2.14.7'},
+                  'vendor_provenance': {vendor: library_refs['writer']}}
+        starts = {role: next(e for e in events if e['event'] == 'endpoint_create_begin' and e['role'] == role)
+                  for role in ('writer', 'reader')}
+        prefixes = []
         while True:
-            graph_proof = query_acknowledged_graphs(pool, events, c['startup_timeout_sec'], emit)
+            readiness = wait_projection_readiness(observer, pool, endpoints, starts, begin['time_ns'],
+                                                 policy, deadline_ns, emit)
+            prefixes.append(readiness['raw_prefix'])
+            remaining = projection_live_budget(pool, deadline_ns)
+            graph_proof = query_acknowledged_graphs(pool, events, min(c['startup_timeout_sec'], remaining), emit)
+            projection_live_budget(pool, deadline_ns)
+            validate_projection_graph_chronology(graph_proof, events, readiness, deadline_ns)
             try:
                 graph = export_graph(graph_proof, endpoints, c['topic'], out / 'public-graph.json')
-                break
-            except RuntimeError:
-                if time.monotonic() >= deadline:
-                    raise
-                retry_at = time.monotonic() + .1
-                pool.wait(lambda: time.monotonic() >= retry_at, .3, 'projection_graph_retry')
-        exported = emit('projection_graph_exported', graph_snapshot=graph,
+            except RuntimeError as exc:
+                emit('projection_graph_retry', reason=str(exc), readiness_ref=readiness['raw_event_ref'])
+                pool.pump(min(.05, projection_live_budget(pool, deadline_ns)))
+                continue
+            projection_live_budget(pool, deadline_ns)
+            break
+        exported = emit('projection_graph_exported', graph_snapshot=graph, readiness_ref=readiness['raw_event_ref'],
             graph_receipts=[{'role': role, 'command_id': pair['graph']['command_id'],
                 'request_namespace_event_index': next(e['namespace_event_index'] for e in events
                     if e['event'] == 'graph_snapshot_requested' and e['role'] == role and e['command_id'] == pair['graph']['command_id']),
@@ -265,6 +415,7 @@ def namespace_body(request, owner_channel):
                 'match_namespace_event_index': pair['snapshot']['namespace_event_index'],
                 'ack_namespace_event_index': pair['ack']['namespace_event_index']}
                 for role, pair in graph_proof.items()])
+        projection_live_budget(pool, deadline_ns)
         window = {'start_ns': begin['time_ns'], 'end_ns': exported['time_ns']}
         end_offset = exported['time_ns'] - exported['monotonic_ns']
         start_offset = begin['time_ns'] - begin['monotonic_ns']
@@ -279,15 +430,15 @@ def namespace_body(request, owner_channel):
         if (capture.get('health', {}).get('status') != 'ok' or capture.get('thread_stopped') is not True
                 or capture.get('socket_closed') is not True):
             raise RuntimeError('projection_capture_health_incomplete')
-        vendor = '0110' if c['rmw'] == 'rmw_cyclonedds_cpp' else '010f'
-        policy = {'protocol_defaults': True, 'vendor_versions': {'0110': '0.10.5', '010f': '2.14.7'},
-                  'vendor_provenance': {vendor: library_refs['writer']}}
+        chain = verify_projection_prefix_chain(capture, prefixes, policy)
+        verified = emit('projection_prefix_chain_verified', prefix_chain=chain)
         observation = emit('projection_observation', capture_receipt=capture, graph_snapshot=graph,
             observation_window=window, field_policy=policy,
             lifecycle_namespace_event_indices={role: {
                 'begin': next(e['namespace_event_index'] for e in events if e['event'] == 'endpoint_create_begin' and e['role'] == role),
                 'return': endpoints[role]['namespace_event_index']} for role in ('writer', 'reader')},
-            graph_export_ref=exported['raw_event_ref'])
+            graph_export_ref=exported['raw_event_ref'], readiness_ref=readiness['raw_event_ref'],
+            prefix_chain_ref=verified['raw_event_ref'])
         if c['fault_id']:
             fault = controlled_graph(graph, capture, out / 'controlled-public-graph.json')
             emit('fault_control_receipt', **fault, projection_observation_ref=observation['raw_event_ref'])

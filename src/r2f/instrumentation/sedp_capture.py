@@ -21,6 +21,9 @@ import time
 from .rtps import BUILTIN_WRITERS, discovery_activity, rtps_submessages, udp_frame
 
 SCHEMA = 'r2f.passive-sedp-capture/v1'
+# Tool shutdown bounds; the capture spec and target deadlines are unchanged.
+STOP_DRAIN_TIMEOUT_SEC = 1.0
+MAX_DRAIN_EMPTY_ATTEMPTS = 64
 DEFAULT_LIMITS = {'timeout_sec': 120, 'max_bytes': 64 * 1024 * 1024, 'max_packets': 100000,
                   'snaplen': 65535, 'recv_buffer_bytes': 4 * 1024 * 1024,
                   'activity_limit': 4096}
@@ -329,6 +332,8 @@ class PassiveSedpObserver:
         self.output = Path(spec['output_dir'])
         self._lock = threading.RLock()
         self._stop_event = threading.Event()
+        self._drain = {'status': 'not_requested'}
+        self._raw_identity = None
         self._events = deque(maxlen=spec['limits']['activity_limit'])
         # Filtered-frame metadata is bounded by the capture packet limit. It is
         # intentionally separate from the retained pcap and never stores payloads.
@@ -352,6 +357,8 @@ class PassiveSedpObserver:
         self.output.mkdir(parents=True, exist_ok=True)
         try:
             self._raw = (self.output / 'normal-rtps.pcap').open('xb')
+            raw_stat = os.fstat(self._raw.fileno())
+            self._raw_identity = {'device': raw_stat.st_dev, 'inode': raw_stat.st_ino}
             self._index = (self.output / 'packet-index.jsonl').open('xb')
             self._filtered_index = (self.output / 'filtered-rtps-index.jsonl').open('xb')
             header = struct.pack('<IHHIIII', 0xa1b23c4d, 2, 4, 0, 0, self.spec['limits']['snaplen'], 1)
@@ -386,13 +393,54 @@ class PassiveSedpObserver:
 
     def _run(self):
         try:
-            while not self._stop_event.is_set():
+            while True:
+                if self._stop_event.is_set():
+                    with self._lock:
+                        if self._drain['status'] != 'requested':
+                            break
+                        if time.monotonic_ns() >= self._drain['deadline_monotonic_ns']:
+                            self._drain.update(status='incomplete', reason='drain_deadline')
+                            break
+                        if not self._drain.get('nonblocking'):
+                            # Only the receive thread changes its socket mode.
+                            self._socket.settimeout(0.0)
+                            self._drain['nonblocking'] = True
                 if time.monotonic() - self._started_monotonic >= self.spec['limits']['timeout_sec']:
                     self._limit_reason = 'timeout_sec'
                     break
                 try:
                     frame, ancillary, flags, address = self._socket.recvmsg(self.spec['limits']['snaplen'], 128, socket.MSG_TRUNC)
-                except socket.timeout:
+                except (socket.timeout, BlockingIOError):
+                    with self._lock:
+                        if self._stop_event.is_set() and self._drain['status'] == 'requested':
+                            if not self._drain.get('nonblocking'):
+                                # An in-flight blocking receive timed out. Switch mode
+                                # at the top, then obtain a nonblocking empty witness.
+                                continue
+                            empty = _now()
+                            boundary = self._packet_statistics()
+                            self._drain.update(empty_confirmed=empty, empty_statistics=boundary)
+                            unread = max(0, self._counters['kernel_packets'] - self._counters['kernel_drops']
+                                         - self._counters['frames_received'])
+                            self._drain['unread_packets_at_empty_boundary'] = unread
+                            self._drain['empty_attempts'].append({
+                                'empty_confirmed': empty, 'statistics': boundary,
+                                'unread_packets': unread, 'frames_received': self._counters['frames_received']})
+                            if time.monotonic_ns() >= self._drain['deadline_monotonic_ns']:
+                                self._drain.update(status='incomplete', reason='drain_deadline')
+                            elif boundary is None:
+                                self._drain.update(status='incomplete', reason='empty_statistics_unavailable')
+                            elif unread:
+                                # A packet arrived between EAGAIN and the sample.
+                                # Keep receiving within the same deadline, then
+                                # obtain another empty/statistics boundary.
+                                if len(self._drain['empty_attempts']) >= MAX_DRAIN_EMPTY_ATTEMPTS:
+                                    self._drain.update(status='incomplete', reason='drain_empty_attempt_limit')
+                                else:
+                                    continue
+                            else:
+                                self._drain.update(status='drained', reason='socket_empty')
+                            break
                     continue
                 # recvmsg with MSG_TRUNC still only returns snaplen bytes in Python;
                 # flag is retained, original length is unavailable on this API.
@@ -468,10 +516,32 @@ class PassiveSedpObserver:
         except Exception as exc:
             self._error = type(exc).__name__ + ':' + str(exc)
         finally:
+            with self._lock:
+                if self._drain['status'] == 'requested':
+                    self._drain.update(status='incomplete', reason=(
+                        'capture_limit:' + self._limit_reason if self._limit_reason else
+                        'capture_error' if self._error else 'capture_thread_ended'))
+                if self._drain['status'] != 'not_requested':
+                    self._drain.update(ended=_now(), frames_received_after_request=
+                        self._counters['frames_received'] - self._drain['frames_received_at_request'])
             self._stop_event.set()
+
+    def _packet_statistics(self):
+        """Read and reset PACKET_STATISTICS, retaining cumulative final counters."""
+        try:
+            kernel = self._socket.getsockopt(263, 6, 12)  # SOL_PACKET/PACKET_STATISTICS
+            values = struct.unpack('=' + 'I' * (len(kernel) // 4), kernel)
+            self._counters['kernel_packets'] += values[0]
+            self._counters['kernel_drops'] += values[1]
+            return {'packets': values[0], 'drops': values[1], 'sampled': _now()}
+        except OSError as exc:
+            self._error = (self._error + ';' if self._error else '') + 'packet_statistics:' + str(exc)
+            return None
 
     def _health(self):
         reasons = []
+        if self._drain['status'] not in ('not_requested', 'drained'):
+            reasons.append('capture_drain_incomplete:' + self._drain.get('reason', self._drain['status']))
         if self._error:
             reasons.append('capture_error:' + self._error)
         if self._limit_reason:
@@ -592,7 +662,8 @@ class PassiveSedpObserver:
                     'raw_prefix': {'path': str(self.output / 'normal-rtps.pcap'),
                                    'sha256': self._raw_digest.hexdigest(),
                                    'size': self._raw.tell() if self._raw is not None and not self._raw.closed else (self._stopped or {}).get('raw', {}).get('size'),
-                                   'final': self._stopped is not None},
+                                   'final': self._stopped is not None,
+                                   'file_identity': copy.deepcopy(self._raw_identity)},
                     'ready': copy.deepcopy(self._ready),
                     'assurance': 'wire transmit/control activity; not proof remote vendor installed endpoint'}
 
@@ -601,17 +672,32 @@ class PassiveSedpObserver:
             return copy.deepcopy(self._stopped)
         if self._ready is None:
             raise RuntimeError('capture_not_started')
-        self._stop_event.set()
-        self._thread.join(timeout=2)
+        with self._lock:
+            requested = _now()
+            self._drain = {'status': 'requested', 'request': requested, 'empty_attempts': [],
+                           'cutoff_unix_ns': requested['unix_ns'],
+                           'deadline_monotonic_ns': requested['monotonic_ns'] + int(STOP_DRAIN_TIMEOUT_SEC * 10**9),
+                           'frames_received_at_request': self._counters['frames_received']}
+            if not self._thread.is_alive():
+                self._drain.update(status='incomplete', reason='capture_thread_ended_before_request',
+                                   ended=_now(), frames_received_after_request=0)
+            self._stop_event.set()
+        self._thread.join(timeout=STOP_DRAIN_TIMEOUT_SEC + 1.0)
         if self._thread.is_alive():
             raise RuntimeError('capture_thread_did_not_stop')
         with self._lock:
-            try:
-                kernel = self._socket.getsockopt(263, 6, 12)  # SOL_PACKET/PACKET_STATISTICS
-                vals = struct.unpack('=' + 'I' * (len(kernel) // 4), kernel)
-                self._counters.update(kernel_packets=vals[0], kernel_drops=vals[1])
-            except OSError as exc:
-                self._error = (self._error + ';' if self._error else '') + 'packet_statistics:' + str(exc)
+            final_statistics = self._packet_statistics()
+            self._drain['close_statistics'] = final_statistics
+            self._drain['kernel_unread_packets_at_stop'] = max(0,
+                self._counters['kernel_packets'] - self._counters['kernel_drops'] - self._counters['frames_received'])
+            if self._drain['status'] == 'drained' and final_statistics is not None:
+                # PACKET_STATISTICS resets at the empty boundary. These arrivals
+                # are causally after that boundary and outside request cutoff.
+                self._drain['post_empty_packets'] = final_statistics['packets']
+                self._drain['post_empty_drops'] = final_statistics['drops']
+                self._drain['post_empty_scope'] = 'after_empty_statistics_outside_request_cutoff'
+            else:
+                self._drain['post_empty_scope'] = 'unresolved_no_complete_empty_boundary'
             self._socket.close()
             for f in (self._raw, self._index, self._filtered_index):
                 f.flush()
@@ -626,10 +712,15 @@ class PassiveSedpObserver:
                                  'sha256': self._filtered_digest.hexdigest(),
                                  'records': len(self._filtered), 'overflow': self._filtered_overflow},
                              'counters': dict(self._counters), 'diagnostics': dict(self._diagnostics),
+                             'drain': copy.deepcopy(self._drain),
+                             'complete_through_unix_ns': (self._drain['cutoff_unix_ns']
+                                 if self._drain['status'] == 'drained' and self._error is None else None),
                              'error': self._error, 'limit_reason': self._limit_reason,
                              'thread_stopped': True, 'socket_closed': True,
                              'participant_created': False, 'packet_transmission': False}
             self._stopped['health'] = self._health()
+            if self._stopped['health']['status'] != 'ok':
+                self._stopped['complete_through_unix_ns'] = None
             with (self.output / 'capture-receipt.json').open('x') as f:
                 json.dump(self._stopped, f, indent=2, sort_keys=True)
                 f.write('\n')

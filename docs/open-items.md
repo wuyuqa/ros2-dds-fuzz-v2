@@ -1,6 +1,6 @@
 # 待核实事项与证据更新
 
-最新快照指引（2026-11-15）：下文旧 source 的 seal、开发状态及待办均按各节历史身份解读；当前以[末尾 f576 历史矩阵与 b891 development smoke 快照](#current-capture-snapshot)为准，b891 smoke 为3真实通过、1启动前阻断且已清理，PermissionError复核修复的代码owner freeze与main独立验证均通过，仍待提交冻结、新四格 smoke及正式四target重跑。
+最新快照指引（2026-11-15）：下文旧 source 的 seal、开发状态及待办均按各节历史身份解读；当前以[末尾 cf507 正式矩阵与 projection 修复快照](#current-capture-snapshot)为准：cf507前三target各自seal=true、projection seal=false且已完整清理；九文件修复的整合full已由Hooke执行并经main读盘审核通过，本次审计时尚待提交冻结及新运行GO，candidate0/required72不变。
 
 日期：2026-11-14。初始状态不假设阻塞。以下项目来自原规格审阅、主agent工程核对和派遣消息，尚未等同于本机运行结论。主agent要求继续全部 S1 scope；工程未知须经真实检查后更新，不能现在认定不可解。
 
@@ -153,7 +153,7 @@ Ptolemy 的 runner/replay receipt 透传修复已落盘；[主agent独立修复�
 
 <a id="current-capture-snapshot"></a>
 
-### f576 历史矩阵与 b891 capture / development smoke 快照（2026-11-15）
+### cf507 正式矩阵与当前 projection 修复快照（2026-11-15）
 
 历史正式矩阵 source HEAD=`f57656c4a11546ea88935d3eece176b6e80d1260`、behavior=`0fd868f4bb14466efe0bf636e22cee6f2069a9cd46ed5920b27a868228524771`，执行至 cleanup 身份保持冻结，domain80、两 RMW；[独立中止审计与逐格 raw/capture hashes](../results/final-validation/stop-review-20261115T011711Z-556e7e3a/executor-stop-audit.json)保留全部计数。
 
@@ -168,19 +168,36 @@ Ptolemy 的 runner/replay receipt 透传修复已落盘；[主agent独立修复�
 
 [owner 测试](../results/capture-compatibility/fastdds-statistics-20261115T013420Z/validation.json)为 capture **44 / 1.545s**、projection/recovery **59 / 5.583s**、full **366 / 71.328s**，均 OK；[主agent独立最终审计](../results/main-review/statistics-final-audit-20261115T095221-e021ac1d/review.json)及[测试日志](../results/main-review/statistics-final-audit-20261115T095221-e021ac1d/unittest.stderr.log)记录 **366 tests / 69.843s OK**、source/两文件 hash 前后不变、diff-check=0、89 Python AST通过，四 target manifest hash 不变。上述 capture 修复随后提交为 HEAD=`b891355705a7e43b420c712bfc336ceb8afb83be`、behavior=`8c87773b0e3c14c91e021e701d63fed7c9dd07df87681e202c581873d138e011`；以下 smoke 执行及 cleanup 时 source_frozen=true、dirty=[]，通过只支持 b891 历史身份。
 
-[本次 development smoke summary](../results/final-validation/capture-compat-smoke-20261115T012416Z-fd137f60/runs/smoke-20261115T015930Z-90a39028/summary.json)与[main独立结果审计](../results/main-review/smoke-outcome-audit-20261115T100430-85f8e97a/review.json)确认 domain80、4 attempts = 3真实 judged/pass + 1启动前 blocked，driver rc1；development=true、not_formal=true、seal=false，不伪造control支持。结果如下：
+[b891 历史 development smoke summary](../results/final-validation/capture-compat-smoke-20261115T012416Z-fd137f60/runs/smoke-20261115T015930Z-90a39028/summary.json)与[main独立结果审计](../results/main-review/smoke-outcome-audit-20261115T100430-85f8e97a/review.json)确认 domain80、4 attempts = 3真实 judged/pass + 1启动前 blocked，driver rc1；development=true、not_formal=true、seal=false，不伪造control支持。结果如下：
 
 | b891 smoke cell | 实际证据 |
 |---|---|
 | third Cyclone / mutated.0 | 真实 drop hit 195；restore身份关联、fresh match/graph、capture health与oracle均通过。 |
 | third FastDDS / mutated.0 | 真实 drop hit 420；restore身份关联、fresh match/graph、capture health与oracle均通过；保留2,952个statistics footer及36个other_builtin submessage，未算作额外SPDP/SEDP hit。 |
 | fourth Cyclone / transparent.0 | 真实独立wire/graph两端点、18项比较一致，capture health=ok、oracle pass。 |
-| fourth FastDDS / transparent.0 | preflight因 `domain_conflict:old_campaign_or_process_owner` 阻断，process_scan为conflicts=[]、unreadable_same_uid_pids=[2191331]；real_execution=false，无ROS workers/pcap/capsule execution，aborted/unknown是工具门结果，非SUT候选。本次尚无FastDDS真实projection证据。 |
+| fourth FastDDS / transparent.0 | preflight因 `domain_conflict:old_campaign_or_process_owner` 阻断，process_scan为conflicts=[]、unreadable_same_uid_pids=[2191331]；real_execution=false，无ROS workers/pcap/capsule execution，aborted/unknown是工具门结果，非SUT候选。该 b891 smoke 尚无FastDDS真实projection证据。 |
 
 [executor逐格证据与清理](../results/final-validation/smoke-launch-20261115T015930Z-0bcaee9e/executor-final-audit.json)保存raw/pcap hashes、typed facts/oracle及receipt：四格config/capsule确定性input receipts一致，前三格capsule execution已绑定；6个实际workers均rc0，全部cleanup=true、无intervention或残留，每格26项预期runtime锁路径检查通过，已存在锁均未持有且无活owner，未使用路径不存在、ports27400–27649空闲、driver退出、串行窗口已释放，44个未选cell保持计划。[owner closeout](../results/final-validation/smoke-closeout-20261115T020428Z-c125a5b3/closeout.json) SHA256=`7747c1b79d07984633de90b39dabe6e5743a3290c3d6904b380656dca413a2bd`；未重试或改写旧batch。PID2191331归属及本次精确根因无法确认，不能认定属于其他agent。
 
-Ptolemy仅修改 `src/r2f/runtime/domains.py` / `tests/test_runtime_contract.py`，已给出[两文件owner freeze与验证](../results/process-scan-exit-race/20261115T020712Z-5b8d63c5/after.json)（SHA256=`1168ddb908100a86b36787407f0e138d95f646a857d91cf47e536f778bd786bd`）：targeted **32 tests / 0.193s OK**、full **376 tests / 67.170s OK**，测试前后source/两文件hash不变。PermissionError后有界二次核验仅排除已确认退出或同身份Z；存活、不可验证、身份冲突及PID复用继续block。[受控真实/proc交错探针](../results/process-scan-exit-race/20261115T020712Z-5b8d63c5/proc-probe.json)6个child均实际触发PermissionError并正常退出：旧HEAD对persistent live、Z、消失均blocked，新树仅确认Z/消失时排除，persistent live仍blocked。该探针非自然竞态采样，**不证明历史PID2191331归属或本次精确根因**，旧smoke阻断证据不改。
+该轮Ptolemy仅修改 `src/r2f/runtime/domains.py` / `tests/test_runtime_contract.py`，已给出[两文件owner freeze与验证](../results/process-scan-exit-race/20261115T020712Z-5b8d63c5/after.json)（SHA256=`1168ddb908100a86b36787407f0e138d95f646a857d91cf47e536f778bd786bd`）：targeted **32 tests / 0.193s OK**、full **376 tests / 67.170s OK**，测试前后source/两文件hash不变。PermissionError后有界二次核验仅排除已确认退出或同身份Z；存活、不可验证、身份冲突及PID复用继续block。[受控真实/proc交错探针](../results/process-scan-exit-race/20261115T020712Z-5b8d63c5/proc-probe.json)6个child均实际触发PermissionError并正常退出：旧HEAD对persistent live、Z、消失均blocked，新树仅确认Z/消失时排除，persistent live仍blocked。该探针非自然竞态采样，**不证明历史PID2191331归属或本次精确根因**，旧smoke阻断证据不改。
 
-[main独立最终全仓审计](../results/main-review/process-scan-final-audit-20261115T101622-1eb1e9fe/review.json)及[测试日志](../results/main-review/process-scan-final-audit-20261115T101622-1eb1e9fe/unittest.stderr.log)确认 **376 tests / 67.721s OK**、source/4代码测试文件hash前后不变、diff-check=0、89 Python AST通过、四target manifest hash不变。[main在全新目录独立复跑受控/proc探针](../results/main-review/process-scan-probe-audit-20261115T101744-f0fed0eb/review.json)同样6/6真实PermissionError、全部child rc0、无forced cleanup，修复只放行确认Z/gone，live继续blocked；该结果仍不证明历史PID根因。**代码owner freeze与main独立验证均通过，三docs最终freeze；待提交freeze、新完整4-cell smoke及正式四target。**
+[main独立最终全仓审计](../results/main-review/process-scan-final-audit-20261115T101622-1eb1e9fe/review.json)及[测试日志](../results/main-review/process-scan-final-audit-20261115T101622-1eb1e9fe/unittest.stderr.log)确认 **376 tests / 67.721s OK**、source/4代码测试文件hash前后不变、diff-check=0、89 Python AST通过、四target manifest hash不变。[main在全新目录独立复跑受控/proc探针](../results/main-review/process-scan-probe-audit-20261115T101744-f0fed0eb/review.json)同样6/6真实PermissionError、全部child rc0、无forced cleanup，修复只放行确认Z/gone，live继续blocked；该结果仍不证明历史PID根因。该轮修复及三docs随后提交为 HEAD=`cf507e8210b7326a4f8f4838045028a398770778`、behavior=`b256dd4d2ff8f2dcd9552862db0a538573ce777801bafc99b153bdf6a2044ec1`。[cf507独立smoke审计](../results/main-review/smoke-pass-audit-20261115T022508360Z-014b796a/review.json)确认四格actual/judged/pass、8 workers rc0、cleanup通过；该development证据不计正式成熟。
 
-当前HEAD仍为b891，修复树behavior=`b256dd4d2ff8f2dcd9552862db0a538573ce777801bafc99b153bdf6a2044ec1`、source_frozen=false（dirty behavior为domains.py）；owner代码freeze不等于source已提交冻结，capture两文件仍匹配原78b6963e… / 999be095… hash，辅助保持冻结。待单独提交GO及新source冻结后，以新GO完整重跑四格development smoke，再由main审核并另发正式四target GO；f576 first2与b891三格历史通过均不迁移至新source。正式四target、F07、Phase2–4在新source仍待验收，自然candidate **0**、完整required分母 **72** 不变。
+cf507正式batch为 [`batch-20261115T022650Z-3e2cd9c7`](../results/final-validation/batch-20261115T022650Z-3e2cd9c7/summary.json)，revision0、domain80、两RMW；执行至cleanup时source_frozen=true、dirty=[]。[main独立结果审计](../results/main-review/formal-outcome-audit-20261115T024414000Z-e44427b7/review.json)确认：
+
+| cf507 target | 正式实际结果 |
+|---|---|
+| [discovery.late_endpoint](../results/final-validation/batch-20261115T022650Z-3e2cd9c7/01-discovery.late_endpoint/summary.json) | 18 required pass + 6预期negative fail；seal=true，runner/verify rc0、audit/cleanup通过，四control各6/6、unknown0；正常18格均blackbox_observed、errors=[]。 |
+| [discovery.late_join_delivery](../results/final-validation/batch-20261115T022650Z-3e2cd9c7/02-discovery.late_join_delivery/summary.json) | 18 required pass + 6预期negative fail；seal=true，runner/verify rc0、audit/cleanup通过，四control各6/6、unknown0；正常18格均blackbox_observed、errors=[]。 |
+| [discovery.interruption_recovery](../results/final-validation/batch-20261115T022650Z-3e2cd9c7/03-discovery.interruption_recovery/summary.json) | 18 required pass + 6预期negative fail；seal=true，runner/verify rc0、audit/cleanup通过，四control各6/6、unknown0。 |
+| [builtin.discovery_projection_reconciliation](../results/final-validation/batch-20261115T022650Z-3e2cd9c7/04-builtin.discovery_projection_reconciliation/summary.json) | 17 required pass + 1 unknown；5预期negative fail + 1 aborted/unknown；seal=false，runner/verify rc1；health/transparency/fault各5/6、mutation6/6，24格capture health均ok，cleanup通过。 |
+
+第四target的FastDDS `baseline.2`因 `no_live_wire_endpoint_at_graph_snapshot:010f7f01fc949e600100000000000604` 判judged/unknown；`negative.1`因 `projection fault original source comparison not healthy` 为aborted/unknown，未满足预期fault control。[完整pcap逐端点只读审计](../results/readonly-review/projection-wire-timing-20261115T024241Z-ad78d35f/report.json)确认：前者缺reader完整GUID `010f7f01fc949e600100000000000604`，后者缺writer完整GUID `010f7f0140a782750000000000000603`；各自整份留存pcap（含16字节GUID直接搜索）均未见对应GUID，不能说公告出现在graph之后，也不能断言未读队列含该缺失公告。prefix、role对应builtin writer活动不能替代实际完整endpoint证据；上述为观察闭环缺口，非SUT候选。
+
+[executor最终审计与逐target清理](../results/final-validation/formal-launch-20261115T022650Z-7b0c97d6/executor-final-audit.json)保留96份真实runtime/raw及capsule execution、95 judged + 1 aborted、192 workers全部rc0，driver rc1且已退出；四target cleanup均true、无intervention/残留，逐target26项预期runtime锁路径检查通过，已存在锁均未持有且无活owner，未使用路径不存在，ports27400–27649空闲、owner锁释放、串行窗口已交还。未重试，原batch的raw/hash、health、verdict及seal均保持不变；前三target seal仅支持cf507身份，整份formal batch未通过。
+
+本次整合审计时，HEAD=`cf507e8210b7326a4f8f4838045028a398770778`、behavior=`28146d394ffdea9bd44b665d130fa80a78a05ca12029c0acfbeff7c165bbef6e`，九文件projection/capture修复尚未提交、source_frozen=false。修复要求实际完整endpoint GUID/role/live wire readiness成立后再取全新graph；读取hash绑定、允许尾部追加的pcap prefix，并将prefix与最终capture证据分开；stop执行有界drain，只有覆盖窗口末尾的 `complete_through` cutoff才允许形成完整观察，超时或覆盖不足继续unknown。[capture prefix/drain owner freeze](../results/observer-tools/prefix-drain-20261115T025326Z/freeze.json)及[Ptolemy四文件最终freeze](../results/projection-endpoint-readiness/20261115T031100Z-final-api-d3fc07ac/freeze.json)保留实现与定向证据，后者 **59 tests / 2.930s OK**（freeze SHA256=`456d23521cfd1afa1728f35dd0e460e04a43219bb58a364f8d42321b3cbbe90d`）。
+
+[最终整合离线审计](../results/main-review/prefix-readiness-integration-20261115T032013Z-78e48c96/summary.json)由main派遣Hooke执行、main读盘复核通过，overall_pass=true：唯一全仓 **407 tests / 90.333s OK、rc0**，90 Python AST通过、diff-check=0；九文件SHA与owner freeze一致，九文件hash、全source inventory/behavior及四target manifest前后均一致。代码owner freeze与最终主审核均通过，没有发现需要改业务代码的问题；该审计未启动ROS或replay，不形成新source的正式seal。提交后behavior应保持上述 `28146d39…` 身份。
+
+本次提交前快照收束时尚无commit或新ROS GO；后续须另获提交GO、冻结新source并获明确运行GO后重新验收，cf507及更早source的通过不迁移。新source正式四target、F07、Phase2–4及supplement均待验收，自然candidate **0**、完整required分母 **72** 不变，未宣称整个用户目标完成。

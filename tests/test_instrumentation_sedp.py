@@ -5,11 +5,12 @@ from pathlib import Path
 import socket
 import struct
 import tempfile
+import threading
 import time
 import unittest
 from unittest.mock import patch
 
-from r2f.instrumentation.sedp import PassiveSedpObserver, build_capture_spec, parse_sedp_capture
+from r2f.instrumentation.sedp import PassiveSedpObserver, build_capture_spec, parse_sedp_capture, parse_sedp_capture_prefix
 from r2f.instrumentation.rtps import discovery_activity, udp_frame
 from r2f.instrumentation.sedp_capture import _rtps_metadata
 from r2f.instrumentation.sedp_wire import read_capture
@@ -142,19 +143,25 @@ class FakeSocket:
         self.frames = list(frames)
         self.closed = False
         self.statistics_error = statistics_error
+        self.delivered = 0
+        self.stat_packets_seen = 0
+        self.timeout = None
 
     def setsockopt(self, *a): pass
     def bind(self, *a): pass
-    def settimeout(self, *a): pass
+    def settimeout(self, value): self.timeout = value
 
     def recvmsg(self, *a):
         if self.frames:
             item = self.frames.pop(0)
+            self.delivered += 1
             packet, stamp = item[:2]
             flags = item[2] if len(item) > 2 else 0
             stamp = time.time_ns() if stamp is None else stamp
             ancillary = [(socket.SOL_SOCKET, 35, struct.pack('=qq', stamp // 10**9, stamp % 10**9))]
             return packet, ancillary, flags, ('lo', 0, 4, 0, b'')
+        if self.timeout == 0.0:
+            raise BlockingIOError()
         time.sleep(.005)
         raise socket.timeout()
 
@@ -163,7 +170,10 @@ class FakeSocket:
             return 8 * 1024 * 1024
         if self.statistics_error:
             raise OSError('unavailable statistics')
-        return struct.pack('=III', 2, 0, 0)
+        total = self.delivered + len(self.frames)
+        packets = total - self.stat_packets_seen
+        self.stat_packets_seen = total
+        return struct.pack('=III', packets, 0, 0)
 
     def close(self): self.closed = True
 
@@ -908,6 +918,252 @@ class PassiveCaptureContracts(unittest.TestCase):
                 observer.start(); stopped = observer.stop()
             self.assertEqual(stopped['health']['status'], 'degraded')
             self.assertIn('packet_statistics', stopped['error'])
+
+
+    def test_stop_drains_frames_queued_at_request_and_preserves_final_artifacts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            observer = PassiveSedpObserver(self.spec(Path(tmp)))
+            entered = threading.Event()
+            class QueuedSocket(FakeSocket):
+                def recvmsg(self, *args):
+                    entered.set()
+                    if not observer._stop_event.wait(1):
+                        raise socket.timeout()
+                    return super().recvmsg(*args)
+            packets = [frame(), frame(prefix=OTHER)]
+            fake = QueuedSocket([(p, None) for p in packets])
+            with patch('r2f.instrumentation.sedp_capture.validate_capture_namespace', return_value={}), patch('r2f.instrumentation.sedp_capture.socket.socket', return_value=fake):
+                observer.start()
+                self.assertTrue(entered.wait(1))
+                before = observer.snapshot_activity(since_ns=observer.ready['unix_ns'], participant_prefixes=[PREFIX])
+                self.assertFalse(parse_sedp_capture_prefix(before['raw_prefix'])['events'])
+                stopped = observer.stop()
+                self.assertEqual(observer.stop(), stopped)
+            self.assertEqual(stopped['drain']['status'], 'drained')
+            self.assertEqual(stopped['drain']['reason'], 'socket_empty')
+            self.assertEqual(stopped['drain']['frames_received_after_request'], 2)
+            self.assertEqual(stopped['drain']['kernel_unread_packets_at_stop'], 0)
+            self.assertEqual(stopped['drain']['cutoff_unix_ns'], stopped['drain']['request']['unix_ns'])
+            self.assertLessEqual(stopped['drain']['request']['monotonic_ns'], stopped['drain']['empty_confirmed']['monotonic_ns'])
+            self.assertEqual(stopped['health']['status'], 'ok')
+            self.assertTrue(stopped['thread_stopped'] and stopped['socket_closed'] and fake.closed)
+            _, records, diagnostics = read_capture(stopped)
+            self.assertFalse(diagnostics)
+            self.assertEqual([r['frame'] for r in records], packets)
+            for name in ('raw', 'index', 'filtered_rtps_index'):
+                self.assertEqual(hashlib.sha256(Path(stopped[name]['path']).read_bytes()).hexdigest(), stopped[name]['sha256'])
+
+    def test_live_snapshot_prefix_is_inode_bound_and_append_parseable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            observer = PassiveSedpObserver(self.spec(Path(tmp)))
+            fake = FakeSocket([(frame(), None)])
+            with patch('r2f.instrumentation.sedp_capture.validate_capture_namespace', return_value={}), patch('r2f.instrumentation.sedp_capture.socket.socket', return_value=fake):
+                observer.start()
+                deadline = time.monotonic() + 1
+                while observer._counters['packets_written'] < 1 and time.monotonic() < deadline: time.sleep(.001)
+                snapshot = observer.snapshot_activity(since_ns=observer.ready['unix_ns'], participant_prefixes=[PREFIX])
+                raw = snapshot['raw_prefix']
+                self.assertFalse(raw['final'])
+                self.assertEqual(raw['file_identity']['inode'], Path(raw['path']).stat().st_ino)
+                first = parse_sedp_capture_prefix(raw)
+                fake.frames.append((frame(prefix=OTHER), None))
+                deadline = time.monotonic() + 1
+                while observer._counters['packets_written'] < 2 and time.monotonic() < deadline: time.sleep(.001)
+                observer.snapshot_activity(since_ns=observer.ready['unix_ns'], participant_prefixes=[PREFIX])
+                self.assertEqual(parse_sedp_capture_prefix(raw), first)
+                self.assertEqual(len(first['activity']), 1)
+                stopped = observer.stop()
+            self.assertEqual(stopped['counters']['packets_written'], 2)
+            self.assertEqual(stopped['drain']['status'], 'drained')
+
+    def test_continuously_busy_stop_is_bounded_and_incomplete(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            observer = PassiveSedpObserver(self.spec(Path(tmp)))
+            entered = threading.Event()
+            class BusySocket(FakeSocket):
+                def recvmsg(self, *args):
+                    entered.set()
+                    self.frames.append((frame(), None))
+                    return super().recvmsg(*args)
+            fake = BusySocket([])
+            with patch('r2f.instrumentation.sedp_capture.validate_capture_namespace', return_value={}), patch('r2f.instrumentation.sedp_capture.socket.socket', return_value=fake), patch('r2f.instrumentation.sedp_capture.STOP_DRAIN_TIMEOUT_SEC', .03):
+                observer.start()
+                self.assertTrue(entered.wait(1))
+                start = time.monotonic()
+                stopped = observer.stop()
+                self.assertLess(time.monotonic() - start, 1)
+            self.assertEqual(stopped['drain']['status'], 'incomplete')
+            self.assertEqual(stopped['drain']['reason'], 'drain_deadline')
+            self.assertIsNone(stopped['complete_through_unix_ns'])
+            self.assertEqual(stopped['health']['status'], 'degraded')
+            self.assertIn('capture_drain_incomplete:drain_deadline', stopped['health']['reasons'])
+            self.assertGreater(stopped['counters']['packets_written'], 0)
+            self.assertTrue(stopped['socket_closed'] and stopped['thread_stopped'])
+
+    def test_empty_to_statistics_arrival_is_drained_then_boundary_retried(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            observer = PassiveSedpObserver(self.spec(Path(tmp)))
+            class BoundaryArrivalSocket(FakeSocket):
+                injected = False
+                def recvmsg(self, *args):
+                    observer._stop_event.wait(1)
+                    return super().recvmsg(*args)
+                def getsockopt(self, level, option, *args):
+                    if level != socket.SOL_SOCKET and not self.injected:
+                        self.frames.append((frame(), None))
+                        self.injected = True
+                    return super().getsockopt(level, option, *args)
+            fake = BoundaryArrivalSocket([])
+            with patch('r2f.instrumentation.sedp_capture.validate_capture_namespace', return_value={}), patch('r2f.instrumentation.sedp_capture.socket.socket', return_value=fake):
+                observer.start()
+                stopped = observer.stop()
+            self.assertEqual(stopped['drain']['status'], 'drained')
+            self.assertEqual([a['unread_packets'] for a in stopped['drain']['empty_attempts']], [1, 0])
+            self.assertEqual(stopped['drain']['frames_received_after_request'], 1)
+            self.assertEqual(stopped['counters']['packets_written'], 1)
+            self.assertEqual(stopped['counters']['kernel_packets'], 1)
+            self.assertEqual(stopped['drain']['kernel_unread_packets_at_stop'], 0)
+            self.assertEqual(stopped['complete_through_unix_ns'], stopped['drain']['cutoff_unix_ns'])
+            self.assertEqual(stopped['health']['status'], 'ok')
+            self.assertEqual(read_capture(stopped)[1][0]['frame'], frame())
+
+    def test_after_empty_arrival_is_recorded_outside_request_cutoff(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            observer = PassiveSedpObserver(self.spec(Path(tmp)))
+            boundary_sampled, late_arrived = threading.Event(), threading.Event()
+            class AfterEmptySocket(FakeSocket):
+                samples = 0
+                def recvmsg(self, *args):
+                    observer._stop_event.wait(1)
+                    return super().recvmsg(*args)
+                def getsockopt(self, level, option, *args):
+                    if level == socket.SOL_SOCKET: return super().getsockopt(level, option, *args)
+                    self.samples += 1
+                    if self.samples == 2 and not late_arrived.wait(1):
+                        raise AssertionError('producer failed to deliver after boundary')
+                    sample = super().getsockopt(level, option, *args)
+                    if self.samples == 1: boundary_sampled.set()
+                    return sample
+            fake = AfterEmptySocket([(frame(), None)])
+            def producer():
+                if boundary_sampled.wait(1):
+                    fake.frames.append((frame(prefix=OTHER), None))
+                    late_arrived.set()
+            producer_thread = threading.Thread(target=producer)
+            producer_thread.start()
+            with patch('r2f.instrumentation.sedp_capture.validate_capture_namespace', return_value={}), patch('r2f.instrumentation.sedp_capture.socket.socket', return_value=fake):
+                observer.start()
+                stopped = observer.stop()
+            producer_thread.join(timeout=1)
+            self.assertFalse(producer_thread.is_alive())
+            self.assertTrue(late_arrived.is_set())
+            self.assertEqual(stopped['drain']['status'], 'drained')
+            self.assertEqual(stopped['drain']['unread_packets_at_empty_boundary'], 0)
+            self.assertEqual(stopped['drain']['post_empty_packets'], 1)
+            self.assertEqual(stopped['drain']['kernel_unread_packets_at_stop'], 1)
+            self.assertEqual(stopped['counters']['kernel_packets'], 2)
+            self.assertEqual(stopped['counters']['frames_received'], 1)
+            self.assertEqual(stopped['complete_through_unix_ns'], stopped['drain']['cutoff_unix_ns'])
+            self.assertLess(stopped['complete_through_unix_ns'], stopped['unix_ns'])
+            self.assertEqual(stopped['health']['status'], 'ok')
+            self.assertEqual(len(read_capture(stopped)[1]), 1)
+
+    def test_periodic_producer_needs_no_quiet_interval_for_nonblocking_empty(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            observer = PassiveSedpObserver(self.spec(Path(tmp)))
+            class PeriodicSocket(FakeSocket):
+                next_packet = 0
+                changes = []
+                def settimeout(self, value):
+                    self.changes.append((value, threading.current_thread().name))
+                    super().settimeout(value)
+                def recvmsg(self, *args):
+                    observer._stop_event.wait(1)
+                    now = time.monotonic()
+                    if self.timeout == 0.0 and now < self.next_packet:
+                        raise BlockingIOError()
+                    # A blocking drain would keep waiting for each next packet.
+                    if now < self.next_packet: time.sleep(self.next_packet - now)
+                    self.next_packet = time.monotonic() + .02
+                    self.frames.append((frame(), None))
+                    return super().recvmsg(*args)
+            fake = PeriodicSocket([])
+            with patch('r2f.instrumentation.sedp_capture.validate_capture_namespace', return_value={}), patch('r2f.instrumentation.sedp_capture.socket.socket', return_value=fake), patch('r2f.instrumentation.sedp_capture.STOP_DRAIN_TIMEOUT_SEC', .1):
+                observer.start()
+                stopped = observer.stop()
+            self.assertEqual(stopped['drain']['status'], 'drained')
+            self.assertTrue(stopped['drain']['nonblocking'])
+            self.assertEqual(stopped['counters']['packets_written'], 1)
+            self.assertIn((0.0, 'r2f-passive-sedp'), fake.changes)
+            self.assertEqual(stopped['health']['status'], 'ok')
+
+    def test_empty_confirmation_after_deadline_is_incomplete(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            observer = PassiveSedpObserver(self.spec(Path(tmp)))
+            class SlowEmptySocket(FakeSocket):
+                def recvmsg(self, *args):
+                    observer._stop_event.wait(1)
+                    if self.timeout == 0.0: time.sleep(.03)
+                    raise socket.timeout()
+            fake = SlowEmptySocket([])
+            with patch('r2f.instrumentation.sedp_capture.validate_capture_namespace', return_value={}), patch('r2f.instrumentation.sedp_capture.socket.socket', return_value=fake), patch('r2f.instrumentation.sedp_capture.STOP_DRAIN_TIMEOUT_SEC', .01):
+                observer.start()
+                stopped = observer.stop()
+            self.assertEqual(stopped['drain']['status'], 'incomplete')
+            self.assertEqual(stopped['drain']['reason'], 'drain_deadline')
+            self.assertIsNone(stopped['complete_through_unix_ns'])
+            self.assertEqual(stopped['health']['status'], 'degraded')
+            self.assertGreaterEqual(stopped['drain']['empty_confirmed']['monotonic_ns'], stopped['drain']['deadline_monotonic_ns'])
+
+    def test_capture_timeout_during_drain_is_still_enforced(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            observer = PassiveSedpObserver(self.spec(Path(tmp), limits={'timeout_sec': .02}))
+            entered = threading.Event()
+            class BusySocket(FakeSocket):
+                def recvmsg(self, *args):
+                    entered.set()
+                    self.frames.append((frame(), None))
+                    return super().recvmsg(*args)
+            fake = BusySocket([])
+            with patch('r2f.instrumentation.sedp_capture.validate_capture_namespace', return_value={}), patch('r2f.instrumentation.sedp_capture.socket.socket', return_value=fake):
+                observer.start()
+                self.assertTrue(entered.wait(1))
+                stopped = observer.stop()
+            self.assertEqual(stopped['limit_reason'], 'timeout_sec')
+            self.assertEqual(stopped['drain']['status'], 'incomplete')
+            self.assertIn('capture_limit:timeout_sec', stopped['health']['reasons'])
+            self.assertTrue(stopped['thread_stopped'] and stopped['socket_closed'])
+
+    def test_stop_resource_limit_or_packets_arriving_after_empty_stay_incomplete(self):
+        for mode in ('limit', 'late_packets'):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as tmp:
+                observer = PassiveSedpObserver(self.spec(Path(tmp), limits={'max_packets': 1} if mode == 'limit' else {}))
+                class QueuedSocket(FakeSocket):
+                    def recvmsg(self, *args):
+                        observer._stop_event.wait(1)
+                        return super().recvmsg(*args)
+                    def getsockopt(self, level, option, *args):
+                        if mode == 'late_packets' and level != socket.SOL_SOCKET:
+                            total = self.delivered + 1
+                            packets = total - self.stat_packets_seen
+                            self.stat_packets_seen = total
+                            return struct.pack('=III', packets, 0, 0)
+                        return super().getsockopt(level, option, *args)
+                fake = QueuedSocket([(frame(), None)] * (3 if mode == 'limit' else 1))
+                with patch('r2f.instrumentation.sedp_capture.validate_capture_namespace', return_value={}), patch('r2f.instrumentation.sedp_capture.socket.socket', return_value=fake):
+                    observer.start()
+                    stopped = observer.stop()
+                self.assertEqual(stopped['drain']['status'], 'incomplete')
+                self.assertEqual(stopped['drain']['kernel_unread_packets_at_stop'], 1)
+                self.assertEqual(stopped['health']['status'], 'degraded')
+                self.assertEqual(stopped['counters']['packets_written'], 1)
+                self.assertTrue(stopped['socket_closed'] and stopped['thread_stopped'])
+                if mode == 'limit': self.assertIn('capture_limit:max_packets', stopped['health']['reasons'])
+                else:
+                    self.assertIn('empty_confirmed', stopped['drain'])
+                    self.assertEqual(stopped['drain']['reason'], 'drain_empty_attempt_limit')
+                    self.assertIsNone(stopped['complete_through_unix_ns'])
+                    self.assertEqual(stopped['drain']['post_empty_scope'], 'unresolved_no_complete_empty_boundary')
 
     def test_existing_artifact_is_never_overwritten(self):
         with tempfile.TemporaryDirectory() as tmp:

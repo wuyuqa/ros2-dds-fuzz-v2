@@ -4,10 +4,16 @@ from collections import Counter
 import copy
 import hashlib
 import json
+import os
+import re
+import stat
 from pathlib import Path
 import struct
 from .rtps import discovery_activity, udp_frame, rtps_submessages
 from .sedp_fields import parse_parameter_list, endpoint_fields
+
+
+MAX_CAPTURE_PREFIX_BYTES = 64 * 1024 * 1024
 
 
 def read_capture(artifact):
@@ -15,6 +21,8 @@ def read_capture(artifact):
     raw = artifact.get('raw', artifact)
     if not isinstance(raw, dict) or not raw.get('path') or not raw.get('sha256'):
         raise ValueError('capture requires explicit raw path and sha256')
+    if raw.get('final') is False:
+        raise ValueError('capture_prefix_requires_prefix_parser')
     path = Path(raw['path'])
     before = path.stat()
     data = path.read_bytes()
@@ -25,6 +33,11 @@ def read_capture(artifact):
     digest = hashlib.sha256(data).hexdigest()
     if digest != raw['sha256']:
         raise ValueError('capture_sha256_mismatch')
+    return _read_pcap_bytes(data, {'path': str(path.resolve()), 'sha256': digest, 'size': len(data)})
+
+
+def _read_pcap_bytes(data, raw):
+    """Decode already hash-bound bytes for final captures and fixed prefixes alike."""
     magic = {b'\x4d\x3c\xb2\xa1': ('<', 1), b'\xa1\xb2\x3c\x4d': ('>', 1),
              b'\xd4\xc3\xb2\xa1': ('<', 1000), b'\xa1\xb2\xc3\xd4': ('>', 1000)}
     if len(data) < 24 or data[:4] not in magic:
@@ -54,8 +67,7 @@ def read_capture(artifact):
         if captured < original:
             diagnostics.append({'packet_index': len(records) - 1, 'reason': 'truncated_frame'})
         pos += 16 + captured
-    return {'path': str(path.resolve()), 'sha256': digest, 'size': len(data),
-            'linktype': linktype, 'timestamp_precision_ns': precision}, records, diagnostics
+    return {**raw, 'linktype': linktype, 'timestamp_precision_ns': precision}, records, diagnostics
 
 
 def parse_sedp_capture(artifact, *, field_policy=None):
@@ -65,6 +77,59 @@ def parse_sedp_capture(artifact, *, field_policy=None):
     consumers of third-target activity need no endpoint QoS fields.
     """
     raw, records, diagnostics = read_capture(artifact)
+    return _decode_sedp(raw, records, diagnostics, artifact, field_policy=field_policy)
+
+
+def parse_sedp_capture_prefix(raw_prefix, field_policy=None):
+    """Decode a flushed, inode-bound first N bytes while its pcap may append.
+
+    A prefix proves only retained observations, never final capture completeness.
+    The expected device/inode are supplied by the live observer snapshot.
+    """
+    raw, records, diagnostics = _read_capture_prefix(raw_prefix)
+    result = _decode_sedp(raw, records, diagnostics, {}, field_policy=field_policy)
+    result['independent_source'] = 'passive_rtps_wire_prefix'
+    return result
+
+
+def _read_capture_prefix(raw_prefix):
+    if not isinstance(raw_prefix, dict) or raw_prefix.get('final') is not False:
+        raise ValueError('nonfinal_capture_prefix_required')
+    size, digest = raw_prefix.get('size'), raw_prefix.get('sha256')
+    if isinstance(size, bool) or not isinstance(size, int) or not 24 <= size <= MAX_CAPTURE_PREFIX_BYTES:
+        raise ValueError('invalid_capture_prefix_size')
+    if not isinstance(digest, str) or re.fullmatch('[0-9a-f]{64}', digest) is None:
+        raise ValueError('invalid_capture_prefix_sha256')
+    name, identity = raw_prefix.get('path'), raw_prefix.get('file_identity')
+    if not isinstance(name, str) or not name or not Path(name).is_absolute() or '\0' in name:
+        raise ValueError('absolute_capture_prefix_path_required')
+    if (not isinstance(identity, dict) or set(identity) != {'device', 'inode'} or
+            any(isinstance(v, bool) or not isinstance(v, int) or v < 0 for v in identity.values()) or not identity['inode']):
+        raise ValueError('capture_prefix_file_identity_required')
+    path = Path(name)
+    def validate(current):
+        if (not stat.S_ISREG(current.st_mode) or current.st_dev != identity['device'] or current.st_ino != identity['inode']):
+            raise ValueError('capture_prefix_path_or_inode_changed')
+        if current.st_size < size:
+            raise ValueError('capture_prefix_short_read')
+    validate(path.lstat())
+    # O_NOFOLLOW also rejects replacement with a symlink between lstat and open.
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd, 'rb') as stream:
+        validate(os.fstat(stream.fileno()))
+        data = stream.read(size)
+        if len(data) != size:
+            raise ValueError('capture_prefix_short_read')
+        validate(os.fstat(stream.fileno()))
+        validate(path.lstat())
+    if hashlib.sha256(data).hexdigest() != digest:
+        raise ValueError('capture_prefix_sha256_mismatch')
+    raw = {'path': name, 'sha256': digest, 'size': size, 'final': False, 'file_identity': dict(identity)}
+    return _read_pcap_bytes(data, raw)
+
+
+def _decode_sedp(raw, records, diagnostics, artifact, *, field_policy=None):
+    """Shared wire decoder. Graph and submitted QoS never supply wire fields."""
     activity, copies, endpoint_events = [], Counter(), []
     policy = copy.deepcopy(field_policy or {})
     for record in records:
@@ -73,6 +138,8 @@ def parse_sedp_capture(artifact, *, field_policy=None):
         ref = {key: record[key] for key in ('packet_index', 'record_offset', 'frame_offset',
                                           'captured_length', 'original_length', 'frame_sha256')}
         ref.update(path=raw['path'], sha256=raw['sha256'])
+        if raw.get('final') is False:
+            ref.update(size=raw['size'], final=False, file_identity=copy.deepcopy(raw['file_identity']))
         for event in events:
             key = (event['frame_sha256'], event['submessage_offset'])
             copies[key] += 1

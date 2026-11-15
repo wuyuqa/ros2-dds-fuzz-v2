@@ -211,6 +211,38 @@ def _binding_times(binding, guid, graph_raw_path):
         return None
 
 
+def _drain_window_valid(receipt, end):
+    """New receipts cover the stop request cutoff, not the later close time."""
+    if 'drain' not in receipt and 'complete_through_unix_ns' not in receipt:
+        return True  # Retain the original contract for legacy receipts.
+    drain = receipt.get('drain')
+    complete = receipt.get('complete_through_unix_ns')
+    if (not isinstance(drain, dict) or drain.get('status') != 'drained'
+            or not _positive_int(complete) or not end <= complete <= receipt['unix_ns']
+            or type(drain.get('cutoff_unix_ns')) is not int or drain['cutoff_unix_ns'] != complete
+            or drain.get('nonblocking') is not True or drain.get('reason') != 'socket_empty'
+            or type(drain.get('unread_packets_at_empty_boundary')) is not int
+            or drain['unread_packets_at_empty_boundary'] != 0):
+        return False
+    request, empty = drain.get('request'), drain.get('empty_confirmed')
+    statistics, ended = drain.get('empty_statistics'), drain.get('ended')
+    if not all(isinstance(value, dict) for value in (request, empty, statistics, ended)):
+        return False
+    sampled = statistics.get('sampled')
+    if (not isinstance(sampled, dict) or request.get('unix_ns') != complete
+            or any(type(statistics.get(key)) is not int or statistics[key] < 0 for key in ('packets', 'drops'))
+            or statistics['drops'] != 0):
+        return False
+    points = (request, empty, sampled, ended, receipt)
+    for clock in ('unix_ns', 'monotonic_ns'):
+        stamps = [point.get(clock) for point in points]
+        if not all(_positive_int(stamp) for stamp in stamps) or stamps != sorted(stamps):
+            return False
+    deadline = drain.get('deadline_monotonic_ns')
+    return (_positive_int(deadline) and request['monotonic_ns'] < deadline
+            and sampled['monotonic_ns'] < deadline)
+
+
 def _capture_window_valid(discovery, start, end):
     artifact = discovery.get('capture_receipt')
     if not isinstance(artifact, dict):
@@ -221,6 +253,7 @@ def _capture_window_valid(discovery, start, end):
             return False
         return (receipt['raw']['sha256'] == discovery['raw']['sha256']
                 and receipt['ready']['unix_ns'] <= start <= end <= receipt['unix_ns']
+                and _drain_window_valid(receipt, end)
                 and receipt['thread_stopped'] and receipt['socket_closed']
                 and receipt['health']['status'] == 'ok'
                 and receipt['health']['kernel_drop_status'] == 'known_at_stop'

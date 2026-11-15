@@ -102,6 +102,88 @@ def reconcile(parts):
     return reconcile_discovery_projection(w, g, endpoint_bindings=b, observation_window=window)
 
 
+def with_drain(parts, root, cutoff=BASE+150):
+    """Hash-bound new receipt with an empty witness and packets after that boundary."""
+    artifact = parts[0]['capture_receipt']
+    artifact.update(monotonic_ns=14000, complete_through_unix_ns=cutoff,
+        drain={'status': 'drained', 'reason': 'socket_empty', 'nonblocking': True,
+               'cutoff_unix_ns': cutoff, 'request': {'unix_ns': cutoff, 'monotonic_ns': 10000},
+               'deadline_monotonic_ns': 20000,
+               'empty_confirmed': {'unix_ns': BASE+152, 'monotonic_ns': 11000},
+               'empty_statistics': {'packets': 1, 'drops': 0,
+                                    'sampled': {'unix_ns': BASE+153, 'monotonic_ns': 12000}},
+               'unread_packets_at_empty_boundary': 0,
+               'ended': {'unix_ns': BASE+154, 'monotonic_ns': 13000},
+               'post_empty_packets': 3, 'post_empty_drops': 0, 'kernel_unread_packets_at_stop': 3,
+               'post_empty_scope': 'after_empty_statistics_outside_request_cutoff'})
+    rebind_capture(parts, root)
+    return parts
+
+
+def rebind_capture(parts, root):
+    artifact = parts[0]['capture_receipt']
+    artifact['receipt_raw'] = jsonraw(root/'capture.json', {k:v for k,v in artifact.items() if k != 'receipt_raw'})
+
+
+class SedpDrainCoverageContracts(unittest.TestCase):
+    def test_legacy_and_new_window_inside_or_at_cutoff_remain_consistent(self):
+        for cutoff in (None, BASE+150, BASE+151):
+            with self.subTest(cutoff=cutoff), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                parts = fixture(root)
+                if cutoff is not None:
+                    with_drain(parts, root, cutoff)
+                self.assertEqual(reconcile(parts)['comparison_status'], 'consistent')
+
+    def test_window_after_cutoff_but_before_close_is_unknown(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            parts = with_drain(fixture(root), root, BASE+145)
+            self.assertLess(parts[3]['end_ns'], parts[0]['capture_receipt']['unix_ns'])
+            result = reconcile(parts)
+            self.assertEqual(result['comparison_status'], 'unknown')
+            self.assertIn('capture_window_or_health_not_established', result['unknown_reasons'])
+
+    def test_missing_incomplete_null_or_inconsistent_drain_cannot_claim_coverage(self):
+        modes = ('incomplete', 'missing_complete', 'null_complete', 'bool_complete', 'float_complete',
+                 'missing_drain', 'null_drain', 'cutoff_mismatch', 'request_mismatch', 'empty_before_cutoff',
+                 'missing_empty', 'missing_statistics', 'statistics_before_empty', 'empty_after_deadline',
+                 'unread_at_empty', 'blocking_receive', 'missing_clock', 'complete_after_close')
+        for mode in modes:
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                parts = with_drain(fixture(root), root)
+                artifact = parts[0]['capture_receipt']
+                drain = artifact['drain']
+                if mode == 'incomplete': drain['status'] = 'incomplete'
+                if mode == 'missing_complete': artifact.pop('complete_through_unix_ns')
+                if mode == 'null_complete': artifact['complete_through_unix_ns'] = None
+                if mode == 'bool_complete': artifact['complete_through_unix_ns'] = True
+                if mode == 'float_complete': artifact['complete_through_unix_ns'] = float(BASE+150)
+                if mode == 'missing_drain': artifact.pop('drain')
+                if mode == 'null_drain': artifact['drain'] = None
+                if mode == 'cutoff_mismatch': drain['cutoff_unix_ns'] += 1
+                if mode == 'request_mismatch': drain['request']['unix_ns'] -= 1
+                if mode == 'empty_before_cutoff': drain['empty_confirmed']['unix_ns'] = BASE+149
+                if mode == 'missing_empty': drain.pop('empty_confirmed')
+                if mode == 'missing_statistics': drain['empty_statistics'] = None
+                if mode == 'statistics_before_empty': drain['empty_statistics']['sampled']['monotonic_ns'] = 10001
+                if mode == 'empty_after_deadline': drain['deadline_monotonic_ns'] = 11000
+                if mode == 'unread_at_empty': drain['unread_packets_at_empty_boundary'] = 1
+                if mode == 'blocking_receive': drain['nonblocking'] = False
+                if mode == 'missing_clock': drain['empty_confirmed'].pop('monotonic_ns')
+                if mode == 'complete_after_close': artifact['complete_through_unix_ns'] = BASE+161
+                rebind_capture(parts, root)
+                self.assertEqual(reconcile(parts)['comparison_status'], 'unknown', mode)
+
+    def test_unbound_cutoff_tamper_is_unknown(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            parts = with_drain(fixture(root), root)
+            parts[0]['capture_receipt']['complete_through_unix_ns'] += 1
+            self.assertEqual(reconcile(parts)['comparison_status'], 'unknown')
+
+
 class SedpFieldContracts(unittest.TestCase):
     def test_defaults_require_complete_list_and_have_protocol_provenance(self):
         observed = fields(plist())
