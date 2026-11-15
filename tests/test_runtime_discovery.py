@@ -8,11 +8,16 @@ from unittest.mock import Mock, patch
 
 from r2f.runtime.domains import scan_processes
 from r2f.runtime.namespace_pair import (
-    acknowledged_graphs, activity_is_pair_observed, normalize_discovery_config,
-    same_source, summarize_discovery, validate_host_leases,
+    RECOVERY_ACTIVITY_LIMIT, acknowledged_graphs, activity_is_pair_observed,
+    normalize_discovery_config, recovery_capture_spec, same_source,
+    summarize_discovery, validate_host_leases,
 )
 from r2f.runtime.ros2_pair import normalize_config, run_pair
 from r2f.runtime.worker import extended_graph_qos
+
+CAPTURE_PROOF = {'host_net_namespace': 'net:[1]', 'host_user_namespace': 'user:[2]',
+                 'net_namespace': 'net:[3]', 'user_namespace': 'user:[4]',
+                 'host_uid': 1000, 'host_cap_eff': 0}
 
 
 class RuntimeDiscovery(unittest.TestCase):
@@ -32,6 +37,32 @@ class RuntimeDiscovery(unittest.TestCase):
                 with self.subTest(key=key, value=value), self.assertRaises(ValueError):
                     normalize_discovery_config(self.config(**{key: value}))
         self.assertTrue(normalize_discovery_config(self.config())['observe_extended_qos'])
+
+    def test_recovery_capture_spec_has_bounded_higher_activity_limit(self):
+        with tempfile.TemporaryDirectory() as d:
+            first = recovery_capture_spec(output_dir=pathlib.Path(d) / 'observer', run_id='offline-recovery',
+                                          domain_id=173, netns_identity=CAPTURE_PROOF)
+            second = recovery_capture_spec(output_dir=pathlib.Path(d) / 'observer', run_id='offline-recovery',
+                                           domain_id=173, netns_identity=CAPTURE_PROOF)
+        self.assertEqual(RECOVERY_ACTIVITY_LIMIT, 32768)
+        self.assertEqual(first['limits']['activity_limit'], RECOVERY_ACTIVITY_LIMIT)
+        self.assertGreater(first['limits']['activity_limit'], 4096)
+        self.assertLessEqual(first['limits']['activity_limit'], 1000000)
+        self.assertEqual(first, second)
+
+    def test_recovery_capture_spec_hash_and_bounds_still_apply(self):
+        from r2f.instrumentation.sedp import PassiveSedpObserver
+        with tempfile.TemporaryDirectory() as d:
+            output = pathlib.Path(d) / 'observer'
+            spec = recovery_capture_spec(output_dir=output, run_id='offline-recovery', domain_id=173,
+                                         netns_identity=CAPTURE_PROOF)
+            changed = dict(spec)
+            changed['limits'] = dict(spec['limits'], activity_limit=RECOVERY_ACTIVITY_LIMIT + 1)
+            with self.assertRaisesRegex(ValueError, 'capture_spec_hash_mismatch'):
+                PassiveSedpObserver(changed)
+            with self.assertRaisesRegex(ValueError, 'unbounded capture limit'):
+                recovery_capture_spec(output_dir=output, run_id='offline-recovery', domain_id=173,
+                                      netns_identity=CAPTURE_PROOF, limits={'activity_limit': 1000001})
 
     def test_host_preflight_failure_never_starts_namespace(self):
         with tempfile.TemporaryDirectory() as d, patch('r2f.runtime.namespace_pair.check_environment',

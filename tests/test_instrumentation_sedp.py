@@ -12,7 +12,7 @@ from unittest.mock import patch
 
 from r2f.instrumentation.sedp import PassiveSedpObserver, build_capture_spec, parse_sedp_capture, parse_sedp_capture_prefix
 from r2f.instrumentation.rtps import discovery_activity, udp_frame
-from r2f.instrumentation.sedp_capture import _rtps_metadata
+from r2f.instrumentation.sedp_capture import DEFAULT_LIMITS, _rtps_metadata
 from r2f.instrumentation.sedp_wire import read_capture
 
 PREFIX = '011000000000000000000001'
@@ -222,6 +222,39 @@ class PassiveCaptureContracts(unittest.TestCase):
             self.assertEqual(events[0]['source_guid_prefix'], PREFIX)
         self.assertEqual(discovery_activity(frame(writer='00000903'))[0], [])
         self.assertEqual(discovery_activity(frame(writer='000100c2'))[0][0]['kind'], 'SPDP_DATA')
+
+    def test_explicit_activity_limit_is_bounded_and_hashed_without_changing_default(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp)
+            default = self.spec(path)
+            recovery = self.spec(path, limits={'activity_limit': 32768})
+            self.assertEqual(DEFAULT_LIMITS['activity_limit'], 4096)
+            self.assertEqual(default['limits']['activity_limit'], 4096)
+            self.assertEqual(recovery['limits']['activity_limit'], 32768)
+            self.assertNotEqual(default['spec_sha256'], recovery['spec_sha256'])
+            changed = dict(recovery)
+            changed['limits'] = dict(recovery['limits'], activity_limit=32769)
+            with self.assertRaisesRegex(ValueError, 'capture_spec_hash_mismatch'):
+                PassiveSedpObserver(changed)
+            with self.assertRaisesRegex(ValueError, 'unbounded capture limit'):
+                self.spec(path, limits={'activity_limit': 1000001})
+
+    def test_activity_limit_eviction_still_makes_window_incomplete(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp)
+            packet = frame()
+            observer = PassiveSedpObserver(self.spec(path, limits={'activity_limit': 1}))
+            fake = FakeSocket([(packet, None), (packet, None)])
+            with patch('r2f.instrumentation.sedp_capture.validate_capture_namespace', return_value={'isolated': True}), patch('r2f.instrumentation.sedp_capture.socket.socket', return_value=fake):
+                ready = observer.start()
+                end = time.monotonic() + 1
+                while observer._counters['packets_written'] < 2 and time.monotonic() < end: time.sleep(.005)
+                result = observer.snapshot_activity(since_ns=ready['unix_ns'], participant_prefixes=[PREFIX])
+                stopped = observer.stop()
+            self.assertGreaterEqual(stopped['counters']['activity_events_evicted'], 1)
+            self.assertFalse(result['window_buffer_retained'])
+            self.assertEqual(result['status'], 'observed')
+            self.assertTrue(result['activity_observed'])
 
     def test_identity_time_dedup_and_shutdown_hashes(self):
         with tempfile.TemporaryDirectory() as tmp:

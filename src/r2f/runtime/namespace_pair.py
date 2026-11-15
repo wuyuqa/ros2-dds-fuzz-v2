@@ -27,6 +27,16 @@ from .process import WorkerPool
 
 IMPLEMENTATION = 'isolated_netns_nft_discovery_udp_drop'
 CLOCK_GUARD_NS = 50_000_000
+RECOVERY_ACTIVITY_LIMIT = 32768
+
+
+def recovery_capture_spec(*, output_dir, run_id, domain_id, netns_identity, limits=None):
+    """Build the third target's bounded observer spec without changing global defaults."""
+    from r2f.instrumentation.sedp import build_capture_spec
+    supplied = {'timeout_sec': 240, 'max_bytes': 32 * 1024 * 1024, 'snaplen': 65535,
+                'activity_limit': RECOVERY_ACTIVITY_LIMIT, **(limits or {})}
+    return build_capture_spec(run_id=run_id, domain_id=domain_id, netns_identity=netns_identity,
+                              output_dir=output_dir, limits=supplied)
 
 
 def execution_chain_identity():
@@ -649,10 +659,9 @@ def _body(request, owner_channel):
         setup_event = emit('discovery_network_setup', receipt=setup)
         profile_records, role_env = write_profiles(output_dir, c['rmw'])
         identity = dict(proof)
-        from r2f.instrumentation.sedp import PassiveSedpObserver, build_capture_spec
-        spec = build_capture_spec(run_id=c['run_id'], domain_id=c['domain_id'], netns_identity=identity,
-                                  output_dir=output_dir / 'discovery-observer',
-                                  limits={'timeout_sec': 240, 'max_bytes': 32 * 1024 * 1024, 'snaplen': 65535})
+        from r2f.instrumentation.sedp import PassiveSedpObserver
+        spec = recovery_capture_spec(output_dir=output_dir / 'discovery-observer', run_id=c['run_id'],
+                                     domain_id=c['domain_id'], netns_identity=identity)
         observer = PassiveSedpObserver(spec)
         ready = observer.start()
         ready_event = emit('discovery_observer_ready', receipt=ready)
