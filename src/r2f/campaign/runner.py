@@ -71,6 +71,7 @@ def plan_campaign(output_dir, *, repo=None, run_id=None, domain_id=173, seed=0,
                                 expected_target_revision=target.target_revision,
                                 source_manifest=manifest["source_manifest"],
                                 final_input=submitted, effective_input_sha256=capsule.input["effective_input_sha256"],
+                                input_layer_receipts=capsule.input["effective_input"]["input_layer_receipts"],
                                 control_kind=cell.get("control_kind"))
         directory = output_dir / "cells" / cell["cell_id"]
         replay_path = directory / "capsule.json"

@@ -10,9 +10,12 @@ from unittest.mock import Mock, patch
 
 from r2f.campaign.identity import runtime_config, semantic_input
 from r2f.campaign.replay import audit_replay, replay_cell
+from r2f.campaign.runner import plan_campaign
 from r2f.campaign.runtime_adapter import ingest_execution
 from r2f.core import ReplayCapsule, canonical_hash, compile_scenario, raw_sha256
 from r2f.modules.s1.module import S1Module
+from r2f.modules.s1.targets import EXECUTION_ORDER
+from r2f.runtime.instrumentation_bridge import prepare
 from test_campaign_evidence import fixture_pair
 
 REPO = Path(__file__).resolve().parents[1]
@@ -127,6 +130,64 @@ class CampaignReplayContracts(unittest.TestCase):
             self.assertIn(artifact, report['artifacts'])
         self.assert_original_unchanged()
         self.assert_auditable(report)
+
+    def test_all_planned_capsules_replay_exact_nonempty_receipts_into_observation_input(self):
+        fields = {'run_id', 'domain_id', 'target_id', 'target_revision', 'rmw', 'arm', 'repeat',
+                  'seed', 'topic', 'message_type', 'effective_input_sha256', 'final_input',
+                  'input_layer_receipts'}
+        checked = 0
+        for index, target_id in enumerate(EXECUTION_ORDER):
+            with patch('r2f.campaign.runner.source_manifest', return_value=copy.deepcopy(self.source)):
+                planned = plan_campaign(self.root / ('planned-' + str(index)), target_id=target_id,
+                                        run_id='planned-receipts-' + str(index), domain_id=80, seed=31)
+            self.assertEqual(len(planned['rows']), 24)
+            for row in planned['rows']:
+                with self.subTest(target_id=target_id, cell=row['cell_id']):
+                    capsule_path = Path(row['replay_path'])
+                    original = capsule_path.read_bytes()
+                    capsule = ReplayCapsule.from_dict(json.loads(original))
+                    effective = capsule.input['effective_input']
+                    self.assertTrue(effective['input_layer_receipts'])
+                    seen = []
+
+                    def runtime(config, directory):
+                        # Exercise the actual observer boundary; do not insert
+                        # receipt fields or start a process in this injected runtime.
+                        ctx = prepare(config, directory, {})
+                        seen.append({'config': copy.deepcopy(config),
+                                     'execution_input': copy.deepcopy(ctx.execution_input),
+                                     'prepared_ref': copy.deepcopy(ctx.prepared),
+                                     'prepared': json.loads(Path(ctx.prepared['raw_path']).read_text())})
+                        return blocked(config, directory)
+
+                    output = self.root / ('replay-receipts-' + str(index)) / row['cell_id']
+                    report = replay_cell(capsule_path, output_dir=output, domain_id=81, runtime=runtime)
+                    self.assertEqual(len(seen), 1, report)
+                    config = seen[0]['config']
+                    self.assertTrue(fields.issubset(config), fields - config.keys())
+                    expected = {'schema': 'r2f.observation-execution-input/v1',
+                                **{key: config[key] for key in fields}}
+                    self.assertEqual(seen[0]['execution_input'], expected)
+                    self.assertEqual(seen[0]['prepared']['execution_input'], expected)
+                    ref = seen[0]['prepared_ref']
+                    self.assertEqual(raw_sha256(ref['raw_path']), ref['raw_sha256'])
+                    self.assertEqual(config['input_layer_receipts'], effective['input_layer_receipts'])
+                    self.assertEqual(config['final_input'], effective['final_input'])
+                    self.assertEqual(config['effective_input_sha256'], capsule.input['effective_input_sha256'])
+                    for key in ('target_id', 'target_revision', 'rmw', 'arm', 'repeat', 'seed', 'topic', 'message_type'):
+                        self.assertEqual(config[key], capsule.input[key], key)
+                    self.assertEqual(config['domain_id'], 81)
+                    self.assertNotEqual(config['run_id'], planned['run_id'])
+                    self.assertEqual(json.loads((output / 'runtime_config.json').read_text()), config)
+                    derived = ReplayCapsule.from_dict(json.loads((output / 'derived_capsule.json').read_text()))
+                    self.assertEqual(derived.input, capsule.input)
+                    self.assertEqual(capsule_path.read_bytes(), original)
+                    self.assertEqual(report['status'], 'fail_environment', report)
+                    self.assertEqual(report['reason_code'], 'runtime_preflight_blocked', report)
+                    self.assertFalse(report['real_ros_execution'])
+                    self.assert_auditable(report)
+                    checked += 1
+        self.assertEqual(checked, 96)
 
     def test_original_failure_new_health_is_not_confirmation(self):
         self.save_original(missing_middle)

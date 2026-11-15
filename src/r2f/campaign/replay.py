@@ -222,6 +222,7 @@ def replay_cell(capsule_path, *, output_dir, domain_id, runtime=None) -> dict:
                     source_repo=str(REPO), expected_head=before['head'],
                     expected_target_revision=scenario.target_revision, source_manifest=scenario.source_manifest,
                     final_input=scenario.final_input, effective_input_sha256=scenario.effective_input_sha256,
+                    input_layer_receipts=scenario.input_layer_receipts,
                     evidence_purpose='normal_conformance_replay',
                     control_kind='fault' if scenario.arm == 'negative' else None)
                 context['config'] = config
