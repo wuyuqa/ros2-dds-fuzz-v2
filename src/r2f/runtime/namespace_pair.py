@@ -390,6 +390,185 @@ class OwnerCheckedPool(WorkerPool):
         super().pump(timeout)
 
 
+class _RecoveryMatchTrajectory:
+    """Raw-only public API diagnostics; never a match gate or an expiry claim.
+
+    Snapshot commands run through the existing pump. Each scheduled pair has an
+    absolute response deadline, so a missing ACK never adds a wait before restore.
+    Worker events remain untouched, including zero counts and late responses.
+    """
+    INTERVAL_NS = 1_000_000_000
+    RESPONSE_NS = 500_000_000
+    IDENTITY_KEYS = ('pid', 'process_start_ticks', 'endpoint_generation',
+                     'rmw_identifier', 'run_id', 'domain_id')
+
+    def __init__(self, events, endpoints, emit, start_ns, deadline_ns, before):
+        self.events, self.endpoints, self.emit = events, endpoints, emit
+        self.start_ns, self.deadline_ns, self.before = start_ns, deadline_ns, before
+        self.after = None
+        self.restore_started_ns = self.restore_boundary_ns = None
+        final_ns = max(start_ns, deadline_ns - min(self.RESPONSE_NS, (deadline_ns - start_ns) // 2))
+        self.schedule = [(stamp, 'periodic') for stamp in
+                         range(start_ns + self.INTERVAL_NS, final_ns, self.INTERVAL_NS)]
+        self.schedule.append((final_ns, 'pre_restore'))
+        self.samples = []
+
+    @property
+    def next_due_ns(self):
+        return self.schedule[len(self.samples)][0] if len(self.samples) < len(self.schedule) else self.deadline_ns
+
+    def poll(self, pool):
+        while len(self.samples) < len(self.schedule) and time.monotonic_ns() >= self.next_due_ns:
+            due_ns, purpose = self.schedule[len(self.samples)]
+            deadline_ns = min(due_ns + self.RESPONSE_NS, self.deadline_ns)
+            sample = {'scheduled_monotonic_ns': due_ns, 'deadline_monotonic_ns': deadline_ns,
+                      'purpose': purpose, 'requests': {}, 'errors': []}
+            self.samples.append(sample)
+            for role in ('writer', 'reader'):
+                requested_ns = time.monotonic_ns()
+                command_id, error = None, None
+                if requested_ns >= deadline_ns:
+                    error = 'request_deadline_elapsed'
+                else:
+                    try:
+                        command_id = pool.command(role, 'snapshot', requested_monotonic_ns=requested_ns,
+                                                  diagnostic_purpose='discovery_match_trajectory')
+                    except (OSError, ValueError) as exc:
+                        error = type(exc).__name__ + ':' + str(exc)
+                record = self.emit('discovery_match_trajectory_requested', worker_role=role,
+                    command_id=command_id, requested_monotonic_ns=requested_ns,
+                    deadline_monotonic_ns=deadline_ns, scheduled_monotonic_ns=due_ns,
+                    purpose=purpose, command_error=error,
+                    worker_identity={key: self.endpoints[role][key] for key in self.IDENTITY_KEYS})
+                sample['requests'][role] = record
+                if error:
+                    sample['errors'].append(role + ':' + error)
+
+    def _gate_requests(self, evidence):
+        result = {}
+        for role in ('writer', 'reader'):
+            reference = (evidence or {}).get('matches', {}).get(role)
+            snapshots = [e for e in self.events if e['event'] == 'match_snapshot'
+                         and e.get('raw_event_ref') == reference and e.get('role') == role]
+            if len(snapshots) == 1:
+                requests = [e for e in self.events if e['event'] == 'match_snapshot_requested'
+                            and e.get('role') == role and e.get('command_id') == snapshots[0].get('command_id')]
+                if len(requests) == 1:
+                    result[role] = requests[0]
+        return result
+
+    def _pair(self, requests, lower_ns, upper_ns):
+        pair = {'complete': True, 'roles': {}}
+        for role, remote in (('writer', 'reader'), ('reader', 'writer')):
+            request = requests.get(role, {})
+            cid, requested_ns = request.get('command_id'), request.get('requested_monotonic_ns')
+            errors, found = [], {}
+            observation = {'complete': False, 'command_id': cid, 'request_ref': request.get('raw_event_ref'),
+                           'requested_monotonic_ns': requested_ns, 'response_deadline_monotonic_ns': upper_ns,
+                           'errors': errors}
+            pair['roles'][role] = observation
+            if (type(cid) is not int or type(requested_ns) is not int
+                    or type(request.get('monotonic_ns')) is not int
+                    or type(lower_ns) is not int or type(upper_ns) is not int
+                    or not lower_ns <= requested_ns <= request.get('monotonic_ns', -1) < upper_ns):
+                errors.append('request_boundary_or_identity_incomplete')
+            if (type(cid) is int and cid == requests.get(remote, {}).get('command_id')):
+                errors.append('command_pair_not_independent')
+            if request.get('event') == 'discovery_match_trajectory_requested' and (
+                    request.get('worker_role') != role or request.get('worker_identity') !=
+                    {key: self.endpoints[role][key] for key in self.IDENTITY_KEYS}):
+                errors.append('request_worker_identity_invalid')
+            for kind in ('match_snapshot', 'graph_snapshot', 'command_done'):
+                matches = [e for e in self.events if type(cid) is int and e['event'] == kind
+                           and e.get('role') == role and type(e.get('command_id')) is int and e['command_id'] == cid]
+                observation[kind + '_refs'] = [e.get('raw_event_ref') for e in matches]
+                if len(matches) != 1:
+                    errors.append(kind + '_missing_or_duplicate')
+                else:
+                    found[kind] = matches[0]
+            if 'match_snapshot' in found:
+                snapshot = found['match_snapshot']
+                observation.update(matched_count=snapshot.get('matched_count'),
+                    sampled_monotonic_ns=snapshot.get('sampled_monotonic_ns'))
+            if 'graph_snapshot' in found:
+                graph = found['graph_snapshot']
+                publishers, subscriptions = graph.get('publishers'), graph.get('subscriptions')
+                if (not isinstance(publishers, list) or not isinstance(subscriptions, list)
+                        or any(not isinstance(x, dict) or not isinstance(x.get('endpoint_gid'), str)
+                               for x in (publishers or []) + (subscriptions or []))):
+                    errors.append('graph_guid_evidence_incomplete')
+                else:
+                    pgids = [x['endpoint_gid'] for x in publishers]
+                    sgids = [x['endpoint_gid'] for x in subscriptions]
+                    observation.update(publisher_gids=pgids, subscription_gids=sgids,
+                        expected_remote_gid=self.endpoints[remote]['endpoint_gid'],
+                        remote_guid_present=self.endpoints[remote]['endpoint_gid'] in (sgids if role == 'writer' else pgids))
+            observation['timed_out'] = (any(not observation[k + '_refs'] for k in
+                ('match_snapshot', 'graph_snapshot', 'command_done')) or
+                type(upper_ns) is int and any(type(e.get('monotonic_ns')) is int
+                    and e['monotonic_ns'] >= upper_ns for e in found.values()))
+            if observation['timed_out']:
+                errors.append('response_timeout_or_late_evidence')
+            if len(found) == 3:
+                snapshot, graph, ack = (found[k] for k in ('match_snapshot', 'graph_snapshot', 'command_done'))
+                stamps = [requested_ns, snapshot.get('sampled_monotonic_ns'), snapshot.get('monotonic_ns'),
+                          graph.get('monotonic_ns'), ack.get('monotonic_ns'), upper_ns]
+                # The parent's request record may follow the worker sample in time.
+                # Only the worker chain, and separately the request record, use the deadline.
+                indices = [e.get('namespace_event_index') for e in (request, snapshot, graph, ack)]
+                if (not all(type(t) is int for t in stamps) or stamps != sorted(stamps)
+                        or type(upper_ns) is not int or ack.get('monotonic_ns', upper_ns) >= upper_ns
+                        or not all(type(i) is int for i in indices) or any(a >= b for a, b in zip(indices, indices[1:]))):
+                    errors.append('worker_clock_or_event_order_invalid')
+                if (any(any(e.get(k) != self.endpoints[role].get(k) for k in self.IDENTITY_KEYS)
+                        for e in (snapshot, graph, ack))
+                        or snapshot.get('endpoint_gid') != self.endpoints[role]['endpoint_gid']
+                        or snapshot.get('count_api') != ('get_subscription_count' if role == 'writer' else 'get_publisher_count')
+                        or type(snapshot.get('matched_count')) is not int or snapshot['matched_count'] < 0):
+                    errors.append('worker_count_or_identity_invalid')
+            observation['complete'] = not errors
+            observation['loss_observed'] = (not errors and observation['matched_count'] == 0
+                                            and observation.get('remote_guid_present') is False)
+            observation['matched_observed'] = (not errors and observation['matched_count'] == 1
+                and observation.get('publisher_gids') == [self.endpoints['writer']['endpoint_gid']]
+                and observation.get('subscription_gids') == [self.endpoints['reader']['endpoint_gid']])
+            pair['complete'] = pair['complete'] and observation['complete']
+        pair['both_matched'] = all(r['matched_observed'] for r in pair['roles'].values())
+        pair['loss_roles'] = [role for role, r in pair['roles'].items() if r['loss_observed']]
+        return pair
+
+    def summary(self):
+        before = self._pair(self._gate_requests(self.before),
+                            self.endpoints['reader']['created_monotonic_ns'], self.start_ns)
+        openings = [e for e in self.events if e['event'] == 'window_open' and e.get('window') == 'post_restore_delivery']
+        after = self._pair(self._gate_requests(self.after), self.restore_boundary_ns,
+                           openings[0]['monotonic_ns'] if len(openings) == 1 else None)
+        samples = []
+        for sample in self.samples:
+            upper = min(sample['deadline_monotonic_ns'], self.restore_started_ns or self.deadline_ns)
+            samples.append({**sample, **self._pair(sample['requests'], sample['scheduled_monotonic_ns'], upper)})
+        complete = (len(samples) == len(self.schedule) and all(s['complete'] and not s['errors'] for s in samples)
+                    and before['both_matched'] and after['both_matched']
+                    and type(self.restore_started_ns) is int and type(self.restore_boundary_ns) is int
+                    and self.deadline_ns <= self.restore_started_ns <= self.restore_boundary_ns)
+        bilateral = [i for i, sample in enumerate(samples) if sample['loss_roles'] == ['writer', 'reader']]
+        status = 'incomplete'
+        if complete and bilateral:
+            status = 'observed_loss_then_recovery'
+        elif complete and all(s['both_matched'] for s in samples):
+            status = 'no_loss_at_sampled_points'
+        return {'status': status, 'scope': 'sampled_public_count_and_remote_guid_graph_only',
+                'limitation': 'No claim about gaps between samples, internal remote state, or participant lease expiry.',
+                'start_monotonic_ns': self.start_ns, 'drop_deadline_monotonic_ns': self.deadline_ns,
+                'restore_started_monotonic_ns': self.restore_started_ns,
+                'restore_boundary_monotonic_ns': self.restore_boundary_ns,
+                'expected_samples': len(self.schedule),
+                'unsampled_scheduled_monotonic_ns': [stamp for stamp, _ in self.schedule[len(samples):]],
+                'before': before, 'samples': samples, 'after': after,
+                'bilateral_loss_sample_indices': bilateral,
+                'primary_verdict_input': False}
+
+
 def _body(request, owner_channel):
     if request['config']['target_id'] == 'builtin.discovery_projection_reconciliation':
         from .projection_pair import namespace_body
@@ -404,6 +583,7 @@ def _body(request, owner_channel):
     result = {'runtime_status': 'failed', 'reason': None, 'facts': {}, 'environment': {}, 'workers': [],
               'precondition_receipts': preconditions, 'observation_receipts': observations, 'mutation_receipt': receipt}
     pool = observer = carrier = None
+    trajectory = None
     counter_hit = restored = activity_ok = fresh_recovery = drop_activity_ok = False
     endpoints = {}
     raw_path = output_dir / 'raw.jsonl'
@@ -539,17 +719,23 @@ def _body(request, owner_channel):
             emit('control_begin', control_kind=c['arm'], drop_installed=False,
                  precondition_snapshot_ref=precondition['raw_event_ref'], mutation_receipt=dict(receipt))
         emit('window_open', window='discovery_interruption', active_drop=active)
-        deadline = time.monotonic() + c['drop_duration_sec']
+        trajectory_start_ns = time.monotonic_ns()
+        deadline_ns = trajectory_start_ns + int(c['drop_duration_sec'] * 10**9)
+        deadline = deadline_ns / 10**9
+        trajectory = _RecoveryMatchTrajectory(events, endpoints, emit, trajectory_start_ns, deadline_ns, matched)
         try:
             while time.monotonic() < deadline:
                 if active:
                     counter = carrier.counters()
                     counter_hit = counter_hit or counter['hit']
                     emit('discovery_drop_counter', receipt=counter)
-                pause(min(c['counter_interval_sec'], max(0, deadline - time.monotonic())))
+                trajectory.poll(pool)
+                pause(min(c['counter_interval_sec'], max(0, deadline - time.monotonic()),
+                          max(0, (trajectory.next_due_ns - time.monotonic_ns()) / 10**9)))
             during = activity(drop_wall_ns, 'discovery_interruption')
             drop_activity_ok = activity_is_pair_observed(during['activity'])
         finally:
+            trajectory.restore_started_ns = time.monotonic_ns()
             if active:
                 restore = carrier.restore()
                 restored = restore['restored']
@@ -563,6 +749,7 @@ def _body(request, owner_channel):
                         drop_was_installed=active, drop_installed=False, post_restore_unix_ns=restore_wall_ns,
                         post_restore_monotonic_ns=restore_mono_ns, clock_guard_ns=CLOCK_GUARD_NS,
                         activity_since_unix_ns=restore_wall_ns + CLOCK_GUARD_NS)
+        trajectory.restore_boundary_ns = restore_mono_ns
         result['environment']['recovery_clock'] = {'unix_ns': restore_wall_ns, 'monotonic_ns': restore_mono_ns,
                                                    'source': 'host_kernel_realtime_and_shared_monotonic', 'clock_guard_ns': CLOCK_GUARD_NS,
                                                    'limitation': 'packet realtime is checked for clock offset discontinuity'}
@@ -582,6 +769,7 @@ def _body(request, owner_channel):
         try:
             post_evidence = step('observe_recovery_graph', ['verify_namespace_bindings'],
                                  lambda: snapshot_pair(restore_mono_ns), observation=True)
+            trajectory.after = post_evidence
             fresh_recovery = True
         except (TimeoutError, RuntimeError) as exc:
             emit('discovery_observation_unknown', reason=str(exc))
@@ -659,6 +847,8 @@ def _body(request, owner_channel):
             result['workers'] = pool.metadata
             if any(worker.get('returncode') != 0 for worker in pool.metadata):
                 result.update(runtime_status='failed', reason='worker_shutdown_failed')
+        if trajectory is not None:
+            emit('discovery_match_trajectory', active_drop=active, **trajectory.summary())
         result['facts'] = summarize_discovery(events, active=receipt['applied'], counter_hit=counter_hit,
             restored=restored, activity_ok=activity_ok, fresh_recovery=fresh_recovery, drop_activity_ok=drop_activity_ok)
         if not same_source(request['source'], execution_chain_identity()):
