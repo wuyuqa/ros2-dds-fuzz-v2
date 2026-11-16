@@ -234,9 +234,17 @@ _MUTATORS = ("M01 boundary_pick", "M02 enum_replace", "M03 range_sample",
              "M04 relation_boundary", "M05 special_value", "M06 timing_offset",
              "M07 environment_windows", "M08 compatibility_pair")
 MUTATOR_IDS = {item.split()[0] for item in _MUTATORS}
-MUTATOR_CATALOG = {item.split()[0]: {"name": item.split()[1], "version": 1,
-                                     "status": "declared_not_implemented_in_this_slice"}
-                   for item in _MUTATORS}
+# M01-M03 are registered in the default core registry.  M04-M08 are
+# implemented as pure functions but deliberately unregistered: they are only
+# reachable through the explicit F2 generation path (``mutate_f2``).  Being
+# generatable is still not execution capability; E02/E03/G01 stay pending.
+_IMPLEMENTED_UNREGISTERED = {"M04", "M05", "M06", "M07", "M08"}
+MUTATOR_CATALOG = {item.split()[0]: {
+    "name": item.split()[1], "version": 1,
+    "status": ("implemented_unregistered_outside_f1_registry"
+               if item.split()[0] in _IMPLEMENTED_UNREGISTERED
+               else "registered"),
+} for item in _MUTATORS}
 
 _BUDGET = ("docs/s1-fuzz-expansion-implementation-plan-2026-11-16.md#3.1 "
            "(engineering sampling budget, not a DDS normative bound)")
@@ -714,7 +722,12 @@ def catalog_digest():
 # Nothing here executes anything.  A contract is an input-space declaration.
 # ---------------------------------------------------------------------------
 
+#: Mutators that a *contract* may claim.  Deliberately unchanged so the
+#: already-sealed F1 contracts and their hashes do not move.
 IMPLEMENTED_MUTATOR_IDS = frozenset({"M01", "M02", "M03"})
+#: Mutators that may generate an input through the explicit F2 path.  This is
+#: generation capability only; it implies no runtime binding and no execution.
+IMPLEMENTED_F2_MUTATOR_IDS = frozenset({"M04", "M05", "M06", "M07", "M08"})
 
 #: Catalog boundary classes that describe a special value rather than a
 #: numeric range endpoint.  The core ``M01`` only understands ``min``/
@@ -782,6 +795,46 @@ _RULE_RESPONSIBILITY = {
     "discovery": "s1",
     "compatibility": "s1",
     "workload": "s1",
+}
+
+
+#: Surface kinds used when projecting an F2 surface for *generation only*.
+#: These projections are never placed in an ``ExplorationContract`` because the
+#: core contract validator only knows the default (M01-M03) registry; putting
+#: them there would require widening a sealed contract schema.
+_F2_GENERATION_KIND = {
+    "W01": "relation",
+    "E02": "environment",
+    "E03": "environment",
+    "G01": "compatibility",
+    "P01": "parameter_timing",
+    "P04": "parameter_numeric",
+    "P06": "parameter_numeric",
+}
+
+_F2_GENERATION_VALUE_TYPE = {
+    "W01": "int",
+    "E02": "window_plan",
+    "E03": "window_plan",
+    "G01": "pair_relation",
+    "P01": "duration_sec",
+    "P04": "duration_ns",
+    "P06": "duration_ns",
+}
+
+#: Which unregistered mutators are allowed to generate each surface.  A surface
+#: that is not listed here is not generatable through the F2 path.
+F2_GENERATION_MUTATORS = {
+    "W01": ("M04",),
+    "E02": ("M07",),
+    "E03": ("M06", "M07"),
+    "G01": ("M08",),
+    # F1 parameter surfaces that now also expose M05/M06 generation.  These
+    # extra operators are generation-only: the sealed F1 contract projection
+    # (``surface_to_core``) is unchanged and still lists M01-M03 only.
+    "P01": ("M06",),
+    "P04": ("M05",),
+    "P06": ("M05",),
 }
 
 
@@ -1020,6 +1073,115 @@ def exploration_contract(surface_ids=(), *, extra_rule_ids=()):
     return contract
 
 
+def _f2_generation_domain(surface):
+    domain = surface.domain
+    if surface.surface_id == "W01":
+        for key in ("depth", "post_count"):
+            if not isinstance(domain.get(key), list) or not domain[key]:
+                raise UnsupportedCapabilityError(f"W01: domain.{key} is required")
+        return {"depth": list(domain["depth"]),
+                "pre_count": list(domain.get("pre_count", [])),
+                "post_count": list(domain["post_count"])}
+    if surface.surface_id == "E02":
+        counts = [c for c in domain.get("window_counts", []) if type(c) is int and 1 <= c <= 3]
+        if not counts:
+            raise UnsupportedCapabilityError("E02: domain.window_counts must declare 1..3")
+        return {"window_counts": counts,
+                "restore_interval_representatives_s":
+                    list(domain.get("restore_interval_representatives_s", [0.0]))}
+    if surface.surface_id == "E03":
+        anchors = list(domain.get("anchors", []))
+        if not anchors:
+            raise UnsupportedCapabilityError("E03: domain.anchors is required")
+        return {"anchors": anchors, "offsets_s": list(domain.get("offsets_s", [0.0]))}
+    if surface.surface_id == "G01":
+        pairs = list(domain.get("pairs", []))
+        if not pairs:
+            raise UnsupportedCapabilityError("G01: domain.pairs is required")
+        return {"pairs": pairs,
+                "incompatible_pairs": list(domain.get("incompatible_pairs", []))}
+    if surface.surface_id in ("P04", "P06"):
+        low, high = domain.get("sampled_range_ns", [1, 9000000000])
+        return {"min": low, "max": high, "step": 1,
+                "finite_representatives": list(domain.get("finite_representatives", []))}
+    if surface.surface_id == "P01":
+        low, high = domain.get("sampled_range_s", [0, 3])
+        reps = list(domain.get("representatives", []))
+        return {"min": low, "max": high, "step": domain.get("quantum", 0.001),
+                "representatives": reps}
+    raise UnsupportedCapabilityError(
+        f"{surface.surface_id}: no F2 generation projection")
+
+
+def f2_generation_surface(surface_id):
+    """Project an F2-only surface into a core ``MutationSurface`` for generation.
+
+    The projection is deliberately *not* executable: ``runtime_binding`` is the
+    empty string, so ``MutationSurface.executable`` is False and
+    ``validate_plan`` reports it as unsupported for real execution.  It is also
+    never inserted into an ``ExplorationContract``; F2 generation therefore
+    cannot silently widen a sealed F1 contract or its hash.
+
+    W01 is included because its relation classes are the M04 witnesses.  W01
+    remains an auxiliary workload surface: this does not promote it to a core
+    S1 semantic surface, and it stays out of ``F1_SURFACE_IDS``.
+    """
+    from r2f.core.mutation_plan import MutationSurface
+
+    if surface_id not in F2_GENERATION_MUTATORS:
+        raise UnsupportedCapabilityError(
+            f"{surface_id}: no generation path (generatable: "
+            + ",".join(sorted(F2_GENERATION_MUTATORS)) + ")")
+    surface = SURFACES[surface_id]
+    mutators = tuple(F2_GENERATION_MUTATORS[surface_id])
+    if any(m not in IMPLEMENTED_F2_MUTATOR_IDS for m in mutators):
+        raise UnsupportedCapabilityError(
+            f"{surface_id}: declares an unimplemented F2 mutator")
+    return MutationSurface(
+        surface_id=surface.surface_id,
+        version=surface.version,
+        source_refs=list(surface.source_refs),
+        surface_kind=_F2_GENERATION_KIND[surface_id],
+        input_paths=list(surface.input_paths),
+        value_type=_F2_GENERATION_VALUE_TYPE[surface_id],
+        unit=surface.unit,
+        domain=_f2_generation_domain(surface),
+        special_values=[{"name": k, "value": v} for k, v in sorted(surface.special_values.items())],
+        boundary_classes=list(surface.boundary_classes),
+        mutator_ids=list(mutators),
+        value_relations=list(surface.value_relations),
+        tool_requires={name: {"required": True} for name in surface.tool_requires},
+        sut_guards={name: "unknown" for name in surface.sut_guards},
+        carrier_id=surface.carrier_id,
+        runtime_phase=surface.runtime_phase,
+        # Empty binding => not executable.  Generation is not a capability.
+        runtime_binding="",
+        allowed_with=[],
+        conflicts_with=[],
+        order_after=[],
+        fact_ids=list(surface.fact_ids),
+        rule_ids=list(surface.rule_ids),
+        effect_id=surface.effect_id,
+        missing_policy="unknown",
+        unsupported_policy="reject",
+        activation="F2",
+    )
+
+
+def f2_generation_capabilities():
+    """Declarative view of what F2 can *generate* today (nothing executes)."""
+    return {
+        "generatable_surface_ids": sorted(F2_GENERATION_MUTATORS),
+        "mutators": {sid: list(ids) for sid, ids in sorted(F2_GENERATION_MUTATORS.items())},
+        "pending_execution_surface_ids": list(F2_SURFACE_IDS),
+        "f1_parameter_generation_only": ["P01", "P04", "P06"],
+        "notes": ("generation is not execution; runtime_binding is empty and "
+                  "runner execution_admitted stays False"),
+        "w01_stays_auxiliary": True,
+        "f1_surface_ids_unchanged": list(F1_SURFACE_IDS),
+    }
+
+
 def capability_matrix():
     """Static capability view: routable F1 surfaces versus pending F2 ones."""
     return {
@@ -1037,4 +1199,6 @@ def capability_matrix():
             } for sid in SURFACES
         },
         "declared_only_mutator_ids": sorted(MUTATOR_IDS - IMPLEMENTED_MUTATOR_IDS),
+        "implemented_unregistered_mutator_ids": sorted(IMPLEMENTED_F2_MUTATOR_IDS),
+        "f2_generation": f2_generation_capabilities(),
     }

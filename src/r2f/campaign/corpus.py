@@ -745,3 +745,241 @@ def corpus_from_profile(profile, seeds=None, *, cycle_id=None, target_id=None):
     if not corpus.entries:
         raise CorpusProfileError("profile produced an empty corpus")
     return corpus
+
+# ---------------------------------------------------------------------------
+# Explicit F2 generation path.
+#
+# F2 surfaces (E02/E03/G01) and W01's relation classes are generatable but
+# NOT executable: their projected core surface has an empty runtime binding and
+# the shared runner keeps ``execution_admitted=False`` for them.  They must
+# therefore never enter the F1 live corpus built by ``corpus_from_profile``.
+# This separate builder produces *generation-only* records:
+#
+#   * ``executable=False`` so ``Corpus.selectable()`` never hands them to a
+#     runner that would have to refuse them case by case;
+#   * ``execution_admitted=False`` and ``activation="F2"`` so an accidental
+#     promotion is visible in the data, not just in a comment;
+#   * ``planned_only=True`` with no raw/oracle/receipt fields, so they cannot be
+#     mistaken for evidence or a hit.
+#
+# Nothing here starts ROS, opens a socket, or writes execution evidence.
+# ---------------------------------------------------------------------------
+
+F2_GENERATION_SLICE = "f2_generation_only"
+
+
+def _f2_profile_document(profile):
+    profile = _load_profile_document(profile)
+    if profile.get("schema_version") != _PROFILE_SCHEMA:
+        raise CorpusProfileError("unsupported profile schema_version")
+    if profile.get("campaign_kind") != "exploratory":
+        raise CorpusProfileError("profile campaign_kind must be exploratory")
+    if profile.get("activation") != "F2":
+        raise CorpusProfileError(
+            "profile activation must be F2 for the F2 generation path; "
+            "F1 profiles use corpus_from_profile")
+    if profile.get("required_catalog_included") is not False:
+        raise CorpusProfileError("exploratory profile must not include the required catalog")
+    if profile.get("enabled") is not False:
+        raise CorpusProfileError("profile must stay enabled=false; enabling is a separate owner decision")
+    if not isinstance(profile.get("profile_id"), str) or not profile["profile_id"]:
+        raise CorpusProfileError("profile profile_id is required")
+    if profile.get("seed_catalog_status") != "authored_t02":
+        raise CorpusProfileError("profile seed_catalog_status must be authored_t02")
+    return profile
+
+
+def _f2_seed_specs(specs, *, context="f2 profile"):
+    if not isinstance(specs, list) or not specs:
+        raise CorpusProfileError(f"{context} seed_specs must be a nonempty list")
+    normalized, seen = [], set()
+    for index, spec in enumerate(specs):
+        if not isinstance(spec, dict):
+            raise CorpusProfileError(f"{context} seed_specs[{index}] must be an object")
+        seed_id = spec.get("seed_id")
+        target_id = spec.get("target_id")
+        boundary = spec.get("boundary_class")
+        mutator_id = spec.get("mutator_id")
+        variant = spec.get("variant_id") or f"{seed_id}-{mutator_id}"
+        if not all(isinstance(v, str) and v for v in (seed_id, target_id, boundary, mutator_id)):
+            raise CorpusProfileError(
+                f"{context} seed_specs[{index}] requires seed_id/target_id/boundary_class/mutator_id")
+        if spec.get("executable") is not False:
+            raise CorpusProfileError(
+                f"{context} seed_specs[{index}] {seed_id}: F2 generation entries must declare "
+                "executable=false; generation is not execution")
+        key = (seed_id, target_id, variant)
+        if key in seen:
+            raise CorpusProfileError(f"{context} seed_specs duplicates {seed_id}/{variant}")
+        seen.add(key)
+        overrides = spec.get("overrides", {})
+        if not isinstance(overrides, dict):
+            raise CorpusProfileError(f"{context} seed_specs[{index}].overrides must be an object")
+        logical = overrides.get("logical_config", {})
+        if not isinstance(logical, dict):
+            raise CorpusProfileError(f"{context} overrides.logical_config must be an object")
+        normalized.append({"seed_id": seed_id, "target_id": target_id,
+                           "variant_id": variant, "boundary_class": boundary,
+                           "mutator_id": mutator_id, "executable": False,
+                           "overrides": {"logical_config": deepcopy(logical)}})
+    return normalized
+
+
+def _f2_cycles(profile):
+    """Parse F2 cycles with generation-only seed specs.
+
+    Deliberately separate from ``_profile_cycles``: that parser enforces the F1
+    rule ``executable is True`` and would reject every honest F2 entry.
+    """
+    cycles = profile.get("cycles")
+    if not isinstance(cycles, list) or not cycles:
+        raise CorpusProfileError(
+            "F2 generation profile must declare explicit cycles")
+    normalized, seen = [], set()
+    for index, cycle in enumerate(cycles):
+        if not isinstance(cycle, dict):
+            raise CorpusProfileError(f"profile cycles[{index}] must be an object")
+        cycle_id = cycle.get("cycle_id")
+        if not isinstance(cycle_id, str) or not cycle_id:
+            raise CorpusProfileError(f"profile cycles[{index}].cycle_id is required")
+        if cycle_id in seen:
+            raise CorpusProfileError(f"profile cycles duplicates cycle_id {cycle_id}")
+        seen.add(cycle_id)
+        target_id = cycle.get("target_id")
+        if not isinstance(target_id, str) or not target_id:
+            raise CorpusProfileError(f"profile cycle {cycle_id}.target_id is required")
+        surfaces = cycle.get("surfaces")
+        if not isinstance(surfaces, list) or not surfaces or any(
+                not isinstance(item, str) or not item for item in surfaces):
+            raise CorpusProfileError(f"profile cycle {cycle_id}.surfaces must be nonempty ids")
+        if len(set(surfaces)) != len(surfaces):
+            raise CorpusProfileError(f"profile cycle {cycle_id}.surfaces contains duplicates")
+        specs = _f2_seed_specs(cycle.get("seed_specs"), context=f"profile cycle {cycle_id}")
+        if any(spec["target_id"] != target_id for spec in specs):
+            raise CorpusProfileError(
+                f"profile cycle {cycle_id} contains a seed for a different target")
+        normalized.append({"cycle_id": cycle_id, "target_id": target_id,
+                           "surfaces": list(surfaces), "seed_specs": specs})
+    return normalized
+
+
+def f2_generation_corpus_from_profile(profile, seeds=None, *, cycle_id=None):
+    """Build a generation-only corpus for F2 surfaces (never an F1 live corpus).
+
+    This is an explicit, separately-named path.  ``corpus_from_profile`` keeps
+    rejecting F2 surfaces, so F1 selection cannot silently pick these up.
+    """
+    from r2f.modules.s1 import fuzz_catalog
+    from r2f.modules.s1.targets import (
+        EXPLORATORY_RUNTIME_TARGET, EXPLORATORY_TARGET_ORDER,
+        exploratory_target_declarations,
+    )
+    from r2f.core.mutators import F2_MUTATORS
+
+    profile = _f2_profile_document(profile)
+    rmws = _profile_strings(profile, "rmws")
+    all_surfaces = _profile_strings(profile, "surfaces")
+    all_targets = _profile_strings(profile, "target_ids")
+    cycles = _f2_cycles(profile)
+    if cycle_id is None:
+        raise CorpusProfileError("explicit cycle_id is required; refusing a mixed generation corpus")
+    matches = [cycle for cycle in cycles if cycle["cycle_id"] == cycle_id]
+    if len(matches) != 1:
+        raise CorpusProfileError(f"profile has no unique cycle matching {cycle_id!r}")
+    cycle = matches[0]
+    if cycle["target_id"] not in all_targets:
+        raise CorpusProfileError(
+            f"cycle {cycle_id} target {cycle['target_id']} is not in profile target_ids")
+
+    for surface_id in all_surfaces:
+        if surface_id not in fuzz_catalog.SURFACES:
+            raise CorpusProfileError(f"profile surfaces contains unknown surface {surface_id}")
+        if surface_id not in fuzz_catalog.F2_GENERATION_MUTATORS:
+            raise CorpusProfileError(
+                f"profile surface {surface_id} has no F2 generation path "
+                f"(generatable: {','.join(sorted(fuzz_catalog.F2_GENERATION_MUTATORS))})")
+        projected = fuzz_catalog.f2_generation_surface(surface_id)
+        if projected.executable:
+            raise CorpusProfileError(
+                f"surface {surface_id} projected as executable; F2 generation must not be")
+    seed_map = seeds
+    if seed_map is None:
+        seed_map = fuzz_catalog.load_seeds()["seeds"]
+    declared = exploratory_target_declarations()
+    corpus = Corpus()
+    live_variants = set()
+    for spec in cycle["seed_specs"]:
+        seed_id = spec["seed_id"]
+        if seed_id not in seed_map:
+            raise CorpusProfileError(f"seed {seed_id} is missing from the provided seed mapping")
+        seed = seed_map[seed_id]
+        fuzz_catalog.validate_seed(seed)
+        surface_id = (seed.get("surface_refs") or [None])[0]
+        if surface_id not in fuzz_catalog.F2_GENERATION_MUTATORS:
+            raise CorpusProfileError(
+                f"seed {seed_id} surface {surface_id} has no F2 generation path")
+        if surface_id not in all_surfaces:
+            raise CorpusProfileError(
+                f"seed {seed_id} surface {surface_id} is not declared in the selected cycle")
+        if spec["mutator_id"] not in fuzz_catalog.F2_GENERATION_MUTATORS[surface_id]:
+            raise CorpusProfileError(
+                f"seed {seed_id} mutator {spec['mutator_id']} is not declared for {surface_id}")
+        if spec["mutator_id"] not in F2_MUTATORS:
+            raise CorpusProfileError(f"mutator {spec['mutator_id']} is not implemented")
+        surface = fuzz_catalog.SURFACES[surface_id]
+        if spec["boundary_class"] not in surface.boundary_classes:
+            raise CorpusProfileError(
+                f"seed {seed_id} boundary_class {spec['boundary_class']} is not declared by {surface_id}")
+        target_id = spec["target_id"]
+        if target_id not in EXPLORATORY_TARGET_ORDER:
+            raise CorpusProfileError(f"seed {seed_id} target {target_id} is not exploratory")
+        if target_id != cycle["target_id"]:
+            raise CorpusProfileError(
+                f"seed {seed_id} target {target_id} does not match cycle target {cycle['target_id']}")
+        runtime_target = EXPLORATORY_RUNTIME_TARGET.get(target_id)
+        # A target with no required runtime family (G01) is still generatable:
+        # generation is not execution.  When a family is declared, the seed must
+        # agree with it; the family is never invented here.
+        if runtime_target is not None and seed.get("target_family") != runtime_target:
+            raise CorpusProfileError(
+                f"seed {seed_id} target_family {seed.get('target_family')} "
+                f"does not match {target_id} runtime family {runtime_target}")
+        if runtime_target is None and not isinstance(seed.get("target_family"), str):
+            raise CorpusProfileError(f"seed {seed_id} must declare a target_family")
+        if declared.get(target_id) is None:
+            raise CorpusProfileError(f"target {target_id} is not declared")
+        live_variants.add(spec["variant_id"])
+        target_contract = declared[target_id].exploration_contract
+        if target_contract is None:
+            raise CorpusProfileError(f"target {target_id} has no exploration contract")
+        for rmw in rmws:
+            entry = {
+                "target_id": target_id,
+                "target_revision": declared[target_id].target_revision,
+                "rmw": rmw,
+                "contract_hash": target_contract.contract_hash(),
+                "surface_id": surface_id,
+                "boundary_class": spec["boundary_class"],
+                "seed_id": seed_id,
+                "variant_id": spec["variant_id"],
+                "seed_content_sha256": fuzz_catalog.seed_content_sha256(seed),
+                "seed_template": True,
+                "seed_provenance_kind": seed.get("provenance", {}).get("kind"),
+                "derived_from_execution": False,
+                "profile_id": profile["profile_id"],
+                "cycle_id": cycle["cycle_id"],
+                "mutator_id": spec["mutator_id"],
+                "final_config": {**deepcopy(seed["logical_config"]),
+                                  **deepcopy(spec["overrides"]["logical_config"])},
+                # Generation-only.  Never selectable, never a hit, never a run.
+                "executable": False,
+                "execution_admitted": False,
+                "activation": "F2",
+                "planned_only": True,
+                "capability_status": "generatable_pending_execution",
+                "runner_slice": F2_GENERATION_SLICE,
+            }
+            corpus.add_seed(entry)
+    if not corpus.entries:
+        raise CorpusProfileError("F2 profile produced an empty generation corpus")
+    return corpus
