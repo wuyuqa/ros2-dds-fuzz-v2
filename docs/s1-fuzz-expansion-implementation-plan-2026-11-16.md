@@ -57,6 +57,16 @@
 - 能力边界：F1 可路由 surface 为 P01–P06/E01/W01/W02；E02/E03/G01 仍为 F2 pending；M04–M08 未实现；P02–P06/W01/W02/E02/E03 的 seed 仍 pending；runner 探索闭环仍在实施。
 - 尚未启动 ROS/campaign/nft，未产生真实新执行、自然候选或 seal；已完成项均属离线合同/夹具，不得当作 DDS 或 SUT 证据。
 
+## 阶段推进：projection/recovery 真实准入（4d63912）
+
+- 已用真实运行把 projection.fuzz_v1 与 recovery.fuzz_v1 从 planned-only 推进到可执行：
+  - projection：P02–P06，含 best_effort、deadline/lease 的 zero 与 infinite；CycloneDDS/FastDDS 均产生 judged raw，`qos_binding_observed` 两角色齐全，`projection_observation` 存在。
+  - recovery：E01 单窗真实 `completed`，window ledger、restore boundary、recovery confirmed 均有 raw；但稳定 match 后 3s 窗口内 discovery counter 仍为 0，mutation currently ineffective，非 SUT 缺陷。
+- 修掉的 runtime/adapter 真实问题：projection manifest 误报、duration 0=INFINITE 等价类、FastDDS depth/history 观察限制、projection adapter 分派、mutation ineffective 分支、recovery window_hits 未初始化、emit event 键冲突、restore_mono_ns 作用域。
+- 当前真实 judged 累计 68 条（三类 target、双 RMW、多 surface/极值），自然 candidate 仍为 **0**。
+- E02/E03/G01 仍不可执行：G01 缺独立关系观察；E01 窗口内无新 discovery 流量，需 F3 的 endpoint 重建/新 participant 来产生真实命中。
+- 不把 `mutation_ineffective`、FastDDS 观察限制、zero=INFINITE 等价归为 SUT 候选；不打开未验证的多窗口执行。
+
 ## 当前冻结身份与阶段结论（af90c13）
 
 - HEAD `af90c130…`，behavior `116f52ae…`，`source_frozen=true`，`dirty_behavior_paths=[]`。
