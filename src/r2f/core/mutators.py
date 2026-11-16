@@ -283,10 +283,13 @@ def M03_range_sample(input, surface, rng, context=None):
     span_steps = max(1, int(round((domain["max"] - domain["min"]) / step)))
     # Local neighbourhood only for a genuinely narrow field; a wide domain
     # (e.g. nanoseconds) must still explore the declared range.
-    if type(current) in (int, float) and span_steps <= 4096:
-        # Neighbourhood relative to the parent, capped to a small fraction of
-        # the declared span so a 0.001 s seed is not turned into 0.06 s.
-        max_delta = max(1, min(int(span_steps * 0.05) or 1, 64))
+    if type(current) in (int, float) and not (current == 0 and span_steps > 1_000_000):
+        # Neighbourhood relative to the parent, capped by a small absolute
+        # fraction of the current value (and a few steps for tiny values) so a
+        # 0.5 s window is not randomly rewritten to 0.07 s.
+        relative = max(1, int(abs(current) / step * 0.05)) if step else 1
+        domain_relative = max(1, int(span_steps * 0.01))
+        max_delta = max(1, min(max(relative, domain_relative), span_steps, 4096))
         delta_steps = rng.randrange(-max_delta, max_delta + 1)
         raw = current + delta_steps * step
     else:

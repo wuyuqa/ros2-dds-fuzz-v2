@@ -794,6 +794,8 @@ def _generate_case(sequence, entry, target, contract, surface, parent, mutator_i
             config['reader_recreate_in_window'] = True
             if 'reader_recreate_delay_sec' in profile:
                 config['reader_recreate_delay_sec'] = profile['reader_recreate_delay_sec']
+            if 'reader_recreate_at_fraction' in profile:
+                config['reader_recreate_at_fraction'] = profile['reader_recreate_at_fraction']
         binding = {"status": "preserved", "silent_normalization": False,
                    "submitted_config_sha256": canonical_hash(plan.final_config),
                    "normalized_config_sha256": canonical_hash(normalized),
