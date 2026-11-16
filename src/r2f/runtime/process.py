@@ -76,7 +76,10 @@ class WorkerPool:
             if predicate():
                 return
             if check_health:
-                failed = [(role, p.returncode) for role, p in self.workers.items() if p.poll() is not None]
+                # A probe is deliberately stopped during the window; its clean
+                # exit (rc0) is expected.  Writer/reader must stay alive.
+                failed = [(role, p.returncode) for role, p in self.workers.items()
+                          if p.poll() is not None and not (role == 'probe' and p.returncode == 0)]
                 if failed:
                     self.pump(0)
                     raise RuntimeError(f'worker_exited:{failed}')

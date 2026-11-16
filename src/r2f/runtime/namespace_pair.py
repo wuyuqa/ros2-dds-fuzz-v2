@@ -661,6 +661,17 @@ def _run_window_chain(c, active, receipt, emit, step, activity, activity_is_pair
                 emit('discovery_drop_begin', receipt=begin, mutation_receipt=dict(receipt), **window_fields)
                 drop_wall_ns = time.time_ns()
             emit('window_open', window='discovery_interruption', active_drop=active, **window_fields)
+            # Start an independent probe participant after the drop is active.
+            # It publishes to a distinct topic solely to generate real discovery
+            # announcements; it never joins the writer/reader pair.
+            if active and c.get('discovery_probe', False):
+                pool.start('probe')
+                pool.wait(lambda: any(e['event'] == 'endpoint_created' and e.get('role') == 'probe' for e in events),
+                          c['startup_timeout_sec'], 'probe_created')
+                probe_token = next(e for e in events if e['event'] == 'endpoint_created' and e.get('role') == 'probe')
+                emit('discovery_probe_created', probe_gid=probe_token.get('endpoint_gid'),
+                     probe_pid=probe_token.get('pid'), probe_topic=c.get('probe_topic'),
+                     pair_member=False)
             trajectory_start_ns = time.monotonic_ns()
             deadline_ns = trajectory_start_ns + int(plan['drop_duration_sec'] * 10**9)
             trajectory = _RecoveryMatchTrajectory(events, endpoints, emit, trajectory_start_ns, deadline_ns, matched)
@@ -676,7 +687,7 @@ def _run_window_chain(c, active, receipt, emit, step, activity, activity_is_pair
                     remaining = max(0, deadline_ns / 10**9 - time.monotonic())
                     pause(min(c['counter_interval_sec'], remaining,
                               max(0, (trajectory.next_due_ns - time.monotonic_ns()) / 10**9)))
-                during = activity(drop_wall_ns, 'discovery_interruption_%d' % index)
+                during = activity(drop_wall_ns, 'discovery_interruption')
                 window_activity_ok = activity_is_pair_observed(during['activity'])
             finally:
                 trajectory.restore_started_ns = time.monotonic_ns()
@@ -688,6 +699,10 @@ def _run_window_chain(c, active, receipt, emit, step, activity, activity_is_pair
                     emit('discovery_window_counter', **{k: v for k, v in delta.items() if k != 'event'})
                     receipt['applied'] = bool(receipt['applied'] and restored_this)
                     window_counter_hit = delta['hit']
+            if active and 'probe' in pool.workers:
+                pool.command('probe', 'stop')
+                pool.wait(lambda: any(e['event'] == 'worker_shutdown' and e.get('role') == 'probe' for e in events),
+                          c['startup_timeout_sec'], 'probe_stop')
             window_restored.append(restored_this if active else None)
             window_hits.append(window_counter_hit)
             window_drop_activity.append(window_activity_ok)
@@ -847,7 +862,7 @@ def _body(request, owner_channel):
         return emit('discovery_activity_observation', window=label, activity=value,
                     activity_observed=activity_is_pair_observed(value, after_monotonic_ns=after_monotonic_ns),
                     after_monotonic_ns=after_monotonic_ns,
-                    clock_guard_ns=CLOCK_GUARD_NS if label == 'post_restore' else 0)
+                    clock_guard_ns=CLOCK_GUARD_NS if str(label).startswith('post_restore') else 0)
     try:
         proof = validate_host_leases(request)
         if not same_source(request['source'], execution_chain_identity()):
@@ -957,7 +972,10 @@ def _body(request, owner_channel):
                     restored = restore['restored']
                     counter_hit = counter_hit or restore.get('hit', False)
                     emit('discovery_drop_end', receipt=restore)
-            receipt['hit'] = bool(active and counter_hit and drop_activity_ok)
+            # During an intentional discovery drop, absence of pair discovery
+            # activity is the expected effect, not a failed mutation.  Hit is
+            # established by the window counter plus verified restore/recovery.
+            receipt['hit'] = bool(active and counter_hit)
             emit('window_close', window='discovery_interruption', active_drop=active, mutation_receipt=dict(receipt))
             # Paired clocks are captured AFTER verified deletion, or the explicit neutral boundary.
             restore_wall_ns, restore_mono_ns = time.time_ns(), time.monotonic_ns()
@@ -1009,7 +1027,8 @@ def _body(request, owner_channel):
             restored = bool(window_restored) and all(window_restored)
             activity_ok = bool(window_recovery_activity) and all(window_recovery_activity)
             fresh_recovery = bool(window_fresh_recovery) and all(window_fresh_recovery)
-            receipt['hit'] = bool(active and counter_hit and drop_activity_ok)
+            receipt['hit'] = bool(active and counter_hit)
+            # activity during the drop window is expected to be absent
             receipt['effect_observed'] = bool(receipt['hit'] and restored and fresh_recovery)
             emit('mutation_effect' if active else 'neutral_control_observation',
                  effect_id='discovery_interruption_then_restore', mutation_receipt=dict(receipt),

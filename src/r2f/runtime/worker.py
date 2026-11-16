@@ -136,7 +136,16 @@ def main():
              message_info=metadata)
 
     create_begin = emit('endpoint_create_begin', topic=config['topic'], qos=q, message_type='std_msgs/msg/String')
-    endpoint = node.create_publisher(String, config['topic'], qos) if role == 'writer' else node.create_subscription(String, config['topic'], receive, qos)
+    if role == 'probe':
+        # Independent participant/endpoint used only to generate real discovery
+        # announcements during an interruption window.  It never joins the
+        # writer/reader pair and its topic is deliberately distinct.
+        probe_topic = config.get('probe_topic', '/r2f/probe/discovery_only')
+        endpoint = node.create_publisher(String, probe_topic, qos)
+    elif role == 'writer':
+        endpoint = node.create_publisher(String, config['topic'], qos)
+    else:
+        endpoint = node.create_subscription(String, config['topic'], receive, qos)
     created_ns = time.monotonic_ns()
 
     def graph():
@@ -148,9 +157,11 @@ def main():
                             'durability': info.qos_profile.durability.name.lower(),
                             'depth': info.qos_profile.depth,
                             **extended_graph_qos(info.qos_profile, config.get('observe_extended_qos', False))}}
-        publishers = [entry(x) for x in node.get_publishers_info_by_topic(config['topic'])]
-        subscriptions = [entry(x) for x in node.get_subscriptions_info_by_topic(config['topic'])]
-        for item in publishers if role == 'writer' else subscriptions:
+        graph_topic = (config.get('probe_topic', '/r2f/probe/discovery_only')
+                       if role == 'probe' else config['topic'])
+        publishers = [entry(x) for x in node.get_publishers_info_by_topic(graph_topic)]
+        subscriptions = [entry(x) for x in node.get_subscriptions_info_by_topic(graph_topic)]
+        for item in publishers if role in ('writer', 'probe') else subscriptions:
             if item['node_name'] == name:
                 local_gid = item['endpoint_gid']
         return {'publishers': publishers, 'subscriptions': subscriptions}
@@ -180,7 +191,8 @@ def main():
         while True:
             executor.spin_once(timeout_sec=0.02)
             now = time.monotonic_ns()
-            count = endpoint.get_subscription_count() if role == 'writer' else endpoint.get_publisher_count()
+            count = (endpoint.get_subscription_count()
+                     if role in ('writer', 'probe') else endpoint.get_publisher_count())
             if count != last_count:
                 emit('match', matched_count=count, endpoint_gid=local_gid)
                 emit('graph_snapshot', **graph())

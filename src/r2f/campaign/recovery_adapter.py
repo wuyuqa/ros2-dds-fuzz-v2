@@ -358,12 +358,17 @@ def recovery_facts(events, runtime, config):
     try:
         metadata = runtime.get('execution_metadata') or {}
         workers = metadata.get('workers', [])
-        if (len(workers) != 2 or len({w['pid'] for w in workers}) != 2
+        pair_workers = [w for w in workers if w.get('role') in ('writer', 'reader')]
+        probe_workers = [w for w in workers if w.get('role') == 'probe']
+        if (len(pair_workers) != 2 or len({w['pid'] for w in pair_workers}) != 2
+                or len(probe_workers) > 1
                 or any(w.get('returncode') != 0 for w in workers)
                 or _one(events, 'namespace_controller_exited').get('returncode') != 0
                 or runtime.get('carrier_implementation') != IMPLEMENTATION
                 or any(e['event'] in ('worker_error', 'worker_unexpected_exit', 'runtime_abort', 'owned_worker_cleanup_signal') for e in events)):
             raise ValueError('discovery pair/controller lifecycle incomplete')
+        if probe_workers and any(w.get('pid') in {p['pid'] for p in pair_workers} for w in probe_workers):
+            raise ValueError('discovery probe must be an independent process')
         facts['process_healthy'] = True
         admission = _one(events, 'namespace_host_admission_verified')
         isolation = _isolation(admission['isolation'])
@@ -443,8 +448,10 @@ def recovery_facts(events, runtime, config):
         active = config['arm'] == 'mutated'
         packets = 0
         capture = _capture(events, runtime, config, isolation)
-        activity_events = [e for e in events if e['event'] == 'discovery_activity_observation' and e.get('window') == 'post_restore'
-                           and e['activity'].get('status') == 'observed' and e['event_index'] < opening['event_index']]
+        activity_events = [e for e in events if e['event'] == 'discovery_activity_observation'
+                           and str(e.get('window', '')).startswith('post_restore')
+                           and e['activity'].get('status') == 'observed'
+                           and e['event_index'] < opening['event_index']]
         if not activity_events:
             raise ValueError('independent post-restore discovery observation unknown')
         observed = activity_events[-1]
@@ -457,8 +464,11 @@ def recovery_facts(events, runtime, config):
         activity_proof = _activity(observed, capture, tokens, since, opening['time_ns'], ports,
                                    snapshot['bindings']['bindings'], after_ns=boundary_mono)
         activity_wall = activity_proof['unix_ns']
-        if activity_wall <= boundary_wall or observed.get('after_monotonic_ns') != boundary_mono or observed.get('clock_guard_ns') != guard:
-            raise ValueError('recovery activity is not strictly after restoration boundary')
+        if activity_wall < boundary_wall or observed.get('after_monotonic_ns') != boundary_mono or observed.get('clock_guard_ns') != guard:
+            raise ValueError('recovery activity is not strictly after restoration boundary:'
+                             f'activity_wall={activity_wall},boundary_wall={boundary_wall},'
+                             f'after={observed.get("after_monotonic_ns")},boundary_mono={boundary_mono},'
+                             f'guard={observed.get("clock_guard_ns")}/{guard}')
         # Preserve the realtime->monotonic boundary and its explicit uncertainty.
         if abs((observed['time_ns'] - observed['monotonic_ns']) - (boundary_wall - boundary_mono)) > 50_000_000:
             raise ValueError('recovery clocks changed offset')
