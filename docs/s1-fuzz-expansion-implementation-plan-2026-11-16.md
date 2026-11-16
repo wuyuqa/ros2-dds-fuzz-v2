@@ -26,6 +26,13 @@
 
 > **范围补充（2026-11-16 提出，2026-11-17 状态更新）**：用户提出将多 endpoint、生命周期、发现时序、持续 episode 等纳入成熟路线。F1/F2 保留为首个交付包，不再代表整个成熟路线；参见 [S1 扩展范围与成熟版本判定](/home/wuyuqa/ros2-dds-fuzz-v2/docs/s1-expanded-scope-and-maturity-2026-11-16.md)。下文“暂缓”仅指不阻塞 F1/F2，不是永久排除。F3–F7 的预算与接口尚未冻结，也未启动实现。
 
+### F1 真实探索扩展（source 4b7f7ea/5907b0c）
+
+- 真实 late endpoint 覆盖 4 个 authored 变体（0.001/0.01/0.15/quantized），CycloneDDS 与 FastDDS 各 4 条全部 `judged`/oracle pass；raw 保留在 `results/fuzz-cli/late-final-*`、`late-fastrtps-real`。
+- 真实 late join 覆盖 publish interval 变体，CycloneDDS 与 FastDDS 均有 `judged`/pass；W02 zero 因没有精确 M01/special-value 支持，已从 real 变体中移除，不以 0.005s 冒充 zero。
+- 公开结果中自然 candidate 仍为 0；正常路径不伪造候选，corpus 对 `success_only` 明确拒绝。
+- projection/recovery fuzz_v1 的 `execute=True` 仍为 planned-only：runtime admission 未获 live raw，不打开。
+- 已将 scheduler 的覆盖维度加入 `variant_id`，warmup 先跨变体交错；M03 对宽域保留范围采样，对窄域做父值邻域，避免把 authored 变体压成一个值。
 ### 2026-11-17 真实 F1 与 legacy 基线（source e6af301）
 
 - 真实 F1 late endpoint 两条通过：`fuzz-cli-late-007`、`fuzz-cli-late-008`，均 `judged`、`actual_run=true`、mutation receipt 七项真、oracle pass；raw 分别在对应 `results/fuzz-cli/.../runtime/raw.jsonl`，SHA256 见 cycle/row。

@@ -151,9 +151,39 @@
       "seed_specs": [
         {
           "seed_id": "W02",
+          "variant_id": "W02-001",
           "target_id": "discovery.late_join_delivery.fuzz_v1",
           "boundary_class": "finite",
-          "executable": true
+          "executable": true,
+          "overrides": {
+            "logical_config": {
+              "publish_interval_sec": 0.001
+            }
+          }
+        },
+        {
+          "seed_id": "W02",
+          "variant_id": "W02-010",
+          "target_id": "discovery.late_join_delivery.fuzz_v1",
+          "boundary_class": "finite",
+          "executable": true,
+          "overrides": {
+            "logical_config": {
+              "publish_interval_sec": 0.01
+            }
+          }
+        },
+        {
+          "seed_id": "W02",
+          "variant_id": "W02-100",
+          "target_id": "discovery.late_join_delivery.fuzz_v1",
+          "boundary_class": "finite",
+          "executable": true,
+          "overrides": {
+            "logical_config": {
+              "publish_interval_sec": 0.1
+            }
+          }
         }
       ]
     },

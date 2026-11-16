@@ -564,6 +564,8 @@ def run_exploratory_cycle(output_dir, *, corpus, feedback, scheduler, profile, r
                     # to M01 or silently use the first mutator.
                     boundary = entry.get("boundary_class")
                     preferred = ("M03" if boundary in {"log_range", "sampled"} else "M01")
+                    if boundary in {"zero", "finite", "infinite", "quantized_neighbor"} and "M01" in mutator_ids:
+                        preferred = "M01"
                     requested = entry.get("mutator_id")
                     # A corpus template's default M01 is not an explicit user
                     # override for a sampled-range boundary; prefer M03 there.
