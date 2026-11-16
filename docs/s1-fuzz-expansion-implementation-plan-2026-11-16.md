@@ -26,6 +26,14 @@
 
 > **范围补充（2026-11-16 提出，2026-11-17 状态更新）**：用户提出将多 endpoint、生命周期、发现时序、持续 episode 等纳入成熟路线。F1/F2 保留为首个交付包，不再代表整个成熟路线；参见 [S1 扩展范围与成熟版本判定](/home/wuyuqa/ros2-dds-fuzz-v2/docs/s1-expanded-scope-and-maturity-2026-11-16.md)。下文“暂缓”仅指不阻塞 F1/F2，不是永久排除。F3–F7 的预算与接口尚未冻结，也未启动实现。
 
+### 2026-11-17 真实 F1 与 legacy 基线（source e6af301）
+
+- 真实 F1 late endpoint 两条通过：`fuzz-cli-late-007`、`fuzz-cli-late-008`，均 `judged`、`actual_run=true`、mutation receipt 七项真、oracle pass；raw 分别在对应 `results/fuzz-cli/.../runtime/raw.jsonl`，SHA256 见 cycle/row。
+- 先前的 `late-002` 至 `late-006` 失败 run 全部保留：包括 qos observer race、0-delay no-effect、binding_event 下标 bug；修复后重跑，不删除/不覆盖原失败。
+- 当前 source `e6af301` 的 legacy baseline：projection 17/18 required、1 unknown（`rmw_fastrtps_cpp.transparent.0`），recovery transparency 5/6、1 unknown（`rmw_fastrtps_cpp.transparent.2`），fault 均 6/6；seal=false，原因均为 FastDDS environment/process，非本轮 fuzz 代码新增。
+- projection.fuzz_v1 与 recovery.fuzz_v1 的 `execute=True` 仍为 planned-only：runtime 无可用的 fuzz_v1 live raw；不得开启 `execution_admitted`。真实 F1 当前只覆盖 late endpoint/late join 参数面。
+- 这些结果不改变 required 72/24 分母，不构成新 seal；只有 F1 探索闭环与受限真实 carrier 通过。
+
 ## 执行进展与真实执行阻断（2026-11-17）
 
 - 离线 F1 闭环已打通：profile/seed→corpus→scheduler→mutator/plan→v2 capsule→carrier→fake runtime→ingest→feedback→corpus。全仓离线回归实测 **733 tests, OK, skipped=1**（skip 仍为既有 `R2F_PROVIDER_AUDIT_REPORT` fixture）。
