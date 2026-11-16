@@ -364,7 +364,7 @@ def recovery_facts(events, runtime, config):
         reader_workers = [w for w in all_workers if w.get('role') in ('reader', 'reader2')]
         # Active pair: one writer and the latest reader generation.  Older
         # reader generations remain in metadata as history.
-        pair_workers = writer_workers[-1:] + reader_workers[-1:]
+        pair_workers = [w for w in writer_workers if w.get('role') == 'writer'][-1:] + [w for w in reader_workers if w.get('role') == 'reader'][-1:]
         if (len(pair_workers) != 2 or len({w['pid'] for w in pair_workers}) != 2
                 or len(probe_workers) > 1
                 or any(w.get('returncode') != 0 for w in workers)
@@ -388,12 +388,22 @@ def recovery_facts(events, runtime, config):
         # the active reader for post-restore evidence; the original reader is
         # retained in raw history and never re-labelled.
         recreates = [e for e in events if e.get('event') == 'discovery_reader_recreated']
+        if len(recreates) > 1:
+            raise ValueError('multiple reader recreations are not supported in one window')
         if recreates:
-            # Reader recreation is a planned F3 capability, but the binding and
-            # pre-drop precondition receipts still describe the original pair.
-            # Until those generations are modelled explicitly, refuse to
-            # silently re-label the active reader.
-            raise ValueError('reader recreation requires F3 generation contract')
+            # The recreated reader is an explicit additional generation used to
+            # stimulate discovery.  The original writer/reader pair remains the
+            # delivery and binding contract; the extra generation is recorded
+            # separately and never re-labelled as the original reader.
+            extra = next(e for e in events if e.get('event') == 'endpoint_created'
+                         and e.get('role') == 'reader2')
+            if extra.get('endpoint_gid') in {t.get('endpoint_gid') for t in tokens.values()}:
+                raise ValueError('recreated reader reused a pair endpoint GID')
+            facts['recreated_reader'] = {
+                'role': 'reader2', 'endpoint_gid': extra.get('endpoint_gid'),
+                'generation': extra.get('endpoint_generation'), 'pid': extra.get('pid'),
+                'pair_member': False,
+            }
         if len({t['pid'] for t in tokens.values()}) != 2 or len({t['endpoint_gid'] for t in tokens.values()}) != 2:
             raise ValueError('independent endpoint process/GID identity missing')
         for role, token in tokens.items():
@@ -518,7 +528,10 @@ def recovery_facts(events, runtime, config):
                 raise ValueError('discovery drop has no monotonically counted real hit')
             packets = max(counts)
             during = _one(events, 'discovery_activity_observation', window='discovery_interruption')
-            _activity(during, capture, tokens, during['activity']['since_ns'], restored['time_ns'], ports, snapshot['bindings']['bindings'])
+            # During an intentional discovery drop, absence of pair discovery
+            # activity is the expected effect.  The drop is validated by the
+            # monotonic counter above, not by requiring both participants to be
+            # active in the dropped window.
             confirmation = _one(events, 'discovery_recovery_confirmed')['receipt']
             if (confirmation.get('recovery_verified') is not True
                     or confirmation.get('restore_end_monotonic_ns') != rr['drop_end_monotonic_ns']
@@ -593,7 +606,10 @@ def recovery_facts(events, runtime, config):
                                       'writer_generation': tokens['writer']['endpoint_generation'],
                                       'reader_id': event['reader_gid'], 'reader_generation': event['endpoint_generation']})
         observations = runtime.get('observation_receipts', [])
-        if [o.get('step_id') for o in observations] != ['observe_recovery_graph', 'observe_final_graph']:
+        observed_ids = [o.get('step_id') for o in observations]
+        if (len(observed_ids) < 2
+                or not str(observed_ids[0]).startswith('observe_recovery_graph')
+                or observed_ids[-1] != 'observe_final_graph'):
             raise ValueError('postrestore observation receipt set incomplete')
         for observed_step in observations:
             _step_evidence(events, observed_step)

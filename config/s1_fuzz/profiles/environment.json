@@ -81,5 +81,5 @@
     "required": true,
     "policy": "per source+rmw+target contract+recipe"
   },
-  "reader_recreate_in_window": false
+  "reader_recreate_in_window": true
 }
