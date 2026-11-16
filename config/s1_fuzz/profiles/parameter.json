@@ -200,6 +200,32 @@
       "runner_slice": "endpoint_pair_slice",
       "seed_specs": [
         {
+          "seed_id": "P02",
+          "variant_id": "P02-best-effort",
+          "target_id": "builtin.discovery_projection_reconciliation.fuzz_v1",
+          "boundary_class": "enum_exhaustive",
+          "executable": true,
+          "overrides": {
+            "logical_config": {
+              "qos": {
+                "reliability": "best_effort",
+                "durability": "volatile",
+                "depth": 64,
+                "deadline_ns": 1250000000,
+                "liveliness": "automatic",
+                "liveliness_lease_duration_ns": 9223372036854775807
+              }
+            }
+          }
+        },
+        {
+          "seed_id": "P04",
+          "variant_id": "P04-zero",
+          "target_id": "builtin.discovery_projection_reconciliation.fuzz_v1",
+          "boundary_class": "zero",
+          "executable": true
+        },
+        {
           "seed_id": "P04",
           "variant_id": "P04-infinite",
           "target_id": "builtin.discovery_projection_reconciliation.fuzz_v1",
@@ -207,25 +233,30 @@
           "executable": true
         },
         {
-          "seed_id": "P04",
-          "variant_id": "P04-finite",
+          "seed_id": "P06",
+          "variant_id": "P06-zero",
           "target_id": "builtin.discovery_projection_reconciliation.fuzz_v1",
-          "boundary_class": "finite",
+          "boundary_class": "zero",
           "executable": true
         },
         {
           "seed_id": "P06",
-          "variant_id": "P06-infinite",
-          "target_id": "builtin.discovery_projection_reconciliation.fuzz_v1",
-          "boundary_class": "infinite",
-          "executable": true
-        },
-        {
-          "seed_id": "P06",
-          "variant_id": "P06-finite",
+          "variant_id": "P06-finite-1s",
           "target_id": "builtin.discovery_projection_reconciliation.fuzz_v1",
           "boundary_class": "finite",
-          "executable": true
+          "executable": true,
+          "overrides": {
+            "logical_config": {
+              "qos": {
+                "reliability": "reliable",
+                "durability": "volatile",
+                "depth": 64,
+                "deadline_ns": 1250000000,
+                "liveliness": "automatic",
+                "liveliness_lease_duration_ns": 1000000000
+              }
+            }
+          }
         }
       ]
     }
