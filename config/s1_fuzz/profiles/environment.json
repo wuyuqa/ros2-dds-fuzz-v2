@@ -41,12 +41,13 @@
       "seed_specs": [
         {
           "seed_id": "E01",
+          "variant_id": "E01-8s",
           "target_id": "discovery.interruption_recovery.fuzz_v1",
           "boundary_class": "log_range",
           "executable": true,
           "overrides": {
             "logical_config": {
-              "drop_duration_sec": 3.0
+              "drop_duration_sec": 8.0
             }
           }
         }
