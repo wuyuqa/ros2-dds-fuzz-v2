@@ -74,6 +74,15 @@
 - E02/E03/G01 仍不可执行：G01 缺独立关系观察；E01 窗口内无新 discovery 流量，需 F3 的 endpoint 重建/新 participant 来产生真实命中。
 - 不把 `mutation_ineffective`、FastDDS 观察限制、zero=INFINITE 等价归为 SUT 候选；不打开未验证的多窗口执行。
 
+## F3 最小真实能力：reader 重建恢复（0bb6780）
+
+- 在 drop 窗口内启动第二 reader 代际（`reader_recreate_in_window`，profile 显式启用），产生真实 SEDP 刺激；nft discovery counter 命中 true，恢复后主 pair activity 成立。
+- 真实结果：`fuzz-cli-rec-recreate-009` judged/pass（CycloneDDS）、`fuzz-cli-rec-recreate-010` 两条 judged/pass（CycloneDDS + FastDDS）。
+- 身份处理：原始 writer/reader 仍是交付与 binding 合同；reader2 作为显式附加代际记录在 `facts.recreated_reader`，`pair_member=false`，不冒充旧 reader。
+- 修正：drop 窗口内不再要求主 pair discovery activity 覆盖双方（drop 的预期效果就是 discovery 不可见）；恢复后 activity 仍必须覆盖主 pair 双方。
+- 该路径是 F3 最小闭环，不是通用多 endpoint/反复重建平台；E02/E03 多窗口、G01 关系守卫仍 pending。
+- 自然 candidate 仍为 0；所有 reader 重建结果都是正常 pass，不得当候选。
+
 ## 当前冻结身份与阶段结论（af90c13）
 
 - HEAD `af90c130…`，behavior `116f52ae…`，`source_frozen=true`，`dirty_behavior_paths=[]`。
