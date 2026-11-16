@@ -24,6 +24,7 @@ def main():
     parser.add_argument("--exploratory-profile", type=Path,
                         help="explicit exploratory profile; selects a separate exploratory cycle")
     parser.add_argument("--cycle-id", help="cycle inside the exploratory profile")
+    parser.add_argument("--max-inputs", type=int, default=1, help="bounded exploratory inputs (default 1)")
     args = vars(parser.parse_args())
     parameters_path = args.pop("parameters_json")
     if parameters_path:
@@ -41,7 +42,7 @@ def main():
             args["output_dir"], corpus=corpus, feedback=FeedbackLog(),
             scheduler=scheduler, profile=profile, execute=args["execute"],
             runtime=run_pair if args["execute"] else None,
-            run_id=args["run_id"], max_inputs=1, domain_id=args["domain_id"])
+            run_id=args["run_id"], max_inputs=args["max_inputs"], domain_id=args["domain_id"])
         print(json.dumps({"run_id": result["run_id"], "cycle_path": str(Path(args["output_dir"]).resolve() / "cycle.json"),
                           "execution_stage": result["rows"][0].get("execution_stage") if result["rows"] else None}, indent=2))
         return 0 if not args["execute"] or any(r.get("actual_run") for r in result["rows"]) else 1

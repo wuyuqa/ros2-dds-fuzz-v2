@@ -369,6 +369,7 @@ def _profile_seed_specs(specs, *, context="profile"):
         seed_id = spec.get("seed_id")
         target_id = spec.get("target_id")
         boundary = spec.get("boundary_class")
+        variant = spec.get("variant_id") or seed_id
         executable = spec.get("executable")
         if not isinstance(seed_id, str) or not seed_id:
             raise CorpusProfileError(f"{context} seed_specs[{index}].seed_id is required")
@@ -379,12 +380,22 @@ def _profile_seed_specs(specs, *, context="profile"):
         if executable is not True:
             raise CorpusProfileError(
                 f"{context} seed_specs[{index}] {seed_id}: live corpus entries must be executable=true")
-        key = (seed_id, target_id)
+        key = (seed_id, target_id, variant)
         if key in seen:
-            raise CorpusProfileError(f"{context} seed_specs duplicates {seed_id} for {target_id}")
+            raise CorpusProfileError(
+                f"{context} seed_specs duplicates {seed_id}/{variant} for {target_id}")
         seen.add(key)
+        overrides = spec.get("overrides", {})
+        if not isinstance(overrides, dict):
+            raise CorpusProfileError(f"{context} seed_specs[{index}].overrides must be an object")
+        logical = overrides.get("logical_config", {})
+        if not isinstance(logical, dict):
+            raise CorpusProfileError(
+                f"{context} seed_specs[{index}].overrides.logical_config must be an object")
         normalized.append({"seed_id": seed_id, "target_id": target_id,
-                           "boundary_class": boundary, "executable": True})
+                           "variant_id": variant,
+                           "boundary_class": boundary, "executable": True,
+                           "overrides": {"logical_config": deepcopy(logical)}})
     return normalized
 
 
@@ -631,11 +642,13 @@ def corpus_from_profile(profile, seeds=None, *, cycle_id=None, target_id=None):
         raise CorpusProfileError("invalid corpus limits: " + str(exc)) from exc
 
     declared = exploratory_target_declarations()
-    live_seed_ids = set()
+    live_seed_variants = set()
     for spec in specs:
         seed_id = spec["seed_id"]
-        if seed_id in live_seed_ids:
-            raise CorpusProfileError(f"seed {seed_id} is declared twice in the live corpus")
+        variant_id = spec.get("variant_id", seed_id)
+        if variant_id in live_seed_variants:
+            raise CorpusProfileError(f"seed variant {variant_id} is declared twice in the live corpus")
+        live_seed_variants.add(variant_id)
         if seed_id in pending_seeds:
             raise CorpusProfileError(f"seed {seed_id} is both live and pending")
         if seed_id not in seed_map:
@@ -704,7 +717,7 @@ def corpus_from_profile(profile, seeds=None, *, cycle_id=None, target_id=None):
             # contract.  The corpus records only the projected set.
             pass
 
-        live_seed_ids.add(seed_id)
+        live_seed_variants.add(variant_id)
         contract_hash = contract.contract_hash()
         for rmw in rmws:
             entry = {
@@ -715,6 +728,7 @@ def corpus_from_profile(profile, seeds=None, *, cycle_id=None, target_id=None):
                 "surface_id": surface_id,
                 "boundary_class": spec["boundary_class"],
                 "seed_id": seed_id,
+                "variant_id": spec.get("variant_id", seed_id),
                 "seed_content_sha256": fuzz_catalog.seed_content_sha256(seed),
                 "seed_template": True,
                 "seed_provenance_kind": seed.get("provenance", {}).get("kind"),
@@ -722,7 +736,8 @@ def corpus_from_profile(profile, seeds=None, *, cycle_id=None, target_id=None):
                 "profile_id": profile["profile_id"],
                 "cycle_id": cycle["cycle_id"],
                 "mutator_id": implemented[0],
-                "final_config": deepcopy(seed["logical_config"]),
+                "final_config": {**deepcopy(seed["logical_config"]),
+                                  **deepcopy(spec.get("overrides", {}).get("logical_config", {}))},
                 "executable": True,
             }
             corpus.add_seed(entry)

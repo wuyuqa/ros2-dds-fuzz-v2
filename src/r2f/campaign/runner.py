@@ -690,6 +690,7 @@ def _generate_case(sequence, entry, target, contract, surface, parent, mutator_i
         "operations": [op.to_dict() for op in plan.operations],
         "runtime_windows": plan.runtime_windows,
         "seed_id": entry.get("seed_id"),
+        "variant_id": entry.get("variant_id"),
     })
 
     cell_id = f"{run_id}.{sequence:04d}.{surface.surface_id}"
@@ -794,6 +795,7 @@ def _generate_case(sequence, entry, target, contract, surface, parent, mutator_i
         "boundary_class": proposal.parameters.get("boundary_class") or "sampled",
         "parameter_class": proposal.parameters.get("boundary_class") or "sampled",
         "seed_id": entry.get("seed_id"),
+        "variant_id": entry.get("variant_id"),
         "parent_content_sha256": entry["content_sha256"],
         "plan_parent_content_sha256": plan.parent_content_sha256,
         "content_sha256": child_content,

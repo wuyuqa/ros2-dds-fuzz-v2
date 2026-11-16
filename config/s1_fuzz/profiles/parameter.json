@@ -92,9 +92,51 @@
       "seed_specs": [
         {
           "seed_id": "P01",
+          "variant_id": "P01-finite-001",
           "target_id": "discovery.late_endpoint.fuzz_v1",
           "boundary_class": "finite",
-          "executable": true
+          "executable": true,
+          "overrides": {
+            "logical_config": {
+              "reader_delay_sec": 0.001
+            }
+          }
+        },
+        {
+          "seed_id": "P01",
+          "variant_id": "P01-finite-010",
+          "target_id": "discovery.late_endpoint.fuzz_v1",
+          "boundary_class": "finite",
+          "executable": true,
+          "overrides": {
+            "logical_config": {
+              "reader_delay_sec": 0.01
+            }
+          }
+        },
+        {
+          "seed_id": "P01",
+          "variant_id": "P01-finite-150",
+          "target_id": "discovery.late_endpoint.fuzz_v1",
+          "boundary_class": "finite",
+          "executable": true,
+          "overrides": {
+            "logical_config": {
+              "reader_delay_sec": 0.15
+            }
+          }
+        },
+        {
+          "seed_id": "P01",
+          "variant_id": "P01-quantized-020",
+          "target_id": "discovery.late_endpoint.fuzz_v1",
+          "boundary_class": "quantized_neighbor",
+          "executable": true,
+          "overrides": {
+            "logical_config": {
+              "reader_delay_sec": 0.02
+            }
+          }
         }
       ]
     },

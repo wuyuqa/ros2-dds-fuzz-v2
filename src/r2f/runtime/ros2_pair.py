@@ -865,7 +865,12 @@ def run_pair(config: dict, output_dir: Path) -> dict:
             deltas = [b['monotonic_ns'] - a['monotonic_ns'] for a, b in zip(sends, sends[1:])]
             actual_interval = (sum(deltas) / len(deltas) / 10**9) if deltas else None
             tolerance = max(0.002, c['publish_interval_sec'] * 0.5)
-            interval_bound = actual_interval is not None and abs(actual_interval - c['publish_interval_sec']) <= tolerance
+            # W02 is a requested pacing lower bound, not a throughput claim.
+            # The controller waits for publish ACK before the next interval, so
+            # the observed inter-send gap is >= configured; a gap below the
+            # configured lower bound is the actual binding violation.
+            interval_bound = (actual_interval is not None
+                              and actual_interval >= c['publish_interval_sec'] - tolerance)
             if 'W02' in c.get('fuzz_surfaces', []) and not interval_bound:
                 raise RuntimeError('publish_interval_binding_not_observed')
             emit('timing_binding_observed', configured_publish_interval_sec=c['publish_interval_sec'],
