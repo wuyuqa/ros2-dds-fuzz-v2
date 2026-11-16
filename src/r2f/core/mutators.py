@@ -150,13 +150,37 @@ def _boundary_values(surface):
         "max_minus_one": _quantize(maximum - step, surface),
         "max": maximum,
     }
+    # Declared semantic classes are real input classes, not aliases for min.
+    # "finite" selects a non-zero representative inside the declared range;
+    # "zero"/"infinite" come from special_values and are checked by the caller
+    # when it chooses the class.  Never silently fold a class into min.
+    special = {item.get("name"): item.get("value")
+               for item in surface.special_values if isinstance(item, dict)}
+    if "finite" in surface.boundary_classes:
+        finite = None
+        for item in surface.special_values:
+            if isinstance(item, dict) and item.get("name") == "finite":
+                candidate = item.get("value")
+                if type(candidate) in (int, float) and minimum <= candidate <= maximum:
+                    finite = candidate
+                    break
+        if finite is None:
+            finite = next((v for v in (0.01, 0.02, 0.15, 1.0)
+                           if minimum <= v <= maximum), None)
+        if finite is None:
+            raise ValueError("finite boundary class has no representative in the declared domain")
+        values["finite"] = _quantize(finite, surface)
+    if "zero" in surface.boundary_classes and "zero" in special:
+        values["zero"] = special["zero"]
+    if "infinite" in surface.boundary_classes and "infinite" in special:
+        values["infinite"] = special["infinite"]
+    if "quantized_neighbor" in surface.boundary_classes:
+        values["quantized_neighbor"] = _quantize(minimum + step, surface)
     declared = surface.boundary_classes or ["min", "max"]
     result = []
     for cls in declared:
         if cls not in values:
             raise ValueError(f"unsupported boundary class: {cls}")
-        if values[cls] < minimum or values[cls] > maximum:
-            raise ValueError(f"boundary class {cls} lies outside the declared domain")
         result.append((cls, values[cls]))
     return result
 
@@ -169,7 +193,14 @@ def M01_boundary_pick(input, surface, rng, context=None):
     before = snapshot(input)
     path = surface.input_paths[0]
     values = _boundary_values(surface)
-    cls, value = values[rng.randrange(len(values))]
+    requested = context.get("boundary_class")
+    if requested is not None:
+        selected = [(cls, value) for cls, value in values if cls == requested]
+        if not selected:
+            raise ValueError(f"requested boundary class is not declared: {requested}")
+    else:
+        selected = values
+    cls, value = selected[rng.randrange(len(selected))]
     return _proposal(surface, "M01", {"boundary_class": cls}, before, {path: value}, context,
                      notes={"selected_class": cls})
 

@@ -559,7 +559,19 @@ def run_exploratory_cycle(output_dir, *, corpus, feedback, scheduler, profile, r
                         raise ExploratoryCycleError(
                             "corpus entry requires a nonempty parent final_config")
                     mutator_ids = [mid for mid in surface.mutator_ids if mid in MUTATORS]
-                    mutator_id = entry.get("mutator_id") or (mutator_ids[0] if mutator_ids else None)
+                    # A sampled-range boundary (e.g. E01 log_range) is M03;
+                    # endpoint boundaries are M01.  Never feed a sampling class
+                    # to M01 or silently use the first mutator.
+                    boundary = entry.get("boundary_class")
+                    preferred = ("M03" if boundary in {"log_range", "sampled"} else "M01")
+                    requested = entry.get("mutator_id")
+                    # A corpus template's default M01 is not an explicit user
+                    # override for a sampled-range boundary; prefer M03 there.
+                    if preferred in mutator_ids and boundary in {"log_range", "sampled"}:
+                        mutator_id = preferred
+                    else:
+                        mutator_id = requested if requested in mutator_ids else (
+                            preferred if preferred in mutator_ids else (mutator_ids[0] if mutator_ids else None))
                     if not mutator_ids:
                         row = reject(sequence, entry,
                                      "unsupported_capability:no_implemented_mutator")
@@ -635,7 +647,8 @@ def _generate_case(sequence, entry, target, contract, surface, parent, mutator_i
     rng_seed = _derive_rng_seed(scheduler, selection, entry)
     rng = make_rng(rng_seed)
     proposal = mutate(adapted_parent, surface, rng,
-                      context={"application_phase": _application_phase(surface)},
+                      context={"application_phase": _application_phase(surface),
+                               "boundary_class": entry.get("boundary_class")},
                       mutator_id=mutator_id)
 
     windows, runtime_windows = [], []
@@ -836,9 +849,11 @@ def _generate_case(sequence, entry, target, contract, surface, parent, mutator_i
             execution={"config": config, "output_dir": result_path.parent,
                        "runtime": runtime})
     except Exception as exc:
+        import traceback as _traceback
         runtime_result = {"real_execution": False, "runtime_status": "tool_error",
                           "reason": f"{type(exc).__name__}:{exc}",
-                          "evidence_origin": "injected_runtime"}
+                          "evidence_origin": "injected_runtime",
+                          "tool_error_traceback": _traceback.format_exc()}
     _atomic_json(result_path, runtime_result)
     execution = ingest_execution(scenario, config, runtime_result, capsule, services=services)
     row.update(execution)

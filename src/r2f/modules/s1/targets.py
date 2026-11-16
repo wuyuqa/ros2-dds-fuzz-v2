@@ -165,11 +165,11 @@ EXPLORATORY_RUNTIME_TARGET = {
 #: activation, scope statement)
 _EXPLORATORY_SCOPE = {
     "discovery.late_endpoint.fuzz_v1": (
-        ("P01", "W01", "W02"), (), "late_joiner", "ros2_endpoint", "F1",
+        ("P01", "W02"), (), "late_joiner", "ros2_endpoint", "F1",
         "Fuzz variant of the required late-reader target: reader delay plus "
         "bounded workload surfaces, generated through the shared mutation plan."),
     "discovery.late_join_delivery.fuzz_v1": (
-        ("P01", "W01", "W02"), (), "late_joiner", "ros2_endpoint", "F1",
+        ("P01", "W02"), (), "late_joiner", "ros2_endpoint", "F1",
         "Fuzz variant of reliable volatile post-match delivery: the delivery "
         "rule is shared; workload parameters are the new input surfaces."),
     "discovery.interruption_recovery.fuzz_v1": (

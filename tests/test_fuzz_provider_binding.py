@@ -101,8 +101,10 @@ class RequiredCatalogFrozen(unittest.TestCase):
 
 
 class CatalogProjection(unittest.TestCase):
-    def test_nine_f1_surfaces_project_with_implemented_mutators_only(self):
-        for sid in catalog.F1_SURFACE_IDS:
+    def test_eight_live_f1_surfaces_project_with_implemented_mutators_only(self):
+        # W01's relation classes need M04; it is capability-pending, not a
+        # uniform-sampling substitute.  The remaining F1 surfaces project.
+        for sid in (s for s in catalog.F1_SURFACE_IDS if s != "W01"):
             with self.subTest(sid=sid):
                 surface = catalog.surface_to_core(catalog.SURFACES[sid])
                 self.assertTrue(surface.executable)
@@ -121,13 +123,10 @@ class CatalogProjection(unittest.TestCase):
         e01 = catalog.surface_to_core(catalog.SURFACES["E01"]).domain
         self.assertEqual((e01["min"], e01["max"]), (0.05, 8.0))
 
-    def test_pruned_boundary_classes_are_recorded_not_silently_dropped(self):
+    def test_semantic_boundary_classes_are_preserved(self):
         p04 = catalog.surface_to_core(catalog.SURFACES["P04"])
-        self.assertEqual(sorted(p04.boundary_classes), ["max", "min"])
-        note = [r for r in p04.value_relations if r.startswith("core_projection_pruned_boundary_classes=")]
-        self.assertEqual(len(note), 1)
-        for cls in ("zero", "infinite"):
-            self.assertIn(cls, note[0])
+        self.assertEqual(sorted(p04.boundary_classes),
+                         ["finite", "infinite", "quantized_neighbor", "zero"])
         names = {item["name"] for item in p04.special_values}
         self.assertEqual(names, {"zero", "infinite"})
 
@@ -156,9 +155,12 @@ class CatalogProjection(unittest.TestCase):
         # Edges to surfaces outside the subset are pruned, never dangling.
         self.assertEqual(first.surface_by_id["P01"].allowed_with, ["W02"])
         self.assertEqual(first.surface_by_id["W02"].allowed_with, ["P01"])
-        full = catalog.exploration_contract(catalog.F1_SURFACE_IDS)
-        self.assertEqual(len(full.surfaces), 9)
+        live = tuple(s for s in catalog.F1_SURFACE_IDS if s != "W01")
+        full = catalog.exploration_contract(live)
+        self.assertEqual(len(full.surfaces), 8)
         self.assertNotIn("G01", full.surface_by_id)
+        with self.assertRaises(catalog.UnsupportedCapabilityError):
+            catalog.exploration_contract(("P01", "W01"))
 
     def test_f2_rule_stays_resolvable_without_claiming_a_surface(self):
         contract = catalog.exploration_contract((), extra_rule_ids=("s1.discovery.compatibility_guard.v1",))
@@ -287,13 +289,23 @@ class DeterministicPlanConsumption(unittest.TestCase):
             with self.subTest(surface=surface_id, mutator=mutator_id):
                 plan = _plan(self.provider, target_id, surface_id, mutator_id, base)
                 self.assertTrue(plan.operations)
-                self.assertNotEqual(canonical_hash(plan.final_config), canonical_hash(base))
+                # An individual seed may legally select an equal value (no-op);
+                # the suite below verifies at least one real content change per
+                # surface family instead of requiring every draw to differ.
                 prepared = self.provider.prepare(_scenario(self.targets[target_id], plan))
                 self.assertEqual(prepared["plan_status"], "valid")
                 self.assertEqual(canonical_hash(prepared["final_input"]),
                                  canonical_hash(plan.final_config))
                 seen.add(surface_id)
         self.assertTrue({"P01", "P02", "P04"} <= seen)
+        changed = set()
+        for target_id, surface_id, mutator_id, base in self.CASES:
+            for seed in range(6):
+                plan = _plan(self.provider, target_id, surface_id, mutator_id, base, seed=seed)
+                if canonical_hash(plan.final_config) != canonical_hash(base):
+                    changed.add(surface_id)
+                    break
+        self.assertTrue({"P01", "P02", "P04"} <= changed)
 
     def test_same_plan_and_seed_never_regenerates_a_different_input(self):
         for target_id, surface_id, mutator_id, base in self.CASES:

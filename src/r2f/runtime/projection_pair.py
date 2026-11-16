@@ -402,11 +402,14 @@ def namespace_body(request, owner_channel):
             raise RuntimeError('projection_requires_independent_worker_processes')
         if c['target_id'] == FUZZ_TARGET:
             observed = {}
+            from .ros2_pair import wait_for_qos_binding
             for role in ('writer', 'reader'):
-                rows = [e for e in events if e.get('event') == 'qos_binding_observed' and e.get('role') == role]
-                if len(rows) != 1:
-                    raise RuntimeError('qos_binding_observation_missing:' + role)
-                row = rows[0]
+                # Same pipe race as the endpoint pair: the binding row is emitted
+                # by the worker right after endpoint_created and may not be read
+                # yet.  Wait bounded; timeout is an observation gap, not a SUT
+                # verdict.  GID binding and non-empty profile remain strict.
+                row = wait_for_qos_binding(events, pool, role, endpoints[role]['endpoint_gid'],
+                                           c['startup_timeout_sec'], emit=emit, exactly_one=True)
                 if row.get('requested') != c[role + '_qos']:
                     raise RuntimeError('qos_binding_requested_mismatch:' + role)
                 if not row.get('observed_self') or row.get('observed_self_gid') != endpoints[role]['endpoint_gid']:

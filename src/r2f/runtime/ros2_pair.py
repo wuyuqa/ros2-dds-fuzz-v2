@@ -370,6 +370,41 @@ def runtime_capabilities():
                 'execution_evidence': False}}
 
 
+def wait_for_qos_binding(events, pool, role, endpoint_gid, timeout, emit=None, *, exactly_one):
+    """Wait until the role's latest ``qos_binding_observed`` is GID-bound.
+
+    ``pool.start(role)`` only returns once the worker acknowledges creation; the
+    worker's following ``qos_binding_observed`` row may still be in flight.  This
+    helper pumps the pool under a bounded deadline.  A timeout is an observation
+    gap (tool/observer), never a SUT violation: it is recorded as
+    ``discovery_observation_unknown`` before raising, and the original raw stays
+    intact.  Identity checks are not relaxed: the latest row must belong to the
+    same endpoint GID and must carry a non-empty observed profile.
+    """
+    def rows():
+        return [e for e in events if e.get('event') == 'qos_binding_observed'
+                and e.get('role') == role]
+
+    try:
+        pool.wait(lambda: bool(rows()), timeout, 'qos_binding_observation:' + role)
+    except TimeoutError:
+        if emit is not None:
+            emit('discovery_observation_unknown',
+                 reason='qos_binding_observation_timeout:' + role,
+                 classification='observation_timeout_not_sut_violation',
+                 role=role, budget_sec=timeout)
+        raise RuntimeError('qos_binding_observation_missing:' + role)
+    observed = rows()
+    if exactly_one and len(observed) != 1:
+        raise RuntimeError('qos_binding_observation_ambiguous:' + role)
+    last = observed[-1]
+    if last.get('observed_self_gid') != endpoint_gid:
+        raise RuntimeError('qos_binding_observation_not_bound_to_endpoint:' + role)
+    if last.get('observed_self') is None:
+        raise RuntimeError('qos_binding_observation_empty:' + role)
+    return last
+
+
 def summarize_events(events):
     sends = [e for e in events if e['event'] == 'send' and e.get('phase') == 'post_match']
     recvs = [e for e in events if e['event'] == 'receive' and e.get('phase') == 'post_match']
@@ -743,10 +778,13 @@ def run_pair(config: dict, output_dir: Path) -> dict:
             for role, token in (('writer', writer_token), ('reader', reader_token)):
                 if token.get('qos') != requested_by_role[role]:
                     raise RuntimeError('endpoint_reported_qos_differs_from_config:' + role)
-                observed_rows = [e for e in events if e.get('event') == 'qos_binding_observed'
-                                 and e.get('role') == role]
-                if not observed_rows or observed_rows[-1].get('observed_self_gid') != token['endpoint_gid']:
-                    raise RuntimeError('qos_binding_observation_missing:' + role)
+                # The worker emits qos_binding_observed on its own creation path;
+                # that line can still be unread in the pipe when pool.start()
+                # returns.  Wait for it (bounded) instead of reading a stale
+                # event list.  GID binding and non-empty observation stay strict.
+                wait_for_qos_binding(events, pool, role, token['endpoint_gid'],
+                                     c['startup_timeout_sec'], emit=emit,
+                                     exactly_one=False)
             observed = {
                 'P01': {'configured_delay_sec': delay, 'observed_delay_ns': actual_delay,
                         'basis': 'reader_created_monotonic_minus_writer_created_monotonic'},
@@ -758,16 +796,26 @@ def run_pair(config: dict, output_dir: Path) -> dict:
                         'basis': 'actual_inter_publish_monotonic_delta'},
             }
             selected = {sid: observed[sid] for sid in c.get('fuzz_surfaces', []) if sid in observed}
-            binding_event = emit('exploratory_binding_observed', observed=selected,
-                                 requested_qos=requested_by_role,
-                                 submitted_qos=submitted_qos,
-                                 observation_basis='public_api_endpoint_and_creation_events')
+            binding_event_index = len(events)
+            emit('exploratory_binding_observed', observed=selected,
+                 requested_qos=requested_by_role,
+                 submitted_qos=submitted_qos,
+                 observation_basis='public_api_endpoint_and_creation_events')
             emit('qos_binding_verified', endpoints=requested_by_role,
                  observation_api='get_publishers_info_by_topic/get_subscriptions_info_by_topic',
-                 binding_event_ref=binding_event['event_index'])
+                 binding_event_ref=binding_event_index)
         if active_mutation:
-            receipt.update(applied=True, hit=True, effect_observed=True)
-            emit('mutation_effect', effect_id='reader_created_after_writer', mutation_receipt=dict(receipt))
+            # A submitted mutation is not automatically a hit.  P01's zero
+            # delay is a legitimate boundary input but has no observable timing
+            # effect; record it as no_effect instead of fabricating hit=True.
+            timing_hit = (c.get('mutation_kind') != 'late_joiner'
+                          or bool(c.get('fuzz_surfaces'))
+                          and (delay > 0.0 and actual_delay > 0))
+            receipt.update(applied=True, hit=timing_hit, effect_observed=timing_hit)
+            emit('mutation_effect' if timing_hit else 'mutation_no_effect',
+                 effect_id='reader_created_after_writer', mutation_receipt=dict(receipt),
+                 configured_delay_sec=delay, observed_delay_ns=actual_delay,
+                 reason=None if timing_hit else 'zero_delay_has_no_observable_timing_effect')
         elif c['arm'] == 'transparent':
             emit('transparency_control', declaration={'mutation_kind': c['mutation_kind'], 'parameters': c['mutation_parameters']},
                  applied_input_equal_to_baseline=True, effective_reader_delay_sec=delay, mutation_hit=False)

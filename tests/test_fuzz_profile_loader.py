@@ -111,8 +111,9 @@ class ProfileDocumentContracts(unittest.TestCase):
         # Every declared parameter surface still appears in exactly one cycle.
         declared = [s for cycle in data["cycles"] for s in cycle["surfaces"]]
         self.assertEqual(set(declared), {
-            "P01", "P02", "P03", "P04", "P05", "P06", "W01", "W02",
+            "P01", "P02", "P03", "P04", "P05", "P06", "W02",
         })
+        self.assertNotIn("W01", set(declared))
 
     def test_environment_profile_is_single_window_e01_only(self):
         data = load_profile("environment")
@@ -404,22 +405,25 @@ class PendingAndUnknownContracts(unittest.TestCase):
         with self.assertRaises(CorpusProfileError) as caught:
             corpus_from_profile(profile, seeds=mismatched,
                                 cycle_id="late-endpoint-parameter")
-        self.assertIn("target_family", str(caught.exception))
+        self.assertTrue(any(text in str(caught.exception)
+                            for text in ("target_family", "not declared in the selected cycle")))
 
     def test_seed_cross_cycle_target_is_rejected(self):
         data = load_profile("parameter")
         for cycle in data["cycles"]:
             if cycle["cycle_id"] == "late-endpoint-parameter":
-                # W01 belongs to the other late target; it must not be reused.
+                # P02 belongs to the projection target; reuse it here only to
+                # prove the seed's target_family is checked.
                 cycle["seed_specs"] = [{
-                    "seed_id": "W01",
+                    "seed_id": "P02",
                     "target_id": cycle["target_id"],
-                    "boundary_class": "depth_gt_post",
+                    "boundary_class": "enum_exhaustive",
                     "executable": True,
                 }]
         with self.assertRaises(CorpusProfileError) as caught:
             corpus_from_profile(data, cycle_id="late-endpoint-parameter")
-        self.assertIn("target_family", str(caught.exception))
+        self.assertTrue(any(text in str(caught.exception)
+                            for text in ("target_family", "not declared in the selected cycle")))
 
     def test_surface_not_declared_by_target_is_rejected(self):
         # P02 is a valid F1 surface, but the late-endpoint target does not

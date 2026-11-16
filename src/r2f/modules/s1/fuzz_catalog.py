@@ -828,6 +828,9 @@ def surface_to_core(surface):
     if surface.surface_id in F2_SURFACE_IDS:
         raise UnsupportedCapabilityError(
             f"{surface.surface_id}: capability pending (declared, not F1 routable)")
+    if surface.surface_id == 'W01':
+        raise UnsupportedCapabilityError(
+            "W01: relation_boundary mutator (M04) is not implemented; not substituting uniform sampling")
     if surface.kind not in _CORE_SURFACE_KIND:
         raise UnsupportedCapabilityError(
             f"{surface.surface_id}: kind {surface.kind} has no core surface-kind projection")
@@ -851,17 +854,23 @@ def surface_to_core(surface):
     boundary_classes = list(surface.boundary_classes)
     value_relations = list(surface.value_relations)
     if kind == "parameter_numeric":
-        # The core M01 understands only numeric range endpoints.  Catalog
-        # classes such as ``zero``/``infinite``/``log_range`` stay in the
-        # catalogue and in ``special_values``; the projected contract records
-        # the omission instead of letting M01 reject a prose class at runtime.
-        pruned = [c for c in boundary_classes if c not in _NUMERIC_BOUNDARY_CLASSES]
-        boundary_classes = [c for c in boundary_classes if c in _NUMERIC_BOUNDARY_CLASSES]
-        if not boundary_classes:
-            boundary_classes = ["min", "max"]
-        if pruned:
-            value_relations.append(
-                "core_projection_pruned_boundary_classes=" + ",".join(pruned))
+        # Core M01 understands numeric endpoints plus declared special classes;
+        # M03 handles sampled ranges.  Catalog classes that are sampling modes
+        # (``log_range``) are not M01 boundary values and must not be passed to
+        # M01.  Keep only classes the implementation can actually honour.
+        m01_classes = set(_NUMERIC_BOUNDARY_CLASSES) | _SPECIAL_BOUNDARY_CLASSES | {"quantized_neighbor"}
+        m03_classes = {"log_range"}
+        annotation_classes = {"short_window_may_be_ineffective"}
+        supported = m01_classes | m03_classes
+        unsupported = [c for c in boundary_classes
+                       if c not in supported and c not in annotation_classes]
+        if unsupported:
+            raise UnsupportedCapabilityError(
+                f"{surface.surface_id}: boundary classes require an unimplemented mutator: "
+                + ",".join(unsupported))
+        # Annotation classes stay in the catalogue only; core generation uses
+        # classes it can actually honour.
+        boundary_classes = [c for c in boundary_classes if c not in annotation_classes] or ["min", "max"]
     if surface.runtime_binding is None or surface.runtime_binding not in RUNTIME_BINDINGS:
         raise UnsupportedCapabilityError(
             f"{surface.surface_id}: runtime binding "

@@ -74,8 +74,8 @@ def parent_config(delay=0.15):
 #: Two genuinely different surfaces so an observation of one class leaves a
 #: non-empty "uncovered" pool of the other.  ``P01`` mutates reader_delay_sec;
 #: ``W02`` mutates publish_interval_sec, so their contents never alias.
-P01_BOUNDARIES = ("p01_a", "p01_b")
-W02_BOUNDARIES = ("w02_a", "w02_b")
+P01_BOUNDARIES = ("finite", "quantized_neighbor")
+W02_BOUNDARIES = ("zero", "finite")
 
 
 def seed(seed_id, surface_id, boundary, config):
@@ -300,9 +300,10 @@ class ExploratoryFeedbackLoop(unittest.TestCase):
         self.assertTrue(feedback.events[0]["coverage"])
         self.assertGreaterEqual(result["budget"]["executed"], 1)
         offer = row["corpus_offer"]
-        self.assertTrue(offer["admitted"], offer)
-        self.assertEqual(offer["reason"], "new_relation_class")
-        self.assertIn(offer["content_sha256"], corpus.entries)
+        # Success alone is deliberately not a corpus admission reason.
+        self.assertFalse(offer["admitted"], offer)
+        self.assertEqual(offer["reason"], "success_only")
+        self.assertNotIn(offer["content_sha256"], corpus.entries)
         self.assertEqual(result["corpus"]["entry_count"], len(corpus.entries))
         # An offline injected fixture is plumbing evidence, never a SUT candidate.
         self.assertEqual(result["budget"].get("candidates", 0), 0)

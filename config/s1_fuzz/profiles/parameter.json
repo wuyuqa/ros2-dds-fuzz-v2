@@ -18,7 +18,6 @@
     "P04",
     "P05",
     "P06",
-    "W01",
     "W02"
   ],
   "seed_specs": [
@@ -87,7 +86,6 @@
       "target_id": "discovery.late_endpoint.fuzz_v1",
       "surfaces": [
         "P01",
-        "W01",
         "W02"
       ],
       "runner_slice": "endpoint_pair_slice",
@@ -105,17 +103,10 @@
       "target_id": "discovery.late_join_delivery.fuzz_v1",
       "surfaces": [
         "P01",
-        "W01",
         "W02"
       ],
       "runner_slice": "endpoint_pair_slice",
       "seed_specs": [
-        {
-          "seed_id": "W01",
-          "target_id": "discovery.late_join_delivery.fuzz_v1",
-          "boundary_class": "depth_gt_post",
-          "executable": true
-        },
         {
           "seed_id": "W02",
           "target_id": "discovery.late_join_delivery.fuzz_v1",
