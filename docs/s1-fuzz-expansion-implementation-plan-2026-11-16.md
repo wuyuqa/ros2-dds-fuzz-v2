@@ -57,6 +57,14 @@
 - 能力边界：F1 可路由 surface 为 P01–P06/E01/W01/W02；E02/E03/G01 仍为 F2 pending；M04–M08 未实现；P02–P06/W01/W02/E02/E03 的 seed 仍 pending；runner 探索闭环仍在实施。
 - 尚未启动 ROS/campaign/nft，未产生真实新执行、自然候选或 seal；已完成项均属离线合同/夹具，不得当作 DDS 或 SUT 证据。
 
+## 当前冻结身份与阶段结论（af90c13）
+
+- HEAD `af90c130…`，behavior `116f52ae…`，`source_frozen=true`，`dirty_behavior_paths=[]`。
+- F1 真实闭环：late endpoint 4 个 authored 变体在 CycloneDDS/FastDDS 各 4 条 judged/pass；late join 4 条 judged/pass；raw 保存在 `results/fuzz-cli/`。自然候选仍为 **0**，没有伪造候选或 seal。
+- F2 仅 generation-only：M04–M08 与 E02/E03/G01 可生成计划，`execution_admitted=false` 未改；W01 关系类未进入 F1 封合同，避免改变 contract hash。
+- 全仓离线回归 **807 tests, OK, skipped=1**；旧四 target hash 与原 catalog hash `947757406e7a…4eb6` 未变，catalog digest `28dff571…47c6`。
+- 尚不能称 S1 完整成熟或有 2–3 个真实候选；未完成项是 projection/recovery fuzz_v1 的真实 live、E02/E03/G01 的执行。
+
 ## 0. 阅读与批准入口
 
 本文按“交付范围 → 变异面 → 数据合同 → 执行机制 → 派工 → 测试 → 运行预算 → 候选审核”组织。
