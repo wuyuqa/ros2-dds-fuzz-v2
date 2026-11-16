@@ -258,7 +258,11 @@ _EXPLORATORY_ROUTES = {
     "builtin.discovery_projection_reconciliation.fuzz_v1": {
         "family": "projection_pair", "backend": "projection_pair",
         "carrier": "ros2_endpoint", "mutation_kind": "endpoint_qos_variation",
-        "execution_admitted": False,
+        # Verified live on 7bccef7: projection_pair reached real_execution=true,
+        # runtime_status=completed, two role QoS bindings, wire readiness,
+        # graph export and projection_observation.  Admission is evidence-based,
+        # not inferred from planned config alone.
+        "execution_admitted": True,
     },
 }
 

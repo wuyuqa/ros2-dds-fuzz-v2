@@ -121,10 +121,10 @@ def fresh_match_proof(events, tokens, opening, *, anchor_ns=None):
 
 def facts_from_events(events, runtime, config):
     """Only raw tokens produce primary facts; summaries cannot substitute."""
-    if config.get("target_id") == "builtin.discovery_projection_reconciliation":
+    if str(config.get("target_id", "")).startswith("builtin.discovery_projection_reconciliation"):
         from .projection_adapter import projection_facts
         return projection_facts(events, runtime, config)
-    if config.get("target_id") == "discovery.interruption_recovery":
+    if str(config.get("target_id", "")).startswith("discovery.interruption_recovery"):
         from .recovery_adapter import recovery_facts
         return recovery_facts(events, runtime, config)
     facts = {"schema_version": 1, "environment_healthy": runtime.get("environment", {}).get("ok") is True,
@@ -210,10 +210,10 @@ def facts_from_events(events, runtime, config):
 
 def canonical_receipts(scenario, runtime, events):
     """Exact 1:1 runtime step mapping; raw before/after events are mandatory."""
-    if scenario.target_id == "builtin.discovery_projection_reconciliation":
+    if scenario.target_id.startswith("builtin.discovery_projection_reconciliation"):
         from .projection_adapter import projection_receipts
         return projection_receipts(scenario, runtime, events)
-    if scenario.target_id == "discovery.interruption_recovery":
+    if scenario.target_id.startswith("discovery.interruption_recovery"):
         from .recovery_adapter import recovery_receipts
         return recovery_receipts(scenario, runtime, events)
     receipts, state = [], {}
@@ -405,6 +405,26 @@ def ingest_execution(scenario, config, runtime, capsule, *, services=None):
                 from .projection_adapter import projection_fault_receipt
                 fault_control = projection_fault_receipt(events, config, runtime["discovery_projection"])
         else:
+            if receipt.applied is True and receipt.hit is not True:
+                # Submitted/applied but with no observable effect: keep the
+                # terminal state at reached and report mutation_ineffective.
+                # This is not a SUT failure and never advances to mutation_applied.
+                audit["mutation_ineffective"] = True
+                audit["mutation_ineffective_reason"] = config.get(
+                    "mutation_ineffective_reason", "no_observable_effect")
+                row = record.to_dict()
+                row.update(audit, domain_id=config["domain_id"], typed_facts=facts,
+                           oracle={"rule_id": scenario.target.rule_contract["primary_rule"],
+                                   "rule_role": "primary", "verdict": "not_applicable",
+                                   "reason_codes": ["mutation_ineffective"],
+                                   "forbidden_residuals": [], "closure": {}},
+                           oracle_verdict="not_applicable",
+                           rule_id=scenario.target.rule_contract["primary_rule"],
+                           raw_path=runtime.get("raw_path"), raw_sha256=runtime.get("raw_sha256"),
+                           runtime_execution_metadata=runtime.get("execution_metadata") or runtime.get("execution"),
+                           observation_receipts=runtime.get("observation_receipts", []),
+                           environment=runtime.get("environment", {}))
+                return row
             record.advance(ExecutionStage.MUTATION_APPLIED, mutation_receipt=receipt.to_dict())
         if facts.get("evidence_error"):
             raise ValueError(facts["evidence_error"])

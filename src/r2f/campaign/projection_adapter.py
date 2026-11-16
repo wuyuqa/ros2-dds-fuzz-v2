@@ -242,7 +242,11 @@ def projection_facts(events, runtime, config):
         # value disagreeing with wire is the primary observation, not a reason
         # to abort and discard a potential SUT projection inconsistency.
         if config['arm']=='mutated' and config['qos']==config['baseline_qos']:
-            raise ValueError('QoS mutation did not change baseline input')
+            # A legitimate submitted input that equals the neutral baseline
+            # has no observable mutation effect.  Record it as ineffective so
+            # the lifecycle reports mutation_ineffective, never a SUT finding.
+            facts['mutation_ineffective'] = True
+            facts['mutation_ineffective_reason'] = 'qos_equals_baseline'
     except (KeyError,ValueError,TypeError,OSError,IndexError) as exc:
         facts['evidence_error']=str(exc)
     return facts

@@ -200,31 +200,29 @@
       "runner_slice": "endpoint_pair_slice",
       "seed_specs": [
         {
-          "seed_id": "P02",
+          "seed_id": "P04",
+          "variant_id": "P04-infinite",
           "target_id": "builtin.discovery_projection_reconciliation.fuzz_v1",
-          "boundary_class": "enum_exhaustive",
-          "executable": true
-        },
-        {
-          "seed_id": "P03",
-          "target_id": "builtin.discovery_projection_reconciliation.fuzz_v1",
-          "boundary_class": "enum_exhaustive",
+          "boundary_class": "infinite",
           "executable": true
         },
         {
           "seed_id": "P04",
+          "variant_id": "P04-finite",
           "target_id": "builtin.discovery_projection_reconciliation.fuzz_v1",
           "boundary_class": "finite",
           "executable": true
         },
         {
-          "seed_id": "P05",
+          "seed_id": "P06",
+          "variant_id": "P06-infinite",
           "target_id": "builtin.discovery_projection_reconciliation.fuzz_v1",
-          "boundary_class": "enum_exhaustive",
+          "boundary_class": "infinite",
           "executable": true
         },
         {
           "seed_id": "P06",
+          "variant_id": "P06-finite",
           "target_id": "builtin.discovery_projection_reconciliation.fuzz_v1",
           "boundary_class": "finite",
           "executable": true

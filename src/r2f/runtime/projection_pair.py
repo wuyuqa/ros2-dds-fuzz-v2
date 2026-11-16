@@ -420,14 +420,51 @@ def namespace_body(request, owner_channel):
             binding_event = emit('qos_binding_verified', endpoints={r: observed[r]['observed'] for r in observed},
                                  requested={r: observed[r]['requested'] for r in observed},
                                  observation_api={r: observed[r]['observation_api'] for r in observed})
-            if any(row['observed'] != row['requested'] for row in observed.values()):
-                # The SDK reports what it actually applied: a difference here is
-                # a binding failure, never a SUT or DDS finding.
-                raise RuntimeError('qos_binding_observed_differs_from_submitted')
+            # Compare only fields the submission actually declared.  rclpy
+            # reports additional protocol defaults (for example history=keep_last)
+            # that were not part of the submitted profile; treating those as a
+            # mismatch is a comparison bug, not a SUT finding.  The full observed
+            # profile is retained separately for projection reconciliation.
+            for role, row in observed.items():
+                requested = row['requested']
+                observed_self = row['observed']
+                # DDS/RMW semantics: duration 0 is the infinite class.  The
+                # graph API reports it as INT64_MAX, so compare semantic
+                # classes instead of raw integers for these two policies.
+                def _same(key, a, b):
+                    if key in ('deadline_ns', 'liveliness_lease_duration_ns'):
+                        infinite = 9223372036854775807
+                        if a in (0, infinite) and b in (0, infinite):
+                            return True
+                    # FastDDS reports depth=0/history=unknown for some profiles
+                    # where the field is not exposed by the graph projection.
+                    # That is an observation limitation, not a QoS mismatch.
+                    if key in ('depth', 'history') and b in (0, 'unknown', None):
+                        return True
+                    return a == b
+                diff = {key: (requested.get(key), observed_self.get(key))
+                        for key in requested
+                        if not _same(key, requested.get(key), observed_self.get(key))}
+                if diff:
+                    raise RuntimeError(
+                        'qos_binding_observed_differs_from_submitted:' + role
+                        + ':' + ','.join(sorted(diff)))
+                row['extra_observed_fields'] = {
+                    key: value for key, value in observed_self.items()
+                    if key not in requested}
             result['binding_receipts'] = observed
             result['binding_verification_ref'] = binding_event.get('raw_event_ref')
-        receipt.update(applied=active, hit=active, effect_observed=active)
-        emit('mutation_effect' if active else 'neutral_projection_control', effect_id='public_qos_configuration',
+        # A submitted mutation that equals the neutral baseline is a no-op,
+        # not a hit.  Record submitted/applied but keep hit false.
+        effective_change = bool(c.get('qos') != c.get('baseline_qos'))
+        receipt.update(submitted=active, carrier_admitted=active,
+                       configured=active, applied=active,
+                       hit=bool(active and effective_change),
+                       effect_observed=bool(active and effective_change))
+        emit('mutation_effect' if (active and effective_change)
+             else ('mutation_no_effect' if active else 'neutral_projection_control'),
+             effect_id='public_qos_configuration',
+             reason=None if effective_change or not active else 'qos_equals_baseline',
              mutation_receipt=dict(receipt), endpoint_refs={r: e['raw_event_ref'] for r, e in endpoints.items()})
         deadline_ns = time.monotonic_ns() + int(c['projection_timeout_sec'] * 10**9)
         vendor = '0110' if c['rmw'] == 'rmw_cyclonedds_cpp' else '010f'

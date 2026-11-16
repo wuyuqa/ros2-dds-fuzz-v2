@@ -118,11 +118,11 @@ class RouteTableContracts(unittest.TestCase):
                 self.assertEqual(slot.mutation_kind, route["mutation_kind"])
 
     def test_only_verified_routes_are_execution_admitted(self):
-        # Planned generation is verified for all four; live execution only for
-        # the pre-existing late-endpoint pair.  Anything else must stay explicit.
+        # Live-admitted routes are evidence-based. Late endpoint and projection
+        # have real judged runs; recovery is still planned-only.
         self.assertTrue(_EXPLORATORY_ROUTES[LATE]["execution_admitted"])
         self.assertFalse(_EXPLORATORY_ROUTES[RECOVERY]["execution_admitted"])
-        self.assertFalse(_EXPLORATORY_ROUTES[PROJECTION]["execution_admitted"])
+        self.assertTrue(_EXPLORATORY_ROUTES[PROJECTION]["execution_admitted"])
 
 
 class ProjectionPlannedGeneration(unittest.TestCase):
@@ -187,23 +187,22 @@ class ProjectionPlannedGeneration(unittest.TestCase):
         # Runtime defaults are not invented by the adapter; normalization adds them.
         self.assertNotIn("deadline_ns", adapted["qos"])
 
-    def test_projection_execute_is_explicitly_unsupported_not_judged(self):
+    def test_projection_execute_is_admitted_and_calls_the_runtime(self):
         cycle = _Cycle(self, PROJECTION, "P02")
         calls = []
 
         def runtime(config, output_dir):
             calls.append(config)
-            return {"real_execution": True, "runtime_status": "ok"}
+            return {"real_execution": False, "runtime_status": "blocked",
+                    "reason": "fixture", "evidence_origin": "offline_fixture"}
 
         result = cycle.run(execute=True, runtime=runtime, name="p02-exec")
         row = result["rows"][0]
-        self.assertEqual(calls, [])
-        self.assertEqual(row["execution_stage"], "planned")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(row["execution_stage"], "aborted")
         self.assertIs(row["actual_run"], False)
-        self.assertEqual(row["reason_code"],
-                         "unsupported_capability:execution_backend_not_admitted:projection_pair")
-        self.assertNotIn("oracle", row)
-        self.assertFalse(any(row["mutation_receipt"].values()))
+        self.assertNotEqual(row.get("reason_code"),
+                            "unsupported_capability:execution_backend_not_admitted:projection_pair")
 
 
 class RecoveryPlannedGeneration(unittest.TestCase):

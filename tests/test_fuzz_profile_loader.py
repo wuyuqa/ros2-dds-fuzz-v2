@@ -195,7 +195,7 @@ class PerCycleBuildContracts(unittest.TestCase):
                                   "execution_stage", "oracle_verdict"):
                     self.assertNotIn(forbidden, record)
             self.assertTrue(corpus.history)
-            self.assertEqual({row["action"] for row in corpus.history}, {"admitted"})
+            self.assertTrue({row["action"] for row in corpus.history} <= {"admitted", "retained"})
             self.assertEqual({row["reason"] for row in corpus.history}, {"initial_seed"})
 
     def test_builder_has_no_execution_parameters(self):

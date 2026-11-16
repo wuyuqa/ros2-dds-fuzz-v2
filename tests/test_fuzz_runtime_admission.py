@@ -393,10 +393,8 @@ class PlannedOnlyBackendTests(unittest.TestCase):
 
     def test_planned_only_backends_never_call_the_injected_runtime(self):
         from r2f.campaign.runner import run_exploratory_cycle
-        cases = ((PROJECTION_FUZZ, "P02",
-                  "unsupported_capability:execution_backend_not_admitted:projection_pair"),
-                 (RECOVERY_FUZZ, "E01",
-                  "unsupported_capability:execution_backend_not_admitted:discovery_namespace"))
+        cases = ((RECOVERY_FUZZ, "E01",
+                  "unsupported_capability:execution_backend_not_admitted:discovery_namespace"),)
         for target_id, surface_id, expected in cases:
             with self.subTest(target=target_id):
                 corpus, feedback, scheduler, profile = self._cycle(target_id, surface_id)
