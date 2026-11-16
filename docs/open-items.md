@@ -1,6 +1,10 @@
 # 待核实事项与证据更新
 
-最新快照指引（2026-11-15）：下文旧 source 的 seal、开发状态及待办均按各节历史身份解读；当前以[末尾 cf507 正式矩阵与 projection 修复快照](#current-capture-snapshot)为准：cf507前三target各自seal=true、projection seal=false且已完整清理；九文件修复的整合full已由Hooke执行并经main读盘审核通过，本次审计时尚待提交冻结及新运行GO，candidate0/required72不变。
+当前逐项验收入口（2026-11-15）：见[c884437完整验收表](s1-final-acceptance-2026-11-15.md)。HEAD `c884437be86c2082d449bafade8185c132138955` / behavior `ceaee506bc189a6de9764bbcdd64c6c6753ed782a92c550e40d86b98b6e39205`：统一provider/carrier/fact/oracle已真实接线；新formal四seal、72required pass+24negative预期fail、unknown0/192worker rc0；新F07健康与受控失败、Phase2→4真实zero分支已执行。QoS72原辅助rc1/71of72保留，main已按独立旁证接受72既有观察链。seconds-edge三配置另有分层72格/144不同worker实证：首24原rc1保留并获独立合同旁证，后48新执行及独审通过，不称原首attempt整体通过。自然/instrumentation/confirmed仍0，非空生命周期及2–3自然候选目标未达，不标完整S1/goalcomplete，不进入S2。147及更早source均为历史，seal不迁移；主agent公共API执行边界不是原任务书原话。
+
+main接续历史说明（以下保留main原文；403与“最终逐项验收尚未完成”均为其当时记录，以本页当前入口更新后续状态）：
+
+> 当前接续状态（2026-11-15）：见[主agent接续审查与执行故障记录](main-supervision-2026-11-15.md)。147af87正式四target各seal=true（72 required pass、24预期negative fail、unknown0）；F07及Phase2→4真实zero-candidate分支已有证据，旧文中的待验收描述保留为历史。自然/confirmed候选仍0，最终逐项验收尚未完成；指定6.1-sol子agent服务返回403余额不足，具体接续工作与需用户后续处理事项已记录。
 
 日期：2026-11-14。初始状态不假设阻塞。以下项目来自原规格审阅、主agent工程核对和派遣消息，尚未等同于本机运行结论。主agent要求继续全部 S1 scope；工程未知须经真实检查后更新，不能现在认定不可解。
 
@@ -8,7 +12,54 @@
 
 目标口径更新（2026-11-15T00:45:07+08:00，Asia/Shanghai；来源：本轮用户明确指令）：当前用户目标为“S1模块完全成熟且有2–3个真实SUT候选”。已记录的真实自然候选为0，因此候选数量目标尚未达成。自然数量无法预先保证，只能由真实运行产生；负控、工具错误和合成案例不得凑数。原taskbook允许zero-candidate推进Phase，不代表用户完整目标完成；可以交中间报告，但不能据此将整个goal标记complete。
 
-## 本轮文档 freeze-ready 收束
+## 2026-11-16 当前待决与未完成（e448feb）
+
+本节是当前待决/未完成入口；其后的“当前缺口与主决策（c884437）”及更早O项保留为历史，旧source的formal/F07/Phase24/seal不迁移。当前source为 HEAD `e448febec4fa9f3c24f22eaac7954517e7b4a301` / behavior `e7f92897dd6d122a874f7686a24419173d110abd765106ce5e16e1289e732cfa`，`source_frozen=true`、`dirty_behavior_paths=[]`。修复提交只改`src/r2f/runtime/namespace_pair.py`及两项测试，`activity_limit=32768`，全局默认仍4096，严格retained/adapter/hit门未放宽。
+
+当前source已核收的证据（详见[e448feb验收段](s1-acceptance-a3b1941-2026-11-15.md#2026-11-16-e448feb终态四targetf07与phase24-zero分支已核收-候选仍0)）：
+
+- 正式四target [batch-20261115T165015Z-45cc1bed](/home/wuyuqa/ros2-dds-fuzz-v2/results/final-validation/batch-20261115T165015Z-45cc1bed/summary.json) summary SHA `9869601920d99e5f9d80d483cbabaa0117d1dd8e60fb4f395132ecf447b31146`：固定顺序、每target24cells/48workers、domain111；96 actual judged=72 normal pass＋24 negative预期fail，unknown0，四controls各6/6，四seal=true，四cleanup ok/`owned_live_after=[]`；96唯一raw/capsule/effective input、192唯一worker PID rc0并全部raw `process_exit`绑定；48条namespace controller退出非worker。正式第三target为`drop_duration_sec=3.0`、trajectory全`no_loss_at_sampled_points`，不得写成long25/observed_loss_then_recovery。
+- 单独e448feb long25 [execution](/home/wuyuqa/ros2-dds-fuzz-v2/results/final-validation/recovery-long-interruption-e448feb-20261115T160916Z-8cc7731d/execution-20261115T161302Z-011ed32b)：24/24 judged、Fast/Cyclone mutated `observed_loss_then_recovery`、Fast activity32768/126 retained/0 eviction、seal true；外层cleanup误报PID2995803为Codex app-server瞬时子进程，非本次worker，原`summary.passed=false`保留不改。只作长期失配覆盖，不并入正式batch，不证明lease expiry。
+- e448feb全离线[full log](/home/wuyuqa/ros2-dds-fuzz-v2/results/main-review/e448feb-full-20261115T164801Z-d1fd8e3f/full-unittest.log) SHA `dbc09ea35fce0c187255fe5ec9fd3429fab2fa194a341d89369380c212328cf4`：457 tests、OK(skipped=1)、rc0；skip为既有`R2F_PROVIDER_AUDIT_REPORT` fixture，不得写成456/0skip。
+- e448feb [F07 execution](/home/wuyuqa/ros2-dds-fuzz-v2/results/final-validation/f07-replay-preparation-20261114T223955Z-f04b2d7f/execution-20261115T171147Z-70f8a013) summary SHA `d3ed65890836eb0d58cd78d1d1a23150d06c42e16023e915de333d2fb32dbf11`、driver rc0：healthy domain112 pass/real ROS/verify valid；tool_failure domain113 `fail_environment/runtime_tool_failure/aborted/real_ros_execution=false`，writer PID3071543 rc-9，intent/sent harness `candidate_eligible=false`；原340文件/capsule/report/source/CLI不变、cleanup ok。不是候选，分母增量0。
+- e448feb [Phase24 execution](/home/wuyuqa/ros2-dds-fuzz-v2/results/final-validation/phase24-e448feb-20261115T171430Z-80d06a02/execution-e448feb-p24-20261115T1730Z) summary SHA `be4e3406e66dcdb5789893b309e91bfc424b56209f73f8dbd0da2b477279d470`、driver rc0、`completed_zero_candidate_branch`：instrumentation domain115 intake/candidate0/lifecycle completed；blackbox domain116 observed/errors[]/same-input executed；bounded domain117 24cells/48workers 18pass+6neg/unknown0/four controls6/6/seal true/report SHA`dd68e29e39265b16e38c6ac0f3847f0d0d096175cc57a00d24d96adf8c3c0f5b`；三stage audit ok/candidate_hold=false/cleanup ok/52 workers退出。只证明zero分支。
+- 独立终审Ramanujan只读复核三块证据均acceptable，未发现hash/identity/矩阵/worker退出/cleanup矛盾；并纠正正式第三target为3s、F07受控失败非候选、control/expected effect不入账。
+
+**当前未完成/未实测：**
+
+1. 用户目标“S1模块完全成熟且有2–3个真实SUT候选”未达成。当前natural candidate=0、confirmed=0，四target及Phase24 ledgers的candidates/failures均空；成熟分母仍72，不改变。
+2. 非空candidate admission、triage、confirmation、逐候选replay或`non_replayable`处置尚未有真实对象；候选级两RMW×3 repeat validation未发生。
+3. 当前source四target per-target seal＋F07＋Phase24 zero-branch证据完整，但这不等于完整用户目标；S2未进入，不标goal complete。
+4. 正式第三target的3s矩阵与单独long25不可混写；long25的drop 1→0匹配下降和恢复是allowed expected effect，不是候选，不能声称vendor内部lease expiry。
+5. 旧c884437/a3b1941/147af87及更早source的formal、F07、Phase24、long25和seal只历史，不迁移到e448feb。
+
+**需main后续决定（不是用户已授权）：**
+
+- 路径A：现有scope内有界压力实验，例如recovery `post_match_count=64`或更高交付义务，单次最多24cells/48workers；仍可能继续0候选，不能保证数量。
+- 路径B：扩展scope（mixed-vendor pair、endpoint remove/recreate、lease expiry、discovery delay/reorder/duplicate等）。该路径需owner escalation和用户确认；可能新增target/rule/mutation/carrier、改变run identity，乃至72成熟分母，旧seal失效。
+- 不能为达到2–3候选而使用负控、unknown、工具错误、expected drop effect或控制故障凑数；若仍0，应如实保留zero-candidate分支。
+
+**工具问题与执行约束：**
+
+- long25 cleanup的`run_processes` cmdline子串误报应作为独立工具问题诊断/修复，不重跑已封存campaign，不改原cleanup/summary或把`passed=false`改成true。
+- 若修改helper/脚本，须生成新helper SHA并有main新GO；旧GO/旧helper不得复用为新source执行授权。
+- 新的真实ROS运行仍需唯一owner、串行窗口、domain/preflight/source/target/revision/run_id绑定；不自动重试，不并发。
+
+## 当前缺口与主决策（c884437）
+
+当前实证见[逐项验收表](s1-final-acceptance-2026-11-15.md)。旧O项/失败/服务故障保持历史；本表不发执行GO。
+
+| 项目 | 已确认事实 | 具体主决策/剩余 |
+|---|---|---|
+| M01统一接口 | [真实调用链](s1-final-acceptance-2026-11-15.md#interfaces)已实现并接入campaign/replay/audit，新sourceformal/F07/Phase24已执行 | 原147明确实现缺口关闭，不回改147旧验收；不因全仓测试数宣称任意provider均完成 |
+| M02非空候选/完整成熟 | 自然/instrumentation/confirmed0，真实zero分支/control排除有证 | 原目标内非空admission/triage/确认与2–3数量目标未达，main决定后续有界路径，不能凑数/goalcomplete |
+| M03内部观察/build边界 | [新Phase2](s1-final-acceptance-2026-11-15.md#modes)installed vendor内部事件有真实provenance；source build条件路线未选 | 若另要求源码插装，须独立build/binary/compile/patch/symbol/对照；不是本轮已完成项，也不把允许内部事件路线误列实现缺口 |
+| M04 QoS辅助失败与旁证 | 原controller rc1/aux71of72/incomplete保留；main按[Popper旁证](../results/main-review/qos72-cutoff-adjudication-20261115T093129Z-ebc642cf/freeze.json)接受既有72观察链 | 仅额外close_unread0误报；不写原run controller0、不重跑掩盖，不计SUT候选/分母 |
+| M05非空validation/S2/seconds-edge | 原候选级两RMW×3repeat validation、异常replay归因与确认无对象；S2不进 | [seconds-edge](s1-final-acceptance-2026-11-15.md#seconds-edge)已分层实证72格/144不同worker，原首24 rc1不改；后续仅只读QoS覆盖研究、最多2个未覆盖正常组合建议，尚无新计划/ROS授权，不预报候选 |
+
+source为c884437/ceaee506、正式分母72；主agent公共API执行边界并非原规格原话。旧147四seal、F07/Phase24/supplement仅历史支持，各原件保留。main监督文件及其历史原文未改。
+
+## 历史文档 freeze-ready 收束（当时状态）
 
 记录时间：2026-11-15T01:09:04+08:00（Asia/Shanghai）。来源：main最新工程进展及独立测试报告，由本轮消息提供；文档子agent未复跑测试或运行ROS，未取得本条消息对应的新增产物路径，不补造路径/hash。
 
@@ -28,7 +79,7 @@ F06按主agent裁定，真实zero-ledger/control排除/原始失败保留证明�
 
 D015第三target已有两RMW真实development runtime+ingest，D014第四target已有24行run；当前状态是development evidence / not mature，不再沿用旧`blocked:*`能力结论。third输入为`reconstructed_input`且`capsule_execution=null`，正式18+6/control/seal未验收；fourth为17 required pass+1 unknown、6 fault fail、seal=false，D014及正式18+6/control/seal未验收。失败与unknown保留，完整72 required分母不变。没有新增需要用户确认事项。下方历史待GO/待冻结等记录保留当时语境，以本节和证据账为准。
 
-## 1. 工程未知
+## 1. 历史工程未知（当时记录，非当前待办）
 
 | ID | 事项、来源与现有证据边界 | 下一项可验证动作 / 所需证据 | 协调人 / 状态 |
 | --- | --- | --- | --- |
@@ -153,7 +204,24 @@ Ptolemy 的 runner/replay receipt 透传修复已落盘；[主agent独立修复�
 
 <a id="current-capture-snapshot"></a>
 
-### cf507 正式矩阵与当前 projection 修复快照（2026-11-15）
+### c884437 当前逐项验收快照（2026-11-15）
+
+当前逐项细目见[完整验收表](s1-final-acceptance-2026-11-15.md)。HEAD=`c884437be86c2082d449bafade8185c132138955`、behavior=`ceaee506bc189a6de9764bbcdd64c6c6753ed782a92c550e40d86b98b6e39205`，既有执行各自sourceguard冻结/dirty=[]且前后一致；本轮docs未提交、不改变行为身份。
+
+| 入口 | 本source实际结论与限制 |
+|---|---|
+| [formal batch](../results/final-validation/batch-20261115T082508Z-430eccee/summary.json)、[Ptolemy独审](../results/main-review/formal-c884437-audit-20261115T084136Z-eca41e07/summary.json)、[final freeze](../results/main-review/formal-c884437-audit-20261115T084136Z-eca41e07/final-freeze.json) | 72required pass+24negative预期fail，四target各四control6/6、unknown0/sealtrue；96runtime/raw/capsule、192raw-backed worker rc0。third24drain/6mutated hit，fourth24 exact readiness→fresh graph→prefix/cutoff；1848文件前后hash不变，main审核退出清理。 |
+| [接口实际链](s1-final-acceptance-2026-11-15.md#interfaces)、[唯一full handoff](../results/main-review/provider-integration-20261115T075412Z-9099c293/final-handoff-freeze.json) | 原147 provider缺口已修：S1Module/Registry供给ExecutionServices，campaign prepare→accepts→apply，replay复用原capsule，ingest/audit调用FactProducer/Oracle。428/428 skip0仅作合同支持；原network/exec checker误报按main裁定保留，不说原checker全绿。 |
+| [F07 audit](../results/final-validation/provider-f07-launch-20261115T085101Z-7ddda0ab/executor-final-audit.json)、[freeze](../results/final-validation/provider-f07-launch-20261115T085101Z-7ddda0ab/executor-freeze.json)、[main release](../results/final-validation/provider-f07-launch-20261115T085101Z-7ddda0ab/main-window-release.json) | domain97健康pass、98受控fail_environment/runtime_tool_failure/aborted，真实attempt/raw保留；实际3worker（失败reader未创建），原340不变、完整退出清理。非自然candidate确认，正式分母增量0。 |
+| [Phase24 summary](../results/final-validation/phase24-refresh-20261115T044110Z-7eee6e2a/execution-provider-20261115t084537z-8cc383f5/summary.json)、[freeze](../results/final-validation/provider-phase24-launch-20261115T085739Z-32708c25/executor-freeze.json) | 26pair/52worker rc0/26raw-capsule，内部事件1+同输入clean1+bounded24，三verify0/完整JSON0diff；真实completed_zero_candidate_branch。原目标内非空admission/triage/逐候选两RMW×3repeat validation未实测；未改源码重编译插装。 |
+| [QoS原summary](../results/final-validation/qos-policy-boundaries-20261115T072932Z-656b9c5e/execution-20261115T091455Z-ef0243cb/supplementary-summary.json)、[独立旁证freeze](../results/main-review/qos72-cutoff-adjudication-20261115T093129Z-ebc642cf/freeze.json) | 72cell/144worker rc0、三官方18pass+6negativefail/seal；原aux71/72、controller rc1/incomplete保留。Popper按既有cutoff合同独审72/72链、144worker/完整prepareinput/三official audit与8正反例；main接受既有观察链，原checker额外close_unread0误报不改写，不冒称controller0/重跑后绿。 |
+| [seconds-edge分层实证](s1-final-acceptance-2026-11-15.md#seconds-edge)、[首24旁证freeze](../results/main-review/seconds-edge-graph-adjudication-20261115T101357Z-41d95a6a/freeze.json)、[后48独审freeze](../results/main-review/seconds-edge-remaining48-audit-20261115T103246Z-88308ae8/freeze.json) | c884437/ceaee506：原72prepare已绑定；首配置domain102实际24格/48worker，official18pass+6negativefail/unknown0/seal，原aux23/24、controller/inner/outer/finalaudit rc1、final75of81/incomplete保留；main接受既有requested→sample合同24/24链及26正反例。只执行原未运行后两配置的新工具在103/104完成48格/96不同worker rc0、两seal/aux48、六项returncodes0/final153of153。独审将已接受首24旁证与新48分层合并，支持72实际覆盖/144不同worker、三zero-ledger候选0，不称原首attempt整体通过；清理/退出/release已收，无72分母增量。 |
+
+四control引用、replay/Phase24/QoS均不增加72成熟分母；自然/instrumentation/confirmed0，非空candidate生命周期及用户2–3目标未达，S1完整/goal不标complete，S2不进。各自closure/release记录子树/锁/ports/source结束状态，本次不重做live probe；存在锁未持有且无活owner、未用路径不存在，不称所有预期锁曾获取释放。main公共API边界与seconds-edge补参数是工程裁定，不是原规格豁免；seconds-edge已有上述分层实证，后续QoS覆盖研究仅读、未获新计划/ROS授权，见[主决策](s1-final-acceptance-2026-11-15.md#next)。
+
+**147历史单列**：[147 Hooke正式审计](../results/main-review/formal-147-audit-20261115T040939Z-0e90b6fa/summary.json)四seal/72pass+24negativefail、[旧F07](../results/final-validation/f07-ros-execution-20261115T042435Z-7d683e20/summary.json)、旧Phase24及96格supplement仅支持147/28146d；当时统一接口缺口成立。新source已独立重跑，不迁移这些seal，不覆盖旧unknown/失败。下列更早记录均按原时点解释。
+
+#### 历史 source 与修复依据（保留当时结论）
 
 历史正式矩阵 source HEAD=`f57656c4a11546ea88935d3eece176b6e80d1260`、behavior=`0fd868f4bb14466efe0bf636e22cee6f2069a9cd46ed5920b27a868228524771`，执行至 cleanup 身份保持冻结，domain80、两 RMW；[独立中止审计与逐格 raw/capture hashes](../results/final-validation/stop-review-20261115T011711Z-556e7e3a/executor-stop-audit.json)保留全部计数。
 
@@ -200,4 +268,11 @@ cf507正式batch为 [`batch-20261115T022650Z-3e2cd9c7`](../results/final-validat
 
 [最终整合离线审计](../results/main-review/prefix-readiness-integration-20261115T032013Z-78e48c96/summary.json)由main派遣Hooke执行、main读盘复核通过，overall_pass=true：唯一全仓 **407 tests / 90.333s OK、rc0**，90 Python AST通过、diff-check=0；九文件SHA与owner freeze一致，九文件hash、全source inventory/behavior及四target manifest前后均一致。代码owner freeze与最终主审核均通过，没有发现需要改业务代码的问题；该审计未启动ROS或replay，不形成新source的正式seal。提交后behavior应保持上述 `28146d39…` 身份。
 
-本次提交前快照收束时尚无commit或新ROS GO；后续须另获提交GO、冻结新source并获明确运行GO后重新验收，cf507及更早source的通过不迁移。新source正式四target、F07、Phase2–4及supplement均待验收，自然candidate **0**、完整required分母 **72** 不变，未宣称整个用户目标完成。
+以上为147af87提交前的历史修复快照：当时尚待commit与新ROS GO，cf507及更早source的通过不迁移。后续147af87正式四target结果见本节顶部当前快照；旧失败与unknown保留，自然candidate **0**、完整required分母 **72** 不变。
+
+## F3 触发条件：recovery 窗口内无 discovery 流量（2026-11-17）
+
+- 当前 E01 单窗真实运行（source `4d63912`、domain 172、3s window）中，nft counter packets=0，window hit=false，生命周期为 `mutation_ineffective`，不是 SUT 缺陷。
+- 原因：稳定匹配后 writer/reader 不再发 SEDP，仅 drop 不足以产生 discovery 包。需要窗口内创建新 reader/participant 或重建 endpoint，才能形成真实命中。
+- 该能力属于 F3（多 endpoint/生命周期交错），不在当前 F1/F2 admitted 范围。未实现前不得把 E01 标为真实 hit，也不得靠延长窗口伪造。
+- 另：`mutation_ineffective` 已禁止进入 corpus 覆盖与自然候选；该行为已验证。
