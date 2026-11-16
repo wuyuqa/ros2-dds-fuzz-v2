@@ -118,10 +118,10 @@ class RouteTableContracts(unittest.TestCase):
                 self.assertEqual(slot.mutation_kind, route["mutation_kind"])
 
     def test_only_verified_routes_are_execution_admitted(self):
-        # Live-admitted routes are evidence-based. Late endpoint and projection
-        # have real judged runs; recovery is still planned-only.
+        # Live-admitted routes are evidence-based: late endpoint, projection
+        # and single-window recovery all have real runtime receipts.
         self.assertTrue(_EXPLORATORY_ROUTES[LATE]["execution_admitted"])
-        self.assertFalse(_EXPLORATORY_ROUTES[RECOVERY]["execution_admitted"])
+        self.assertTrue(_EXPLORATORY_ROUTES[RECOVERY]["execution_admitted"])
         self.assertTrue(_EXPLORATORY_ROUTES[PROJECTION]["execution_admitted"])
 
 
@@ -233,21 +233,20 @@ class RecoveryPlannedGeneration(unittest.TestCase):
         self.assertNotEqual(row["final_input"]["drop_duration_sec"],
                             parent["drop_duration_sec"])
 
-    def test_recovery_execute_is_explicitly_unsupported_not_judged(self):
+    def test_recovery_execute_reaches_the_injected_runtime(self):
         cycle = _Cycle(self, RECOVERY, "E01")
         calls = []
 
         def runtime(config, output_dir):
             calls.append(config)
-            return {"real_execution": True, "runtime_status": "ok"}
+            return {"real_execution": False, "runtime_status": "blocked",
+                    "reason": "fixture", "evidence_origin": "offline_fixture"}
 
         result = cycle.run(execute=True, runtime=runtime, name="e01-exec")
         row = result["rows"][0]
-        self.assertEqual(calls, [])
-        self.assertEqual(row["execution_stage"], "planned")
-        self.assertEqual(row["reason_code"],
-                         "unsupported_capability:execution_backend_not_admitted:discovery_namespace")
-        self.assertFalse(any(row["mutation_receipt"].values()))
+        self.assertEqual(len(calls), 1)
+        self.assertNotEqual(row.get("reason_code"),
+                            "unsupported_capability:execution_backend_not_admitted:discovery_namespace")
 
     def test_multi_window_shapes_are_still_refused(self):
         # The runner derives exactly one window; two windows cannot be

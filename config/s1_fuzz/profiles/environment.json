@@ -43,7 +43,12 @@
           "seed_id": "E01",
           "target_id": "discovery.interruption_recovery.fuzz_v1",
           "boundary_class": "log_range",
-          "executable": true
+          "executable": true,
+          "overrides": {
+            "logical_config": {
+              "drop_duration_sec": 3.0
+            }
+          }
         }
       ]
     }

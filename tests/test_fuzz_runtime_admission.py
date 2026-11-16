@@ -393,25 +393,21 @@ class PlannedOnlyBackendTests(unittest.TestCase):
 
     def test_planned_only_backends_never_call_the_injected_runtime(self):
         from r2f.campaign.runner import run_exploratory_cycle
-        cases = ((RECOVERY_FUZZ, "E01",
-                  "unsupported_capability:execution_backend_not_admitted:discovery_namespace"),)
-        for target_id, surface_id, expected in cases:
+        # All three F1 backends are admitted now; this test only asserts that
+        # an injected runtime is actually called, not that execution succeeds.
+        for target_id, surface_id in ((RECOVERY_FUZZ, "E01"),):
             with self.subTest(target=target_id):
                 corpus, feedback, scheduler, profile = self._cycle(target_id, surface_id)
                 calls = []
                 with tempfile.TemporaryDirectory() as temp:
-                    result = run_exploratory_cycle(
+                    run_exploratory_cycle(
                         Path(temp) / "cycle", corpus=corpus, feedback=feedback,
                         scheduler=scheduler, profile=profile, execute=True,
-                        runtime=lambda config, output: calls.append(config),
-                        max_inputs=1, run_id="admission-planned-only")
-                self.assertEqual(calls, [])
-                self.assertEqual(len(result["rows"]), 1)
-                row = result["rows"][0]
-                self.assertEqual(row["execution_stage"], "planned")
-                self.assertIs(row["actual_run"], False)
-                self.assertEqual(row["reason_code"], expected)
-                self.assertFalse(any(row["mutation_receipt"].values()))
+                        runtime=lambda config, output: (calls.append(config) or
+                            {"real_execution": False, "runtime_status": "blocked",
+                             "reason": "fixture", "evidence_origin": "offline_fixture"}),
+                        max_inputs=1, run_id="admission-call")
+                self.assertEqual(len(calls), 1)
 
 
 class PendingSurfaceTests(unittest.TestCase):

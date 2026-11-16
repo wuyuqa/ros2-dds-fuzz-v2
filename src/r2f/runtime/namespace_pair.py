@@ -626,6 +626,12 @@ def _run_window_chain(c, active, receipt, emit, step, activity, activity_is_pair
     previous_recovery_ref = precondition['raw_event_ref']
     counter_hit = False
     try:
+        if active:
+            receipt.update(submitted=True, carrier_admitted=True)
+            emit('mutation_begin', mutation_kind='discovery_drop', carrier='wire_proxy',
+                 implementation=IMPLEMENTATION,
+                 precondition_snapshot_ref=precondition['raw_event_ref'],
+                 mutation_receipt=dict(receipt))
         for index, plan in enumerate(plans):
             anchor_ref = precondition['raw_event_ref'] if index == 0 else previous_recovery_ref
             if index and active and not (window_recovery_activity[-1] and window_fresh_recovery[-1]):
@@ -679,7 +685,7 @@ def _run_window_chain(c, active, receipt, emit, step, activity, activity_is_pair
                     restored_this = restore['restored'] is True
                     emit('discovery_drop_end', receipt=restore, **window_fields)
                     delta = ledger.end(index, restore)
-                    emit('discovery_window_counter', **delta)
+                    emit('discovery_window_counter', **{k: v for k, v in delta.items() if k != 'event'})
                     receipt['applied'] = bool(receipt['applied'] and restored_this)
                     window_counter_hit = delta['hit']
             window_restored.append(restored_this if active else None)
@@ -742,6 +748,7 @@ def _run_window_chain(c, active, receipt, emit, step, activity, activity_is_pair
                 'trigger_offset_sec': plan['trigger_offset_sec'],
                 'drop_duration_sec': plan['drop_duration_sec'],
                 'restore_interval_sec': plan['restore_interval_sec'],
+                'restore_boundary_monotonic_ns': restore_mono_ns,
                 'counter_hit': bool(window_counter_hit),
                 'drop_activity_observed': bool(window_activity_ok),
                 'recovery_activity_observed': bool(window_recovery_ok),
@@ -763,7 +770,7 @@ def _run_window_chain(c, active, receipt, emit, step, activity, activity_is_pair
         ledger.abort(type(exc).__name__ + ':' + str(exc))
         raise
     finally:
-        emit('discovery_window_ledger', **ledger.summary())
+        emit('discovery_window_ledger', **{k: v for k, v in ledger.summary().items() if k != 'event'})
     return ledger
 
 
@@ -786,6 +793,11 @@ def _body(request, owner_channel):
     counter_hit = restored = activity_ok = fresh_recovery = drop_activity_ok = False
     restored_aggregate = None
     window_records = []
+    window_hits = []
+    window_drop_activity = []
+    window_recovery_activity = []
+    window_fresh_recovery = []
+    window_restored = []
     endpoints = {}
     raw_path = output_dir / 'raw.jsonl'
     def emit(event, **fields):
@@ -1023,7 +1035,12 @@ def _body(request, owner_channel):
             timed_out = True
         emit('window_close', window='post_restore_delivery', deadline_expired=timed_out)
         try:
-            step('observe_final_graph', ['verify_namespace_bindings'], lambda: snapshot_pair(restore_mono_ns), observation=True)
+            if window_records:
+                final_restore_mono_ns = window_records[-1]['restore_boundary_monotonic_ns']
+            else:
+                final_restore_mono_ns = restore_mono_ns
+            step('observe_final_graph', ['verify_namespace_bindings'],
+                 lambda: snapshot_pair(final_restore_mono_ns), observation=True)
         except (TimeoutError, RuntimeError) as exc:
             fresh_recovery = False
             emit('discovery_observation_unknown', reason=str(exc))
@@ -1034,8 +1051,10 @@ def _body(request, owner_channel):
                  responsibility_layer='harness', candidate_eligible=False)
         result.update(runtime_status='completed', reason=None)
     except Exception as exc:
+        import traceback as _tb
         result.update(runtime_status='failed', reason=type(exc).__name__ + ':' + str(exc))
-        emit('runtime_abort', reason=result['reason'], error_receipt=getattr(exc, 'receipt', None))
+        emit('runtime_abort', reason=result['reason'], error_receipt=getattr(exc, 'receipt', None),
+             tool_error_traceback=_tb.format_exc())
     finally:
         if carrier is not None:
             try:

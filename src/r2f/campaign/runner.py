@@ -253,7 +253,10 @@ _EXPLORATORY_ROUTES = {
     "discovery.interruption_recovery.fuzz_v1": {
         "family": "discovery_namespace", "backend": "discovery_namespace",
         "carrier": "wire_proxy", "mutation_kind": "discovery_drop",
-        "execution_admitted": False,
+        # Verified single-window live on 6fcc8fd: namespace preflight passed,
+        # window ledger began/ended, restore completed and runtime_status
+        # completed.  Multi-window remains refused below.
+        "execution_admitted": True,
     },
     "builtin.discovery_projection_reconciliation.fuzz_v1": {
         "family": "projection_pair", "backend": "projection_pair",
