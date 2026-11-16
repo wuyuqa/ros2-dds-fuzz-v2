@@ -673,6 +673,11 @@ def _run_window_chain(c, active, receipt, emit, step, activity, activity_is_pair
                      probe_pid=probe_token.get('pid'), probe_topic=c.get('probe_topic'),
                      pair_member=False)
             if active and c.get('reader_recreate_in_window', False):
+                delay = c.get('reader_recreate_delay_sec', 0.0)
+                if isinstance(delay, (int, float)) and 0 < delay < plan['drop_duration_sec']:
+                    delay_deadline = time.monotonic() + float(delay)
+                    while time.monotonic() < delay_deadline:
+                        pool.pump(min(0.05, max(0.0, delay_deadline - time.monotonic())))
                 # A second reader generation attaches to the same topic while
                 # discovery is dropped.  Its SPDP/SEDP announcements are the
                 # real stimulus for the window; the original reader remains.

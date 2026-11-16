@@ -41,13 +41,49 @@
       "seed_specs": [
         {
           "seed_id": "E01",
-          "variant_id": "E01-8s",
+          "variant_id": "E01-0.2s",
+          "target_id": "discovery.interruption_recovery.fuzz_v1",
+          "boundary_class": "log_range",
+          "executable": true,
+          "overrides": {
+            "logical_config": {
+              "drop_duration_sec": 0.2
+            }
+          }
+        },
+        {
+          "seed_id": "E01",
+          "variant_id": "E01-0.5s",
           "target_id": "discovery.interruption_recovery.fuzz_v1",
           "boundary_class": "log_range",
           "executable": true,
           "overrides": {
             "logical_config": {
               "drop_duration_sec": 0.5
+            }
+          }
+        },
+        {
+          "seed_id": "E01",
+          "variant_id": "E01-1.0s",
+          "target_id": "discovery.interruption_recovery.fuzz_v1",
+          "boundary_class": "log_range",
+          "executable": true,
+          "overrides": {
+            "logical_config": {
+              "drop_duration_sec": 1.0
+            }
+          }
+        },
+        {
+          "seed_id": "E01",
+          "variant_id": "E01-3.0s",
+          "target_id": "discovery.interruption_recovery.fuzz_v1",
+          "boundary_class": "log_range",
+          "executable": true,
+          "overrides": {
+            "logical_config": {
+              "drop_duration_sec": 3.0
             }
           }
         }
@@ -81,5 +117,6 @@
     "required": true,
     "policy": "per source+rmw+target contract+recipe"
   },
-  "reader_recreate_in_window": true
+  "reader_recreate_in_window": true,
+  "reader_recreate_delay_sec": 0.49
 }

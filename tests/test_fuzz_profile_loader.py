@@ -121,7 +121,12 @@ class ProfileDocumentContracts(unittest.TestCase):
         self.assertEqual(len(data["cycles"]), 1)
         cycle = data["cycles"][0]
         self.assertEqual(cycle["surfaces"], ["E01"])
-        self.assertEqual([s["seed_id"] for s in cycle["seed_specs"]], ["E01"])
+        specs = cycle["seed_specs"]
+        self.assertTrue(specs)
+        self.assertEqual({s["seed_id"] for s in specs}, {"E01"})
+        self.assertEqual(len({s.get("variant_id", s["seed_id"]) for s in specs}), len(specs))
+        self.assertTrue(all(0 < s["overrides"]["logical_config"]["drop_duration_sec"] <= 8
+                            for s in specs if s.get("overrides")))
         self.assertNotIn("E02", cycle["surfaces"])
 
     def test_composed_profile_declares_parameter_and_single_window_environment(self):
