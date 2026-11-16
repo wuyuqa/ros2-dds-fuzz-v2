@@ -79,7 +79,7 @@ class WorkerPool:
                 # A probe is deliberately stopped during the window; its clean
                 # exit (rc0) is expected.  Writer/reader must stay alive.
                 failed = [(role, p.returncode) for role, p in self.workers.items()
-                          if p.poll() is not None and not (role in ('probe', 'reader2') and p.returncode == 0)]
+                          if p.poll() is not None and not (role in ('probe', 'reader2', 'reader3') and p.returncode == 0)]
                 if failed:
                     self.pump(0)
                     raise RuntimeError(f'worker_exited:{failed}')

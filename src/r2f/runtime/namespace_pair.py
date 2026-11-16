@@ -673,27 +673,35 @@ def _run_window_chain(c, active, receipt, emit, step, activity, activity_is_pair
                      probe_pid=probe_token.get('pid'), probe_topic=c.get('probe_topic'),
                      pair_member=False)
             if active and c.get('reader_recreate_in_window', False):
+                count = c.get('reader_recreate_count', 1)
+                if type(count) is not int or not 1 <= count <= 2:
+                    raise RuntimeError('reader_recreate_count must be 1 or 2')
                 fraction = c.get('reader_recreate_at_fraction')
                 if fraction is not None:
                     if type(fraction) not in (int, float) or not 0 <= fraction < 1:
                         raise RuntimeError('reader_recreate_at_fraction must be in [0,1)')
-                    delay = plan['drop_duration_sec'] * float(fraction)
+                    base_delay = plan['drop_duration_sec'] * float(fraction)
                 else:
-                    delay = c.get('reader_recreate_delay_sec', 0.0)
-                if isinstance(delay, (int, float)) and 0 < delay < plan['drop_duration_sec']:
-                    delay_deadline = time.monotonic() + float(delay)
-                    while time.monotonic() < delay_deadline:
-                        pool.pump(min(0.05, max(0.0, delay_deadline - time.monotonic())))
-                # A second reader generation attaches to the same topic while
-                # discovery is dropped.  Its SPDP/SEDP announcements are the
-                # real stimulus for the window; the original reader remains.
-                pool.start('reader2')
-                pool.wait(lambda: any(e['event'] == 'endpoint_created' and e.get('role') == 'reader2' for e in events),
-                          c['startup_timeout_sec'], 'reader2_created')
-                reader2 = next(e for e in events if e['event'] == 'endpoint_created' and e.get('role') == 'reader2')
-                emit('discovery_reader_recreated', reader_gid=reader2.get('endpoint_gid'),
-                     reader_pid=reader2.get('pid'), generation=reader2.get('endpoint_generation'),
-                     pair_member=True, role='reader2')
+                    base_delay = c.get('reader_recreate_delay_sec', 0.0)
+                for generation in range(1, count + 1):
+                    role_name = 'reader%d' % (generation + 1)
+                    # Spread multiple generations within the remaining window.
+                    step_delay = base_delay if generation == 1 else min(
+                        plan['drop_duration_sec'] * 0.9,
+                        base_delay + (generation - 1) * plan['drop_duration_sec'] * 0.2)
+                    if isinstance(step_delay, (int, float)) and 0 < step_delay < plan['drop_duration_sec']:
+                        delay_deadline = time.monotonic() + float(step_delay)
+                        while time.monotonic() < delay_deadline:
+                            pool.pump(min(0.05, max(0.0, delay_deadline - time.monotonic())))
+                    pool.start(role_name)
+                    pool.wait(lambda role_name=role_name: any(
+                        e['event'] == 'endpoint_created' and e.get('role') == role_name for e in events),
+                        c['startup_timeout_sec'], role_name + '_created')
+                    token = next(e for e in events if e['event'] == 'endpoint_created'
+                                 and e.get('role') == role_name)
+                    emit('discovery_reader_recreated', reader_gid=token.get('endpoint_gid'),
+                         reader_pid=token.get('pid'), generation=token.get('endpoint_generation'),
+                         pair_member=True, role=role_name, recreate_index=generation)
             trajectory_start_ns = time.monotonic_ns()
             deadline_ns = trajectory_start_ns + int(plan['drop_duration_sec'] * 10**9)
             trajectory = _RecoveryMatchTrajectory(events, endpoints, emit, trajectory_start_ns, deadline_ns, matched)
@@ -725,10 +733,13 @@ def _run_window_chain(c, active, receipt, emit, step, activity, activity_is_pair
                 pool.command('probe', 'stop')
                 pool.wait(lambda: any(e['event'] == 'worker_shutdown' and e.get('role') == 'probe' for e in events),
                           c['startup_timeout_sec'], 'probe_stop')
-            if active and c.get('reader_recreate_in_window', False) and 'reader2' in pool.workers:
-                pool.command('reader2', 'stop')
-                pool.wait(lambda: any(e['event'] == 'worker_shutdown' and e.get('role') == 'reader2' for e in events),
-                          c['startup_timeout_sec'], 'reader2_stop')
+            if active and c.get('reader_recreate_in_window', False):
+                for role_name in ('reader2', 'reader3'):
+                    if role_name in pool.workers:
+                        pool.command(role_name, 'stop')
+                        pool.wait(lambda role_name=role_name: any(
+                            e['event'] == 'worker_shutdown' and e.get('role') == role_name for e in events),
+                            c['startup_timeout_sec'], role_name + '_stop')
             window_restored.append(restored_this if active else None)
             window_hits.append(window_counter_hit)
             window_drop_activity.append(window_activity_ok)

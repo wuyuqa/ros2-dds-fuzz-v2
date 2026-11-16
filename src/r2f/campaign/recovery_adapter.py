@@ -388,22 +388,25 @@ def recovery_facts(events, runtime, config):
         # the active reader for post-restore evidence; the original reader is
         # retained in raw history and never re-labelled.
         recreates = [e for e in events if e.get('event') == 'discovery_reader_recreated']
-        if len(recreates) > 1:
-            raise ValueError('multiple reader recreations are not supported in one window')
+        if len(recreates) > 2:
+            raise ValueError('at most two reader recreations are supported in one window')
         if recreates:
-            # The recreated reader is an explicit additional generation used to
+            # Recreated readers are explicit additional generations used to
             # stimulate discovery.  The original writer/reader pair remains the
-            # delivery and binding contract; the extra generation is recorded
-            # separately and never re-labelled as the original reader.
-            extra = next(e for e in events if e.get('event') == 'endpoint_created'
-                         and e.get('role') == 'reader2')
-            if extra.get('endpoint_gid') in {t.get('endpoint_gid') for t in tokens.values()}:
-                raise ValueError('recreated reader reused a pair endpoint GID')
-            facts['recreated_reader'] = {
-                'role': 'reader2', 'endpoint_gid': extra.get('endpoint_gid'),
-                'generation': extra.get('endpoint_generation'), 'pid': extra.get('pid'),
-                'pair_member': False,
-            }
+            # delivery and binding contract; extras are recorded separately and
+            # never re-labelled as the original reader.
+            extras = []
+            for recreate in recreates:
+                role_name = recreate.get('role')
+                token = next(e for e in events if e.get('event') == 'endpoint_created'
+                             and e.get('role') == role_name)
+                if token.get('endpoint_gid') in {t.get('endpoint_gid') for t in tokens.values()}:
+                    raise ValueError('recreated reader reused a pair endpoint GID')
+                extras.append({'role': role_name, 'endpoint_gid': token.get('endpoint_gid'),
+                               'generation': token.get('endpoint_generation'),
+                               'pid': token.get('pid'), 'pair_member': False,
+                               'recreate_index': recreate.get('recreate_index')})
+            facts['recreated_readers'] = extras
         if len({t['pid'] for t in tokens.values()}) != 2 or len({t['endpoint_gid'] for t in tokens.values()}) != 2:
             raise ValueError('independent endpoint process/GID identity missing')
         for role, token in tokens.items():

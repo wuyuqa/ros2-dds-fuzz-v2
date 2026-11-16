@@ -118,5 +118,6 @@
     "policy": "per source+rmw+target contract+recipe"
   },
   "reader_recreate_in_window": true,
-  "reader_recreate_at_fraction": 0.5
+  "reader_recreate_at_fraction": 0.3,
+  "reader_recreate_count": 2
 }

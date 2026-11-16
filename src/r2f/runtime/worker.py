@@ -109,7 +109,7 @@ def main():
 
     # Recreated reader generations use an explicit role alias but the same
     # reader endpoint semantics and QoS contract.
-    endpoint_role = 'reader' if role in ('reader', 'reader2') else role
+    endpoint_role = 'reader' if role in ('reader', 'reader2', 'reader3') else role
     q = config.get(endpoint_role + '_qos', config['qos'])
     qos = create_public_qos(q)
 
