@@ -36,7 +36,7 @@ def main():
             parser.error("--exploratory-profile requires --cycle-id")
         profile = json.loads(profile_path.read_text())
         corpus = corpus_from_profile(profile, cycle_id=cycle_id)
-        scheduler = ExploratoryScheduler(corpus, FeedbackLog(), rng_seed=args["seed"], warmup=0)
+        scheduler = ExploratoryScheduler(corpus, FeedbackLog(), rng_seed=args["seed"], warmup=min(len(corpus.selectable()), args["max_inputs"]))
         from r2f.runtime.ros2_pair import run_pair
         result = run_exploratory_cycle(
             args["output_dir"], corpus=corpus, feedback=FeedbackLog(),

@@ -34,10 +34,19 @@ def observation_complete(record):
 
 
 def surface_class(record):
+    """Coverage key: surface × boundary × variant.
+
+    A seed variant is a distinct declared input class; folding all variants of
+    one boundary into a single class made the uncovered pool collapse after one
+    observation and stopped further exploration.
+    """
     surface = record.get("surface_id") or record.get("boundary_class")
     boundary = record.get("boundary_class") or record.get("boundary")
+    variant = record.get("variant_id")
     if not isinstance(surface, str) or not surface or not isinstance(boundary, str) or not boundary:
         return None
+    if isinstance(variant, str) and variant:
+        return (surface, boundary, variant)
     return (surface, boundary)
 
 

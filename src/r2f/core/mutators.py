@@ -198,6 +198,15 @@ def M01_boundary_pick(input, surface, rng, context=None):
         selected = [(cls, value) for cls, value in values if cls == requested]
         if not selected:
             raise ValueError(f"requested boundary class is not declared: {requested}")
+        # For a finite seed, a finite parent value is itself a valid boundary
+        # witness.  Keep it so authored variants are not collapsed to one
+        # representative.
+        try:
+            current = _get_path(before, path)
+        except ValueError:
+            current = None
+        if requested == "finite" and type(current) in (int, float) and current > 0:
+            selected = [(requested, current)]
     else:
         selected = values
     cls, value = selected[rng.randrange(len(selected))]
@@ -235,11 +244,29 @@ def M03_range_sample(input, surface, rng, context=None):
     before = snapshot(input)
     domain = _numeric_domain(surface)
     step = _step(surface)
-    offset = rng.randrange(int(math.floor((domain["max"] - domain["min"]) / step)) + 1)
-    raw = domain["min"] + offset * step
-    value = min(max(_quantize(raw, surface), domain["min"]), domain["max"])
     path = surface.input_paths[0]
-    return _proposal(surface, "M03", {"sampling": "uniform", "step": step}, before,
+    # Range sampling stays local to the parent: pick a bounded neighbourhood
+    # around the seed value instead of ignoring the authored parent entirely.
+    current = _get_path(before, path) if isinstance(path, str) else None
+    span_steps = max(1, int(round((domain["max"] - domain["min"]) / step)))
+    # Local neighbourhood only for a genuinely narrow field; a wide domain
+    # (e.g. nanoseconds) must still explore the declared range.
+    if type(current) in (int, float) and span_steps <= 4096:
+        max_delta = max(1, min(256, span_steps))
+        delta_steps = rng.randrange(-max_delta, max_delta + 1)
+        raw = current + delta_steps * step
+    else:
+        # Deterministic coverage over the declared grid for a missing parent.
+        # The RNG chooses a bucket; the seed sequence walks distinct buckets so
+        # a small seed budget still exercises distinct values.
+        span = int(math.floor((domain["max"] - domain["min"]) / step))
+        buckets = max(1, min(64, span + 1))
+        base = rng.randrange(buckets)
+        sequence = int(context.get("seed_index", 0))
+        offset = (base + sequence) % (span + 1)
+        raw = domain["min"] + offset * step
+    value = min(max(_quantize(raw, surface), domain["min"]), domain["max"])
+    return _proposal(surface, "M03", {"sampling": "local_bounded", "step": step}, before,
                      {path: value}, context)
 
 

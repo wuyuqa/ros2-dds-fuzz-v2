@@ -110,7 +110,11 @@ class ExploratoryScheduler:
         rows = self._rows()
         sequence = len(self.selection_log)
         if sequence < self.warmup:
-            ordered = sorted(rows, key=lambda r: (r.get("seed_id") or "", r["content_sha256"]))
+            # Interleave variants before repeating a variant across RMWs so a short
+            # warm-up covers distinct boundary classes.
+            ordered = sorted(rows, key=lambda r: (r.get("rmw") or "",
+                                                   r.get("variant_id") or r.get("seed_id") or "",
+                                                   r["content_sha256"]))
             chosen = ordered[sequence % len(ordered)]
             event = {"sequence": sequence, "phase": "warmup", "pool": "warmup",
                      "requested_pool": "warmup", "fallback_chain": [], "weighted": False,

@@ -796,6 +796,7 @@ def _generate_case(sequence, entry, target, contract, surface, parent, mutator_i
         "parameter_class": proposal.parameters.get("boundary_class") or "sampled",
         "seed_id": entry.get("seed_id"),
         "variant_id": entry.get("variant_id"),
+        "parent_final_input": entry.get("final_config"),
         "parent_content_sha256": entry["content_sha256"],
         "plan_parent_content_sha256": plan.parent_content_sha256,
         "content_sha256": child_content,
