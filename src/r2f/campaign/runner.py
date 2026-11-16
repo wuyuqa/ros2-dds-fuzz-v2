@@ -798,6 +798,14 @@ def _generate_case(sequence, entry, target, contract, surface, parent, mutator_i
                 config['reader_recreate_at_fraction'] = profile['reader_recreate_at_fraction']
             if 'reader_recreate_count' in profile:
                 config['reader_recreate_count'] = profile['reader_recreate_count']
+            if 'reader_recreate_interval_sec' in profile:
+                config['reader_recreate_interval_sec'] = profile['reader_recreate_interval_sec']
+            if 'publish_burst_in_window' in profile:
+                config['publish_burst_in_window'] = profile['publish_burst_in_window']
+            if 'publish_burst_count' in profile:
+                config['publish_burst_count'] = profile['publish_burst_count']
+            if 'publish_burst_interval_sec' in profile:
+                config['publish_burst_interval_sec'] = profile['publish_burst_interval_sec']
         binding = {"status": "preserved", "silent_normalization": False,
                    "submitted_config_sha256": canonical_hash(plan.final_config),
                    "normalized_config_sha256": canonical_hash(normalized),

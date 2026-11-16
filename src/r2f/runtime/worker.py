@@ -235,6 +235,35 @@ def main():
                     emit('send', send_sequence=sequence, phase=phase, writer_gid=local_gid,
                          publish_returned=True, payload_sha256=__import__('hashlib').sha256(message.data.encode()).hexdigest())
                 emit('command_done', command_id=command['command_id'])
+            elif command['command'] == 'publish_burst' and role == 'writer':
+                # Publish a bounded sequence without per-sample controller ACKs;
+                # one command_done closes the burst.  This creates real
+                # publish/creation overlap rather than a serialized schedule.
+                sequences = command.get('sequences')
+                phase = command.get('phase', 'post_restore')
+                if (not isinstance(sequences, list) or not sequences
+                        or any(type(x) is not int for x in sequences)):
+                    emit('worker_command_error', command_id=command['command_id'],
+                         error='invalid_burst_sequences')
+                else:
+                    interval = command.get('interval_sec', 0.0)
+                    if type(interval) not in (int, float) or interval < 0 or interval > 1.0:
+                        emit('worker_command_error', command_id=command['command_id'],
+                             error='invalid_burst_interval')
+                    else:
+                        for index, sequence in enumerate(sequences):
+                            payload = {'run_id': config['run_id'], 'send_sequence': sequence, 'phase': phase}
+                            message = String()
+                            message.data = json.dumps(payload, sort_keys=True)
+                            endpoint.publish(message)
+                            emit('send', send_sequence=sequence, phase=phase, writer_gid=local_gid,
+                                 publish_returned=True, burst=True,
+                                 payload_sha256=__import__('hashlib').sha256(message.data.encode()).hexdigest())
+                            if interval and index + 1 < len(sequences):
+                                end = time.monotonic() + float(interval)
+                                while time.monotonic() < end:
+                                    executor.spin_once(timeout_sec=min(0.01, max(0.0, end - time.monotonic())))
+                        emit('command_done', command_id=command['command_id'], burst_count=len(sequences))
     finally:
         executor.shutdown()
         node.destroy_node()

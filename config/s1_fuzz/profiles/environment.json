@@ -41,49 +41,29 @@
       "seed_specs": [
         {
           "seed_id": "E01",
-          "variant_id": "E01-0.2s",
+          "variant_id": "E01-fast-0.2s",
           "target_id": "discovery.interruption_recovery.fuzz_v1",
           "boundary_class": "log_range",
           "executable": true,
           "overrides": {
             "logical_config": {
-              "drop_duration_sec": 0.2
+              "drop_duration_sec": 0.2,
+              "publish_interval_sec": 0.001,
+              "post_match_count": 32
             }
           }
         },
         {
           "seed_id": "E01",
-          "variant_id": "E01-0.5s",
+          "variant_id": "E01-fast-1.0s",
           "target_id": "discovery.interruption_recovery.fuzz_v1",
           "boundary_class": "log_range",
           "executable": true,
           "overrides": {
             "logical_config": {
-              "drop_duration_sec": 0.5
-            }
-          }
-        },
-        {
-          "seed_id": "E01",
-          "variant_id": "E01-1.0s",
-          "target_id": "discovery.interruption_recovery.fuzz_v1",
-          "boundary_class": "log_range",
-          "executable": true,
-          "overrides": {
-            "logical_config": {
-              "drop_duration_sec": 1.0
-            }
-          }
-        },
-        {
-          "seed_id": "E01",
-          "variant_id": "E01-3.0s",
-          "target_id": "discovery.interruption_recovery.fuzz_v1",
-          "boundary_class": "log_range",
-          "executable": true,
-          "overrides": {
-            "logical_config": {
-              "drop_duration_sec": 3.0
+              "drop_duration_sec": 1.0,
+              "publish_interval_sec": 0.001,
+              "post_match_count": 32
             }
           }
         }
@@ -118,6 +98,10 @@
     "policy": "per source+rmw+target contract+recipe"
   },
   "reader_recreate_in_window": true,
-  "reader_recreate_at_fraction": 0.3,
-  "reader_recreate_count": 2
+  "reader_recreate_at_fraction": 0.0,
+  "reader_recreate_count": 2,
+  "reader_recreate_interval_sec": 0.001,
+  "publish_burst_in_window": true,
+  "publish_burst_count": 32,
+  "publish_burst_interval_sec": 0.02
 }

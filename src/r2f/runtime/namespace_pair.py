@@ -672,6 +672,23 @@ def _run_window_chain(c, active, receipt, emit, step, activity, activity_is_pair
                 emit('discovery_probe_created', probe_gid=probe_token.get('endpoint_gid'),
                      probe_pid=probe_token.get('pid'), probe_topic=c.get('probe_topic'),
                      pair_member=False)
+            burst_command_id = None
+            if active and c.get('reader_recreate_in_window', False):
+                # Start the first recreated reader process before the burst so
+                # its rclpy/participant initialization genuinely overlaps the
+                # writer burst instead of starting after it.
+                pool.start('reader2')
+            if active and c.get('publish_burst_in_window', False):
+                burst_count = c.get('publish_burst_count', 32)
+                if type(burst_count) is not int or not 1 <= burst_count <= 512:
+                    raise RuntimeError('publish_burst_count must be 1..512')
+                burst_sequences = list(range(c['pre_match_count'],
+                                             c['pre_match_count'] + burst_count))
+                burst_command_id = pool.command('writer', 'publish_burst',
+                                                sequences=burst_sequences, phase='window_burst', interval_sec=c.get('publish_burst_interval_sec', 0.0))
+                emit('publish_burst_submitted', command_id=burst_command_id,
+                     sequences=burst_sequences, phase='window_burst',
+                     controller_waits_for_ack=False)
             if active and c.get('reader_recreate_in_window', False):
                 count = c.get('reader_recreate_count', 1)
                 if type(count) is not int or not 1 <= count <= 2:
@@ -686,14 +703,20 @@ def _run_window_chain(c, active, receipt, emit, step, activity, activity_is_pair
                 for generation in range(1, count + 1):
                     role_name = 'reader%d' % (generation + 1)
                     # Spread multiple generations within the remaining window.
+                    interval = c.get('reader_recreate_interval_sec')
+                    if interval is None:
+                        interval = plan['drop_duration_sec'] * 0.2
+                    if type(interval) not in (int, float) or interval < 0:
+                        raise RuntimeError('reader_recreate_interval_sec must be nonnegative')
                     step_delay = base_delay if generation == 1 else min(
                         plan['drop_duration_sec'] * 0.9,
-                        base_delay + (generation - 1) * plan['drop_duration_sec'] * 0.2)
+                        base_delay + (generation - 1) * float(interval))
                     if isinstance(step_delay, (int, float)) and 0 < step_delay < plan['drop_duration_sec']:
                         delay_deadline = time.monotonic() + float(step_delay)
                         while time.monotonic() < delay_deadline:
                             pool.pump(min(0.05, max(0.0, delay_deadline - time.monotonic())))
-                    pool.start(role_name)
+                    if role_name != 'reader2' or not pool.workers.get('reader2'):
+                        pool.start(role_name)
                     pool.wait(lambda role_name=role_name: any(
                         e['event'] == 'endpoint_created' and e.get('role') == role_name for e in events),
                         c['startup_timeout_sec'], role_name + '_created')
