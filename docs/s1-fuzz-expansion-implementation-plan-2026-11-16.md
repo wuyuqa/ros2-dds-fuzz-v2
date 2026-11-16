@@ -57,6 +57,13 @@
 - 能力边界：F1 可路由 surface 为 P01–P06/E01/W01/W02；E02/E03/G01 仍为 F2 pending；M04–M08 未实现；P02–P06/W01/W02/E02/E03 的 seed 仍 pending；runner 探索闭环仍在实施。
 - 尚未启动 ROS/campaign/nft，未产生真实新执行、自然候选或 seal；已完成项均属离线合同/夹具，不得当作 DDS 或 SUT 证据。
 
+### E01 probe 实验结论（45a3e19）
+
+- 在 drop 窗口内创建独立 probe participant 可以产生真实 discovery 公告；raw 中 `discovery_window_counter.hit=true`，说明 counter 机制可用。
+- 但恢复后 `discovery_activity` 仍要求覆盖原 writer/reader 双方；probe 不属于主 pair，不能替代该证据，因此 adapter 正确拒绝 `does not cover both matched participants`。
+- probe 默认关闭（`discovery_probe=false`），不参与正式 F1/F2 结果；它只是诊断/未来 F3 的载体。
+- 结论：E01 要在单窗内真实命中并恢复，必须让主 pair 在窗口内重新发现（endpoint 重建/新 participant 加入主 pair），这是 F3 范畴。不能把 probe 当主 pair 活动或候选。
+
 ## 阶段推进：projection/recovery 真实准入（4d63912）
 
 - 已用真实运行把 projection.fuzz_v1 与 recovery.fuzz_v1 从 planned-only 推进到可执行：
