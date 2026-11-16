@@ -1,0 +1,68 @@
+{
+  "seed_id": "P01",
+  "version": 1,
+  "surface_refs": [
+    "P01"
+  ],
+  "target_family": "discovery.late_endpoint",
+  "capability": {
+    "status": "authored",
+    "f1_routable": true,
+    "runtime_binding": "late_joiner.reader_delay_sec",
+    "note": "template only; not execution evidence"
+  },
+  "status": "authored",
+  "logical_config": {
+    "topic": "/r2f/s1/late_endpoint",
+    "message_type": "std_msgs/msg/String",
+    "qos": {
+      "reliability": "reliable",
+      "durability": "volatile",
+      "depth": 64
+    },
+    "reader_delay_sec": 0.15,
+    "baseline_reader_delay_sec": 0.02,
+    "pre_match_count": 2,
+    "post_match_count": 6,
+    "publish_interval_sec": 0.03,
+    "match_timeout_sec": 8.0,
+    "delivery_timeout_sec": 5.0,
+    "startup_timeout_sec": 10.0
+  },
+  "operation_windows": [
+    {
+      "step": "connect_clock",
+      "window": "setup"
+    },
+    {
+      "step": "start_pair",
+      "window": "setup"
+    },
+    {
+      "step": "first_write",
+      "window": "setup"
+    },
+    {
+      "step": "delay_reader",
+      "window": "pre_reader_create",
+      "delay_surface": "P01",
+      "unit": "s"
+    }
+  ],
+  "provenance": {
+    "kind": "template",
+    "source": "plan 3.1/4 initial corpus shape; existing semantic_input defaults",
+    "derived_from_execution": false
+  },
+  "capability_requirements": {
+    "tools": [
+      "public_ros2_api"
+    ],
+    "sut_guards": [
+      "writer_prejoin_before_reader_create"
+    ],
+    "runtime_binding": "late_joiner.reader_delay_sec"
+  },
+  "parent_content_sha256_rule": "content_sha256 over surface_refs,target_family,logical_config,operation_windows; excludes rng_seed,repeat,run_id,domain,guid,wall time",
+  "rng_seed_role": "chosen per attempt by caller; never embedded in this template"
+}

@@ -1,0 +1,69 @@
+{
+  "seed_id": "P05",
+  "version": 1,
+  "surface_refs": [
+    "P05"
+  ],
+  "target_family": "builtin.discovery_projection_reconciliation",
+  "capability": {
+    "status": "authored",
+    "f1_routable": true,
+    "runtime_binding": "projection.qos_profile",
+    "note": "template only; liveliness kind projection, not lease expiry or assert behavior"
+  },
+  "status": "authored",
+  "logical_config": {
+    "topic": "/r2f/s1/projection_liveliness",
+    "message_type": "std_msgs/msg/String",
+    "qos": {
+      "reliability": "reliable",
+      "durability": "volatile",
+      "depth": 64,
+      "deadline_ns": 1250000000,
+      "liveliness": "manual_by_topic",
+      "liveliness_lease_duration_ns": 1000000000
+    },
+    "pre_match_count": 2,
+    "post_match_count": 6,
+    "publish_interval_sec": 0.03,
+    "match_timeout_sec": 8.0,
+    "delivery_timeout_sec": 5.0,
+    "startup_timeout_sec": 10.0
+  },
+  "operation_windows": [
+    {
+      "step": "create_writer",
+      "window": "setup"
+    },
+    {
+      "step": "create_reader",
+      "window": "setup"
+    },
+    {
+      "step": "observe_projection",
+      "window": "endpoint_projection_window",
+      "projection_surface": "P05",
+      "requires": [
+        "endpoint_submitted_qos",
+        "endpoint_observed_qos",
+        "observer_completeness"
+      ]
+    }
+  ],
+  "provenance": {
+    "kind": "template",
+    "source": "plan 3.1/4 P05 liveliness enum; existing projection_pair QoS schema",
+    "derived_from_execution": false
+  },
+  "capability_requirements": {
+    "tools": [
+      "public_ros2_api"
+    ],
+    "sut_guards": [
+      "endpoint_created_before_observation"
+    ],
+    "runtime_binding": "projection.qos_profile"
+  },
+  "parent_content_sha256_rule": "content_sha256 over surface_refs,target_family,logical_config,operation_windows; excludes rng_seed,repeat,run_id,domain,guid,wall time",
+  "rng_seed_role": "chosen per attempt by caller; never embedded in this template"
+}

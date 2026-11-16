@@ -1,5 +1,7 @@
 """Append-only lifecycle audit of already observed conformance anomalies."""
 
+import re
+import os
 from dataclasses import dataclass, field
 from enum import Enum
 
@@ -79,6 +81,21 @@ def _validate_observation_identity(row):
         raise ValueError("observed requires stable endpoint/instrumentation identity")
 
 
+REVIEW_EVIDENCE_KEYS = frozenset({
+    "source", "raw", "capsule", "replay", "oracle", "control", "summary",
+})
+
+_SOURCE_REF = re.compile(r"^(?:[0-9a-f]{7,64}|[A-Za-z0-9_.\-/]{2,})$")
+
+
+def _existing_reference(value, field):
+    """A review must point at real local artefacts, not invented labels."""
+    nonempty(value, f"review.evidence_refs.{field}")
+    if not os.path.exists(value):
+        raise ValueError(f"review evidence reference does not exist: {field}={value}")
+    return os.path.abspath(value)
+
+
 class CandidateStatus(str, Enum):
     OBSERVED = "observed"
     ADMITTED = "admitted"
@@ -100,6 +117,7 @@ class CandidateLifecycle:
     _confirmation: dict | None = field(default=None, init=False, repr=False)
     _non_replayable: dict | None = field(default=None, init=False, repr=False)
     _blackbox_validation: str = field(default="not_run", init=False, repr=False)
+    _reviews: list = field(default_factory=list, init=False, repr=False)
 
     def __post_init__(self):
         nonempty(self.candidate_id, "candidate_id")
@@ -195,12 +213,80 @@ class CandidateLifecycle:
         self._audit("non_replayable", **self._non_replayable)
         return self
 
-    def confirm(self, *, adjudicator_id, adjudication_method, confirmation_basis="", reason=""):
+    def record_review(self, *, reviewer_id, conclusion, evidence_refs, independent_of=None,
+                      notes=""):
+        """Append an independent review opinion.  This never confirms a candidate.
+
+        ``conclusion`` is one of supported/rejected/needs_evidence.  A review
+        must name a reviewer that is not one of ``independent_of`` (the trigger
+        chain/oracle authors) and must reference concrete source, raw and
+        capsule artefacts.  Review metadata is evidence for adjudication, not a
+        lifecycle transition.
+        """
+        nonempty(reviewer_id, "review.reviewer_id")
+        if conclusion not in {"supported", "rejected", "needs_evidence"}:
+            raise ValueError("invalid review conclusion")
+        separations = independent_of if independent_of is not None else []
+        if not isinstance(separations, (list, tuple)) or any(
+                not isinstance(item, str) or not item.strip() for item in separations):
+            raise ValueError("review.independent_of must be a list of identities")
+        if reviewer_id in separations:
+            raise ValueError("reviewer cannot review its own trigger chain/oracle work")
+        if not isinstance(evidence_refs, dict) or not evidence_refs:
+            raise ValueError("review requires source/raw/capsule evidence references")
+        unknown = set(evidence_refs) - REVIEW_EVIDENCE_KEYS
+        if unknown:
+            raise ValueError("review evidence has unknown references: " + ",".join(sorted(unknown)))
+        resolved = {}
+        for key in ("source", "raw", "capsule"):
+            value = evidence_refs.get(key)
+            nonempty(value, f"review.evidence_refs.{key}")
+            if not _SOURCE_REF.fullmatch(value):
+                raise ValueError(f"review evidence reference is not a path/commit: {key}")
+            resolved[key] = _existing_reference(value, key)
+        # Optional extra references must also point at real artefacts when they
+        # look like local paths; a bare label cannot stand in for evidence.
+        for key, value in evidence_refs.items():
+            if key in resolved:
+                continue
+            nonempty(value, f"review.evidence_refs.{key}")
+            if isinstance(value, str) and ("/" in value or os.sep in value):
+                resolved[key] = _existing_reference(value, key)
+        review = {"reviewer_id": reviewer_id, "conclusion": conclusion,
+                  "evidence_refs": resolved,
+                  "independent_of": list(separations),
+                  "notes": notes, "reviewed_at": utc_now(),
+                  "review_id": f"review-{len(self._reviews) + 1}"}
+        self._reviews.append(review)
+        self._audit("reviewed", review_id=review["review_id"], conclusion=conclusion,
+                    reviewer_id=reviewer_id)
+        return self
+
+    def _independent_supporting_review(self):
+        """Most recent independent supporting review, if any.
+
+        The reviewer and the adjudicator are different roles: a review is an
+        input to adjudication, not the adjudication itself.  Any independent
+        reviewer with concrete references qualifies; adjudication remains a
+        separate, explicit act by ``confirm``.
+        """
+        for review in reversed(self._reviews):
+            if review["conclusion"] == "supported":
+                return review
+        return None
+
+    def confirm(self, *, adjudicator_id, adjudication_method, confirmation_basis="", reason="",
+                require_review=False):
         if self.candidate_status != "triaged" or not self._triage or self._triage["responsibility_layer"] != "sut":
             raise ValueError("confirmation requires SUT triage")
         nonempty(adjudicator_id, "adjudicator_id")
         if adjudication_method not in {"single_agent", "peer_review", "rule_engine"}:
             raise ValueError("invalid adjudication_method")
+        mandatory_review = require_review or self.evidence.get("review_required") is True
+        review = self._independent_supporting_review() if self._reviews else None
+        if mandatory_review and review is None:
+            raise ValueError("confirmation requires an independent supporting review "
+                             "with source/raw/capsule references")
         matching_replay = False
         if self.replay_status == "pass" and self._replay_attempts:
             attempt = self._replay_attempts[-1]
@@ -219,6 +305,9 @@ class CandidateLifecycle:
         self._confirmation = {"adjudicator_id": adjudicator_id, "adjudication_method": adjudication_method,
                               "adjudicated_at": utc_now(), "confirmation_basis": confirmation_basis or "conformance_signature_match",
                               "reason": reason}
+        if review is not None:
+            self._confirmation["review_id"] = review["review_id"]
+            self._confirmation["reviewed_evidence"] = snapshot(review["evidence_refs"])
         self.candidate_status = "confirmed"
         self._audit("confirmed", **self._confirmation)
         return self
@@ -230,7 +319,7 @@ class CandidateLifecycle:
         self._audit("blackbox_validation", status=status)
         return self
 
-    def validate(self, *, require_disposition=False):
+    def validate(self, *, require_disposition=False, require_review=False):
         self._validate_observed()
         if self.candidate_status != "observed":
             self._validate_admission()
@@ -240,6 +329,10 @@ class CandidateLifecycle:
         if self.candidate_status == "confirmed" and self.replay_status != "pass":
             if not self._confirmation or not self._confirmation["confirmation_basis"]:
                 raise ValueError("confirmed without replay requires named evidence basis")
+        if require_review and self.candidate_status == "confirmed":
+            if not self._independent_supporting_review():
+                raise ValueError("confirmed candidate requires an independent supporting review "
+                                 "with source/raw/capsule evidence")
         return True
 
     def to_dict(self):
@@ -249,4 +342,5 @@ class CandidateLifecycle:
                 "evidence_tier": self.evidence["evidence_tier"], "replay_status": self.replay_status,
                 "replay_attempts": snapshot(self._replay_attempts), "non_replayable": snapshot(self._non_replayable),
                 "blackbox_validation": self._blackbox_validation, "derived_labels": ["replay_unconfirmed"] if unconfirmed else [],
+                "reviews": snapshot(self._reviews),
                 "history": snapshot(self._history), **snapshot(self._triage or {}), **snapshot(self._confirmation or {})}

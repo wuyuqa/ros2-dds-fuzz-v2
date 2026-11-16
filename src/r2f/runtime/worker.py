@@ -35,8 +35,25 @@ def extended_graph_qos(qos, enabled=False):
             'liveliness_lease_duration_ns': qos.liveliness_lease_duration.nanoseconds}
 
 
+PUBLIC_QOS_FIELDS = frozenset({'depth', 'history', 'reliability', 'durability',
+                                'deadline_ns', 'liveliness', 'liveliness_lease_duration_ns'})
+
+
 def create_public_qos(q):
-    """Construct only public rclpy policies, retaining integer-nanosecond durations."""
+    """Construct only public rclpy policies, rejecting fields it cannot express.
+
+    Unknown fields are an adapter error, never silently dropped: the caller's
+    binding check (V35) must be able to see that the submitted input did not
+    reach the public API.
+    """
+    unknown = set(q) - PUBLIC_QOS_FIELDS
+    if unknown:
+        raise ValueError('unsupported_public_qos_field:' + ','.join(sorted(unknown)))
+    history_name = q.get('history', 'keep_last')
+    if history_name != 'keep_last':
+        # This runtime always requests KEEP_LAST; accepting anything else here
+        # would be an unverifiable silent normalization.
+        raise ValueError('unsupported_public_history:' + str(history_name))
     from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPolicy, LivelinessPolicy
     from rclpy.duration import Duration
     kwargs = {'depth': q['depth'], 'history': HistoryPolicy.KEEP_LAST,
@@ -48,6 +65,15 @@ def create_public_qos(q):
     if 'liveliness' in q:
         kwargs['liveliness'] = getattr(LivelinessPolicy, q['liveliness'].upper())
     return QoSProfile(**kwargs)
+
+
+def self_qos_entry(graph, role, endpoint_gid):
+    """Return the SDK-reported graph entry for this worker's own endpoint."""
+    rows = graph['publishers'] if role == 'writer' else graph['subscriptions']
+    for item in rows:
+        if item.get('endpoint_gid') == endpoint_gid:
+            return item
+    return None
 
 
 def main():
@@ -138,6 +164,14 @@ def main():
          create_begin_monotonic_ns=create_begin['monotonic_ns'], create_begin_time_ns=create_begin['time_ns'],
          topic=config['topic'], qos=q, message_type='std_msgs/msg/String')
     emit('graph_snapshot', **initial_graph)
+    if str(config.get('target_id', '')).endswith('.fuzz_v1'):
+        # The only observed values used for exploratory parameter binding come
+        # from the same SDK graph call that reports this endpoint's GID.
+        own = self_qos_entry(initial_graph, role, local_gid) if local_gid else None
+        emit('qos_binding_observed', requested=q,
+             observed_self=own['qos'] if own else None,
+             observed_self_gid=own['endpoint_gid'] if own else None,
+             observation_api='get_%s_info_by_topic' % ('publishers' if role == 'writer' else 'subscriptions'))
     input_buffer = b''
     pending_commands = []
     last_count = None

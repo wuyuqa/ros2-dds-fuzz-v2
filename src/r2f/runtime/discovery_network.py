@@ -44,6 +44,7 @@ import argparse
 from dataclasses import dataclass
 import fcntl
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -294,6 +295,166 @@ def parse_counter(payload, table):
         return {key: counter[key] for key in ('packets', 'bytes')}
     except (KeyError, TypeError, ValueError) as exc:
         raise DiscoveryNetworkError(f'nft counter unavailable: {exc}') from exc
+
+
+MAX_RUNTIME_WINDOWS = 3
+WINDOW_ANCHORS = ('fresh_match', 'previous_restore_confirmed')
+
+
+class WindowPlanError(ValueError):
+    pass
+
+
+class WindowGateError(RuntimeError):
+    pass
+
+
+def validate_window_plan(windows):
+    """Validate an exploratory 1..3 window drop->restore plan.
+
+    This is input validation only: it neither applies a rule nor proves a hit.
+    The first window must anchor on a fresh match; later windows may only use
+    the previous verified restore, which is what makes the chain auditable.
+    """
+    if not isinstance(windows, (list, tuple)):
+        raise WindowPlanError('runtime_windows must be a list')
+    if not 1 <= len(windows) <= MAX_RUNTIME_WINDOWS:
+        raise WindowPlanError('runtime_windows must contain 1..%d windows' % MAX_RUNTIME_WINDOWS)
+    normalized = []
+    fields = {'window_id', 'window_index', 'trigger_anchor', 'trigger_offset_sec',
+              'drop_duration_sec', 'restore_interval_sec'}
+    for index, window in enumerate(windows):
+        if not isinstance(window, dict):
+            raise WindowPlanError('runtime window must be a dict')
+        unknown = set(window) - fields
+        if unknown:
+            raise WindowPlanError('unknown runtime window field: ' + ','.join(sorted(unknown)))
+        window_id = window.get('window_id', 'w%d' % index)
+        if not isinstance(window_id, str) or not window_id.strip():
+            raise WindowPlanError('runtime window_id required')
+        if window.get('window_index', index) != index:
+            raise WindowPlanError('runtime window_index must be sequential from zero')
+        anchor = window.get('trigger_anchor', 'fresh_match' if index == 0 else 'previous_restore_confirmed')
+        if anchor not in WINDOW_ANCHORS:
+            raise WindowPlanError('unsupported window trigger_anchor: ' + str(anchor))
+        if index == 0 and anchor != 'fresh_match':
+            raise WindowPlanError('first window must anchor on fresh_match')
+        values = {}
+        for key in ('trigger_offset_sec', 'drop_duration_sec', 'restore_interval_sec'):
+            value = window.get(key, 0.0)
+            if isinstance(value, bool) or not isinstance(value, (int, float)) \
+                    or not math.isfinite(value) or not 0.0 <= value <= 30.0:
+                raise WindowPlanError('invalid runtime window %s' % key)
+            values[key] = float(value)
+        if values['drop_duration_sec'] <= 0:
+            raise WindowPlanError('drop_duration_sec must be positive')
+        normalized.append({'window_id': window_id, 'window_index': index,
+                           'trigger_anchor': anchor, **values})
+    ids = [item['window_id'] for item in normalized]
+    if len(ids) != len(set(ids)):
+        raise WindowPlanError('duplicate runtime window_id')
+    return normalized
+
+
+def window_counter_delta(begin, end):
+    """Per-window counter delta; a later window can never inherit earlier packets."""
+    if not isinstance(begin, dict) or not isinstance(end, dict):
+        raise DiscoveryNetworkError('begin and end receipts required')
+    if begin.get('table') != end.get('table'):
+        raise DiscoveryNetworkError('counter receipts belong to different window tables')
+    before, after = begin.get('counter_snapshot'), end.get('counter_snapshot')
+    if not isinstance(before, dict) or not isinstance(after, dict):
+        raise DiscoveryNetworkError('counter snapshot missing for window delta')
+    values = {}
+    for label, snapshot in (('before', before), ('after', after)):
+        packets, byte_count = snapshot.get('packets'), snapshot.get('bytes')
+        if isinstance(packets, bool) or not isinstance(packets, int) or packets < 0 \
+                or isinstance(byte_count, bool) or not isinstance(byte_count, int) or byte_count < 0:
+            raise DiscoveryNetworkError('invalid %s counter values' % label)
+        values[label] = (packets, byte_count)
+    delta_packets = values['after'][0] - values['before'][0]
+    delta_bytes = values['after'][1] - values['before'][1]
+    if delta_packets < 0 or delta_bytes < 0:
+        raise DiscoveryNetworkError('window counter reset detected; delta cannot be attributed')
+    return {'event': 'discovery_window_counter', 'table': begin['table'],
+            'window_index': begin.get('window_index'),
+            'packets_before': values['before'][0], 'packets_after': values['after'][0],
+            'bytes_before': values['before'][1], 'bytes_after': values['after'][1],
+            'packets_delta': delta_packets, 'bytes_delta': delta_bytes,
+            'counter_observed': True, 'hit': delta_packets > 0,
+            'counter_semantics': 'per_window_delta_not_cumulative'}
+
+
+class WindowLedger:
+    """Ordering gate for a 1..3 window drop->restore chain.
+
+    Pure bookkeeping: callers perform the real nft/namespace work. The ledger
+    guarantees that a window cannot start before the previous window's restore
+    was verified and its fresh post-restore activity was confirmed.
+    """
+
+    def __init__(self, windows):
+        self.plan = validate_window_plan(windows)
+        self.records = []
+        self.aborted = None
+
+    def start(self, index, begin_receipt):
+        if self.aborted is not None:
+            raise WindowGateError('window chain already aborted: ' + self.aborted)
+        if index != len(self.records):
+            raise WindowGateError('windows must start sequentially')
+        if index and not self.records[-1]['recovery_confirmed']:
+            raise WindowGateError('previous window restore is not confirmed')
+        if index >= len(self.plan):
+            raise WindowGateError('window index exceeds plan')
+        if not isinstance(begin_receipt, dict) or begin_receipt.get('applied') is not True:
+            raise WindowGateError('applied drop begin receipt required')
+        self.records.append({'window_index': index, 'window_id': self.plan[index]['window_id'],
+                             'begin': json.loads(json.dumps(begin_receipt, allow_nan=False)),
+                             'end': None, 'counter': None, 'recovery': None,
+                             'recovery_confirmed': False, 'restored': False, 'error': None})
+        return self.records[-1]
+
+    def end(self, index, end_receipt):
+        if index >= len(self.records) or self.records[index]['end'] is not None:
+            raise WindowGateError('window end without matching open window')
+        record = self.records[index]
+        if not isinstance(end_receipt, dict) or end_receipt.get('restored') is not True:
+            raise WindowGateError('verified restore receipt required to close a window')
+        record['end'] = json.loads(json.dumps(end_receipt, allow_nan=False))
+        record['restored'] = True
+        record['counter'] = window_counter_delta(record['begin'], record['end'])
+        return record['counter']
+
+    def confirm_recovery(self, index, recovery_receipt):
+        if index >= len(self.records) or not self.records[index]['restored']:
+            raise WindowGateError('recovery confirmation requires a closed window')
+        record = self.records[index]
+        if not isinstance(recovery_receipt, dict) or recovery_receipt.get('recovery_verified') is not True:
+            raise WindowGateError('recovery_verified receipt required before next window')
+        record['recovery'] = json.loads(json.dumps(recovery_receipt, allow_nan=False))
+        record['recovery_confirmed'] = True
+        return record
+
+    def abort(self, reason):
+        self.aborted = str(reason)
+        for record in self.records:
+            record['error'] = self.aborted
+        return {'event': 'discovery_window_chain_aborted', 'reason': self.aborted,
+                'open_windows': [r['window_index'] for r in self.records if r['end'] is None],
+                'cleanup_required': True, 'rules_must_be_removed': True}
+
+    def summary(self):
+        return {'event': 'discovery_window_ledger', 'plan': self.plan,
+                'window_count': len(self.records),
+                'windows': [{'window_index': r['window_index'], 'window_id': r['window_id'],
+                             'restored': r['restored'], 'recovery_confirmed': r['recovery_confirmed'],
+                             'counter': r['counter'], 'error': r['error']} for r in self.records],
+                'aborted': self.aborted,
+                'chain_complete': self.aborted is None and len(self.records) == len(self.plan)
+                                  and all(r['recovery_confirmed'] for r in self.records),
+                'hit': any(r['counter'] and r['counter']['hit'] for r in self.records),
+                'counter_semantics': 'each_window_delta_only'}
 
 
 class DiscoveryDropController:

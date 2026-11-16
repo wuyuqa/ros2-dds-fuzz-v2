@@ -10,7 +10,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 
 from ._json import integer, nonempty, sha256_digest, snapshot
-from .evidence import INPUT_SCHEMA, canonical_hash, effective_input_hash
+from .evidence import (INPUT_SCHEMA, INPUT_SCHEMA_V2, INPUT_SCHEMA_VERSIONS,
+                       canonical_hash, effective_input_hash)
 from .execution import validate_execution
 from .scenario import Scenario
 from .oracle import _effect_names
@@ -28,10 +29,39 @@ class ReplayStatus(str, Enum):
     INCONCLUSIVE = "inconclusive"
 
 
+# Input-identity v2 additions that must never appear on a v1 capsule.  The
+# envelope schema itself stays ``r2f.conformance-capsule/v1`` so old readers
+# can still load v1 capsules unchanged.
+_V2_ONLY_INPUT_KEYS = frozenset({
+    "input_identity_schema", "mutation_plan", "operations", "runtime_windows",
+    "contract_hash", "input_model", "model_hash", "profile_id",
+})
+_PLAN_BINDING_KEYS = ("mutation_plan", "operations", "runtime_windows", "contract_hash")
+
+
 def validate_replay_input(data):
-    if not isinstance(data, dict) or data.get("input_identity_schema") != INPUT_SCHEMA:
+    """Dispatch input-identity validation by the declared schema.
+
+    Unknown versions are rejected; v2 must never silently fall back to v1.
+    """
+    if not isinstance(data, dict):
+        raise ValueError("replay input must be a dict")
+    schema = data.get("input_identity_schema")
+    if schema not in INPUT_SCHEMA_VERSIONS:
         raise ValueError("unsupported replay input identity schema")
+    if schema == INPUT_SCHEMA:
+        return _validate_replay_input_v1(data)
+    return _validate_replay_input_v2(data)
+
+
+def _validate_replay_input_v1(data):
+    # Historical path: byte-identical semantics and no extra accepted fields.
+    leaked = set(data) & (_V2_ONLY_INPUT_KEYS - {"input_identity_schema"})
+    if leaked:
+        raise ValueError("v1 replay input cannot carry v2-only fields: " + ",".join(sorted(leaked)))
     effective = data.get("effective_input")
+    if isinstance(effective, dict) and set(effective) & (_V2_ONLY_INPUT_KEYS - {"input_identity_schema"}):
+        raise ValueError("v1 effective input cannot carry v2-only fields")
     digest = effective_input_hash(effective)
     if data.get("effective_input_sha256") != digest:
         raise ValueError("replay effective input SHA256 mismatch")
@@ -47,6 +77,89 @@ def validate_replay_input(data):
         raise ValueError("replay state plan mismatch")
     if data.get("mutation_parameters") != effective.get("mutation_parameters") or data.get("mutation_parameters") != scenario.mutation_parameters:
         raise ValueError("replay mutation parameters mismatch")
+    if not isinstance(data.get("source_manifest"), dict) or not data["source_manifest"]:
+        raise ValueError("replay source_manifest must be nonempty")
+    if data["source_manifest"] != effective.get("source_manifest"):
+        raise ValueError("replay source_manifest mismatch")
+    for key in ("topic", "message_type"):
+        nonempty(data.get(key), key)
+    if not isinstance(data.get("qos"), dict):
+        raise ValueError("replay qos must be a dict")
+    submitted = effective["final_input"]
+    if not isinstance(submitted, dict):
+        raise ValueError("normal conformance final_input must be a config dict")
+    for key in ("topic", "message_type", "qos"):
+        if key in submitted and data[key] != submitted[key]:
+            raise ValueError(f"replay {key} differs from final submitted config")
+    if data.get("origin_domain") is not None:
+        integer(data["origin_domain"], "origin_domain")
+    return True
+
+
+def _validate_replay_input_v2(data):
+    """Validate a plan-bearing exploration input without regenerating it.
+
+    The saved plan is authoritative: loading a capsule must not call a mutator
+    or provider ``prepare``.  Every plan field is cross-bound to the effective
+    input, the scenario, and the submitted final input.
+    """
+    effective = data.get("effective_input")
+    if not isinstance(effective, dict):
+        raise ValueError("v2 replay effective_input must be a dict")
+    if effective.get("input_identity_schema") != INPUT_SCHEMA_V2:
+        raise ValueError("v2 replay effective input must declare the v2 schema")
+    digest = effective_input_hash(effective, schema=INPUT_SCHEMA_V2)
+    if data.get("effective_input_sha256") != digest:
+        raise ValueError("replay effective input SHA256 mismatch")
+
+    has_plan = "mutation_plan" in effective or "mutation_plan" in data
+    if has_plan:
+        for key in _PLAN_BINDING_KEYS:
+            if key not in data or key not in effective:
+                raise ValueError(f"v2 replay input is missing plan binding field: {key}")
+            if canonical_hash(data[key]) != canonical_hash(effective[key]):
+                raise ValueError(f"v2 replay plan binding differs from effective input: {key}")
+    else:
+        partial = [key for key in _PLAN_BINDING_KEYS if key in data or key in effective]
+        if partial:
+            raise ValueError("v2 replay input declares partial plan fields: " + ",".join(sorted(partial)))
+
+    scenario = Scenario.from_dict(data["scenario"])
+    scenario_data = scenario.to_dict()
+    if scenario.target.to_dict() != data.get("target"):
+        raise ValueError("replay target manifest mismatch")
+    if canonical_hash(data["target"]) != effective.get("target_sha256"):
+        raise ValueError("replay effective target manifest hash mismatch")
+    for key in ("target_id", "target_revision", "seed", "rmw", "arm", "repeat", "mutation_kind", "carrier"):
+        if data.get(key) != effective.get(key) or data.get(key) != scenario_data.get(key):
+            raise ValueError(f"replay input metadata mismatch: {key}")
+    if data.get("state_steps") != effective.get("state_steps") or data.get("state_steps") != scenario_data["state_steps"]:
+        raise ValueError("replay state plan mismatch")
+    if data.get("mutation_parameters") != effective.get("mutation_parameters") or data.get("mutation_parameters") != scenario.mutation_parameters:
+        raise ValueError("replay mutation parameters mismatch")
+
+    if has_plan:
+        saved_plan = data["mutation_plan"]
+        if canonical_hash(scenario_data.get("mutation_plan")) != canonical_hash(saved_plan):
+            raise ValueError("replay scenario mutation plan differs from capsule plan")
+        from .mutation_plan import MutationPlan
+        plan = MutationPlan.from_dict(saved_plan)
+        if canonical_hash(plan.final_config) != canonical_hash(effective["final_input"]):
+            raise ValueError("replay mutation plan final_config differs from submitted final input")
+        if canonical_hash(scenario.mutation_plan.to_dict()) != canonical_hash(saved_plan):
+            raise ValueError("replay scenario plan is not the saved plan")
+    elif "mutation_plan" in scenario_data:
+        raise ValueError("v2 replay scenario carries an unbounded mutation plan")
+
+    if "contract" in effective:
+        contract = effective["contract"]
+        if not isinstance(contract, dict) or not contract:
+            raise ValueError("v2 replay contract must be a nonempty dict")
+        from .mutation_plan import ExplorationContract
+        declared = ExplorationContract.from_dict(contract)
+        if has_plan and data["contract_hash"] != declared.contract_hash():
+            raise ValueError("replay plan contract_hash differs from the declared contract")
+
     if not isinstance(data.get("source_manifest"), dict) or not data["source_manifest"]:
         raise ValueError("replay source_manifest must be nonempty")
     if data["source_manifest"] != effective.get("source_manifest"):
@@ -158,25 +271,71 @@ class ReplayCapsule:
 
     @classmethod
     def from_scenario(cls, scenario, *, source_manifest, final_input=None,
-                      input_layer_receipts=None, origin_domain=None):
-        submitted = snapshot(scenario.parameters if final_input is None else final_input)
+                      input_layer_receipts=None, origin_domain=None, input_schema=None):
+        """Build an offline capsule for an executed-or-planned input.
+
+        ``input_schema`` may force a version.  By default a scenario carrying a
+        ``mutation_plan`` writes ``r2f.input-identity/v2`` so the plan, its
+        operations and runtime windows enter the digest; a legacy scenario keeps
+        writing v1 with byte-identical canonical bytes.
+        """
+        has_plan = scenario.mutation_plan is not None
+        if input_schema is None:
+            schema = INPUT_SCHEMA_V2 if has_plan else INPUT_SCHEMA
+        else:
+            if input_schema not in INPUT_SCHEMA_VERSIONS:
+                raise ValueError("unsupported replay input identity schema")
+            schema = input_schema
+        if schema == INPUT_SCHEMA_V2 and not has_plan:
+            raise ValueError("a v2 capsule requires an explicit mutation_plan")
+        if schema == INPUT_SCHEMA and has_plan:
+            raise ValueError("a plan-bearing scenario must use the v2 input identity")
+
+        if has_plan:
+            # Do not inject defaults that would differ from the plan's final
+            # config; the plan is authoritative and the hash must bind it.
+            submitted = None if final_input is None else snapshot(final_input)
+            effective = scenario.effective_input_v2(final_input=submitted,
+                                                   input_layer_receipts=input_layer_receipts,
+                                                   source_manifest=source_manifest)
+            submitted = effective["final_input"]
+        else:
+            submitted = snapshot(scenario.parameters if final_input is None else final_input)
+            if not isinstance(submitted, dict):
+                raise ValueError("normal conformance config must be a dict")
+            # Endpoint defaults are explicit in the final submitted configuration.
+            submitted.setdefault("topic", "/r2f/conformance")
+            submitted.setdefault("message_type", "std_msgs/msg/String")
+            submitted.setdefault("qos", {})
+            effective = scenario.effective_input(final_input=submitted,
+                                                 input_layer_receipts=input_layer_receipts,
+                                                 source_manifest=source_manifest)
         if not isinstance(submitted, dict):
             raise ValueError("normal conformance config must be a dict")
-        # Endpoint defaults are explicit in the final submitted configuration.
-        submitted.setdefault("topic", "/r2f/conformance")
-        submitted.setdefault("message_type", "std_msgs/msg/String")
-        submitted.setdefault("qos", {})
-        effective = scenario.effective_input(final_input=submitted, input_layer_receipts=input_layer_receipts,
-                                             source_manifest=source_manifest)
-        input_data = {"input_identity_schema": INPUT_SCHEMA, "scenario": scenario.to_dict(),
+        if schema == INPUT_SCHEMA_V2:
+            missing = [key for key in ("topic", "message_type", "qos") if key not in submitted]
+            if missing:
+                raise ValueError("v2 replay final input is missing submitted config field(s): "
+                                 + ",".join(missing))
+
+        scenario_data = scenario.to_dict()
+        if schema == INPUT_SCHEMA_V2:
+            digest = effective_input_hash(effective, schema=INPUT_SCHEMA_V2)
+        else:
+            digest = effective_input_hash(effective)
+        input_data = {"input_identity_schema": schema, "scenario": scenario_data,
                       "target": scenario.target.to_dict(), "target_id": scenario.target_id,
                       "target_revision": scenario.target_revision, "seed": scenario.seed, "rmw": scenario.rmw,
                       "arm": scenario.arm, "repeat": scenario.repeat, "mutation_kind": scenario.mutation_kind,
                       "carrier": scenario.carrier, "mutation_parameters": scenario.mutation_parameters,
                       "state_steps": [s.to_dict() for s in scenario.state_steps],
                       "source_manifest": snapshot(source_manifest), "effective_input": effective,
-                      "effective_input_sha256": effective_input_hash(effective), "origin_domain": origin_domain,
-                      **{key: submitted[key] for key in ("topic", "message_type", "qos")}}
+                      "effective_input_sha256": digest, "origin_domain": origin_domain,
+                      **{key: submitted[key] for key in ("topic", "message_type", "qos") if key in submitted}}
+        if schema == INPUT_SCHEMA_V2:
+            for key in _PLAN_BINDING_KEYS:
+                if key in effective:
+                    input_data[key] = snapshot(effective[key])
         return cls(input_data)
 
     def record_execution(self, metadata):
@@ -254,6 +413,18 @@ def rerun_conformance(capsule, runner, *, domain):
         validate_replay_input(capsule.input)
     except (ValueError, KeyError, TypeError) as exc:
         return capsule.record_attempt("fail_artifact", failure_reason=f"{type(exc).__name__}: {exc}", domain=domain)
+    if capsule.input.get("input_identity_schema") == INPUT_SCHEMA_V2:
+        # The v1 replay audit binds a legacy runtime config and compares the
+        # required four-target execution signature.  Exploratory v2 capsules
+        # need their own plan-aware runtime config and audit; refusing here is a
+        # declared tool gap, never a SUT verdict or an excuse to relax the
+        # public-ROS2-API execution-source gate.
+        return capsule.record_attempt(
+            "fail_artifact",
+            failure_reason="v2_exploratory_replay_not_implemented: plan-aware replay audit "
+                           "is pending; saved input is retained unchanged",
+            domain=domain, reason_code="v2_exploratory_replay_not_implemented",
+            phase="preflight")
     integer(domain, "domain")
     if domain == capsule.input.get("origin_domain"):
         raise ValueError("conformance rerun requires a new isolated domain")

@@ -1,0 +1,115 @@
+{
+  "seed_id": "E02",
+  "version": 1,
+  "surface_refs": [
+    "E02"
+  ],
+  "target_family": "discovery.interruption_recovery",
+  "capability": {
+    "status": "capability_pending",
+    "f1_routable": false,
+    "runtime_binding": null,
+    "reason": "multi-window runner/orchestration is not wired; seed is a template only"
+  },
+  "status": "capability_pending",
+  "logical_config": {
+    "topic": "/r2f/s1/discovery_multiwindow",
+    "message_type": "std_msgs/msg/String",
+    "qos": {
+      "reliability": "reliable",
+      "durability": "volatile",
+      "depth": 64
+    },
+    "reader_delay_sec": 0.02,
+    "baseline_reader_delay_sec": 0.02,
+    "pre_match_count": 2,
+    "post_match_count": 6,
+    "publish_interval_sec": 0.03,
+    "match_timeout_sec": 8.0,
+    "delivery_timeout_sec": 5.0,
+    "startup_timeout_sec": 10.0,
+    "drop_duration_sec": 0.2,
+    "recovery_timeout_sec": 8.0,
+    "counter_interval_sec": 0.25,
+    "environment_windows": {
+      "count": 2,
+      "restore_interval_sec": 0.2
+    },
+    "window_count_domain": [1, 2, 3],
+    "restore_interval_domain_s": [0.0, 0.02, 0.2, 1.0]
+  },
+  "operation_windows": [
+    {
+      "step": "create_endpoints",
+      "window": "setup"
+    },
+    {
+      "step": "establish_match",
+      "window": "setup"
+    },
+    {
+      "step": "drop_discovery",
+      "window": "post_match_window_1",
+      "duration_surface": "E01",
+      "duration_sec": 0.2,
+      "requires": [
+        "pair_match_observed",
+        "drop_counter_bound"
+      ]
+    },
+    {
+      "step": "restore_and_confirm",
+      "window": "post_match_window_1",
+      "requires": [
+        "rules_removed",
+        "fresh_identity_correlated_discovery_activity"
+      ]
+    },
+    {
+      "step": "wait_restore_interval",
+      "window": "inter_window_gap",
+      "interval_surface": "E02",
+      "interval_sec": 0.2,
+      "requires": [
+        "previous_window_restored"
+      ]
+    },
+    {
+      "step": "drop_discovery",
+      "window": "post_match_window_2",
+      "duration_surface": "E01",
+      "duration_sec": 0.2,
+      "requires": [
+        "previous_window_restored",
+        "drop_counter_bound"
+      ]
+    },
+    {
+      "step": "restore_and_confirm",
+      "window": "post_match_window_2",
+      "requires": [
+        "rules_removed",
+        "fresh_identity_correlated_discovery_activity"
+      ]
+    }
+  ],
+  "provenance": {
+    "kind": "template",
+    "source": "plan 3.1/4 E02 two-window drop/restore with 200ms restore interval; no live multi-window runner yet",
+    "derived_from_execution": false
+  },
+  "capability_requirements": {
+    "tools": [
+      "isolated_netns_nft_discovery_drop",
+      "pair_bound_drop_counter",
+      "multi_window_runner"
+    ],
+    "sut_guards": [
+      "previous_window_restored",
+      "discovery_activity_observed_after_restore"
+    ],
+    "runtime_binding": null
+  },
+  "parent_content_sha256_rule": "content_sha256 over surface_refs,target_family,logical_config,operation_windows; excludes rng_seed,repeat,run_id,domain,guid,wall time",
+  "rng_seed_role": "chosen per attempt by caller; never embedded in this template"
+}

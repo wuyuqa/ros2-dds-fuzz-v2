@@ -19,7 +19,8 @@ import subprocess
 import sys
 import time
 
-from .discovery_network import DiscoveryDropController, assert_isolated_namespace, namespace_command
+from .discovery_network import (DiscoveryDropController, WindowGateError, WindowLedger,
+                              assert_isolated_namespace, namespace_command, validate_window_plan)
 from .discovery_profiles import write_profiles
 from .domains import IsolationError, LeaseSet, probe_rtps_ports
 from .environment import REPO, activated_environment, check_environment, source_identity
@@ -60,6 +61,26 @@ def normalize_discovery_config(config):
         if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or not 0 < value <= 30:
             raise ValueError('invalid_discovery_parameter:' + key)
         c[key] = float(value)
+    windows = c.get('environment_windows')
+    if windows is not None:
+        # Exploratory multi-window plan. Validation is input-only; execution
+        # evidence is produced by the namespace body, never here.
+        c['runtime_windows'] = validate_window_plan(windows)
+        c['window_chain_requested'] = True
+    else:
+        c['runtime_windows'] = validate_window_plan([{
+            'window_id': 'legacy',
+            'window_index': 0,
+            'trigger_anchor': 'fresh_match',
+            'trigger_offset_sec': 0.0,
+            'drop_duration_sec': c['drop_duration_sec'],
+            'restore_interval_sec': 0.0,
+        }])
+        c['window_chain_requested'] = False
+    c['window_budget_sec'] = (
+        sum(w['trigger_offset_sec'] + w['drop_duration_sec'] + w['restore_interval_sec']
+            for w in c['runtime_windows'])
+        + c['recovery_timeout_sec'] * len(c['runtime_windows']))
     c['observe_extended_qos'] = True
     return c
 
@@ -136,11 +157,12 @@ def _supervise(c, output_dir, environment, lease, source, emit):
             child.close()
             parent.sendall(json.dumps(request, sort_keys=True).encode() + b'\n')
             emit('namespace_controller_started', controller_pid=process.pid, controller_pgid=process.pid,
-                 implementation=('isolated_netns_passive_sedp_public_qos' if c['target_id'] == 'builtin.discovery_projection_reconciliation' else IMPLEMENTATION),
+                 implementation=('isolated_netns_passive_sedp_public_qos'
+                                 if c['target_id'].startswith('builtin.discovery_projection_reconciliation') else IMPLEMENTATION),
                  inherited_lease_count=len(lease.handles), stderr_path=str(stderr_path))
             os.set_blocking(process.stdout.fileno(), False)
             selector.register(process.stdout, selectors.EVENT_READ)
-            deadline = time.monotonic() + 30 + 4 * c['startup_timeout_sec'] + 4 * c['match_timeout_sec'] + c['drop_duration_sec'] + c['recovery_timeout_sec'] + c['delivery_timeout_sec'] + c['post_match_count'] * (c['publish_interval_sec'] + 1)
+            deadline = time.monotonic() + 30 + 4 * c['startup_timeout_sec'] + 4 * c['match_timeout_sec'] + c.get('window_budget_sec', c['drop_duration_sec'] + c['recovery_timeout_sec']) + c['delivery_timeout_sec'] + c['post_match_count'] * (c['publish_interval_sec'] + 1)
             source_check_at = 0
             while selector.get_map():
                 now = time.monotonic()
@@ -217,11 +239,17 @@ def run_discovery_pair(config, output_dir, result):
     """Host branch of the public run_pair entry; never called by the netns child."""
     from .ros2_pair import RECEIPT_KEYS
     try:
-        if config['target_id'] == 'builtin.discovery_projection_reconciliation':
+        if config['target_id'].startswith('builtin.discovery_projection_reconciliation'):
             from .projection_pair import normalize_projection_config
             c = normalize_projection_config(config)
         else:
             c = normalize_discovery_config(config)
+            if c.get('fuzz_surfaces'):
+                from .ros2_pair import exploratory_bindings, require_binding_preserved
+                expected = exploratory_bindings(c)
+                require_binding_preserved(expected, c)
+                result['exploratory_bindings'] = expected
+                result['runtime_capability'] = 'discovery_drop_window_chain'
     except ValueError as exc:
         result['reason'] = 'blocked:' + str(exc)
         return result
@@ -233,7 +261,7 @@ def run_discovery_pair(config, output_dir, result):
         return result
     events = result['events']
     result['raw_path'] = str(raw_path)
-    projection = c['target_id'] == 'builtin.discovery_projection_reconciliation'
+    projection = c['target_id'].startswith('builtin.discovery_projection_reconciliation')
     implementation = 'isolated_netns_passive_sedp_public_qos' if projection else IMPLEMENTATION
     result['carrier_implementation'] = implementation
     lease, source, started = None, execution_chain_identity(), time.monotonic_ns()
@@ -579,8 +607,169 @@ class _RecoveryMatchTrajectory:
                 'primary_verdict_input': False}
 
 
+def _run_window_chain(c, active, receipt, emit, step, activity, activity_is_pair_observed,
+                      snapshot_pair, pause, carrier, pool, events, endpoints, matched,
+                      precondition, match_receipt, trajectories, window_records,
+                      window_hits, window_drop_activity, window_recovery_activity,
+                      window_fresh_recovery, window_restored):
+    """Execute a validated 1..3 window drop->restore chain.
+
+    Every window has its own drop begin/end, counter delta, restore boundary and
+    post-restore recovery confirmation. A window may only start after the
+    previous window's restore and fresh activity have been verified. Exceptions
+    always restore the current window before propagating; the caller's outer
+    handler keeps the original error and still cleans up the carrier.
+    """
+    plans = c['runtime_windows']
+    multi = True
+    ledger = WindowLedger(plans)
+    previous_recovery_ref = precondition['raw_event_ref']
+    counter_hit = False
+    try:
+        for index, plan in enumerate(plans):
+            anchor_ref = precondition['raw_event_ref'] if index == 0 else previous_recovery_ref
+            if index and active and not (window_recovery_activity[-1] and window_fresh_recovery[-1]):
+                raise WindowGateError('previous_window_recovery_not_confirmed')
+            if plan['trigger_offset_sec']:
+                offset_deadline = time.monotonic() + plan['trigger_offset_sec']
+                while time.monotonic() < offset_deadline:
+                    pool.pump(min(0.05, max(0.0, offset_deadline - time.monotonic())))
+            window_fields = {'window_index': index, 'window_id': plan['window_id'],
+                             'trigger_anchor': plan['trigger_anchor'], 'anchor_ref': anchor_ref}
+            emit('discovery_window_begin', drop_installed=active, **window_fields)
+            begin = None
+            window_counter_hit = False
+            window_activity_ok = False
+            trajectory = None
+            drop_wall_ns = time.time_ns()
+            if active:
+                window_precondition = dict(match_receipt)
+                if index:
+                    # Later windows must cite the preceding verified restore,
+                    # never reuse the pre-first-window match snapshot.
+                    window_precondition['evidence_ref'] = previous_recovery_ref
+                    window_precondition['previous_restore_confirmed'] = True
+                begin = carrier.start(match_receipt=window_precondition)
+                receipt.update(configured=begin['configured'], applied=begin['applied'])
+                ledger.start(index, begin)
+                emit('discovery_drop_begin', receipt=begin, mutation_receipt=dict(receipt), **window_fields)
+                drop_wall_ns = time.time_ns()
+            emit('window_open', window='discovery_interruption', active_drop=active, **window_fields)
+            trajectory_start_ns = time.monotonic_ns()
+            deadline_ns = trajectory_start_ns + int(plan['drop_duration_sec'] * 10**9)
+            trajectory = _RecoveryMatchTrajectory(events, endpoints, emit, trajectory_start_ns, deadline_ns, matched)
+            trajectories.append(trajectory)
+            restored_this = False
+            try:
+                while time.monotonic() < deadline_ns / 10**9:
+                    if active:
+                        counter = carrier.counters()
+                        window_counter_hit = window_counter_hit or counter['hit']
+                        emit('discovery_drop_counter', receipt=counter, **window_fields)
+                    trajectory.poll(pool)
+                    remaining = max(0, deadline_ns / 10**9 - time.monotonic())
+                    pause(min(c['counter_interval_sec'], remaining,
+                              max(0, (trajectory.next_due_ns - time.monotonic_ns()) / 10**9)))
+                during = activity(drop_wall_ns, 'discovery_interruption_%d' % index)
+                window_activity_ok = activity_is_pair_observed(during['activity'])
+            finally:
+                trajectory.restore_started_ns = time.monotonic_ns()
+                if active:
+                    restore = carrier.restore()
+                    restored_this = restore['restored'] is True
+                    emit('discovery_drop_end', receipt=restore, **window_fields)
+                    delta = ledger.end(index, restore)
+                    emit('discovery_window_counter', **delta)
+                    receipt['applied'] = bool(receipt['applied'] and restored_this)
+                    window_counter_hit = delta['hit']
+            window_restored.append(restored_this if active else None)
+            window_hits.append(window_counter_hit)
+            window_drop_activity.append(window_activity_ok)
+            emit('window_close', window='discovery_interruption', active_drop=active,
+                 mutation_receipt=dict(receipt), **window_fields)
+            restore_wall_ns, restore_mono_ns = time.time_ns(), time.monotonic_ns()
+            boundary = emit('discovery_restore_boundary', restored=restored_this if active else None,
+                            neutral=not active, drop_was_installed=active, drop_installed=False,
+                            post_restore_unix_ns=restore_wall_ns, post_restore_monotonic_ns=restore_mono_ns,
+                            clock_guard_ns=CLOCK_GUARD_NS,
+                            activity_since_unix_ns=restore_wall_ns + CLOCK_GUARD_NS, **window_fields)
+            trajectory.restore_boundary_ns = restore_mono_ns
+            result_clock = {'unix_ns': restore_wall_ns, 'monotonic_ns': restore_mono_ns,
+                            'source': 'host_kernel_realtime_and_shared_monotonic',
+                            'clock_guard_ns': CLOCK_GUARD_NS,
+                            'limitation': 'packet realtime is checked for clock offset discontinuity'}
+            recovery_deadline = time.monotonic() + c['recovery_timeout_sec']
+            activity_event = None
+            window_recovery_ok = False
+            while time.monotonic() < recovery_deadline:
+                activity_event = activity(restore_wall_ns + CLOCK_GUARD_NS, 'post_restore_%d' % index,
+                                          after_monotonic_ns=restore_mono_ns)
+                window_recovery_ok = activity_event['activity_observed']
+                clock_offset = time.time_ns() - time.monotonic_ns()
+                if abs(clock_offset - (restore_wall_ns - restore_mono_ns)) > CLOCK_GUARD_NS:
+                    window_recovery_ok = False
+                    emit('discovery_observation_unknown',
+                         reason='realtime_monotonic_offset_discontinuity', **window_fields)
+                    break
+                if window_recovery_ok:
+                    break
+                pause(0.2)
+            window_recovery_activity.append(window_recovery_ok)
+            window_fresh = False
+            post_evidence = None
+            try:
+                post_evidence = step('observe_recovery_graph_%d' % index, ['verify_namespace_bindings'],
+                                     lambda restore_mono_ns=restore_mono_ns: snapshot_pair(restore_mono_ns),
+                                     observation=True)
+                trajectory.after = post_evidence
+                window_fresh = True
+            except (TimeoutError, RuntimeError) as exc:
+                emit('discovery_observation_unknown', reason=str(exc), **window_fields)
+            window_fresh_recovery.append(window_fresh)
+            previous_recovery_ref = boundary['raw_event_ref']
+            if active and window_recovery_ok and window_fresh:
+                recovery = carrier.confirm_recovery(activity_receipt={
+                    **match_receipt, 'monotonic_ns': time.monotonic_ns(),
+                    'activity_observed': True, 'source': 'public_ros2_pair',
+                    'evidence_ref': activity_event['raw_event_ref'], 'fresh_graph_count': post_evidence})
+                recovery_event = emit('discovery_recovery_confirmed', receipt=recovery,
+                                      requires_runtime_semantic_adjudication=True, **window_fields)
+                previous_recovery_ref = recovery_event['raw_event_ref']
+                ledger.confirm_recovery(index, recovery)
+            window_records.append({
+                'window_index': index, 'window_id': plan['window_id'],
+                'trigger_anchor': plan['trigger_anchor'],
+                'trigger_offset_sec': plan['trigger_offset_sec'],
+                'drop_duration_sec': plan['drop_duration_sec'],
+                'restore_interval_sec': plan['restore_interval_sec'],
+                'counter_hit': bool(window_counter_hit),
+                'drop_activity_observed': bool(window_activity_ok),
+                'recovery_activity_observed': bool(window_recovery_ok),
+                'fresh_count_graph': bool(window_fresh),
+                'restored': restored_this if active else None,
+                'restore_boundary_ref': boundary['raw_event_ref'],
+                'calendar_clock': result_clock,
+                'counter': ledger.records[index]['counter']})
+            emit('discovery_window_restore_verified', window_index=index, window_id=plan['window_id'],
+                 restored=restored_this if active else None,
+                 recovery_confirmed=bool(active and window_recovery_ok and window_fresh),
+                 counter_hit=bool(window_counter_hit),
+                 restore_interval_sec=plan['restore_interval_sec'])
+            if plan['restore_interval_sec']:
+                pause(plan['restore_interval_sec'])
+            if index < len(plans) - 1 and active and not (window_recovery_ok and window_fresh):
+                raise WindowGateError('next_window_requires_previous_restore_evidence')
+    except BaseException as exc:
+        ledger.abort(type(exc).__name__ + ':' + str(exc))
+        raise
+    finally:
+        emit('discovery_window_ledger', **ledger.summary())
+    return ledger
+
+
 def _body(request, owner_channel):
-    if request['config']['target_id'] == 'builtin.discovery_projection_reconciliation':
+    if request['config']['target_id'] in ('builtin.discovery_projection_reconciliation',
+                                          'builtin.discovery_projection_reconciliation.fuzz_v1'):
         from .projection_pair import namespace_body
         return namespace_body(request, owner_channel)
     from .ros2_pair import RECEIPT_KEYS, wait_for_fresh_match
@@ -593,8 +782,10 @@ def _body(request, owner_channel):
     result = {'runtime_status': 'failed', 'reason': None, 'facts': {}, 'environment': {}, 'workers': [],
               'precondition_receipts': preconditions, 'observation_receipts': observations, 'mutation_receipt': receipt}
     pool = observer = carrier = None
-    trajectory = None
+    trajectories = []
     counter_hit = restored = activity_ok = fresh_recovery = drop_activity_ok = False
+    restored_aggregate = None
+    window_records = []
     endpoints = {}
     raw_path = output_dir / 'raw.jsonl'
     def emit(event, **fields):
@@ -714,83 +905,104 @@ def _body(request, owner_channel):
         match_receipt = {'domain_id': c['domain_id'], 'match_established': True,
                          'evidence_ref': precondition['raw_event_ref'], 'worker_pids': pids,
                          **{role + '_gid': token['endpoint_gid'] for role, token in endpoints.items()}}
-        if active:
-            receipt.update(submitted=True, carrier_admitted=True)
-            emit('mutation_begin', mutation_kind='discovery_drop', carrier='wire_proxy', implementation=IMPLEMENTATION,
-                 precondition_snapshot_ref=precondition['raw_event_ref'], mutation_receipt=dict(receipt))
-            drop_wall_ns = time.time_ns()
-            begin = carrier.start(match_receipt=match_receipt)
-            receipt.update(configured=begin['configured'], applied=begin['applied'])
-            emit('discovery_drop_begin', receipt=begin, mutation_receipt=dict(receipt))
-            drop_wall_ns = time.time_ns()
-        else:
-            drop_wall_ns = time.time_ns()
-            emit('control_begin', control_kind=c['arm'], drop_installed=False,
-                 precondition_snapshot_ref=precondition['raw_event_ref'], mutation_receipt=dict(receipt))
-        emit('window_open', window='discovery_interruption', active_drop=active)
-        trajectory_start_ns = time.monotonic_ns()
-        deadline_ns = trajectory_start_ns + int(c['drop_duration_sec'] * 10**9)
-        deadline = deadline_ns / 10**9
-        trajectory = _RecoveryMatchTrajectory(events, endpoints, emit, trajectory_start_ns, deadline_ns, matched)
-        try:
-            while time.monotonic() < deadline:
-                if active:
-                    counter = carrier.counters()
-                    counter_hit = counter_hit or counter['hit']
-                    emit('discovery_drop_counter', receipt=counter)
-                trajectory.poll(pool)
-                pause(min(c['counter_interval_sec'], max(0, deadline - time.monotonic()),
-                          max(0, (trajectory.next_due_ns - time.monotonic_ns()) / 10**9)))
-            during = activity(drop_wall_ns, 'discovery_interruption')
-            drop_activity_ok = activity_is_pair_observed(during['activity'])
-        finally:
-            trajectory.restore_started_ns = time.monotonic_ns()
+        if not c.get('window_chain_requested'):
+            # Legacy single-window path: behaviour is preserved, including the
+            # restore-in-finally drop loop that its AST contract test inspects
+            # directly inside this function body.
             if active:
-                restore = carrier.restore()
-                restored = restore['restored']
-                counter_hit = counter_hit or restore.get('hit', False)
-                emit('discovery_drop_end', receipt=restore)
-        receipt['hit'] = bool(active and counter_hit and drop_activity_ok)
-        emit('window_close', window='discovery_interruption', active_drop=active, mutation_receipt=dict(receipt))
-        # Paired clocks are captured AFTER verified deletion, or the explicit neutral boundary.
-        restore_wall_ns, restore_mono_ns = time.time_ns(), time.monotonic_ns()
-        boundary = emit('discovery_restore_boundary', restored=restored if active else None, neutral=not active,
-                        drop_was_installed=active, drop_installed=False, post_restore_unix_ns=restore_wall_ns,
-                        post_restore_monotonic_ns=restore_mono_ns, clock_guard_ns=CLOCK_GUARD_NS,
-                        activity_since_unix_ns=restore_wall_ns + CLOCK_GUARD_NS)
-        trajectory.restore_boundary_ns = restore_mono_ns
-        result['environment']['recovery_clock'] = {'unix_ns': restore_wall_ns, 'monotonic_ns': restore_mono_ns,
-                                                   'source': 'host_kernel_realtime_and_shared_monotonic', 'clock_guard_ns': CLOCK_GUARD_NS,
-                                                   'limitation': 'packet realtime is checked for clock offset discontinuity'}
-        recovery_deadline = time.monotonic() + c['recovery_timeout_sec']
-        activity_event = None
-        while time.monotonic() < recovery_deadline:
-            activity_event = activity(restore_wall_ns + CLOCK_GUARD_NS, 'post_restore', after_monotonic_ns=restore_mono_ns)
-            activity_ok = activity_event['activity_observed']
-            clock_offset = time.time_ns() - time.monotonic_ns()
-            if abs(clock_offset - (restore_wall_ns - restore_mono_ns)) > CLOCK_GUARD_NS:
-                activity_ok = False
-                emit('discovery_observation_unknown', reason='realtime_monotonic_offset_discontinuity')
-                break
-            if activity_ok:
-                break
-            pause(0.2)
-        try:
-            post_evidence = step('observe_recovery_graph', ['verify_namespace_bindings'],
-                                 lambda: snapshot_pair(restore_mono_ns), observation=True)
-            trajectory.after = post_evidence
-            fresh_recovery = True
-        except (TimeoutError, RuntimeError) as exc:
-            emit('discovery_observation_unknown', reason=str(exc))
-        if active and activity_ok and fresh_recovery:
-            recovery = carrier.confirm_recovery(activity_receipt={**match_receipt,
-                'monotonic_ns': time.monotonic_ns(), 'activity_observed': True, 'source': 'public_ros2_pair',
-                'evidence_ref': activity_event['raw_event_ref'], 'fresh_graph_count': post_evidence})
-            emit('discovery_recovery_confirmed', receipt=recovery, requires_runtime_semantic_adjudication=True)
-        receipt['effect_observed'] = bool(receipt['hit'] and restored and activity_ok and fresh_recovery)
-        emit('mutation_effect' if active else 'neutral_control_observation', effect_id='discovery_interruption_then_restore',
-             mutation_receipt=dict(receipt), discovery_activity_observed=activity_ok, fresh_count_graph=fresh_recovery,
-             restore_boundary_ref=boundary['raw_event_ref'])
+                receipt.update(submitted=True, carrier_admitted=True)
+                emit('mutation_begin', mutation_kind='discovery_drop', carrier='wire_proxy', implementation=IMPLEMENTATION,
+                     precondition_snapshot_ref=precondition['raw_event_ref'], mutation_receipt=dict(receipt))
+                drop_wall_ns = time.time_ns()
+                begin = carrier.start(match_receipt=match_receipt)
+                receipt.update(configured=begin['configured'], applied=begin['applied'])
+                emit('discovery_drop_begin', receipt=begin, mutation_receipt=dict(receipt))
+                drop_wall_ns = time.time_ns()
+            else:
+                drop_wall_ns = time.time_ns()
+                emit('control_begin', control_kind=c['arm'], drop_installed=False,
+                     precondition_snapshot_ref=precondition['raw_event_ref'], mutation_receipt=dict(receipt))
+            emit('window_open', window='discovery_interruption', active_drop=active)
+            trajectory_start_ns = time.monotonic_ns()
+            deadline_ns = trajectory_start_ns + int(c['drop_duration_sec'] * 10**9)
+            deadline = deadline_ns / 10**9
+            trajectory = _RecoveryMatchTrajectory(events, endpoints, emit, trajectory_start_ns, deadline_ns, matched)
+            try:
+                while time.monotonic() < deadline:
+                    if active:
+                        counter = carrier.counters()
+                        counter_hit = counter_hit or counter['hit']
+                        emit('discovery_drop_counter', receipt=counter)
+                    trajectory.poll(pool)
+                    pause(min(c['counter_interval_sec'], max(0, deadline - time.monotonic()),
+                              max(0, (trajectory.next_due_ns - time.monotonic_ns()) / 10**9)))
+                during = activity(drop_wall_ns, 'discovery_interruption')
+                drop_activity_ok = activity_is_pair_observed(during['activity'])
+            finally:
+                trajectory.restore_started_ns = time.monotonic_ns()
+                if active:
+                    restore = carrier.restore()
+                    restored = restore['restored']
+                    counter_hit = counter_hit or restore.get('hit', False)
+                    emit('discovery_drop_end', receipt=restore)
+            receipt['hit'] = bool(active and counter_hit and drop_activity_ok)
+            emit('window_close', window='discovery_interruption', active_drop=active, mutation_receipt=dict(receipt))
+            # Paired clocks are captured AFTER verified deletion, or the explicit neutral boundary.
+            restore_wall_ns, restore_mono_ns = time.time_ns(), time.monotonic_ns()
+            boundary = emit('discovery_restore_boundary', restored=restored if active else None, neutral=not active,
+                            drop_was_installed=active, drop_installed=False, post_restore_unix_ns=restore_wall_ns,
+                            post_restore_monotonic_ns=restore_mono_ns, clock_guard_ns=CLOCK_GUARD_NS,
+                            activity_since_unix_ns=restore_wall_ns + CLOCK_GUARD_NS)
+            trajectory.restore_boundary_ns = restore_mono_ns
+            result['environment']['recovery_clock'] = {'unix_ns': restore_wall_ns, 'monotonic_ns': restore_mono_ns,
+                                                       'source': 'host_kernel_realtime_and_shared_monotonic', 'clock_guard_ns': CLOCK_GUARD_NS,
+                                                       'limitation': 'packet realtime is checked for clock offset discontinuity'}
+            recovery_deadline = time.monotonic() + c['recovery_timeout_sec']
+            activity_event = None
+            while time.monotonic() < recovery_deadline:
+                activity_event = activity(restore_wall_ns + CLOCK_GUARD_NS, 'post_restore', after_monotonic_ns=restore_mono_ns)
+                activity_ok = activity_event['activity_observed']
+                clock_offset = time.time_ns() - time.monotonic_ns()
+                if abs(clock_offset - (restore_wall_ns - restore_mono_ns)) > CLOCK_GUARD_NS:
+                    activity_ok = False
+                    emit('discovery_observation_unknown', reason='realtime_monotonic_offset_discontinuity')
+                    break
+                if activity_ok:
+                    break
+                pause(0.2)
+            try:
+                post_evidence = step('observe_recovery_graph', ['verify_namespace_bindings'],
+                                     lambda: snapshot_pair(restore_mono_ns), observation=True)
+                trajectory.after = post_evidence
+                fresh_recovery = True
+            except (TimeoutError, RuntimeError) as exc:
+                emit('discovery_observation_unknown', reason=str(exc))
+            if active and activity_ok and fresh_recovery:
+                recovery = carrier.confirm_recovery(activity_receipt={**match_receipt,
+                    'monotonic_ns': time.monotonic_ns(), 'activity_observed': True, 'source': 'public_ros2_pair',
+                    'evidence_ref': activity_event['raw_event_ref'], 'fresh_graph_count': post_evidence})
+                emit('discovery_recovery_confirmed', receipt=recovery, requires_runtime_semantic_adjudication=True)
+            receipt['effect_observed'] = bool(receipt['hit'] and restored and activity_ok and fresh_recovery)
+            emit('mutation_effect' if active else 'neutral_control_observation', effect_id='discovery_interruption_then_restore',
+                 mutation_receipt=dict(receipt), discovery_activity_observed=activity_ok, fresh_count_graph=fresh_recovery,
+                 restore_boundary_ref=boundary['raw_event_ref'])
+        else:
+            _run_window_chain(c, active, receipt, emit, step, activity, activity_is_pair_observed,
+                              snapshot_pair, pause, carrier, pool, events, endpoints, matched,
+                              precondition, match_receipt, trajectories, window_records,
+                              window_hits, window_drop_activity, window_recovery_activity,
+                              window_fresh_recovery, window_restored)
+            counter_hit = bool(window_hits) and all(window_hits)
+            drop_activity_ok = bool(window_drop_activity) and all(window_drop_activity)
+            restored = bool(window_restored) and all(window_restored)
+            activity_ok = bool(window_recovery_activity) and all(window_recovery_activity)
+            fresh_recovery = bool(window_fresh_recovery) and all(window_fresh_recovery)
+            receipt['hit'] = bool(active and counter_hit and drop_activity_ok)
+            receipt['effect_observed'] = bool(receipt['hit'] and restored and fresh_recovery)
+            emit('mutation_effect' if active else 'neutral_control_observation',
+                 effect_id='discovery_interruption_then_restore', mutation_receipt=dict(receipt),
+                 discovery_activity_observed=activity_ok, fresh_count_graph=fresh_recovery,
+                 window_hits=window_hits)
         expected = list(range(c['pre_match_count'], c['pre_match_count'] + c['post_match_count']))
         omitted = expected[len(expected) // 2] if c['fault_id'] else None
         emit('delivery_contract', expected_sequences=expected, sentinel_sequence=expected[-1], phase='post_restore',
@@ -830,8 +1042,12 @@ def _body(request, owner_channel):
                 cleanup = carrier.restore()
                 emit('discovery_cleanup_restore', receipt=cleanup)
             except Exception as exc:
-                result.update(runtime_status='failed', reason='discovery_restore_cleanup_failed:' + str(exc))
-                emit('runtime_abort', reason=result['reason'], error_receipt=getattr(exc, 'receipt', None))
+                # V17: preserve the original failure; cleanup failure is
+                # additional evidence, never a replacement error message.
+                result['cleanup_error'] = 'discovery_restore_cleanup_failed:' + str(exc)
+                emit('discovery_cleanup_failed', reason=result['cleanup_error'],
+                     original_reason=result.get('reason'),
+                     error_receipt=getattr(exc, 'receipt', None))
         if observer is not None:
             try:
                 stopped = observer.stop()
@@ -856,10 +1072,23 @@ def _body(request, owner_channel):
             result['workers'] = pool.metadata
             if any(worker.get('returncode') != 0 for worker in pool.metadata):
                 result.update(runtime_status='failed', reason='worker_shutdown_failed')
-        if trajectory is not None:
+        for trajectory in trajectories:
             emit('discovery_match_trajectory', active_drop=active, **trajectory.summary())
+        if window_records:
+            restored_aggregate = (all(r['restored'] is True for r in window_records)
+                                  if active else None)
         result['facts'] = summarize_discovery(events, active=receipt['applied'], counter_hit=counter_hit,
-            restored=restored, activity_ok=activity_ok, fresh_recovery=fresh_recovery, drop_activity_ok=drop_activity_ok)
+            restored=restored_aggregate if window_records else restored,
+            activity_ok=activity_ok, fresh_recovery=fresh_recovery, drop_activity_ok=drop_activity_ok)
+        if window_records:
+            result['facts'].update(discovery_windows=window_records,
+                discovery_window_count=len(window_records),
+                discovery_window_chain_requested=bool(c.get('window_chain_requested')),
+                discovery_window_chain_complete=bool(
+                    all(r['restored'] is True and r['recovery_activity_observed'] and r['fresh_count_graph']
+                        for r in window_records) if active else True),
+                discovery_window_hits=[r['counter_hit'] for r in window_records],
+                discovery_counter_semantics='per_window_delta_only')
         if not same_source(request['source'], execution_chain_identity()):
             result.update(runtime_status='failed', reason='source_identity_changed_during_execution')
         if not any(e['event'] == 'endpoint_created' for e in events):

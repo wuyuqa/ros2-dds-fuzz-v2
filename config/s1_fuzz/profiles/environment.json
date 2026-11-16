@@ -1,0 +1,77 @@
+{
+  "schema_version": "r2f.s1-fuzz-profile/v1",
+  "profile_id": "s1-fuzz-environment",
+  "campaign_kind": "exploratory",
+  "enabled": false,
+  "seed_catalog_status": "authored_t02",
+  "description": "F1 single-window discovery drop/restore profile. One recovery cycle; runner support for the recovery slice is still pending, so live corpus construction is refused rather than emitting cases the endpoint-pair runner rejects.",
+  "required_catalog_included": false,
+  "target_ids": [
+    "discovery.interruption_recovery.fuzz_v1"
+  ],
+  "surfaces": [
+    "E01"
+  ],
+  "seed_specs": [
+    {
+      "seed_id": "E01",
+      "target_id": "discovery.interruption_recovery.fuzz_v1",
+      "boundary_class": "log_range",
+      "executable": true
+    }
+  ],
+  "pending_seed_ids": [
+    "E02",
+    "E03",
+    "G01"
+  ],
+  "pending_surfaces": [
+    "E02",
+    "E03",
+    "G01"
+  ],
+  "cycles": [
+    {
+      "cycle_id": "recovery-single-window",
+      "target_id": "discovery.interruption_recovery.fuzz_v1",
+      "surfaces": [
+        "E01"
+      ],
+      "runner_slice": "endpoint_pair_slice",
+      "seed_specs": [
+        {
+          "seed_id": "E01",
+          "target_id": "discovery.interruption_recovery.fuzz_v1",
+          "boundary_class": "log_range",
+          "executable": true
+        }
+      ]
+    }
+  ],
+  "declared_seed_specs_union": [
+    {
+      "seed_id": "E01",
+      "target_id": "discovery.interruption_recovery.fuzz_v1",
+      "boundary_class": "log_range",
+      "executable": true
+    }
+  ],
+  "rmws": [
+    "rmw_cyclonedds_cpp",
+    "rmw_fastrtps_cpp"
+  ],
+  "execution_boundary": "offline per-cycle corpus construction and planning only; enabled=false by default; recovery cycle is runner-pending and refused for live build; real ROS/namespace/nft execution requires explicit owner GO and source/lock/domain checks",
+  "budget": {
+    "max_inputs": 24,
+    "warmup_inputs": 2,
+    "max_seconds": 900
+  },
+  "corpus": {
+    "capacity": 256,
+    "bucket_limit": 3
+  },
+  "controls": {
+    "required": true,
+    "policy": "per source+rmw+target contract+recipe"
+  }
+}

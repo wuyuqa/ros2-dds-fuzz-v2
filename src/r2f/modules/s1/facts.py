@@ -172,3 +172,97 @@ class ProjectionFacts:
         if projection.get("differences") != differences or (projection["comparison_status"] == "mismatch") != bool(differences):
             raise FactError("projection status/differences contradict comparison facts")
         return cls(writer, reader, tuple(rows), tuple(differences))
+
+# --- Fuzz expansion fact declarations (T02) ----------------------------------
+#
+# Declaring a fact is not execution evidence: every entry lists the independent
+# sources and identity binding that must back a real observation.  This module
+# only declares the specs; producers live in runtime/campaign adapters.
+
+@dataclass(frozen=True)
+class FactSpec:
+    id: str
+    version: int
+    value_type: str
+    unit: str
+    scope: str
+    sources: tuple
+    producer_id: str
+    freshness: str
+    identity_binding: str
+    missing_policy: str
+
+    def __post_init__(self):
+        for name in ("id", "value_type", "unit", "scope", "producer_id",
+                     "freshness", "identity_binding", "missing_policy"):
+            value = getattr(self, name)
+            if not isinstance(value, str) or not value:
+                raise FactError(f"FactSpec.{name}: expected nonempty text")
+        if type(self.version) is not int or self.version < 1:
+            raise FactError("FactSpec.version: expected positive integer")
+        if not isinstance(self.sources, tuple) or not self.sources:
+            raise FactError("FactSpec.sources: expected nonempty tuple")
+        if any(not isinstance(item, str) or not item for item in self.sources):
+            raise FactError("FactSpec.sources: expected nonempty source ids")
+        if self.missing_policy not in ("unknown_not_pass", "blocked_not_pass"):
+            raise FactError("FactSpec.missing_policy must not default to pass")
+
+    def to_dict(self):
+        return {"id": self.id, "version": self.version, "value_type": self.value_type,
+                "unit": self.unit, "scope": self.scope, "sources": list(self.sources),
+                "producer_id": self.producer_id, "freshness": self.freshness,
+                "identity_binding": self.identity_binding, "missing_policy": self.missing_policy}
+
+
+def _spec(fact_id, value_type, unit, scope, sources, producer_id, freshness, identity_binding):
+    return FactSpec(fact_id, 1, value_type, unit, scope, tuple(sources), producer_id,
+                    freshness, identity_binding, "unknown_not_pass")
+
+
+FACT_SPECS = {spec.id: spec for spec in (
+    _spec("endpoint.submitted_qos.v1", "qos_config", "mixed", "endpoint",
+          ("campaign.identity", "input_capsule"), "campaign.identity.semantic_input",
+          "per_input", "submitted endpoint role and value"),
+    _spec("endpoint.observed_qos.v1", "qos_observation", "mixed", "endpoint",
+          ("ros_graph", "passive_rtps_wire"), "runtime.worker",
+          "per_observation", "endpoint id plus generation"),
+    _spec("endpoint.create_identity.v1", "endpoint_identity", "none", "endpoint",
+          ("endpoint_tokens", "process_lifecycle"), "runtime.worker",
+          "per_create_call", "endpoint id, role and generation"),
+    _spec("late.writer_prejoin.v1", "chronology", "ns", "run",
+          ("endpoint_tokens", "publish_tokens"), "runtime.ros2_pair",
+          "per_input", "writer identity plus raw send token"),
+    _spec("late.reader_create_order.v1", "chronology", "ns", "run",
+          ("endpoint_tokens", "create_call_receipts"), "runtime.ros2_pair",
+          "per_input", "reader create call and generation"),
+    _spec("discovery.drop_window.v1", "window_counter", "packets", "window",
+          ("namespace_bindings", "discovery_drop_counter", "raw_events"),
+          "runtime.namespace_pair", "per_window",
+          "window id plus writer/reader pair identities"),
+    _spec("discovery.restore_activity.v1", "recovery_activity", "ns", "window",
+          ("independent_discovery_activity", "fresh_graph_count", "raw_events"),
+          "campaign.recovery_adapter", "per_window",
+          "restored pair identity plus fresh post-boundary activity"),
+    _spec("discovery.pair_match.v1", "pair_relation", "none", "pair",
+          ("match_snapshot", "graph_snapshot"), "campaign.runtime_adapter",
+          "per_snapshot", "writer/reader id plus generation"),
+    _spec("observation.completeness.v1", "completeness", "none", "window",
+          ("observer_health", "log_closure", "raw_events"), "campaign.runtime_adapter",
+          "per_window", "observer and window ids"),
+    _spec("mutation.actual_effect.v1", "effect_status", "none", "layer",
+          ("mutation_receipt", "before_after_raw"), "campaign.runtime_adapter",
+          "per_step", "operation id plus input before/after identity"),
+    _spec("delivery.send_sequence.v1", "sequence_set", "count", "window",
+          ("publish_tokens", "raw_events"), "runtime.ros2_pair",
+          "per_window", "writer identity plus generation"),
+    _spec("delivery.receive_sequence.v1", "sequence_set", "count", "window",
+          ("receive_tokens", "raw_events"), "runtime.ros2_pair",
+          "per_window", "reader and writer identity plus generation"),
+    _spec("delivery.closure.v1", "closure", "count", "window",
+          ("delivery.send_sequence.v1", "delivery.receive_sequence.v1"),
+          "modules.s1.oracles", "per_window", "both endpoint generations"),
+    _spec("compatibility.relation_guard.v1", "relation", "none", "pair",
+          ("endpoint.submitted_qos.v1", "endpoint.observed_qos.v1"),
+          "modules.s1.oracles", "per_window",
+          "offered and requested endpoint identities plus generations"),
+)}

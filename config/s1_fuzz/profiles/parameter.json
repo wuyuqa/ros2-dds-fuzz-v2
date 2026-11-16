@@ -1,0 +1,240 @@
+{
+  "schema_version": "r2f.s1-fuzz-profile/v1",
+  "profile_id": "s1-fuzz-parameter",
+  "campaign_kind": "exploratory",
+  "enabled": false,
+  "seed_catalog_status": "authored_t02",
+  "description": "F1 parameter profile. Each cycle is one target with its own seed list; a corpus is built for exactly one cycle. Disabled by default; outside the required catalog.",
+  "required_catalog_included": false,
+  "target_ids": [
+    "discovery.late_endpoint.fuzz_v1",
+    "discovery.late_join_delivery.fuzz_v1",
+    "builtin.discovery_projection_reconciliation.fuzz_v1"
+  ],
+  "surfaces": [
+    "P01",
+    "P02",
+    "P03",
+    "P04",
+    "P05",
+    "P06",
+    "W01",
+    "W02"
+  ],
+  "seed_specs": [
+    {
+      "seed_id": "P01",
+      "target_id": "discovery.late_endpoint.fuzz_v1",
+      "boundary_class": "finite",
+      "executable": true
+    },
+    {
+      "seed_id": "W01",
+      "target_id": "discovery.late_join_delivery.fuzz_v1",
+      "boundary_class": "depth_gt_post",
+      "executable": true
+    },
+    {
+      "seed_id": "W02",
+      "target_id": "discovery.late_join_delivery.fuzz_v1",
+      "boundary_class": "finite",
+      "executable": true
+    },
+    {
+      "seed_id": "P02",
+      "target_id": "builtin.discovery_projection_reconciliation.fuzz_v1",
+      "boundary_class": "enum_exhaustive",
+      "executable": true
+    },
+    {
+      "seed_id": "P03",
+      "target_id": "builtin.discovery_projection_reconciliation.fuzz_v1",
+      "boundary_class": "enum_exhaustive",
+      "executable": true
+    },
+    {
+      "seed_id": "P04",
+      "target_id": "builtin.discovery_projection_reconciliation.fuzz_v1",
+      "boundary_class": "finite",
+      "executable": true
+    },
+    {
+      "seed_id": "P05",
+      "target_id": "builtin.discovery_projection_reconciliation.fuzz_v1",
+      "boundary_class": "enum_exhaustive",
+      "executable": true
+    },
+    {
+      "seed_id": "P06",
+      "target_id": "builtin.discovery_projection_reconciliation.fuzz_v1",
+      "boundary_class": "finite",
+      "executable": true
+    }
+  ],
+  "pending_seed_ids": [
+    "E02",
+    "E03",
+    "G01"
+  ],
+  "pending_surfaces": [
+    "E02",
+    "E03",
+    "G01"
+  ],
+  "cycles": [
+    {
+      "cycle_id": "late-endpoint-parameter",
+      "target_id": "discovery.late_endpoint.fuzz_v1",
+      "surfaces": [
+        "P01",
+        "W01",
+        "W02"
+      ],
+      "runner_slice": "endpoint_pair_slice",
+      "seed_specs": [
+        {
+          "seed_id": "P01",
+          "target_id": "discovery.late_endpoint.fuzz_v1",
+          "boundary_class": "finite",
+          "executable": true
+        }
+      ]
+    },
+    {
+      "cycle_id": "late-join-parameter",
+      "target_id": "discovery.late_join_delivery.fuzz_v1",
+      "surfaces": [
+        "P01",
+        "W01",
+        "W02"
+      ],
+      "runner_slice": "endpoint_pair_slice",
+      "seed_specs": [
+        {
+          "seed_id": "W01",
+          "target_id": "discovery.late_join_delivery.fuzz_v1",
+          "boundary_class": "depth_gt_post",
+          "executable": true
+        },
+        {
+          "seed_id": "W02",
+          "target_id": "discovery.late_join_delivery.fuzz_v1",
+          "boundary_class": "finite",
+          "executable": true
+        }
+      ]
+    },
+    {
+      "cycle_id": "projection-parameter",
+      "target_id": "builtin.discovery_projection_reconciliation.fuzz_v1",
+      "surfaces": [
+        "P02",
+        "P03",
+        "P04",
+        "P05",
+        "P06"
+      ],
+      "runner_slice": "endpoint_pair_slice",
+      "seed_specs": [
+        {
+          "seed_id": "P02",
+          "target_id": "builtin.discovery_projection_reconciliation.fuzz_v1",
+          "boundary_class": "enum_exhaustive",
+          "executable": true
+        },
+        {
+          "seed_id": "P03",
+          "target_id": "builtin.discovery_projection_reconciliation.fuzz_v1",
+          "boundary_class": "enum_exhaustive",
+          "executable": true
+        },
+        {
+          "seed_id": "P04",
+          "target_id": "builtin.discovery_projection_reconciliation.fuzz_v1",
+          "boundary_class": "finite",
+          "executable": true
+        },
+        {
+          "seed_id": "P05",
+          "target_id": "builtin.discovery_projection_reconciliation.fuzz_v1",
+          "boundary_class": "enum_exhaustive",
+          "executable": true
+        },
+        {
+          "seed_id": "P06",
+          "target_id": "builtin.discovery_projection_reconciliation.fuzz_v1",
+          "boundary_class": "finite",
+          "executable": true
+        }
+      ]
+    }
+  ],
+  "declared_seed_specs_union": [
+    {
+      "seed_id": "P01",
+      "target_id": "discovery.late_endpoint.fuzz_v1",
+      "boundary_class": "finite",
+      "executable": true
+    },
+    {
+      "seed_id": "W01",
+      "target_id": "discovery.late_join_delivery.fuzz_v1",
+      "boundary_class": "depth_gt_post",
+      "executable": true
+    },
+    {
+      "seed_id": "W02",
+      "target_id": "discovery.late_join_delivery.fuzz_v1",
+      "boundary_class": "finite",
+      "executable": true
+    },
+    {
+      "seed_id": "P02",
+      "target_id": "builtin.discovery_projection_reconciliation.fuzz_v1",
+      "boundary_class": "enum_exhaustive",
+      "executable": true
+    },
+    {
+      "seed_id": "P03",
+      "target_id": "builtin.discovery_projection_reconciliation.fuzz_v1",
+      "boundary_class": "enum_exhaustive",
+      "executable": true
+    },
+    {
+      "seed_id": "P04",
+      "target_id": "builtin.discovery_projection_reconciliation.fuzz_v1",
+      "boundary_class": "finite",
+      "executable": true
+    },
+    {
+      "seed_id": "P05",
+      "target_id": "builtin.discovery_projection_reconciliation.fuzz_v1",
+      "boundary_class": "enum_exhaustive",
+      "executable": true
+    },
+    {
+      "seed_id": "P06",
+      "target_id": "builtin.discovery_projection_reconciliation.fuzz_v1",
+      "boundary_class": "finite",
+      "executable": true
+    }
+  ],
+  "rmws": [
+    "rmw_cyclonedds_cpp",
+    "rmw_fastrtps_cpp"
+  ],
+  "execution_boundary": "offline per-cycle corpus construction and planning only; enabled=false by default; projection cycle is runner-pending and refused for live build; real ROS execution requires explicit owner GO and source/lock/domain checks",
+  "budget": {
+    "max_inputs": 32,
+    "warmup_inputs": 4,
+    "max_seconds": 900
+  },
+  "corpus": {
+    "capacity": 256,
+    "bucket_limit": 3
+  },
+  "controls": {
+    "required": true,
+    "policy": "per source+rmw+target contract+recipe"
+  }
+}

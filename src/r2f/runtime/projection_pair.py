@@ -14,6 +14,7 @@ import re
 import time
 
 TARGET = 'builtin.discovery_projection_reconciliation'
+FUZZ_TARGET = 'builtin.discovery_projection_reconciliation.fuzz_v1'
 INFINITE_NS = 9223372036854775807
 DEFAULT_QOS = {'reliability': 'reliable', 'durability': 'volatile', 'depth': 64,
                'deadline_ns': INFINITE_NS, 'liveliness': 'automatic',
@@ -48,16 +49,34 @@ def normalize_projection_config(config):
     submitted = c['mutation_parameters'].get('submitted_qos')
     if submitted is not None and validate_qos(submitted) != c['qos']:
         raise ValueError('projection_submitted_qos_mismatch')
-    if c['arm'] == 'mutated' and c['writer_qos'] == c['baseline_qos'] and c['reader_qos'] == c['baseline_qos']:
-        raise ValueError('projection_variant_does_not_change_qos')
-    if c['arm'] != 'mutated' and any(c[role + '_qos'] != c['baseline_qos'] for role in ('writer', 'reader')):
-        raise ValueError('projection_control_requires_neutral_qos')
+    if c['target_id'] == FUZZ_TARGET:
+        # Fuzz target: the submitted input is the single source of truth. Every
+        # role must use a public profile derived from it; controls are checked
+        # against their own neutral profile rather than the mutated one.
+        submitted = c.get('submitted_parameters')
+        if c['arm'] == 'mutated' and (not isinstance(submitted, dict) or not any(
+                isinstance(key, str) and key.startswith('qos.') for key in submitted)):
+            raise ValueError('projection_fuzz_requires_submitted_qos_parameters')
+        if c['arm'] != 'mutated':
+            roles = [c[role + '_qos'] for role in ('writer', 'reader')]
+            if any(role_qos != c['qos'] for role_qos in roles):
+                raise ValueError('projection_fuzz_control_requires_submitted_qos')
+    else:
+        if c['arm'] == 'mutated' and c['writer_qos'] == c['baseline_qos'] and c['reader_qos'] == c['baseline_qos']:
+            raise ValueError('projection_variant_does_not_change_qos')
+        if c['arm'] != 'mutated' and any(c[role + '_qos'] != c['baseline_qos'] for role in ('writer', 'reader')):
+            raise ValueError('projection_control_requires_neutral_qos')
     timeout = c.get('projection_timeout_sec', 8.)
     if type(timeout) not in (int, float) or not math.isfinite(timeout) or not 0 < timeout <= 30:
         raise ValueError('invalid_projection_timeout_sec')
     c.update(projection_timeout_sec=float(timeout), observe_extended_qos=True,
              # Supervisor budget fields only; no discovery interruption in this target.
              drop_duration_sec=0., recovery_timeout_sec=float(timeout))
+    windows = c.get('environment_windows')
+    if windows:
+        from .discovery_network import validate_window_plan
+        validate_window_plan(windows)
+        raise ValueError('projection_target_does_not_apply_discovery_windows')
     return c
 
 
@@ -381,6 +400,29 @@ def namespace_body(request, owner_channel):
             library_refs[role] = capture_libraries(endpoint['pid'], endpoint['process_start_ticks'], out / (role + '-libraries.json'))
         if endpoints['writer']['pid'] == endpoints['reader']['pid']:
             raise RuntimeError('projection_requires_independent_worker_processes')
+        if c['target_id'] == FUZZ_TARGET:
+            observed = {}
+            for role in ('writer', 'reader'):
+                rows = [e for e in events if e.get('event') == 'qos_binding_observed' and e.get('role') == role]
+                if len(rows) != 1:
+                    raise RuntimeError('qos_binding_observation_missing:' + role)
+                row = rows[0]
+                if row.get('requested') != c[role + '_qos']:
+                    raise RuntimeError('qos_binding_requested_mismatch:' + role)
+                if not row.get('observed_self') or row.get('observed_self_gid') != endpoints[role]['endpoint_gid']:
+                    raise RuntimeError('qos_binding_observation_not_bound_to_endpoint:' + role)
+                observed[role] = {'requested': row['requested'], 'observed': row['observed_self'],
+                                  'observation_api': row.get('observation_api'),
+                                  'raw_event_ref': row.get('raw_event_ref') or f"{out / 'raw.jsonl'}#namespace_event={row['namespace_event_index']}"}
+            binding_event = emit('qos_binding_verified', endpoints={r: observed[r]['observed'] for r in observed},
+                                 requested={r: observed[r]['requested'] for r in observed},
+                                 observation_api={r: observed[r]['observation_api'] for r in observed})
+            if any(row['observed'] != row['requested'] for row in observed.values()):
+                # The SDK reports what it actually applied: a difference here is
+                # a binding failure, never a SUT or DDS finding.
+                raise RuntimeError('qos_binding_observed_differs_from_submitted')
+            result['binding_receipts'] = observed
+            result['binding_verification_ref'] = binding_event.get('raw_event_ref')
         receipt.update(applied=active, hit=active, effect_observed=active)
         emit('mutation_effect' if active else 'neutral_projection_control', effect_id='public_qos_configuration',
              mutation_receipt=dict(receipt), endpoint_refs={r: e['raw_event_ref'] for r, e in endpoints.items()})

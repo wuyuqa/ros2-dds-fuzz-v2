@@ -1,0 +1,70 @@
+{
+  "seed_id": "G01",
+  "version": 1,
+  "surface_refs": [
+    "G01"
+  ],
+  "target_family": "discovery.match_compatibility",
+  "capability": {
+    "status": "capability_pending",
+    "f1_routable": false,
+    "runtime_binding": null,
+    "reason": "per-role offered/requested reliability is not wired in the current runtime"
+  },
+  "status": "capability_pending",
+  "logical_config": {
+    "topic": "/r2f/s1/discovery_compatibility",
+    "message_type": "std_msgs/msg/String",
+    "writer_qos": {
+      "reliability": "best_effort",
+      "durability": "volatile",
+      "depth": 64
+    },
+    "reader_qos": {
+      "reliability": "reliable",
+      "durability": "volatile",
+      "depth": 64
+    },
+    "match_timeout_sec": 8.0,
+    "startup_timeout_sec": 10.0,
+    "pair_relation": "BR"
+  },
+  "operation_windows": [
+    {
+      "step": "create_writer",
+      "window": "setup",
+      "role_qos": "writer_qos"
+    },
+    {
+      "step": "create_reader",
+      "window": "setup",
+      "role_qos": "reader_qos"
+    },
+    {
+      "step": "observe_relation_window",
+      "window": "compatibility_window",
+      "relation_surface": "G01",
+      "requires": [
+        "identity_backed_match_observation",
+        "observer_completeness"
+      ]
+    }
+  ],
+  "provenance": {
+    "kind": "template",
+    "source": "plan 3.1/4 G01 BR relation; no live carrier yet",
+    "derived_from_execution": false
+  },
+  "capability_requirements": {
+    "tools": [
+      "public_ros2_api",
+      "per_role_qos_runtime"
+    ],
+    "sut_guards": [
+      "identity_backed_match_or_delivery_only"
+    ],
+    "runtime_binding": null
+  },
+  "parent_content_sha256_rule": "content_sha256 over surface_refs,target_family,logical_config,operation_windows; excludes rng_seed,repeat,run_id,domain,guid,wall time",
+  "rng_seed_role": "chosen per attempt by caller; never embedded in this template"
+}

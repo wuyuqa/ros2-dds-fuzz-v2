@@ -21,6 +21,208 @@ from .process import WorkerPool
 
 RECEIPT_KEYS = ('planned', 'submitted', 'carrier_admitted', 'configured', 'applied', 'hit', 'effect_observed')
 
+EXPLORATORY_TARGETS = {
+    'discovery.late_endpoint.fuzz_v1': {
+        'runtime_capability': 'public_endpoint_pair_fuzz',
+        'carrier': 'ros2_endpoint',
+        'mutation_kind': 'late_joiner',
+        'backend': 'endpoint_pair',
+        'surfaces': ('P01', 'W01', 'W02'),
+    },
+    'discovery.late_join_delivery.fuzz_v1': {
+        'runtime_capability': 'public_endpoint_pair_fuzz',
+        'carrier': 'ros2_endpoint',
+        'mutation_kind': 'late_joiner',
+        'backend': 'endpoint_pair',
+        'surfaces': ('P01', 'W01', 'W02'),
+    },
+    'builtin.discovery_projection_reconciliation.fuzz_v1': {
+        'runtime_capability': 'public_qos_projection_fuzz',
+        'carrier': 'ros2_endpoint',
+        'mutation_kind': 'endpoint_qos_variation',
+        'backend': 'projection_pair',
+        'surfaces': ('P02', 'P03', 'P04', 'P05', 'P06'),
+    },
+    'discovery.interruption_recovery.fuzz_v1': {
+        'runtime_capability': 'discovery_drop_window_chain',
+        'carrier': 'wire_proxy',
+        'mutation_kind': 'discovery_drop',
+        'backend': 'discovery_namespace',
+        'surfaces': ('P01', 'E01', 'E02', 'E03', 'W01', 'W02'),
+    },
+    'discovery.match_compatibility.fuzz_v1': {
+        'runtime_capability': 'pair_relation_guard',
+        'carrier': 'ros2_endpoint',
+        'mutation_kind': 'endpoint_qos_variation',
+        'backend': 'unsupported_relation_observation',
+        'surfaces': ('G01',),
+    },
+}
+
+# surface -> (binding field, config path, evidence class)
+EXPLORATORY_BINDINGS = {
+    'P01': ('reader_delay_sec', ('reader_delay_sec',), 'timing'),
+    'P02': ('qos.reliability', ('qos', 'reliability'), 'qos'),
+    'P03': ('qos.durability', ('qos', 'durability'), 'qos'),
+    'P04': ('qos.deadline_ns', ('qos', 'deadline_ns'), 'qos'),
+    'P05': ('qos.liveliness', ('qos', 'liveliness'), 'qos'),
+    'P06': ('qos.liveliness_lease_duration_ns', ('qos', 'liveliness_lease_duration_ns'), 'qos_config_only'),
+    # W01 is one surface over three concrete inputs; each is bound by name.
+    'W01': ('qos.depth', ('qos', 'depth'), 'count'),
+    'W02': ('publish_interval_sec', ('publish_interval_sec',), 'timing'),
+    # E01 is single-window: the legacy top-level value is the one the runtime
+    # uses. Multi-window E02 keeps the array path and is still capability pending.
+    'E01': ('drop_duration_sec', ('drop_duration_sec',), 'environment'),
+    'E02': ('environment_windows.count', ('environment_windows',), 'environment_count'),
+    'E03': ('environment_windows.anchor_offset_sec',
+            ('environment_windows', 0, 'trigger_offset_sec'), 'environment_anchor'),
+    # G01 is a pair relation, not a single scalar: both role policies must be
+    # submitted and both must survive normalization before any relation claim.
+    'G01': ('writer_qos.reliability,reader_qos.reliability', None, 'relation_pair'),
+}
+W01_EXTRA_FIELDS = ('pre_match_count', 'post_match_count')
+
+#: F1 recovery fuzz admits exactly the single-window E01 duration surface.
+#: E02/E03 (multi-window and anchor offset) remain declared but capability
+#: pending; admitting their config shape here would execute an unverified
+#: surface.  The chain implementation exists offline but is not live-admitted.
+RECOVERY_FUZZ_TARGET = 'discovery.interruption_recovery.fuzz_v1'
+RECOVERY_FUZZ_ADMITTED_SURFACES = frozenset({'E01'})
+
+
+def recovery_fuzz_admission_error(config):
+    """Return an explicit non-admission reason, or None for the admitted slice.
+
+    This is an input-admission gate, not execution evidence.  It never claims a
+    run happened; it only refuses configs whose declared surfaces/window shape
+    are outside the target's reviewed F1 contract.
+    """
+    if config.get('target_id') != RECOVERY_FUZZ_TARGET:
+        return None
+    surfaces = set(config.get('fuzz_surfaces') or ())
+    pending = sorted(surfaces - RECOVERY_FUZZ_ADMITTED_SURFACES)
+    if pending:
+        return 'unsupported_capability:surface_not_admitted:' + ','.join(pending)
+    windows = config.get('environment_windows')
+    if isinstance(windows, (list, tuple)) and len(windows) > 1:
+        return 'unsupported_capability:multi_window_not_admitted'
+    return None
+
+
+def _get_path(config, path):
+    value = config
+    for key in path:
+        if isinstance(key, int):
+            if not isinstance(value, list) or not -len(value) <= key < len(value):
+                return None, False
+        elif not isinstance(value, dict) or key not in value:
+            return None, False
+        value = value[key]
+    return value, True
+
+
+def exploratory_bindings(config):
+    """Return declared binding expectations for an exploratory input.
+
+    Inputs must declare every surface they claim to exercise together with the
+    exact submitted value. Missing declarations are an adapter error; they are
+    never treated as a no-op.
+    """
+    surfaces = config.get('fuzz_surfaces')
+    if not isinstance(surfaces, list) or not surfaces:
+        raise ValueError('exploratory_input_requires_fuzz_surfaces')
+    submitted = config.get('submitted_parameters')
+    if not isinstance(submitted, dict):
+        raise ValueError('exploratory_input_requires_submitted_parameters')
+    target = EXPLORATORY_TARGETS.get(config.get('target_id'))
+    if target is None:
+        raise ValueError('unknown_exploratory_target')
+    allowed = set(target['surfaces'])
+    unknown = [sid for sid in surfaces if sid not in allowed]
+    if unknown:
+        raise ValueError('surface_not_supported_by_target:' + ','.join(sorted(set(unknown))))
+    expected = []
+    for surface_id in surfaces:
+        field, path, evidence_class = EXPLORATORY_BINDINGS[surface_id]
+        if surface_id == 'G01':
+            pair_fields = ('writer_qos.reliability', 'reader_qos.reliability')
+            for pair_field, role in zip(pair_fields, ('writer', 'reader')):
+                if pair_field not in submitted:
+                    raise ValueError('submitted_parameter_missing:' + pair_field)
+                role_qos = config.get(role + '_qos')
+                if not isinstance(role_qos, dict) or 'reliability' not in role_qos:
+                    raise ValueError('binding_field_missing:' + pair_field)
+                expected.append({'surface_id': surface_id, 'field': pair_field,
+                                 'path': [role + '_qos', 'reliability'],
+                                 'submitted': submitted[pair_field],
+                                 'configured': role_qos['reliability'],
+                                 'evidence_class': evidence_class})
+            continue
+        if field not in submitted:
+            raise ValueError('submitted_parameter_missing:' + field)
+        value, present = _get_path(config, path)
+        if not present:
+            raise ValueError('binding_field_missing:' + field)
+        expected.append({'surface_id': surface_id, 'field': field, 'path': list(path),
+                         'submitted': submitted[field], 'configured': value,
+                         'evidence_class': evidence_class})
+        if surface_id == 'W01':
+            for extra in W01_EXTRA_FIELDS:
+                if extra not in submitted or extra not in config:
+                    raise ValueError('binding_field_missing:' + extra)
+                expected.append({'surface_id': surface_id, 'field': extra, 'path': [extra],
+                                 'submitted': submitted[extra], 'configured': config[extra],
+                                 'evidence_class': evidence_class})
+        if surface_id == 'E03':
+            if submitted.get('environment_windows.anchor_offset_sec') is None:
+                raise ValueError('binding_field_missing:environment_windows.anchor_offset_sec')
+        if surface_id == 'E02':
+            declared = submitted['environment_windows.count']
+            windows = config.get('environment_windows')
+            if not isinstance(declared, int) or isinstance(declared, bool) or declared < 1:
+                raise ValueError('invalid_environment_window_count')
+            if not isinstance(windows, list) or len(windows) != declared:
+                raise ValueError('environment_window_count_not_preserved')
+            if 'environment_windows.restore_interval_sec' not in submitted:
+                raise ValueError('binding_field_missing:environment_windows.restore_interval_sec')
+            expected.append({'surface_id': surface_id, 'field': 'environment_windows.restore_interval_sec',
+                             'path': ['environment_windows', 0, 'restore_interval_sec'],
+                             'submitted': submitted['environment_windows.restore_interval_sec'],
+                             'configured': windows[0].get('restore_interval_sec'),
+                             'evidence_class': 'environment_interval'})
+    return expected
+
+
+def require_binding_preserved(expected, config):
+    """V35: any silent normalization away from the submitted value fails closed."""
+    mismatches = []
+    for binding in expected:
+        if binding['field'] == 'environment_windows.count':
+            windows = config.get('environment_windows')
+            value, present = (len(windows), True) if isinstance(windows, list) else (None, False)
+        else:
+            value, present = _get_path(config, binding['path'])
+        if not present or value != binding['submitted']:
+            mismatches.append({'surface_id': binding['surface_id'], 'field': binding['field'],
+                               'submitted': binding['submitted'], 'effective': value if present else None})
+    if mismatches:
+        raise ValueError('exploratory_binding_normalized_away:' +
+                         ','.join(item['field'] for item in mismatches))
+    return mismatches
+
+
+def exploratory_runtime_capabilities():
+    return {target_id: {'implemented': spec['backend'] != 'unsupported_relation_observation',
+                        'backend': spec['backend'],
+                        'carrier': spec['carrier'],
+                        'mutation_kind': spec['mutation_kind'],
+                        'surfaces': list(spec['surfaces']),
+                        'available': None if spec['backend'] != 'unsupported_relation_observation' else False,
+                        'admitted': False,
+                        'admission_requires_live_preflight': True,
+                        'execution_evidence': False}
+            for target_id, spec in EXPLORATORY_TARGETS.items()}
+
 
 def normalize_config(config):
     if not isinstance(config, dict):
@@ -69,15 +271,38 @@ def normalize_config(config):
             raise ValueError('invalid_count:' + key)
     if c['post_match_count'] < 3 or c['pre_match_count'] < 1:
         raise ValueError('need at least one prejoin and three postmatch samples')
-    default_qos = {'reliability': 'reliable', 'durability': 'volatile', 'depth': 64 if c['target_id'] == 'builtin.discovery_projection_reconciliation' else 32}
+    exploratory = c['target_id'] in EXPLORATORY_TARGETS
+    default_qos = {'reliability': 'reliable', 'durability': 'volatile',
+                   'depth': 64 if c['target_id'].startswith('builtin.discovery_projection_reconciliation') else 32}
     c['qos'] = {**default_qos, **c.get('qos', {})}
     for role in ('writer', 'reader'):
         c[role + '_qos'] = {**c['qos'], **c.get(role + '_qos', {})}
-    for q in (c['qos'], c['writer_qos'], c['reader_qos']):
+    # QoS schema is a per-target capability, not a global widening: the legacy
+    # projection target already required the extended public fields, the new
+    # exploratory QoS targets need them too, and the late-join / interruption
+    # targets stay strictly limited to reliability/durability/depth.
+    projection_schema = c['target_id'].startswith('builtin.discovery_projection_reconciliation')
+    extended_qos = exploratory or projection_schema
+    if projection_schema:
+        default_qos = {**default_qos, 'deadline_ns': INFINITE_QOS_NS,
+                       'liveliness': 'automatic',
+                       'liveliness_lease_duration_ns': INFINITE_QOS_NS}
+        c['qos'] = {**default_qos, **{k: v for k, v in c.get('qos', {}).items()}}
+    allowed_qos = ({'reliability', 'durability', 'depth', 'deadline_ns', 'liveliness',
+                    'liveliness_lease_duration_ns', 'history'} if extended_qos
+                   else {'reliability', 'durability', 'depth'})
+    for label, q in (('qos', c['qos']), ('writer_qos', c['writer_qos']), ('reader_qos', c['reader_qos'])):
+        if not isinstance(q, dict):
+            raise ValueError('invalid_qos_mapping:' + label)
+        unknown = set(q) - allowed_qos
+        if unknown:
+            raise ValueError('unsupported_qos_field:' + label + ':' + ','.join(sorted(unknown)))
         if q['reliability'] not in ('reliable', 'best_effort') or q['durability'] not in ('volatile', 'transient_local'):
             raise ValueError('unsupported_qos_policy')
         if isinstance(q['depth'], bool) or not isinstance(q['depth'], int) or not 1 <= q['depth'] <= 10000:
             raise ValueError('invalid_qos_depth')
+        if extended_qos:
+            _validate_exploratory_qos(q, label)
     fault_name = {'discovery.interruption_recovery': 'post_restore_delivery_omission',
                   'builtin.discovery_projection_reconciliation': 'controlled_projection_field_mismatch'}.get(c['target_id'], 'late_endpoint_delivery_omission')
     c.setdefault('fault_id', fault_name if c['arm'] == 'negative' else None)
@@ -95,7 +320,35 @@ def normalize_config(config):
     for key in ('repeat', 'target_revision'):
         if isinstance(c[key], bool) or not isinstance(c[key], int) or c[key] < 0:
             raise ValueError('invalid_integer:' + key)
+    c.setdefault('source_manifest', {})
+    if c.get('fuzz_surfaces') is not None and not isinstance(c['fuzz_surfaces'], list):
+        raise ValueError('fuzz_surfaces must be a list')
+    if c.get('submitted_parameters') is not None and not isinstance(c['submitted_parameters'], dict):
+        raise ValueError('submitted_parameters must be a dict')
+    if c.get('environment_windows') is not None:
+        from .discovery_network import validate_window_plan
+        windows = validate_window_plan(c['environment_windows'])
+        if c['target_id'] not in ('discovery.interruption_recovery',
+                                  'discovery.interruption_recovery.fuzz_v1'):
+            raise ValueError('environment_windows_only_supported_for_discovery_target')
+        c['environment_windows'] = windows
     return c
+
+
+INFINITE_QOS_NS = 9223372036854775807
+
+
+def _validate_exploratory_qos(q, label):
+    """Strict public-QoS contract for exploratory targets (no silent defaults)."""
+    for key in ('deadline_ns', 'liveliness_lease_duration_ns'):
+        if key in q:
+            value = q[key]
+            if type(value) is not int or not 0 <= value <= INFINITE_QOS_NS:
+                raise ValueError('invalid_qos_duration:%s:%s' % (label, key))
+    if 'liveliness' in q and q['liveliness'] not in ('automatic', 'manual_by_topic'):
+        raise ValueError('unsupported_qos_liveliness:' + label)
+    if 'history' in q and q['history'] != 'keep_last':
+        raise ValueError('unsupported_qos_history:' + label)
 
 
 def runtime_capabilities():
@@ -308,11 +561,50 @@ def run_pair(config: dict, output_dir: Path) -> dict:
             return result
         from .namespace_pair import run_discovery_pair
         return run_discovery_pair(c, output_dir, result)
-    if c['target_id'] not in ('discovery.late_endpoint', 'discovery.late_join_delivery'):
+    if c['target_id'] in EXPLORATORY_TARGETS:
+        spec = EXPLORATORY_TARGETS[c['target_id']]
+        if c['carrier'] != spec['carrier'] or c['mutation_kind'] != spec['mutation_kind']:
+            result['reason'] = ('blocked:exploratory_carrier_contract_mismatch:'
+                                + spec['carrier'] + '/' + spec['mutation_kind'])
+            return result
+        expected = []
+        if c['arm'] == 'mutated' or c.get('fuzz_surfaces'):
+            try:
+                expected = exploratory_bindings(c)
+                require_binding_preserved(expected, c)
+            except (ValueError, TypeError) as exc:
+                result['reason'] = 'blocked:exploratory_binding_error:' + str(exc)
+                result['exploratory_bindings'] = []
+                return result
+        result['exploratory_bindings'] = expected
+        result['runtime_capability'] = spec['runtime_capability']
+        admission_error = recovery_fuzz_admission_error(c)
+        if admission_error:
+            result['reason'] = admission_error
+            result['capability_status'] = 'unsupported_capability'
+            return result
+        if spec['backend'] == 'unsupported_relation_observation':
+            # G01 needs an independent relation observer that this runtime does
+            # not provide. Never fabricate match/delivery for a config-only pair.
+            result['reason'] = 'blocked:unsupported_capability:pair_relation_observation_not_implemented'
+            result['capability_status'] = 'unsupported_capability'
+            return result
+        if spec['backend'] == 'projection_pair':
+            from .namespace_pair import run_discovery_pair
+            # Dispatch only; the target id stays the exploratory id.
+            return run_discovery_pair(c, output_dir, result)
+        if spec['backend'] == 'discovery_namespace':
+            from .namespace_pair import run_discovery_pair
+            return run_discovery_pair(c, output_dir, result)
+        # endpoint_pair fuzz targets use the existing public-API pair below.
+    elif c['target_id'] not in ('discovery.late_endpoint', 'discovery.late_join_delivery'):
         result['reason'] = 'blocked:target_not_supported'
         return result
     if c['carrier'] != 'ros2_endpoint' or c['mutation_kind'] != 'late_joiner':
         result['reason'] = 'blocked:endpoint_carrier_not_expressible'
+        return result
+    if c['target_id'] in EXPLORATORY_TARGETS and c.get('runtime_windows'):
+        result['reason'] = 'blocked:endpoint_pair_does_not_apply_discovery_windows'
         return result
     # Refuse to overwrite any evidence from an earlier invocation.
     raw_path = output_dir / 'raw.jsonl'
@@ -322,6 +614,7 @@ def run_pair(config: dict, output_dir: Path) -> dict:
         result['reason'] = 'blocked:state_directory_already_executed'
         return result
     result['raw_path'] = str(raw_path)
+    exploratory = c['target_id'] in EXPLORATORY_TARGETS
     receipts = result['precondition_receipts']
     observation_receipts = result['observation_receipts']
     receipt = result['mutation_receipt']
@@ -361,6 +654,12 @@ def run_pair(config: dict, output_dir: Path) -> dict:
 
     def capture_graph(graph, ack):
         return observe('capture_graph', graph, ack)
+
+    if exploratory:
+        emit('exploratory_binding_submitted',
+             bindings=result.get('exploratory_bindings', []),
+             submitted_parameters=c.get('submitted_parameters', {}),
+             runtime_capability=result.get('runtime_capability'))
 
     def has(event, role=None, **fields):
         return any(e['event'] == event and (role is None or e.get('role') == role) and all(e.get(k) == v for k, v in fields.items()) for e in events)
@@ -438,6 +737,34 @@ def run_pair(config: dict, output_dir: Path) -> dict:
             raise RuntimeError('reader_not_created_after_writer')
         emit('reader_created_after_writer', writer_gid=writer_token['endpoint_gid'], reader_gid=reader_token['endpoint_gid'],
              delay_ns=actual_delay, configured_delay_sec=delay)
+        if exploratory:
+            requested_by_role = {role: c[role + '_qos'] for role in ('writer', 'reader')}
+            submitted_qos = c.get('submitted_parameters', {})
+            for role, token in (('writer', writer_token), ('reader', reader_token)):
+                if token.get('qos') != requested_by_role[role]:
+                    raise RuntimeError('endpoint_reported_qos_differs_from_config:' + role)
+                observed_rows = [e for e in events if e.get('event') == 'qos_binding_observed'
+                                 and e.get('role') == role]
+                if not observed_rows or observed_rows[-1].get('observed_self_gid') != token['endpoint_gid']:
+                    raise RuntimeError('qos_binding_observation_missing:' + role)
+            observed = {
+                'P01': {'configured_delay_sec': delay, 'observed_delay_ns': actual_delay,
+                        'basis': 'reader_created_monotonic_minus_writer_created_monotonic'},
+                'W01': {'depth': c['qos']['depth'],
+                        'pre_match_count': c['pre_match_count'],
+                        'post_match_count': c['post_match_count'],
+                        'basis': 'config_and_actual_publish_counts'},
+                'W02': {'publish_interval_sec': c['publish_interval_sec'],
+                        'basis': 'actual_inter_publish_monotonic_delta'},
+            }
+            selected = {sid: observed[sid] for sid in c.get('fuzz_surfaces', []) if sid in observed}
+            binding_event = emit('exploratory_binding_observed', observed=selected,
+                                 requested_qos=requested_by_role,
+                                 submitted_qos=submitted_qos,
+                                 observation_basis='public_api_endpoint_and_creation_events')
+            emit('qos_binding_verified', endpoints=requested_by_role,
+                 observation_api='get_publishers_info_by_topic/get_subscriptions_info_by_topic',
+                 binding_event_ref=binding_event['event_index'])
         if active_mutation:
             receipt.update(applied=True, hit=True, effect_observed=True)
             emit('mutation_effect', effect_id='reader_created_after_writer', mutation_receipt=dict(receipt))
@@ -485,6 +812,18 @@ def run_pair(config: dict, output_dir: Path) -> dict:
             delivery_timed_out = False
         except TimeoutError:
             delivery_timed_out = True
+        if exploratory:
+            sends = [e for e in events if e['event'] == 'send' and e.get('phase') == 'post_match']
+            deltas = [b['monotonic_ns'] - a['monotonic_ns'] for a, b in zip(sends, sends[1:])]
+            actual_interval = (sum(deltas) / len(deltas) / 10**9) if deltas else None
+            tolerance = max(0.002, c['publish_interval_sec'] * 0.5)
+            interval_bound = actual_interval is not None and abs(actual_interval - c['publish_interval_sec']) <= tolerance
+            if 'W02' in c.get('fuzz_surfaces', []) and not interval_bound:
+                raise RuntimeError('publish_interval_binding_not_observed')
+            emit('timing_binding_observed', configured_publish_interval_sec=c['publish_interval_sec'],
+                 observed_mean_publish_interval_sec=actual_interval,
+                 samples=len(sends), tolerance_sec=tolerance,
+                 send_schedule_refs=[e['event_index'] for e in sends])
         emit('window_close', window='post_match_delivery', deadline_expired=delivery_timed_out,
              intended_missing_includes_omission=True)
         query_acknowledged_graphs(pool, events, c['startup_timeout_sec'], emit, capture_graph)

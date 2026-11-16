@@ -46,14 +46,44 @@ def identity_hashes(manifest):
             "scope_sha256": canonical_hash(manifest["scope"])}
 
 
+EXPLORATORY_SCHEMA = "r2f.s1-exploratory-report/v1"
+EXPLORATORY_SEAL = "not_applicable_exploratory"
+SUPPORTED_CAMPAIGN_KINDS = frozenset({"required", "exploratory"})
+
+
+def _empty_required_result(errors):
+    return {"sealed": False, "errors": list(errors), "controls": {}, "unknown_gate": {},
+            "required_expected": 18, "fault_expected": 6,
+            "maturity_scope": "per-target only; full S1 denominator remains 72"}
+
+
 def audit_report(report_path):
+    """Dispatch audits by campaign kind; the required 72/18 contract is unchanged.
+
+    Exploratory reports never borrow the required seal.  Unknown kinds are an
+    audit error rather than a silent fallback to the required matrix.
+    """
+    path = Path(report_path).resolve()
+    try:
+        report = json.loads(path.read_text())
+    except (OSError, ValueError) as exc:
+        return _empty_required_result(["report_artifact_error:" + str(exc)])
+    if not isinstance(report, dict):
+        return _empty_required_result(["report_artifact_error:report must be an object"])
+    kind = report.get("campaign_kind", "required")
+    if report.get("schema_version") == EXPLORATORY_SCHEMA or kind == "exploratory":
+        return audit_exploratory_report(path, report=report)
+    if kind not in SUPPORTED_CAMPAIGN_KINDS:
+        return _empty_required_result(["unknown_campaign_kind:" + repr(kind)])
+    return _audit_required_report(path, report)
+
+
+def _audit_required_report(report_path, report):
     """Recompute evidence and controls. A status string is never seal evidence."""
-    report_path = Path(report_path).resolve()
     root = report_path.parent
     errors = []
     details = {"controls": {}, "unknown_gate": {}, "required_expected": 18, "fault_expected": 6}
     try:
-        report = json.loads(report_path.read_text())
         manifest = json.loads(_path(root, report["manifest_path"]).read_text())
         identity = identity_hashes(manifest)
         if report.get("report_sha256") != report_digest(report):
@@ -230,3 +260,396 @@ def audit_report(report_path):
     except (OSError, ValueError, TypeError, KeyError) as exc:
         errors.append("report_artifact_error:" + str(exc))
     return {"sealed": not errors, "errors": errors, **details, "maturity_scope": "per-target only; full S1 denominator remains 72"}
+
+
+def exploratory_report_digest(report):
+    """Digest excludes only derived audit output, never evidence fields."""
+    return canonical_hash({k: v for k, v in report.items() if k not in {"report_sha256", "audit", "seal"}})
+
+
+def _sha_or_none(value):
+    if not isinstance(value, str):
+        return None
+    value = value.strip().lower()
+    return value if len(value) == 64 and all(c in "0123456789abcdef" for c in value) else None
+
+
+def _exploratory_control_key(ref):
+    """A control is only shareable inside one source/RMW/contract/recipe class."""
+    source = ref.get("source_sha256") or ref.get("source_identity") or ref.get("source")
+    contract = ref.get("target_contract") or ref.get("contract") or ref.get("target_id")
+    return (source, ref.get("rmw"), contract, ref.get("recipe"))
+
+
+def _validate_exploratory_profile(report, errors):
+    profile = report.get("profile")
+    if not isinstance(profile, dict):
+        errors.append("exploratory_profile_missing")
+        return None
+    try:
+        from r2f.modules.s1.fuzz_catalog import SURFACES
+    except (ImportError, ValueError) as exc:  # pragma: no cover - catalog is required
+        errors.append("exploratory_catalog_unavailable:" + str(exc))
+        return profile
+    if profile.get("campaign_kind") != "exploratory":
+        errors.append("exploratory_profile_campaign_kind_invalid")
+    if profile.get("required_catalog_included") is not False:
+        errors.append("exploratory_profile_must_not_include_required_catalog")
+    surfaces = profile.get("surfaces")
+    if not isinstance(surfaces, list) or not surfaces:
+        errors.append("exploratory_profile_surfaces_missing")
+    else:
+        unknown = sorted({s for s in surfaces if s not in SURFACES})
+        if unknown:
+            errors.append("exploratory_profile_unknown_surfaces:" + ",".join(unknown))
+    rmws = profile.get("rmws")
+    if not isinstance(rmws, list) or not rmws or any(r not in RMWS for r in rmws):
+        errors.append("exploratory_profile_rmw_invalid")
+    target_ids = profile.get("target_ids")
+    if not isinstance(target_ids, list) or not target_ids:
+        errors.append("exploratory_profile_targets_missing")
+    return profile
+
+
+def _validate_exploratory_identity(report, errors):
+    identity = report.get("identity")
+    if not isinstance(identity, dict):
+        errors.append("exploratory_identity_missing")
+        return
+    for key in ("profile_sha256", "model_sha256", "rule_sha256", "target_sha256"):
+        if _sha_or_none(identity.get(key)) is None:
+            errors.append("exploratory_identity_invalid:" + key)
+    source = report.get("source_manifest")
+    if not isinstance(source, dict):
+        errors.append("exploratory_source_manifest_missing")
+    else:
+        reject_execution_identity(source)
+        if not source.get("head") or not source.get("behavior_tree_sha256"):
+            errors.append("exploratory_source_identity_unfrozen")
+        if source.get("source_frozen") is not True or source.get("dirty_behavior_paths") != []:
+            errors.append("exploratory_source_not_frozen")
+        if identity.get("source_sha256") not in {None, canonical_hash(source)}:
+            errors.append("exploratory_source_identity_mismatch")
+    model = report.get("model")
+    if not isinstance(model, dict):
+        errors.append("exploratory_model_identity_missing")
+    else:
+        from r2f.modules.s1.fuzz_catalog import catalog_digest
+        if model.get("catalog_digest") not in {None, catalog_digest()}:
+            errors.append("exploratory_model_catalog_digest_mismatch")
+        mutators = model.get("mutator_catalog")
+        if not isinstance(mutators, dict) or not mutators:
+            errors.append("exploratory_mutator_catalog_missing")
+        elif model.get("mutator_catalog_sha256") not in {None, canonical_hash(mutators)}:
+            errors.append("exploratory_mutator_catalog_hash_mismatch")
+    from r2f.campaign.scheduler import required_catalog_hash
+    if report.get("required_catalog_sha256") not in {None, required_catalog_hash()}:
+        errors.append("required_catalog_identity_changed")
+    # Exploratory reports may never claim the required matrix or its denominator.
+    if report.get("full_scope_required_cells") == 72 or report.get("required_matrix") is not None:
+        errors.append("exploratory_report_cannot_claim_required_matrix")
+
+
+def _verify_exploratory_row(root, row, report, errors):
+    cell = row.get("cell_id", "<missing>")
+    try:
+        for key in ("cell_id", "run_id", "target_id", "profile_id", "rmw"):
+            if not isinstance(row.get(key), str) or not row.get(key):
+                raise ValueError("identity field missing: " + key)
+        if type(row.get("target_revision")) is not int:
+            raise ValueError("integer target_revision required")
+        if row.get("campaign_kind") != "exploratory":
+            raise ValueError("row campaign_kind must be exploratory")
+        if row.get("run_id") != report.get("run_id"):
+            raise ValueError("row run_id differs from report")
+        if row.get("arm") not in {"baseline", "transparent", "mutated", "negative"}:
+            raise ValueError("invalid arm")
+        if row.get("execution_stage") not in {
+                "modelled", "expressible", "planned", "precondition_executed", "reached",
+                "mutation_applied", "effect_observed", "judged", "aborted"}:
+            raise ValueError("invalid execution_stage")
+        plan = row.get("mutation_plan")
+        if plan is not None:
+            if not isinstance(plan, dict):
+                raise ValueError("mutation_plan must be an object")
+            if row.get("mutation_plan_sha256") != canonical_hash(plan):
+                raise ValueError("mutation_plan_sha256_mismatch")
+        receipts = row.get("input_layer_receipts")
+        if not isinstance(receipts, list):
+            raise ValueError("input_layer_receipts missing")
+        if row.get("effective_input") is not None:
+            effective_input_hash(row["effective_input"])
+        elif row.get("effective_input_sha256") is not None:
+            _sha_or_none(row["effective_input_sha256"]) or (_ for _ in ()).throw(
+                ValueError("effective_input_sha256 must be a sha256 digest"))
+        binding = row.get("binding")
+        if not isinstance(binding, dict):
+            raise ValueError("runtime binding receipt missing")
+        expected = binding.get("expected_config_sha256")
+        observed = binding.get("observed_config_sha256")
+        normalized = binding.get("silent_normalization") is True
+        binding_ok = _sha_or_none(expected) is not None and expected == observed and not normalized
+        executed = row.get("execution_stage") in {"effect_observed", "judged"}
+        tool_error = row.get("tool_error") is True or row.get("runtime_status") == "tool_error"
+        if executed and tool_error:
+            raise ValueError("tool_error row cannot be an executed SUT observation")
+        if executed and row.get("observer_dropped") is True:
+            raise ValueError("observer_dropped row cannot be an executed SUT observation")
+        if executed and not binding_ok:
+            raise ValueError("executed row lacks a clean adapter binding (silent normalization "
+                             "or config hash mismatch)")
+        if row.get("actual_run") is True and row.get("execution_stage") in {"modelled", "expressible", "planned"}:
+            raise ValueError("planned row cannot claim actual_run")
+        if executed:
+            if row.get("actual_run") is not True:
+                raise ValueError("observed row must record actual_run")
+            raw = _path(root, row.get("raw_path"))
+            verify_raw(raw, row.get("raw_sha256"))
+            if row.get("oracle_verdict") not in {"pass", "fail", "unknown", "not_applicable"}:
+                raise ValueError("judged row requires a four-state oracle verdict")
+        if row.get("control_kind") in {"fault", "negative"} and row.get("arm") != "negative":
+            raise ValueError("fault control must use the negative arm")
+        return True
+    except (KeyError, ValueError, TypeError, OSError) as exc:
+        errors.append(f"{cell}: {exc}")
+        return False
+
+
+def _audit_exploratory_budget(report, rows, errors):
+    budget = report.get("budget")
+    if not isinstance(budget, dict):
+        errors.append("exploratory_budget_missing")
+        return
+    counters = {}
+    for key in ("planned", "generated", "attempted", "executed", "aborted", "interrupted"):
+        value = budget.get(key)
+        if value is not None and (type(value) is not int or value < 0):
+            errors.append("exploratory_budget_invalid:" + key)
+            return
+        counters[key] = 0 if value is None else value
+    if not (counters["planned"] >= counters["generated"] >= counters["attempted"] >= counters["executed"]):
+        errors.append("exploratory_budget_counters_inconsistent")
+    actual_executed = sum(1 for r in rows
+                          if r.get("execution_stage") == "judged" and r.get("actual_run") is True)
+    if counters["executed"] != actual_executed:
+        errors.append(f"exploratory_budget_executed_mismatch:{counters['executed']}!={actual_executed}")
+    planned_rows = [r for r in rows if r.get("execution_stage") == "planned"]
+    if len(planned_rows) > counters["planned"]:
+        errors.append("exploratory_planned_rows_exceed_budget")
+    last = report.get("last_state")
+    if not isinstance(last, dict):
+        errors.append("exploratory_last_state_missing")
+    else:
+        if last.get("planned") != counters["planned"] or last.get("executed") != counters["executed"]:
+            errors.append("exploratory_last_state_counters_mismatch")
+        if last.get("cell_id") and last["cell_id"] not in {r.get("cell_id") for r in rows}:
+            errors.append("exploratory_last_state_cell_unknown")
+    abort = report.get("abort")
+    if abort is not None:
+        if not isinstance(abort, dict) or abort.get("reason_code") not in {
+                "source_repo_HEAD_or_behavior_tree_changed", "config_changed", "cli_contract_changed",
+                "observer_unhealthy", "budget_exhausted", "operator_interrupt"}:
+            errors.append("exploratory_abort_reason_unrecognized")
+        else:
+            index = abort.get("after_row_index")
+            if type(index) is not int or index < 0 or index >= len(rows):
+                errors.append("exploratory_abort_index_invalid")
+            else:
+                for row in rows[index + 1:]:
+                    if row.get("actual_run") is True or row.get("execution_stage") in {"effect_observed", "judged"}:
+                        errors.append("exploratory_row_executed_after_abort:" + str(row.get("cell_id")))
+
+
+def _audit_exploratory_controls(report, rows, errors):
+    refs = report.get("control_references")
+    if not isinstance(refs, list):
+        errors.append("exploratory_control_references_missing")
+        return
+    seen = {}
+    for ref in refs:
+        if not isinstance(ref, dict):
+            errors.append("exploratory_control_reference_invalid")
+            continue
+        control_id = ref.get("control_id")
+        if not isinstance(control_id, str) or not control_id:
+            errors.append("exploratory_control_reference_without_id")
+            continue
+        key = _exploratory_control_key(ref)
+        if any(member in {None, ""} for member in key):
+            errors.append("exploratory_control_reference_incomplete:" + control_id)
+            continue
+        if control_id in seen and seen[control_id] != key:
+            errors.append("control_reference_shared_across_incompatible_contract:" + control_id)
+        seen[control_id] = key
+        if ref.get("applies") is not True:
+            errors.append("control_reference_not_applicable:" + control_id)
+        if not _sha_or_none(ref.get("raw_sha256")):
+            errors.append("control_reference_raw_identity_missing:" + control_id)
+        if not isinstance(ref.get("cell_ids"), list) or not ref["cell_ids"]:
+            errors.append("control_reference_cell_list_missing:" + control_id)
+        else:
+            known = {r.get("cell_id") for r in rows}
+            for cell in ref["cell_ids"]:
+                if cell not in known:
+                    errors.append("control_reference_unknown_cell:" + control_id + ":" + str(cell))
+        if ref.get("counts_as_exploratory_input") is True:
+            errors.append("control_counted_as_exploratory_input:" + control_id)
+    referenced = {cell for ref in refs if isinstance(ref, dict) for cell in (ref.get("cell_ids") or [])}
+    for row in rows:
+        if row.get("control_kind") and row.get("actual_run") is True and row.get("cell_id") not in referenced:
+            errors.append("unreferenced_control_execution:" + str(row.get("cell_id")))
+    budget = report.get("budget") or {}
+    declared = budget.get("control_executions")
+    if declared is not None and (type(declared) is not int or declared != len(seen)):
+        errors.append("control_execution_count_not_deduplicated")
+
+
+def _audit_exploratory_ledger(root, report, rows, errors, details):
+    from r2f.reports.candidate_report import exploratory_candidate_ledger, audit_projection
+    ledger_path = _path(root, report.get("candidate_ledger_path"))
+    ledger = json.loads(ledger_path.read_text())
+    if canonical_hash(ledger) != report.get("candidate_ledger_sha256"):
+        errors.append("candidate_ledger_hash_mismatch")
+    expected = exploratory_candidate_ledger(rows, reviews=report.get("review_records") or [])
+    if Counter(c.get("candidate_id") for c in ledger.get("candidates", [])) != Counter(
+            c.get("candidate_id") for c in expected["candidates"]):
+        errors.append("candidate_ledger_dropped_or_invented_anomaly")
+    for key in ("natural_candidate_count", "confirmed_candidates", "tool_error_count",
+                "observer_incomplete_count", "control_count"):
+        if ledger.get(key) != expected.get(key):
+            errors.append("exploratory_ledger_mismatch:" + key)
+    if ledger.get("natural_candidate_count") == 0 and not ledger.get("zero_candidate_explanation"):
+        errors.append("zero_candidate_explanation_missing")
+    # Zero natural candidates, or an anomaly that failed admission and stayed
+    # observed, is a normal exploratory outcome rather than a damaged report.
+    expected_natural = sum(1 for c in ledger.get("candidates", [])
+                           if c.get("responsibility_layer") == "sut"
+                           and c.get("triage_disposition") == "candidate")
+    if ledger.get("natural_candidate_count") != expected_natural:
+        errors.append("natural_candidate_count_not_derived_from_ledger")
+    if ledger.get("confirmed_candidates") != sum(
+            c.get("candidate_status") == "confirmed" for c in ledger.get("candidates", [])):
+        errors.append("confirmed_count_not_derived_from_ledger")
+    for candidate in ledger.get("candidates", []):
+        match = next((c for c in expected["candidates"]
+                      if c.get("candidate_id") == candidate.get("candidate_id")), None)
+        if match is None or audit_projection(candidate) != audit_projection(match):
+            errors.append("candidate_evidence_or_lifecycle_not_bound_to_verified_cell")
+        evidence = candidate.get("evidence") or {}
+        if evidence.get("arm") == "negative" or evidence.get("candidate_source") == "control":
+            errors.append("control_entered_candidate_ledger")
+        if evidence.get("tool_error") is True or evidence.get("observer_dropped") is True:
+            errors.append("tool_error_entered_candidate_ledger")
+        admitted = candidate.get("candidate_status") in {"admitted", "triaged", "deferred", "confirmed"}
+        if admitted and not all(candidate.get(key) for key in
+                                ("triage_disposition", "responsibility_layer", "reason_code")):
+            errors.append("candidate_attribution_missing")
+    for control in ledger.get("controls", []):
+        # Negative/fault controls must retain harness provenance; ordinary
+        # declared health/mutation/transparency controls are not harness faults.
+        if (control.get("arm") == "negative" or control.get("kind") == "fault") \
+                and control.get("source") != "harness":
+            errors.append("negative_control_harness_provenance_lost")
+    # A malformed or unreferenced review is rejected by the reviewer gate.  It
+    # cannot raise a candidate's status, but its mere presence does not mean the
+    # report's own evidence chain is corrupt.
+    rejected = []
+    for index, review in enumerate(report.get("review_records") or []):
+        if not isinstance(review, dict):
+            rejected.append({"index": index, "reason": "review_record_not_an_object"})
+            continue
+        problems = []
+        if review.get("conclusion") not in {"supported", "rejected", "needs_evidence"}:
+            problems.append("review_conclusion_invalid")
+        if not isinstance(review.get("reviewer_id"), str) or not review["reviewer_id"].strip():
+            problems.append("review_without_reviewer")
+        if not isinstance(review.get("evidence_refs"), dict) or not review["evidence_refs"]:
+            problems.append("review_without_evidence_references")
+        if review.get("reviewer_id") in set(review.get("independent_of") or []):
+            problems.append("reviewer_not_independent")
+        if problems:
+            rejected.append({"index": index, "candidate_id": review.get("candidate_id"),
+                             "reason": ",".join(problems)})
+    details["rejected_reviews"] = rejected
+    details["accepted_reviews"] = len(report.get("review_records") or []) - len(rejected)
+    details["candidate_ledger"] = ledger_path.name
+
+
+def audit_exploratory_report(report_path, *, report=None):
+    """Audit an exploratory report without borrowing required maturity or seal.
+
+    ``evidence_valid`` answers whether the report and its artefacts recompute;
+    ``all_oracles_pass`` is a separate observation outcome.  A real SUT anomaly
+    therefore leaves evidence valid.  Exploratory runs never return
+    ``sealed=True``: no frozen exploratory maturity matrix exists yet.
+    """
+    report_path = Path(report_path).resolve()
+    root = report_path.parent
+    errors = []
+    details = {"audit_kind": "exploratory", "required_expected": 18, "fault_expected": 6}
+    try:
+        if report is None:
+            report = json.loads(report_path.read_text())
+        if not isinstance(report, dict):
+            raise ValueError("report must be an object")
+        if report.get("schema_version") != EXPLORATORY_SCHEMA:
+            errors.append("exploratory_schema_version_invalid")
+        if report.get("campaign_kind") != "exploratory":
+            errors.append("exploratory_campaign_kind_invalid")
+        if report.get("report_sha256") != exploratory_report_digest(report):
+            errors.append("report_hash_mismatch")
+        if report.get("seal") is True or report.get("sealed") is True:
+            errors.append("exploratory_report_cannot_borrow_required_seal")
+        if not isinstance(report.get("run_id"), str) or not report["run_id"]:
+            errors.append("run_id_missing")
+        _validate_exploratory_identity(report, errors)
+        profile = _validate_exploratory_profile(report, errors)
+        rows = report.get("rows")
+        if not isinstance(rows, list) or not rows:
+            errors.append("exploratory_rows_missing")
+            rows = []
+        cell_ids = [r.get("cell_id") for r in rows]
+        if len(cell_ids) != len(set(cell_ids)):
+            errors.append("exploratory_cell_ids_duplicated")
+        if profile:
+            known_targets = set(profile.get("target_ids") or [])
+            allowed_rmws = profile.get("rmws") or []
+            for row in rows:
+                if row.get("target_id") not in known_targets:
+                    errors.append("exploratory_row_target_not_in_profile:" + str(row.get("cell_id")))
+                if row.get("rmw") not in allowed_rmws:
+                    errors.append("exploratory_row_rmw_not_in_profile:" + str(row.get("cell_id")))
+        valid = [r for r in rows if _verify_exploratory_row(root, r, report, errors)]
+        details["rows_verified"] = len(valid)
+        details["rows_total"] = len(rows)
+        _audit_exploratory_budget(report, rows, errors)
+        _audit_exploratory_controls(report, rows, errors)
+        _audit_exploratory_ledger(root, report, rows, errors, details)
+        coverage = []
+        for row in valid:
+            if row.get("execution_stage") != "judged" or row.get("actual_run") is not True:
+                continue
+            if row.get("tool_error") is True or row.get("observer_dropped") is True:
+                continue
+            if row.get("observer_complete") is not True:
+                continue
+            coverage.append(row)
+        details["coverage_entries"] = len(coverage)
+        details["coverage_surfaces"] = sorted({s for row in coverage for s in (row.get("surface_ids") or [])})
+        observed = [r for r in valid if r.get("execution_stage") == "judged"]
+        details["unknown_count"] = sum(1 for r in observed if r.get("oracle_verdict") == "unknown")
+        details["oracle_fail_count"] = sum(
+            1 for r in observed if r.get("oracle_verdict") == "fail"
+            and r.get("arm") != "negative" and not r.get("control_kind"))
+        all_pass = bool(observed) and all(r.get("oracle_verdict") in {"pass", "not_applicable"} for r in observed)
+        details["all_oracles_pass"] = all_pass
+        details["evidence_valid"] = not errors
+        return {"sealed": False, "seal": EXPLORATORY_SEAL, "audit_kind": "exploratory",
+                "evidence_valid": not errors, "all_oracles_pass": all_pass,
+                "errors": errors, **details,
+                "maturity_scope": "exploratory only; required 72 denominator unchanged and not claimed"}
+    except (OSError, ValueError, TypeError, KeyError) as exc:
+        errors.append("report_artifact_error:" + str(exc))
+    return {"sealed": False, "seal": EXPLORATORY_SEAL, "audit_kind": "exploratory",
+            "evidence_valid": False, "all_oracles_pass": False, "errors": errors, **details,
+            "maturity_scope": "exploratory only; required 72 denominator unchanged and not claimed"}

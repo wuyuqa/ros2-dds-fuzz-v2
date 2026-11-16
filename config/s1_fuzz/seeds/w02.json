@@ -1,0 +1,84 @@
+{
+  "seed_id": "W02",
+  "version": 1,
+  "surface_refs": [
+    "W02"
+  ],
+  "target_family": "discovery.late_join_delivery",
+  "capability": {
+    "status": "authored",
+    "f1_routable": true,
+    "runtime_binding": "pair.history_and_sample_counts",
+    "note": "auxiliary publish-interval template only; not a high-throughput claim"
+  },
+  "status": "authored",
+  "logical_config": {
+    "topic": "/r2f/s1/publish_interval",
+    "message_type": "std_msgs/msg/String",
+    "qos": {
+      "reliability": "reliable",
+      "durability": "volatile",
+      "depth": 64
+    },
+    "reader_delay_sec": 0.02,
+    "baseline_reader_delay_sec": 0.02,
+    "pre_match_count": 2,
+    "post_match_count": 6,
+    "publish_interval_sec": 0.01,
+    "match_timeout_sec": 8.0,
+    "delivery_timeout_sec": 5.0,
+    "startup_timeout_sec": 10.0
+  },
+  "operation_windows": [
+    {
+      "step": "create_writer",
+      "window": "setup"
+    },
+    {
+      "step": "publish_prefix",
+      "window": "pre_reader",
+      "count": 2
+    },
+    {
+      "step": "delay_reader",
+      "window": "pre_reader_create",
+      "delay_surface": "P01",
+      "delay_sec": 0.02
+    },
+    {
+      "step": "create_reader",
+      "window": "post_reader_create"
+    },
+    {
+      "step": "publish_suffix",
+      "window": "post_match",
+      "count": 6
+    },
+    {
+      "step": "observe_publish_interval",
+      "window": "post_match",
+      "interval_surface": "W02",
+      "requires": [
+        "publish_event_interval_observed",
+        "send_sequence",
+        "observer_completeness"
+      ]
+    }
+  ],
+  "provenance": {
+    "kind": "template",
+    "source": "plan 3.1/4 W02 publish interval; not a throughput measurement",
+    "derived_from_execution": false
+  },
+  "capability_requirements": {
+    "tools": [
+      "public_ros2_api"
+    ],
+    "sut_guards": [
+      "actual_send_interval_observed"
+    ],
+    "runtime_binding": "pair.history_and_sample_counts"
+  },
+  "parent_content_sha256_rule": "content_sha256 over surface_refs,target_family,logical_config,operation_windows; excludes rng_seed,repeat,run_id,domain,guid,wall time",
+  "rng_seed_role": "chosen per attempt by caller; never embedded in this template"
+}

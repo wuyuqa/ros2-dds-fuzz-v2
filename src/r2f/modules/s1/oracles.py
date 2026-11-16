@@ -97,3 +97,162 @@ def _delivery_primary(facts, target_id, require_late=True):
     else:
         result.update(verdict="pass", reason_codes=["postrestore_delivery_contract_satisfied" if target_id == EXECUTION_ORDER[2] else "matched_postjoin_delivery_contract_satisfied"])
     return result
+
+
+# --- G01 offered/requested reliability compatibility guard -------------------
+#
+# This evaluator answers one narrow question: within a complete observation
+# window, did an identity-correlated match or delivery occur for a pair whose
+# offered/requested reliability is incompatible?  Creation succeeding is not a
+# violation; a compatible pair that simply has not matched inside a finite
+# window is unknown, not a DDS contract failure.
+
+COMPATIBILITY_RULE_ID = "s1.discovery.compatibility_guard.v1"
+_OFFERED = ("reliable", "best_effort")
+_INCOMPATIBLE_PAIRS = frozenset({("best_effort", "reliable")})
+
+
+def _guard_result(verdict="unknown", reason=""):
+    return {"rule_id": COMPATIBILITY_RULE_ID, "rule_role": "primary", "verdict": verdict,
+            "reason_codes": [reason] if reason else [],
+            "forbidden_residuals": [],
+            "applicability": {"relation": "offered_requested_reliability",
+                              "offered": None, "requested": None, "compatible": None,
+                              "incompatible_pairs": ["BR"]},
+            "unknown_reasons": [], "closure": {"window_complete": False,
+                                              "match_correlated": False,
+                                              "delivery_correlated": False}}
+
+
+def _guard_unknown(result, reason):
+    result["verdict"] = "unknown"
+    result["reason_codes"] = [reason]
+    result["unknown_reasons"] = [reason]
+    return result
+
+
+def _guard_identity(value):
+    if not isinstance(value, dict):
+        raise ValueError("endpoint identity missing")
+    endpoint_id = value.get("id")
+    if not isinstance(endpoint_id, str) or not endpoint_id:
+        raise ValueError("endpoint id missing")
+    generation = value.get("generation")
+    if type(generation) is not int and not (isinstance(generation, str) and generation):
+        raise ValueError("endpoint generation missing")
+    return endpoint_id, generation
+
+
+def _guard_sequence(items, name):
+    if not isinstance(items, list):
+        raise ValueError(f"{name} must be a list")
+    out = []
+    for item in items:
+        if not isinstance(item, dict):
+            raise ValueError(f"{name} entries must be objects")
+        sequence = item.get("sequence")
+        if type(sequence) is not int or sequence < 0:
+            raise ValueError(f"{name} sequence must be a nonnegative integer")
+        out.append(sequence)
+    if len(set(out)) != len(out):
+        raise ValueError(f"{name} has duplicate sequences")
+    return out
+
+
+def evaluate_match_compatibility_guard(facts) -> dict:
+    """Evaluate the G01 relation guard. Absence of evidence is never a pass."""
+    result = _guard_result()
+    if not isinstance(facts, dict):
+        return _guard_unknown(result, "guard_facts_not_an_object")
+    try:
+        writer_id, writer_generation = _guard_identity(facts.get("writer"))
+        reader_id, reader_generation = _guard_identity(facts.get("reader"))
+        submitted = facts.get("submitted")
+        if not isinstance(submitted, dict):
+            raise ValueError("submitted reliability missing")
+        offered, requested = submitted.get("writer_reliability"), submitted.get("reader_reliability")
+        if offered not in _OFFERED or requested not in _OFFERED:
+            return _guard_unknown(result, "unsupported_reliability_value")
+        window = facts.get("window")
+        if not isinstance(window, dict):
+            raise ValueError("observation window missing")
+        start, end, complete = window.get("start_ns"), window.get("end_ns"), window.get("complete")
+        if type(start) is not int or type(end) is not int or start < 0 or end <= start:
+            raise ValueError("invalid observation window")
+        if type(complete) is not bool:
+            raise ValueError("window completeness must be boolean")
+    except (ValueError, TypeError) as exc:
+        return _guard_unknown(result, f"guard_evidence_invalid:{exc}")
+
+    compatible = (offered, requested) not in _INCOMPATIBLE_PAIRS
+    result["applicability"].update(offered=offered, requested=requested, compatible=compatible)
+    result["closure"]["window_complete"] = complete
+
+    match = facts.get("match")
+    correlated_match = False
+    if match is not None:
+        if not isinstance(match, dict):
+            return _guard_unknown(result, "guard_match_not_an_object")
+        if match.get("identity_correlated") is not True:
+            return _guard_unknown(result, "match_without_identity_correlation")
+        if (match.get("writer_id"), match.get("writer_generation")) != (writer_id, writer_generation) or \
+                (match.get("reader_id"), match.get("reader_generation")) != (reader_id, reader_generation):
+            return _guard_unknown(result, "match_identity_mismatch")
+        at_ns = match.get("at_ns")
+        if type(at_ns) is not int or not start <= at_ns <= end:
+            return _guard_unknown(result, "match_outside_observation_window")
+        correlated_match = True
+        result["closure"]["match_correlated"] = True
+
+    delivery = facts.get("delivery")
+    correlated_delivery = False
+    if delivery is not None:
+        if not isinstance(delivery, dict):
+            return _guard_unknown(result, "guard_delivery_not_an_object")
+        if delivery.get("identity_correlated") is not True:
+            return _guard_unknown(result, "delivery_without_identity_correlation")
+        try:
+            sent = _guard_sequence(delivery.get("sent"), "sent")
+            received = _guard_sequence(delivery.get("received"), "received")
+        except ValueError as exc:
+            return _guard_unknown(result, f"guard_delivery_invalid:{exc}")
+        if not sent:
+            return _guard_unknown(result, "delivery_window_has_no_send_evidence")
+        if any(item.get("writer_id") != writer_id or item.get("writer_generation") != writer_generation
+               for item in delivery.get("sent", [])) or \
+                any(item.get("reader_id") != reader_id or item.get("reader_generation") != reader_generation
+                    for item in delivery.get("received", [])):
+            return _guard_unknown(result, "delivery_identity_mismatch")
+        if received:
+            if not correlated_match:
+                return _guard_unknown(result, "delivery_observed_without_correlated_match")
+            correlated_delivery = True
+            result["closure"]["delivery_correlated"] = True
+
+    if not complete:
+        return _guard_unknown(result, "observation_window_incomplete")
+
+    if not compatible:
+        if correlated_delivery:
+            result.update(verdict="fail", reason_codes=["prohibited_delivery_observed"],
+                          forbidden_residuals=["prohibited_delivery_observed"])
+            return result
+        if correlated_match:
+            result.update(verdict="fail", reason_codes=["prohibited_match_observed"],
+                          forbidden_residuals=["prohibited_match_observed"])
+            return result
+        observed = facts.get("observed")
+        absence_proven = (isinstance(observed, dict)
+                          and observed.get("match") == "absent"
+                          and observed.get("delivery") == "absent"
+                          and observed.get("observer_complete") is True
+                          and observed.get("provenance") is True)
+        if absence_proven:
+            result.update(verdict="pass", reason_codes=["incompatible_pair_not_matched"])
+            return result
+        return _guard_unknown(result, "prohibited_event_absence_not_established")
+
+    if correlated_match:
+        result.update(verdict="pass", reason_codes=["compatible_pair_matched"])
+        return result
+    return _guard_unknown(result, "compatible_pair_unmatched_within_finite_window")

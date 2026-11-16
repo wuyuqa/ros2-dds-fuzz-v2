@@ -37,6 +37,9 @@ class SemanticTarget:
     evidence_policy: dict = field(default_factory=dict)
     rmw_applicability: list[str] = field(default_factory=list)
     control_contract: dict = field(default_factory=dict)
+    # Optional versioned extension.  None must serialize exactly like the
+    # original four target manifests: no empty dict, no extra key.
+    exploration_contract: object = None
 
     def __post_init__(self):
         nonempty(self.target_id, "target_id")
@@ -66,9 +69,17 @@ class SemanticTarget:
         self.rmw_applicability = list(self.rmw_applicability)
         for rmw in self.rmw_applicability:
             nonempty(rmw, "rmw_applicability")
+        if self.exploration_contract is not None:
+            from .mutation_plan import ExplorationContract
+            if isinstance(self.exploration_contract, dict):
+                self.exploration_contract = ExplorationContract.from_dict(self.exploration_contract)
+            if not isinstance(self.exploration_contract, ExplorationContract):
+                raise ValueError("exploration_contract must be an ExplorationContract or None")
+            # Validate references before an undeclared target can be registered.
+            self.exploration_contract.validate()
 
     def to_dict(self):
-        return {"target_id": self.target_id, "intent_and_scope": self.intent_and_scope,
+        data = {"target_id": self.target_id, "intent_and_scope": self.intent_and_scope,
                 "target_revision": self.target_revision,
                 "state_preconditions": [c.to_dict() for c in self.state_preconditions],
                 "state_steps": [s.to_dict() for s in self.state_steps],
@@ -76,6 +87,9 @@ class SemanticTarget:
                 **{key: snapshot(getattr(self, key)) for key in (
                     "observation_contract", "expected_effect_set", "rule_contract", "evidence_policy",
                     "rmw_applicability", "control_contract")}}
+        if self.exploration_contract is not None:
+            data["exploration_contract"] = self.exploration_contract.to_dict()
+        return data
 
     @classmethod
     def from_dict(cls, data):

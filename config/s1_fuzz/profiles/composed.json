@@ -1,0 +1,151 @@
+{
+  "schema_version": "r2f.s1-fuzz-profile/v1",
+  "profile_id": "s1-fuzz-composed",
+  "campaign_kind": "exploratory",
+  "enabled": false,
+  "seed_catalog_status": "authored_t02",
+  "description": "F1 bounded parameter x single-window environment coverage, declared per cycle. Each cycle still runs on one target; environment composition support is pending and refused for live build.",
+  "required_catalog_included": false,
+  "target_ids": [
+    "discovery.late_endpoint.fuzz_v1",
+    "discovery.late_join_delivery.fuzz_v1",
+    "discovery.interruption_recovery.fuzz_v1"
+  ],
+  "surfaces": [
+    "P01",
+    "W02",
+    "E01"
+  ],
+  "seed_specs": [
+    {
+      "seed_id": "P01",
+      "target_id": "discovery.late_endpoint.fuzz_v1",
+      "boundary_class": "finite",
+      "executable": true
+    },
+    {
+      "seed_id": "W02",
+      "target_id": "discovery.late_join_delivery.fuzz_v1",
+      "boundary_class": "finite",
+      "executable": true
+    },
+    {
+      "seed_id": "E01",
+      "target_id": "discovery.interruption_recovery.fuzz_v1",
+      "boundary_class": "log_range",
+      "executable": true
+    }
+  ],
+  "pending_seed_ids": [
+    "E02",
+    "E03",
+    "G01"
+  ],
+  "pending_surfaces": [
+    "E02",
+    "E03",
+    "G01"
+  ],
+  "composition": {
+    "mode": "declared_parameter_x_single_window_environment_seed_coverage",
+    "parameter_surfaces": [
+      "P01",
+      "W02"
+    ],
+    "environment_surfaces": [
+      "E01"
+    ],
+    "max_environment_windows": 1,
+    "status": "declared_seed_coverage_only; per-case multi-surface composition is not claimed in this slice"
+  },
+  "cycles": [
+    {
+      "cycle_id": "late-endpoint-composed",
+      "target_id": "discovery.late_endpoint.fuzz_v1",
+      "surfaces": [
+        "P01",
+        "W02"
+      ],
+      "runner_slice": "endpoint_pair_slice",
+      "seed_specs": [
+        {
+          "seed_id": "P01",
+          "target_id": "discovery.late_endpoint.fuzz_v1",
+          "boundary_class": "finite",
+          "executable": true
+        }
+      ]
+    },
+    {
+      "cycle_id": "late-join-composed",
+      "target_id": "discovery.late_join_delivery.fuzz_v1",
+      "surfaces": [
+        "P01",
+        "W02"
+      ],
+      "runner_slice": "endpoint_pair_slice",
+      "seed_specs": [
+        {
+          "seed_id": "W02",
+          "target_id": "discovery.late_join_delivery.fuzz_v1",
+          "boundary_class": "finite",
+          "executable": true
+        }
+      ]
+    },
+    {
+      "cycle_id": "recovery-composed",
+      "target_id": "discovery.interruption_recovery.fuzz_v1",
+      "surfaces": [
+        "E01"
+      ],
+      "runner_slice": "endpoint_pair_slice",
+      "seed_specs": [
+        {
+          "seed_id": "E01",
+          "target_id": "discovery.interruption_recovery.fuzz_v1",
+          "boundary_class": "log_range",
+          "executable": true
+        }
+      ]
+    }
+  ],
+  "declared_seed_specs_union": [
+    {
+      "seed_id": "P01",
+      "target_id": "discovery.late_endpoint.fuzz_v1",
+      "boundary_class": "finite",
+      "executable": true
+    },
+    {
+      "seed_id": "W02",
+      "target_id": "discovery.late_join_delivery.fuzz_v1",
+      "boundary_class": "finite",
+      "executable": true
+    },
+    {
+      "seed_id": "E01",
+      "target_id": "discovery.interruption_recovery.fuzz_v1",
+      "boundary_class": "log_range",
+      "executable": true
+    }
+  ],
+  "rmws": [
+    "rmw_cyclonedds_cpp",
+    "rmw_fastrtps_cpp"
+  ],
+  "execution_boundary": "offline per-cycle corpus construction and planning only; enabled=false by default; recovery/composed execution is runner-pending and refused for live build; real ROS execution requires explicit owner GO and source/lock/domain checks",
+  "budget": {
+    "max_inputs": 36,
+    "warmup_inputs": 4,
+    "max_seconds": 1200
+  },
+  "corpus": {
+    "capacity": 256,
+    "bucket_limit": 3
+  },
+  "controls": {
+    "required": true,
+    "policy": "per source+rmw+target contract+recipe"
+  }
+}

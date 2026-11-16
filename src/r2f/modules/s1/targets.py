@@ -118,3 +118,151 @@ def target_declarations():
                 fact_sources=["passive_rtps_wire", "ros_graph", "endpoint_create_lifecycle"])
         targets[target_id] = SemanticTarget.from_dict(data)
     return targets
+
+
+# ---------------------------------------------------------------------------
+# Exploratory targets (revision 0).
+#
+# These are *not* part of the required scope.  ``EXECUTION_ORDER`` and
+# ``target_declarations()`` above must stay byte-identical to the frozen
+# required catalog, so exploratory targets are built by a separate function
+# and are only ever registered when a caller explicitly asks for them.
+#
+# Each contract is resolved through ``fuzz_catalog``; an unknown surface, fact,
+# rule or effect raises at construction instead of silently producing a target
+# that cannot be explained.
+# ---------------------------------------------------------------------------
+
+EXPLORATORY_TARGET_IDS = (
+    "discovery.late_endpoint.fuzz_v1",
+    "discovery.late_join_delivery.fuzz_v1",
+    "builtin.discovery_projection_reconciliation.fuzz_v1",
+    "discovery.interruption_recovery.fuzz_v1",
+    "discovery.match_compatibility.fuzz_v1",
+)
+
+EXPLORATORY_TARGET_ORDER = (
+    "discovery.late_endpoint.fuzz_v1",
+    "discovery.late_join_delivery.fuzz_v1",
+    "discovery.interruption_recovery.fuzz_v1",
+    "builtin.discovery_projection_reconciliation.fuzz_v1",
+    "discovery.match_compatibility.fuzz_v1",
+)
+
+#: exploratory target id -> the required target whose runtime adapter and
+#: observation schema it reuses.  This is an explicit capability binding; it
+#: never rewrites execution identity, which stays the new target id.
+EXPLORATORY_RUNTIME_TARGET = {
+    "discovery.late_endpoint.fuzz_v1": "discovery.late_endpoint",
+    "discovery.late_join_delivery.fuzz_v1": "discovery.late_join_delivery",
+    "discovery.interruption_recovery.fuzz_v1": "discovery.interruption_recovery",
+    "builtin.discovery_projection_reconciliation.fuzz_v1":
+        "builtin.discovery_projection_reconciliation",
+    "discovery.match_compatibility.fuzz_v1": None,
+}
+
+#: per exploratory target: (surface ids, extra rule ids, mutation kind, carrier,
+#: activation, scope statement)
+_EXPLORATORY_SCOPE = {
+    "discovery.late_endpoint.fuzz_v1": (
+        ("P01", "W01", "W02"), (), "late_joiner", "ros2_endpoint", "F1",
+        "Fuzz variant of the required late-reader target: reader delay plus "
+        "bounded workload surfaces, generated through the shared mutation plan."),
+    "discovery.late_join_delivery.fuzz_v1": (
+        ("P01", "W01", "W02"), (), "late_joiner", "ros2_endpoint", "F1",
+        "Fuzz variant of reliable volatile post-match delivery: the delivery "
+        "rule is shared; workload parameters are the new input surfaces."),
+    "discovery.interruption_recovery.fuzz_v1": (
+        ("E01",), (), "discovery_drop", "wire_proxy", "F1",
+        "Fuzz variant of discovery drop/restore with a generated drop duration. "
+        "Single-window only; multi-window surfaces remain capability pending."),
+    "builtin.discovery_projection_reconciliation.fuzz_v1": (
+        ("P02", "P03", "P04", "P05", "P06"), (), "endpoint_qos_variation",
+        "ros2_endpoint", "F1",
+        "Fuzz variant of independent wire/graph QoS reconciliation. Only the "
+        "six declared projection QoS fields are generatable."),
+    "discovery.match_compatibility.fuzz_v1": (
+        (), ("s1.discovery.compatibility_guard.v1",), "endpoint_qos_variation",
+        "ros2_endpoint", "F2",
+        "Offered/requested reliability relation guard. Capability pending: the "
+        "per-role QoS runtime binding is not wired, so no live input is claimed."),
+}
+
+
+def exploratory_target_declarations():
+    """Build the five exploratory targets, resolving every catalog reference.
+
+    A surface whose runtime binding is missing is still declared here (so the
+    capability gap is visible and reviewable) but the returned target records
+    the exact pending surface ids; the provider refuses to execute those.
+    """
+    from r2f.core.semantic_target import SemanticTarget
+    from r2f.modules.s1 import fuzz_catalog
+
+    base = target_declarations()
+    targets = {}
+    for target_id in EXPLORATORY_TARGET_ORDER:
+        surface_ids, extra_rules, kind, carrier, activation, scope = _EXPLORATORY_SCOPE[target_id]
+        if activation == "F1":
+            contract = fuzz_catalog.exploration_contract(surface_ids, extra_rule_ids=extra_rules)
+            pending_surfaces = []
+            declared_surfaces = tuple(surface_ids)
+        else:
+            # F2: the surface is declared but not generatable yet.  No surface
+            # enters the core contract (that would claim a value domain and
+            # mutator that do not exist), but the rule, its facts and its
+            # effect must still resolve so the pending target is auditable
+            # rather than an empty shell.
+            contract = fuzz_catalog.exploration_contract((), extra_rule_ids=extra_rules)
+            declared_surfaces = tuple(surface_ids) or ("G01",)
+            pending_surfaces = list(declared_surfaces)
+        runtime_target = EXPLORATORY_RUNTIME_TARGET[target_id]
+        data = {
+            "target_id": target_id,
+            "target_revision": 0,
+            "intent_and_scope": scope,
+            "state_preconditions": [
+                {"condition_id": name, "fact": name, "expected": True}
+                for name in ("environment_ok", "locks_held")
+            ] + ([{"condition_id": "writer_created", "fact": "writer_created", "expected": True}]
+                 if runtime_target in ("discovery.late_endpoint", "discovery.late_join_delivery") else []),
+            "state_steps": [
+                {"step_id": "admit_environment", "action": "admit_environment",
+                 "requires": [{"condition_id": "environment_ok", "fact": "environment_ok", "expected": True},
+                              {"condition_id": "locks_held", "fact": "locks_held", "expected": True}],
+                 "parameters": {}},
+            ],
+            "mutation_slots": [{"mutation_kind": kind, "carrier": carrier,
+                                "parameters": {}}],
+            "observation_contract": {
+                "schema": "s1.exploratory.v1",
+                "reuses": runtime_target,
+                "reuse_kind": "runtime_adapter_and_observation_schema",
+                "surfaces": list(declared_surfaces),
+                "pending_surface_ids": list(pending_surfaces),
+                "activation": activation,
+                "evidence": "no exploratory run is implied by this declaration",
+            },
+            "expected_effect_set": {},
+            "rule_contract": {"shared_with_required": runtime_target,
+                              "compatibility_rule": "s1.discovery.compatibility_guard.v1"
+                              if activation == "F2" else None},
+            "rmw_applicability": list(RMWS),
+            "control_contract": {},
+            "exploration_contract": contract,
+        }
+        # Reuse the reviewed required contract fields where the semantics are
+        # the same instead of restating (and drifting from) them.
+        if runtime_target is not None:
+            source = base[runtime_target]
+            data["expected_effect_set"] = deepcopy(source.expected_effect_set)
+            data["rule_contract"] = deepcopy(source.rule_contract)
+            data["control_contract"] = deepcopy(source.control_contract)
+            data["observation_contract"].update(
+                required_schema=source.observation_contract.get("schema"),
+                required_sources=list(source.observation_contract.get("sources", [])),
+            )
+            data["state_preconditions"] = [dict(p.to_dict()) for p in source.state_preconditions]
+            data["state_steps"] = [dict(s.to_dict()) for s in source.state_steps]
+        targets[target_id] = SemanticTarget.from_dict(data)
+    return targets
