@@ -358,8 +358,13 @@ def recovery_facts(events, runtime, config):
     try:
         metadata = runtime.get('execution_metadata') or {}
         workers = metadata.get('workers', [])
-        pair_workers = [w for w in workers if w.get('role') in ('writer', 'reader')]
+        all_workers = [w for w in workers if w.get('role') in ('writer', 'reader', 'reader2')]
         probe_workers = [w for w in workers if w.get('role') == 'probe']
+        writer_workers = [w for w in all_workers if w.get('role') == 'writer']
+        reader_workers = [w for w in all_workers if w.get('role') in ('reader', 'reader2')]
+        # Active pair: one writer and the latest reader generation.  Older
+        # reader generations remain in metadata as history.
+        pair_workers = writer_workers[-1:] + reader_workers[-1:]
         if (len(pair_workers) != 2 or len({w['pid'] for w in pair_workers}) != 2
                 or len(probe_workers) > 1
                 or any(w.get('returncode') != 0 for w in workers)
@@ -379,13 +384,23 @@ def recovery_facts(events, runtime, config):
         if any('table' in e for e in setup['initial_nft']['nftables']):
             raise ValueError('discovery namespace had preexisting nft rules')
         tokens = {r: _one(events, 'endpoint_created', role=r) for r in ('writer', 'reader')}
+        # F3: an explicit reader generation created inside the window becomes
+        # the active reader for post-restore evidence; the original reader is
+        # retained in raw history and never re-labelled.
+        recreates = [e for e in events if e.get('event') == 'discovery_reader_recreated']
+        if recreates:
+            # Reader recreation is a planned F3 capability, but the binding and
+            # pre-drop precondition receipts still describe the original pair.
+            # Until those generations are modelled explicitly, refuse to
+            # silently re-label the active reader.
+            raise ValueError('reader recreation requires F3 generation contract')
         if len({t['pid'] for t in tokens.values()}) != 2 or len({t['endpoint_gid'] for t in tokens.values()}) != 2:
             raise ValueError('independent endpoint process/GID identity missing')
         for role, token in tokens.items():
             if (token.get('rmw_identifier') != config['rmw'] or token.get('topic') != config['topic']
                     or token.get('qos') != config['qos'] or token.get('message_type') != config['message_type']
                     or not token.get('endpoint_generation')
-                    or not any(w.get('role') == role and w.get('pid') == token['pid'] for w in workers)):
+                    or not any(w.get('role') == token.get('role') and w.get('pid') == token['pid'] for w in workers)):
                 raise ValueError('discovery endpoint submitted identity/config mismatch')
             facts[role] = {'id': token['endpoint_gid'], 'generation': token['endpoint_generation'], 'created_ns': token['created_monotonic_ns']}
         # Verify submitted prejoin publication and reader delay as execution,

@@ -735,6 +735,11 @@ def _generate_case(sequence, entry, target, contract, surface, parent, mutator_i
         "parent_adaptation": adaptation,
     }
     config.update(json.loads(json.dumps(plan.final_config)))
+    # F3 exploratory stimulus: start a second reader generation inside the
+    # drop window.  This is a runtime action, not part of the submitted config
+    # identity.
+    if profile.get('reader_recreate_in_window') is True:
+        config['reader_recreate_in_window'] = True
     if route["backend"] == "projection_pair":
         # Both roles must run the mutated public profile.  Deriving them from the
         # plan's final qos keeps one authoritative submitted value instead of
@@ -785,6 +790,8 @@ def _generate_case(sequence, entry, target, contract, surface, parent, mutator_i
         config["input_identity_schema"] = INPUT_SCHEMA_V2
         config["effective_input_sha256"] = digest
         config["effective_input"] = effective
+        if profile.get('reader_recreate_in_window') is True:
+            config['reader_recreate_in_window'] = True
         binding = {"status": "preserved", "silent_normalization": False,
                    "submitted_config_sha256": canonical_hash(plan.final_config),
                    "normalized_config_sha256": canonical_hash(normalized),

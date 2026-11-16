@@ -47,11 +47,12 @@
           "executable": true,
           "overrides": {
             "logical_config": {
-              "drop_duration_sec": 8.0
+              "drop_duration_sec": 0.5
             }
           }
         }
-      ]
+      ],
+      "reader_recreate_in_window": true
     }
   ],
   "declared_seed_specs_union": [
@@ -79,5 +80,6 @@
   "controls": {
     "required": true,
     "policy": "per source+rmw+target contract+recipe"
-  }
+  },
+  "reader_recreate_in_window": false
 }

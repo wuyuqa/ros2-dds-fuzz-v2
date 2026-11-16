@@ -672,6 +672,17 @@ def _run_window_chain(c, active, receipt, emit, step, activity, activity_is_pair
                 emit('discovery_probe_created', probe_gid=probe_token.get('endpoint_gid'),
                      probe_pid=probe_token.get('pid'), probe_topic=c.get('probe_topic'),
                      pair_member=False)
+            if active and c.get('reader_recreate_in_window', False):
+                # A second reader generation attaches to the same topic while
+                # discovery is dropped.  Its SPDP/SEDP announcements are the
+                # real stimulus for the window; the original reader remains.
+                pool.start('reader2')
+                pool.wait(lambda: any(e['event'] == 'endpoint_created' and e.get('role') == 'reader2' for e in events),
+                          c['startup_timeout_sec'], 'reader2_created')
+                reader2 = next(e for e in events if e['event'] == 'endpoint_created' and e.get('role') == 'reader2')
+                emit('discovery_reader_recreated', reader_gid=reader2.get('endpoint_gid'),
+                     reader_pid=reader2.get('pid'), generation=reader2.get('endpoint_generation'),
+                     pair_member=True, role='reader2')
             trajectory_start_ns = time.monotonic_ns()
             deadline_ns = trajectory_start_ns + int(plan['drop_duration_sec'] * 10**9)
             trajectory = _RecoveryMatchTrajectory(events, endpoints, emit, trajectory_start_ns, deadline_ns, matched)
@@ -703,6 +714,10 @@ def _run_window_chain(c, active, receipt, emit, step, activity, activity_is_pair
                 pool.command('probe', 'stop')
                 pool.wait(lambda: any(e['event'] == 'worker_shutdown' and e.get('role') == 'probe' for e in events),
                           c['startup_timeout_sec'], 'probe_stop')
+            if active and c.get('reader_recreate_in_window', False) and 'reader2' in pool.workers:
+                pool.command('reader2', 'stop')
+                pool.wait(lambda: any(e['event'] == 'worker_shutdown' and e.get('role') == 'reader2' for e in events),
+                          c['startup_timeout_sec'], 'reader2_stop')
             window_restored.append(restored_this if active else None)
             window_hits.append(window_counter_hit)
             window_drop_activity.append(window_activity_ok)
