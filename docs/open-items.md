@@ -276,3 +276,10 @@ cf507正式batch为 [`batch-20261115T022650Z-3e2cd9c7`](../results/final-validat
 - 原因：稳定匹配后 writer/reader 不再发 SEDP，仅 drop 不足以产生 discovery 包。需要窗口内创建新 reader/participant 或重建 endpoint，才能形成真实命中。
 - 该能力属于 F3（多 endpoint/生命周期交错），不在当前 F1/F2 admitted 范围。未实现前不得把 E01 标为真实 hit，也不得靠延长窗口伪造。
 - 另：`mutation_ineffective` 已禁止进入 corpus 覆盖与自然候选；该行为已验证。
+
+## F3 reader 重建身份合同（2026-11-17）
+
+- 已在 `7d26e3c` 加入受控 reader recreation scaffold（`reader_recreate_in_window`，默认 false）以及 `reader2` worker 别名。
+- 真实实验证明：在 drop 窗口内启动第二 reader 可让 nft discovery counter 命中 true，恢复后主 pair activity 也可观察到；但当前 pre-drop binding 与 precondition snapshot 仍只描述初始 writer/reader 代际，直接替换 active reader 会触发 `discovery binding worker identity differs` / identity mismatch。
+- 因此 recovery_adapter 现在显式拒绝混合代际：`reader recreation requires F3 generation contract`，不把新 reader 静默当成旧 reader。
+- 需要 F3 设计：endpoint generation 合同、旧/新 GID 与 PID 的显式映射、pre-drop binding 与 post-restore active pair 的分离、逐代际 raw receipt。完成前不得开启该路径，也不得把 counter 命中当作 SUT 候选。
