@@ -92,7 +92,7 @@ def _step_evidence(events, actual):
     return before, after
 
 
-def _namespace_ready(events, create_before, create_started_ns):
+def _namespace_ready(events, create_before, create_started_ns, carrier_implementation=IMPLEMENTATION):
     """Prove namespace readiness before starting endpoint creation, from raw only."""
     admission = _one(events, 'namespace_host_admission_verified')
     setup_event = _one(events, 'discovery_network_setup')
@@ -109,17 +109,34 @@ def _namespace_ready(events, create_before, create_started_ns):
             raise ValueError('namespace readiness controller/execution identity differs')
     setup = setup_event['receipt']
     setup_isolation = _isolation(setup['isolation'])
+    # Each carrier reports its own neutral precondition: the drop carrier uses
+    # nft fields, the netem carrier uses qdisc/filter fields.  A neutral carrier
+    # must never report a hit under either schema.
+    if carrier_implementation == NETEM_IMPLEMENTATION:
+        neutral = (setup.get('mutation_installed') is False
+                   and setup.get('initial_filter') in ([], None))
+    else:
+        neutral = setup.get('drop_installed') is False
     if (any(setup_isolation[k] != isolation[k] for k in ('net_namespace', 'user_namespace', 'host_net_namespace', 'host_user_namespace', 'uid_map'))
-            or setup.get('health_ok') is not True or setup.get('drop_installed') is not False
-            or setup.get('hit') is not False or setup.get('counter_observed') is not False
+            or setup.get('health_ok') is not True or not neutral
+            or setup.get('hit') is not False
+            or (setup.get('counter_observed') is not False
+                and carrier_implementation != NETEM_IMPLEMENTATION)
             or not admission['monotonic_ns'] <= setup['monotonic_ns'] <= setup_event['monotonic_ns']):
         raise ValueError('namespace readiness setup is not healthy/neutral in admitted namespace')
-    _command(setup['command'], ['nft', '-j', 'list', 'ruleset'], isolation)
-    if (not admission['monotonic_ns'] <= setup['command']['started_monotonic_ns']
-            <= setup['command']['ended_monotonic_ns'] <= setup['monotonic_ns']
-            or json.loads(setup['command']['stdout']) != setup['initial_nft']
-            or any('table' in entry for entry in setup['initial_nft']['nftables'])):
-        raise ValueError('namespace readiness initial ruleset evidence invalid')
+    if carrier_implementation == NETEM_IMPLEMENTATION:
+        # netem health is proven by the qdisc/filter dump, not by an nft listing.
+        if (setup.get('initial_qdisc') is None or setup.get('initial_filter') is None
+                or not admission['monotonic_ns'] <= setup['monotonic_ns']
+                or setup.get('implementation') != NETEM_IMPLEMENTATION):
+            raise ValueError('namespace readiness netem carrier evidence invalid')
+    else:
+        _command(setup['command'], ['nft', '-j', 'list', 'ruleset'], isolation)
+        if (not admission['monotonic_ns'] <= setup['command']['started_monotonic_ns']
+                <= setup['command']['ended_monotonic_ns'] <= setup['monotonic_ns']
+                or json.loads(setup['command']['stdout']) != setup['initial_nft']
+                or any('table' in entry for entry in setup['initial_nft']['nftables'])):
+            raise ValueError('namespace readiness initial ruleset evidence invalid')
     ready = ready_event['receipt']
     namespace = ready['namespace']
     if (ready.get('status') != 'ready' or ready.get('interface') != 'lo' or ready.get('linktype') != 1
@@ -141,7 +158,8 @@ def recovery_receipts(scenario, runtime, events):
     env = _one(events, 'environment_preflight')
     locks = _one(events, 'isolation_locks_acquired')
     create_before = _one(events, 'state_step_before', step_id='create_endpoints')
-    readiness = _namespace_ready(events, create_before, create_before['before']['monotonic_ns'])
+    readiness = _namespace_ready(events, create_before, create_before['before']['monotonic_ns'],
+                                 runtime.get('carrier_implementation', IMPLEMENTATION))
     state = {'environment_ok': env.get('ok') is True, 'locks_held': len(locks.get('locks', [])) == 3,
              'namespace_ready': True}
     actuals = runtime.get('precondition_receipts', [])
