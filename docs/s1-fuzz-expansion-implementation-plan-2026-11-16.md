@@ -709,3 +709,26 @@ FastDDS:    delivery_inside_mutation_window=True, data_plane_observed=False,
 - FastDDS 数据面端口推导：实测其 user-data socket 落在 `PB+DG*domain+11+2p`，但 tc 计数为 0，说明其实际流量路径与推导不一致或走了 SHM；已在 facts 中如实记录为观察限制，未伪判。
 - 真实多窗（E02/E03）运行、mixed-vendor 真实互操作、netem 与 churn 组合的真实运行。
 - 自然候选仍为 0；不得用任何控制/工具错误凑数。
+
+### 真实多窗运行（2026-11-17，HEAD 8e54bb7）
+
+首次把 E02/E03 的多窗链从「可生成」推进到「真实执行」：
+
+```text
+results/fuzz-cli/multiwindow-005   2 窗, CycloneDDS + FastDDS, 均 judged/pass
+results/fuzz-cli/multiwindow-006   3 窗, CycloneDDS + FastDDS, 均 judged/pass
+```
+
+三窗实测逐窗证据（restore_interval 分别为 0 / 0.05 / 0.2 s）：
+
+```text
+CycloneDDS  w0 delta=129  w1 delta=32  w2 delta=32   restored=True ×3  activity=True ×3
+FastDDS     w0 delta=332  w1 delta=66  w2 delta=66   restored=True ×3  activity=True ×3
+```
+
+每个窗口都有独立的 counter delta、restore 验证与恢复后 activity，全部闭合才 `window_complete=true`。
+
+暴露并修复的两个真实缺陷：
+
+13. **多窗下同名 churn 角色重复创建**：第一窗创建的 `reader2` 在第二窗被再次 start，产生两条 `endpoint_created`、两个 pid，且 `discovery_reader_recreated` 引用了上一代的 pid（身份证据错误）。修为链级 `prior_created/prior_destroyed` 状态 + 按 generation 绑定 token。
+14. **提交窗口与计划窗口不一致**：`config['environment_windows']` 用 runtime 形态覆盖了 plan 里的提交值，E01 变异出的 drop 时长没有进入窗口，binding 判为 `not_preserved`。修为以 plan 的窗口为唯一提交权威。
