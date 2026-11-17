@@ -1229,6 +1229,14 @@ def _generate_case(sequence, entry, target, contract, surface, parent, mutator_i
         # per-role map keeps its own key.
         if isinstance(profile.get('role_rmws'), dict):
             config['rmws'] = dict(profile['role_rmws'])
+        # Multi-endpoint projection: the role list is a submitted input, so it
+        # must reach the runtime config verbatim rather than being a runtime
+        # default that the adapter cannot cross-check.
+        if profile.get('projection_roles') is not None:
+            config['projection_roles'] = list(profile['projection_roles'])
+        if isinstance(profile.get('projection_role_qos'), dict):
+            config['projection_role_qos'] = json.loads(
+                json.dumps(profile['projection_role_qos']))
         binding = {"status": "preserved", "silent_normalization": False,
                    "submitted_config_sha256": canonical_hash(plan.final_config),
                    "normalized_config_sha256": canonical_hash(normalized),
