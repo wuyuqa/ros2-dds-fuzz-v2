@@ -128,10 +128,12 @@ def normalize_discovery_config(config):
     c['environment_mutation'] = normalize_environment_mutation(c.get('environment_mutation'))
     if (c['environment_mutation'] is not None
             and c['environment_mutation']['kind'] == 'discovery_netem'
-            and windows is not None):
-        # The 1..3 window chain is a drop/recovery gate; a netem window has no
-        # drop semantics to chain. Refuse the combination instead of silently
-        # reinterpreting one carrier as the other.
+            and windows is not None and len(c['runtime_windows']) > 1):
+        # A single netem window replaces the single drop window and is what the
+        # recovery runner always emits, so that shape stays admitted.  A 1..3
+        # window *chain* is a drop/recovery gate with per-window counters; a
+        # netem window has no drop semantics to chain, so refuse >1 instead of
+        # silently reinterpreting one carrier as the other.
         raise ValueError('environment_windows_not_supported_for_discovery_netem')
     c['carrier_implementation'] = (NETEM_IMPLEMENTATION
                                    if c['environment_mutation'] is not None

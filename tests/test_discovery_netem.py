@@ -434,10 +434,17 @@ class NamespacePairWiringTests(unittest.TestCase):
             self.discovery_config(environment_mutation='discovery_netem')
 
     def test_netem_with_window_chain_is_refused(self):
+        # A single window is the shape the recovery runner always emits and is
+        # admitted; only a real multi-window chain is incompatible with netem.
+        single = self.discovery_config(environment_mutation={'kind': 'discovery_netem',
+                                                            'spec': spec()},
+                                       environment_windows=[{'drop_duration_sec': 0.2}])
+        self.assertEqual(len(single['runtime_windows']), 1)
         with self.assertRaisesRegex(ValueError, 'environment_windows_not_supported'):
             self.discovery_config(environment_mutation={'kind': 'discovery_netem',
                                                        'spec': spec()},
-                                  environment_windows=[{'drop_duration_sec': 0.2}])
+                                  environment_windows=[{'drop_duration_sec': 0.2},
+                                                       {'drop_duration_sec': 0.2}])
 
     def test_netem_never_claims_drop_hit_in_facts(self):
         from r2f.runtime.namespace_pair import summarize_discovery
