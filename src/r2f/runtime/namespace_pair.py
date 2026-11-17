@@ -969,12 +969,34 @@ def run_window_churn(pool, schedule, events, *, window_start_ns,
         pending.pop(0)
         kind, role_name = item['kind'], item['role']
         if kind == 'reader_create':
+            if role_name in created_roles and role_name not in destroyed_roles:
+                # Idempotent: the window chain runs one churn schedule per
+                # window, so a role created in an earlier window is still the
+                # current generation. Re-starting it would emit a second
+                # endpoint_created for the same role and corrupt identity.
+                continue
+            # Bind the token to *this* generation: an earlier window may have
+            # left a stale endpoint_created token for the same role name.
+            previous_index = [e['event_index'] for e in events
+                              if e['event'] == 'endpoint_created' and e.get('role') == role_name
+                              and type(e.get('event_index')) is int]
             pool.start(role_name)
-            pool.wait(lambda role_name=role_name: any(
-                e['event'] == 'endpoint_created' and e.get('role') == role_name for e in events),
-                startup_timeout_sec, role_name + '_created')
-            token = next(e for e in events if e['event'] == 'endpoint_created'
-                         and e.get('role') == role_name)
+            boundary_index = previous_index[-1] if previous_index else None
+
+            def created_since(index=boundary_index, role=role_name):
+                candidates = [e for e in events
+                              if e['event'] == 'endpoint_created' and e.get('role') == role]
+                if index is None:
+                    return candidates
+                newer = [e for e in candidates
+                         if type(e.get('event_index')) is int and e['event_index'] > index]
+                # A producer without event indices cannot prove the boundary;
+                # in that case the newest candidate is the only available token.
+                return newer or candidates
+
+            pool.wait(lambda created_since=created_since: bool(created_since()),
+                      startup_timeout_sec, role_name + '_created')
+            token = created_since()[-1]
             if config is not None:
                 require_role_rmw(config, role_name, token)
             created_roles.add(role_name)

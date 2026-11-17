@@ -1152,9 +1152,14 @@ def _generate_case(sequence, entry, target, contract, surface, parent, mutator_i
         config["writer_qos"] = json.loads(json.dumps(role_qos))
         config["reader_qos"] = json.loads(json.dumps(role_qos))
     if runtime_windows:
-        # namespace_pair reads environment_windows; validate_window_plan rejects
-        # zero/oversized plans, so a multi-window E02/E03 input cannot slip in.
-        config["environment_windows"] = json.loads(json.dumps(runtime_windows))
+        # namespace_pair reads environment_windows.  The plan's own windows are
+        # the single submitted authority: projecting the *runtime* shape here
+        # would silently rewrite the submitted value whenever a surface mutation
+        # changed a duration, and the binding check would then fail closed on a
+        # difference the input never had.
+        submitted_windows = plan.final_config.get("environment_windows")
+        config["environment_windows"] = json.loads(json.dumps(
+            submitted_windows if submitted_windows is not None else runtime_windows))
 
     binding = {"status": "not_checked", "silent_normalization": False,
                "backend": route["backend"], "carrier": carrier}
