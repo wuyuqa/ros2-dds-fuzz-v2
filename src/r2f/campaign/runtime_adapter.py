@@ -137,8 +137,11 @@ def facts_from_events(events, runtime, config):
                                   and not any(e.get("event") in {"worker_error", "worker_unexpected_exit"} for e in events))
     try:
         tokens = {role: _one(events, "endpoint_created", role=role) for role in ("writer", "reader")}
+        # A mixed-vendor pair legitimately reports two different RMW identifiers;
+        # each role must match its own submitted vendor, never the global one.
+        from r2f.runtime.ros2_pair import role_rmw
         for role, token in tokens.items():
-            if not token.get("endpoint_gid") or token.get("rmw_identifier") != config["rmw"]:
+            if not token.get("endpoint_gid") or token.get("rmw_identifier") != role_rmw(config, role):
                 raise ValueError("endpoint identity or RMW missing")
             facts[role] = {"id": token["endpoint_gid"], "generation": token["endpoint_generation"], "created_ns": token["created_monotonic_ns"]}
         writer, reader = facts["writer"], facts["reader"]

@@ -1223,6 +1223,12 @@ def _generate_case(sequence, entry, target, contract, surface, parent, mutator_i
         # switch: a netem profile has no churn but still needs this flag.
         if profile.get('netem_covers_delivery') is not None:
             config['netem_covers_delivery'] = profile['netem_covers_delivery']
+        # Mixed-vendor: the per-role vendor map is a real input, so it must be
+        # part of the submitted config rather than a runtime-side default.
+        # ``profile['rmws']`` is the vendor *list* the corpus iterates, so the
+        # per-role map keeps its own key.
+        if isinstance(profile.get('role_rmws'), dict):
+            config['rmws'] = dict(profile['role_rmws'])
         binding = {"status": "preserved", "silent_normalization": False,
                    "submitted_config_sha256": canonical_hash(plan.final_config),
                    "normalized_config_sha256": canonical_hash(normalized),

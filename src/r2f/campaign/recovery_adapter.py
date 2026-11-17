@@ -14,6 +14,8 @@ from r2f.core.state_machine import StepReceipt
 from r2f.modules.s1.facts import integer
 from .runtime_adapter import _one, _iso, fresh_match_proof
 
+from r2f.runtime.ros2_pair import role_rmw
+
 IMPLEMENTATION = 'isolated_netns_nft_discovery_udp_drop'
 NETEM_IMPLEMENTATION = 'isolated_netns_tc_netem_discovery_udp'
 #: Each carrier has its own reviewed setup/restore receipt schema.  Selecting
@@ -588,7 +590,7 @@ def _multi_window_recovery_facts(events, runtime, config):
         if len({t['pid'] for t in tokens.values()}) != 2 or len({t['endpoint_gid'] for t in tokens.values()}) != 2:
             raise ValueError('independent endpoint process/GID identity missing')
         for role, token in tokens.items():
-            if (token.get('rmw_identifier') != config['rmw'] or token.get('topic') != config['topic']
+            if (token.get('rmw_identifier') != role_rmw(config, role) or token.get('topic') != config['topic']
                     or token.get('qos') != config['qos'] or token.get('message_type') != config['message_type']
                     or not token.get('endpoint_generation')):
                 raise ValueError('discovery endpoint submitted identity/config mismatch')
@@ -840,7 +842,7 @@ def recovery_facts(events, runtime, config):
         if len({t['pid'] for t in tokens.values()}) != 2 or len({t['endpoint_gid'] for t in tokens.values()}) != 2:
             raise ValueError('independent endpoint process/GID identity missing')
         for role, token in tokens.items():
-            if (token.get('rmw_identifier') != config['rmw'] or token.get('topic') != config['topic']
+            if (token.get('rmw_identifier') != role_rmw(config, role) or token.get('topic') != config['topic']
                     or token.get('qos') != config['qos'] or token.get('message_type') != config['message_type']
                     or not token.get('endpoint_generation')
                     or not any(w.get('role') == token.get('role') and w.get('pid') == token['pid'] for w in workers)):
