@@ -607,7 +607,7 @@ def _multi_window_recovery_facts(events, runtime, config):
         facts['match'] = {'writer_id': tokens['writer']['endpoint_gid'],
                           'reader_id': tokens['reader']['endpoint_gid'],
                           'at_ns': match_ns}
-        first_interruption = _window_one(events, 'window_open', 0, window='discovery_interruption')
+        _window_one(events, 'window_open', 0, window='discovery_interruption')
         if not (_window_one(events, 'discovery_window_restore_verified',
                             len(plans) - 1)['event_index'] < opening['event_index']
                 < closing['event_index']):
@@ -686,7 +686,10 @@ def _multi_window_recovery_facts(events, runtime, config):
                       'window_count': len(facts['windows']),
                       'per_window_independent': True},
             observed_effects=['discovery_temporarily_unavailable', 'discovery_restored'],
-            window={'start_ns': first_interruption['monotonic_ns'],
+            # PrimaryFacts' delivery window starts when the post-restore
+            # delivery window opens, not when the interruption began.  The
+            # interruption span is recorded separately under ``windows``.
+            window={'start_ns': opening['monotonic_ns'],
                     'end_ns': closing['monotonic_ns'], 'complete': True},
             window_complete=True,
             window_completion={'complete': True, 'window_count': len(facts['windows'])},
