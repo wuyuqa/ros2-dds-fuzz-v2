@@ -891,9 +891,26 @@ def recovery_facts(events, runtime, config):
         inter_close = _one(events, 'window_close', window=window_name)
         boundary_mono = integer(boundary['post_restore_monotonic_ns'], 'restore boundary')
         boundary_wall = integer(boundary['post_restore_unix_ns'], 'restore realtime boundary')
-        if (not begin['event_index'] < inter_open['event_index'] < inter_close['event_index'] < boundary['event_index'] < opening['event_index'] < closing['event_index']
-                or not inter_close['monotonic_ns'] <= boundary_mono <= boundary['monotonic_ns'] <= opening['monotonic_ns']
-                or inter_close['monotonic_ns'] - inter_open['monotonic_ns'] < config['drop_duration_sec'] * 10**9):
+        if netem_carrier:
+            # netem installs, observes, restores, then closes its own window:
+            # begin < open < restore_boundary < close < post_restore_open.
+            chronological = (begin['event_index'] < inter_open['event_index']
+                             < boundary['event_index'] < inter_close['event_index']
+                             < opening['event_index'] < closing['event_index']
+                             and inter_open['monotonic_ns'] <= boundary_mono
+                             <= boundary['monotonic_ns'] <= inter_close['monotonic_ns']
+                             <= opening['monotonic_ns'])
+            duration = inter_close['monotonic_ns'] - inter_open['monotonic_ns']
+            required = config.get('drop_duration_sec') * 10**9
+        else:
+            chronological = (begin['event_index'] < inter_open['event_index']
+                             < inter_close['event_index'] < boundary['event_index']
+                             < opening['event_index'] < closing['event_index']
+                             and inter_close['monotonic_ns'] <= boundary_mono
+                             <= boundary['monotonic_ns'] <= opening['monotonic_ns'])
+            duration = inter_close['monotonic_ns'] - inter_open['monotonic_ns']
+            required = config['drop_duration_sec'] * 10**9
+        if not chronological or duration < required:
             raise ValueError('discovery drop/restore/delivery window chronology invalid')
         active = config['arm'] == 'mutated'
         packets = 0
