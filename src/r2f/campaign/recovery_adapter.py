@@ -753,6 +753,16 @@ def recovery_facts(events, runtime, config):
     facts = {'schema_version': 1, 'environment_healthy': runtime.get('environment', {}).get('ok') is True,
              'process_healthy': False, 'preconditions_reached': False, 'endpoint_identity_complete': False,
              'observed_effects': [], 'sent': [], 'received': []}
+    # Carrier-level facts the runtime established independently of the delivery
+    # contract must survive into the typed facts; dropping them here would turn
+    # an explicit observation limit back into a generic ineffective mutation.
+    for key in ('delivery_inside_mutation_window', 'delivery_window_refs',
+                'netem_install_ref', 'netem_restore_ref', 'netem_boundary_ref',
+                'delivery_overlap_chronology', 'data_plane_observed',
+                'data_plane_observation_reason'):
+        value = (runtime.get('facts') or {}).get(key)
+        if value is not None:
+            facts[key] = value
     try:
         metadata = runtime.get('execution_metadata') or {}
         workers = metadata.get('workers', [])
