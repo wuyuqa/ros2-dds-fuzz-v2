@@ -69,8 +69,15 @@ def create_public_qos(q):
 
 
 def self_qos_entry(graph, role, endpoint_gid):
-    """Return the SDK-reported graph entry for this worker's own endpoint."""
-    rows = graph['publishers'] if role in ('writer', 'writer2') else graph['subscriptions']
+    """Return the SDK-reported graph entry for this worker's own endpoint.
+
+    The publisher/subscription choice follows the endpoint *kind*, not a fixed
+    role list: writer2..writer4 (and any future writerN) publish, while
+    readerN subscribes.  Hard-coding writer/writer2 sent writer3 to the
+    subscription table, so its binding observation was always empty.
+    """
+    is_publisher = role.startswith('writer') or role == 'probe'
+    rows = graph['publishers'] if is_publisher else graph['subscriptions']
     for item in rows:
         if item.get('endpoint_gid') == endpoint_gid:
             return item
