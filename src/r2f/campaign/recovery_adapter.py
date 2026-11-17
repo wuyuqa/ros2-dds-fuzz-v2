@@ -891,7 +891,53 @@ def recovery_facts(events, runtime, config):
         inter_close = _one(events, 'window_close', window=window_name)
         boundary_mono = integer(boundary['post_restore_monotonic_ns'], 'restore boundary')
         boundary_wall = integer(boundary['post_restore_unix_ns'], 'restore realtime boundary')
-        if netem_carrier:
+        # ``netem_covers_delivery`` splits the netem carrier into two shapes.
+        # The additive ``netem_delivery_overlap`` raw event is the only proof
+        # that the judged delivery window ran while the tc class was installed;
+        # its absence keeps the already-sealed post-restore chronology intact.
+        overlap = next((e for e in events if e.get('event') == 'netem_delivery_overlap'), None)
+        covers_delivery = bool(netem_carrier and overlap is not None)
+        if covers_delivery:
+            # Two explicitly bounded netem segments: the discovery stimulus
+            # window (install/restore/boundary, sealed chronology) and then the
+            # real public delivery window, opened inside its own verified
+            # install..restore segment.  ``netem_delivery_overlap`` is the only
+            # proof that the judged delivery ran while tc was installed.
+            install = _one(events, 'delivery_netem_begin')
+            end_receipt = _one(events, 'delivery_netem_end')
+            delivery_boundary = _one(events, 'delivery_restore_boundary')
+            delivery_boundary_mono = integer(delivery_boundary['post_restore_monotonic_ns'],
+                                             'delivery restore boundary')
+            stimulus_begin = _one(events, 'discovery_netem_begin')
+            stimulus_end = _one(events, 'discovery_netem_end')
+            bound = {'install_event_ref': install, 'delivery_open_ref': opening,
+                     'delivery_close_ref': closing, 'restore_event_ref': end_receipt,
+                     'boundary_event_ref': delivery_boundary,
+                     'stimulus_install_ref': stimulus_begin,
+                     'stimulus_restore_ref': stimulus_end,
+                     'stimulus_boundary_ref': boundary}
+            if (overlap.get('delivery_inside_mutation_window') is not True
+                    or any(_resolve(events, overlap.get(key)) is not value
+                           for key, value in bound.items())
+                    or not (install['event_index'] < opening['event_index']
+                            < closing['event_index'] < end_receipt['event_index']
+                            < delivery_boundary['event_index'])):
+                raise ValueError('netem delivery overlap event is not bound to the real windows')
+            # Sealed stimulus chronology is unchanged: begin < netem open <
+            # restore boundary < recovery observation < delivery window.  The
+            # carrier's own window close follows the delivery segment, so it is
+            # the outer bound rather than an inner one.
+            chronological = (begin['event_index'] < inter_open['event_index']
+                             < boundary['event_index'] < opening['event_index']
+                             < closing['event_index'] < end_receipt['event_index']
+                             < delivery_boundary['event_index'] < inter_close['event_index']
+                             and inter_open['monotonic_ns'] <= boundary_mono
+                             <= boundary['monotonic_ns'] <= opening['monotonic_ns']
+                             <= closing['monotonic_ns'] <= delivery_boundary_mono
+                             <= inter_close['monotonic_ns'])
+            duration = inter_close['monotonic_ns'] - inter_open['monotonic_ns']
+            required = config.get('drop_duration_sec') * 10**9
+        elif netem_carrier:
             # netem installs, observes, restores, then closes its own window:
             # begin < open < restore_boundary < close < post_restore_open.
             chronological = (begin['event_index'] < inter_open['event_index']
@@ -1019,6 +1065,14 @@ def recovery_facts(events, runtime, config):
         facts['match_snapshot_proof'] = proof
         facts['match'] = {'writer_id': tokens['writer']['endpoint_gid'], 'reader_id': tokens['reader']['endpoint_gid'], 'at_ns': match_ns}
         facts['window'] = {'start_ns': opening['monotonic_ns'], 'end_ns': closing['monotonic_ns'], 'complete': True}
+        if covers_delivery:
+            # Install/restore refs name the segment that actually covered the
+            # judged delivery, not the earlier discovery-stimulus segment.
+            facts['delivery_inside_mutation_window'] = True
+            facts['delivery_window_refs'] = {'open_event_ref': _ref(opening),
+                                             'close_event_ref': _ref(closing)}
+            facts['netem_install_ref'] = _ref(_one(events, 'delivery_netem_begin'))
+            facts['netem_restore_ref'] = _ref(_one(events, 'delivery_netem_end'))
         expected = list(range(config['pre_match_count'], config['pre_match_count'] + config['post_match_count']))
         contract = _one(events, 'delivery_contract')
         if (contract.get('expected_sequences') != expected or opening.get('expected_sequences') != expected

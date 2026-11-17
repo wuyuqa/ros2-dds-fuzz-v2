@@ -126,6 +126,13 @@ def normalize_discovery_config(config):
         c['window_chain_requested'] = False
     validate_reader_churn_config(c)
     c['environment_mutation'] = normalize_environment_mutation(c.get('environment_mutation'))
+    covers = c.get('netem_covers_delivery', False)
+    if not isinstance(covers, bool):
+        raise ValueError('invalid_netem_covers_delivery')
+    c['netem_covers_delivery'] = covers
+    if covers and (c['environment_mutation'] is None
+                   or c['environment_mutation']['kind'] != 'discovery_netem'):
+        raise ValueError('netem_covers_delivery_requires_discovery_netem')
     if (c['environment_mutation'] is not None
             and c['environment_mutation']['kind'] == 'discovery_netem'
             and windows is not None and len(c['runtime_windows']) > 1):
@@ -516,7 +523,8 @@ def acknowledged_graphs(events, matches, endpoints):
 
 def summarize_discovery(events, *, active, counter_hit, restored, activity_ok, fresh_recovery, drop_activity_ok,
                         carrier_implementation=IMPLEMENTATION, carrier_kind='discovery_drop',
-                        neutral_spec=False, netem_scope=None):
+                        neutral_spec=False, netem_scope=None, delivery_overlap=None,
+                        data_plane_observed=None, data_plane_reason=None):
     from .ros2_pair import summarize_events
     # Reuse sequence/identity algebra, retaining original raw tokens and phase labels.
     normalized = []
@@ -566,6 +574,22 @@ def summarize_discovery(events, *, active, counter_hit, restored, activity_ok, f
         facts.update(discovery_netem_scope=netem_scope,
                      discovery_netem_responsibility_layer=NETEM_RESPONSIBILITY_LAYER,
                      discovery_netem_loss_pct=NETEM_LOSS_PCT)
+    if delivery_overlap is not None:
+        # Facts only: whether the judged delivery window sat inside the
+        # installed class.  The oracle still judges send/receive sequences and
+        # identity; this never promotes or demotes a candidate.
+        facts.update(delivery_inside_mutation_window=bool(delivery_overlap['inside']),
+                     delivery_window_refs=delivery_overlap['window_refs'],
+                     netem_install_ref=delivery_overlap['install_ref'],
+                     netem_restore_ref=delivery_overlap['restore_ref'],
+                     netem_boundary_ref=delivery_overlap['boundary_ref'],
+                     delivery_overlap_chronology=delivery_overlap['chronology'])
+    if data_plane_observed is not None:
+        # Distinguish "window did not overlap" (tool defect) from "the data
+        # plane used another transport / was not countable" (observation
+        # limit).  Both stay separate from a mutation_ineffective verdict.
+        facts.update(data_plane_observed=bool(data_plane_observed),
+                     data_plane_observation_reason=data_plane_reason)
     return facts
 
 
@@ -1307,6 +1331,14 @@ def _run_netem_window(c, active, receipt, emit, step, activity, activity_is_pair
     removed and then must show fresh independent pair activity plus a fresh
     graph/count before it can be treated as recovered.
 
+    ``netem_covers_delivery`` (installed arm only) adds a second explicitly
+    bounded segment: after the stimulus window has been restored and its
+    recovery evidence observed, the same spec is installed again, the real
+    post-restore delivery runs inside it, and only then is it restored.  That
+    keeps the sealed stimulus chronology (install < open < boundary < graph)
+    intact while making the class actually act on the judged delivery traffic;
+    ``netem_delivery_overlap`` records the delivery-segment refs.
+
     ``receipt['hit']`` stays one of the seven nested boolean fields and is set
     only from real counted packets (>0) + a mutated arm + a non-neutral spec.
     ``hit_semantics`` on the data events states that the hit is a data-plane
@@ -1319,6 +1351,11 @@ def _run_netem_window(c, active, receipt, emit, step, activity, activity_is_pair
     data_scope = scope in ('data', 'both')
     installed = bool(active)
     mutation_active = bool(active and not spec['neutral'])
+    # ``netem_covers_delivery`` puts the real post-restore delivery inside the
+    # installed class.  It is only meaningful when something is installed: a
+    # non-mutated arm installs nothing, so there is no window to overlap with
+    # and the flag must never report an overlap it did not have.
+    covers_delivery = bool(c.get('netem_covers_delivery')) and installed
     window_sec = c['drop_duration_sec']
     if spec['restore_sec']:
         window_sec = min(window_sec, spec['restore_sec'])
@@ -1327,7 +1364,43 @@ def _run_netem_window(c, active, receipt, emit, step, activity, activity_is_pair
     last_counter = None
     restored = False
     begin = None
+    delivery = None
+    install_ref = restore_ref = boundary_ref = None
+    install_index = restore_index = boundary_index = None
     drop_wall_ns = time.time_ns()
+
+    delivery_open = [False]
+
+    def sample(counter):
+        """One counter snapshot: discovery receipt plus additive data receipts.
+
+        Counters taken after the delivery window opened belong to the delivery
+        segment and report under ``data_netem_delivery``; earlier ones keep the
+        sealed ``data_netem`` names byte for byte.  ``discovery_netem_counter``
+        is a stimulus-window receipt only, so it is not emitted from the
+        delivery segment.
+        """
+        nonlocal counters_hit, data_counters_hit
+        window = 'data_netem_delivery' if delivery_open[0] else 'data_netem'
+        counters_hit = counters_hit or _netem_counter_hit(counter, scope)
+        if not delivery_open[0]:
+            emit('discovery_netem_counter', receipt=counter)
+        if data_scope:
+            data_counters_hit = data_counters_hit or bool(_netem_counter_hit(counter, 'data'))
+            emit('data_mutation_counter', window=window, scope=scope,
+                 port_groups=counter.get('port_groups'),
+                 port_group_ids=[group['group_id'] for group in counter.get('port_groups') or []],
+                 group_counters=counter.get('group_counters'),
+                 group_counters_available=counter.get('group_counters_available'),
+                 group_counters_reason=counter.get('group_counters_reason'),
+                 hit_groups=_netem_hit_groups(counter),
+                 expected_ports=counter.get('expected_ports'),
+                 affected_packets=counter.get('affected_packets'),
+                 affected_bytes=counter.get('affected_bytes'),
+                 loss_pct=NETEM_LOSS_PCT, loss_defaulted=True,
+                 hit_semantics=netem_hit_semantics(scope),
+                 responsibility_layer=NETEM_RESPONSIBILITY_LAYER,
+                 counter=counter)
     if installed:
         receipt.update(submitted=True, carrier_admitted=True)
         emit('mutation_begin', mutation_kind='discovery_netem', carrier='wire_proxy',
@@ -1341,8 +1414,10 @@ def _run_netem_window(c, active, receipt, emit, step, activity, activity_is_pair
         data_counters_hit = data_counters_hit or bool(
             _netem_counter_hit(last_counter, 'data'))
         receipt.update(configured=begin['configured'], applied=begin['applied'])
-        emit('discovery_netem_begin', receipt=begin, mutation_receipt=dict(receipt),
-             neutral=begin['neutral'], scope=scope)
+        install_event = emit('discovery_netem_begin', receipt=begin, mutation_receipt=dict(receipt),
+                             neutral=begin['neutral'], scope=scope)
+        install_ref, install_index = (install_event['raw_event_ref'],
+                                      install_event.get('namespace_event_index'))
         if data_scope:
             emit('data_mutation_begin', window='data_netem', scope=scope,
                  spec=dict(spec),
@@ -1373,26 +1448,7 @@ def _run_netem_window(c, active, receipt, emit, step, activity, activity_is_pair
         while time.monotonic() < deadline_ns / 10**9:
             if installed:
                 last_counter = carrier.counters()
-                counters_hit = counters_hit or _netem_counter_hit(last_counter, scope)
-                emit('discovery_netem_counter', receipt=last_counter)
-                if data_scope:
-                    data_counters_hit = data_counters_hit or bool(
-                        _netem_counter_hit(last_counter, 'data'))
-                    emit('data_mutation_counter', window='data_netem', scope=scope,
-                         port_groups=last_counter.get('port_groups'),
-                         port_group_ids=[group['group_id']
-                                         for group in last_counter.get('port_groups') or []],
-                         group_counters=last_counter.get('group_counters'),
-                         group_counters_available=last_counter.get('group_counters_available'),
-                         group_counters_reason=last_counter.get('group_counters_reason'),
-                         hit_groups=_netem_hit_groups(last_counter),
-                         expected_ports=last_counter.get('expected_ports'),
-                         affected_packets=last_counter.get('affected_packets'),
-                         affected_bytes=last_counter.get('affected_bytes'),
-                         loss_pct=NETEM_LOSS_PCT, loss_defaulted=True,
-                         hit_semantics=netem_hit_semantics(scope),
-                         responsibility_layer=NETEM_RESPONSIBILITY_LAYER,
-                         counter=last_counter)
+                sample(last_counter)
             trajectory.poll(pool)
             pause(min(c['counter_interval_sec'], max(0, deadline_ns / 10**9 - time.monotonic()),
                       max(0, (trajectory.next_due_ns - time.monotonic_ns()) / 10**9)))
@@ -1406,7 +1462,9 @@ def _run_netem_window(c, active, receipt, emit, step, activity, activity_is_pair
             if mutation_active:
                 # A neutral transparent class must not flip applied on restore.
                 receipt['applied'] = bool(receipt['applied'] and restored)
-            emit('discovery_netem_end', receipt=end)
+            restore_event = emit('discovery_netem_end', receipt=end)
+            restore_ref = restore_event['raw_event_ref']
+            restore_index = restore_event.get('namespace_event_index')
             if data_scope:
                 end_counter = end.get('counter_snapshot') or {}
                 emit('data_mutation_end', window='data_netem', scope=scope,
@@ -1434,6 +1492,12 @@ def _run_netem_window(c, active, receipt, emit, step, activity, activity_is_pair
                     carrier='discovery_netem',
                     post_restore_unix_ns=restore_wall_ns, post_restore_monotonic_ns=restore_mono_ns,
                     clock_guard_ns=CLOCK_GUARD_NS, activity_since_unix_ns=restore_wall_ns + CLOCK_GUARD_NS)
+    boundary_ref, boundary_index = boundary['raw_event_ref'], boundary.get('namespace_event_index')
+    stimulus_manifest = {'install_ref': install_ref, 'restore_ref': restore_ref,
+                         'boundary_ref': boundary_ref,
+                         'install_index': install_index, 'restore_index': restore_index,
+                         'boundary_index': boundary_index}
+    stimulus_counter = last_counter
     trajectory.restore_boundary_ns = restore_mono_ns
     recovery_deadline = time.monotonic() + c['recovery_timeout_sec']
     activity_event, fresh_recovery, post_evidence = None, False, None
@@ -1461,6 +1525,81 @@ def _run_netem_window(c, active, receipt, emit, step, activity, activity_is_pair
             'source': 'public_ros2_pair', 'evidence_ref': activity_event['raw_event_ref'],
             'fresh_graph_count': post_evidence})
         emit('discovery_netem_recovery_confirmed', receipt=recovery)
+    if covers_delivery and installed:
+        # Second, explicitly bounded netem segment: the real public delivery.
+        # The sealed recovery contract requires boundary < delivery window, so
+        # the stimulus segment above restores first; the delivery window then
+        # opens inside its own verified install..restore segment.
+        dbegin = carrier.start(spec)
+        dbegin_counter = dbegin.get('counter_snapshot')
+        # The install snapshot lives on the begin receipt itself; emitting an
+        # extra counter here would place a stimulus-series counter after that
+        # series' own ``data_mutation_end``.
+        delivery_install_event = emit('delivery_netem_begin', receipt=dbegin,
+                                      mutation_receipt=dict(receipt), neutral=dbegin['neutral'],
+                                      scope=scope, segment='post_restore_delivery')
+        install_ref = delivery_install_event['raw_event_ref']
+        install_index = delivery_install_event.get('namespace_event_index')
+        if data_scope:
+            emit('data_mutation_begin', window='data_netem_delivery', scope=scope,
+                 segment='post_restore_delivery',
+                 spec=dict(spec), port_groups=dbegin.get('groups'),
+                 port_group_ids=[group['group_id'] for group in dbegin.get('groups') or []],
+                 tc_dump_sha256=dbegin.get('tc_dump_sha256'), tc_dump=dbegin.get('tc_dump'),
+                 loss_pct=NETEM_LOSS_PCT, loss_defaulted=True,
+                 responsibility_layer=NETEM_RESPONSIBILITY_LAYER,
+                 hit_semantics=netem_hit_semantics(scope),
+                 counter_snapshot=dbegin_counter,
+                 mutation_receipt=dict(receipt))
+        delivery_open[0] = True
+        delivery = _run_post_restore_delivery(c, emit, pool, events, pause)
+        last_counter = carrier.counters()
+        sample(last_counter)
+        dend = carrier.restore()
+        delivery_restored = dend['restored'] is True
+        if mutation_active:
+            receipt['applied'] = bool(receipt['applied'] and delivery_restored)
+        if data_scope:
+            dend_counter = dend.get('counter_snapshot') or {}
+            emit('data_mutation_end', window='data_netem_delivery', scope=scope,
+                 segment='post_restore_delivery',
+                 restored=delivery_restored,
+                 tc_dump_after_sha256=dend.get('tc_dump_after_sha256'),
+                 tc_dump_sha256=dbegin.get('tc_dump_sha256'),
+                 residual_qdisc=dend.get('residual_qdisc'),
+                 residual_filter=dend.get('residual_filter'),
+                 only_noqueue_root=dend.get('only_noqueue_root'),
+                 counter_snapshot=dend.get('counter_snapshot'),
+                 counter_observed=dend.get('counter_observed'),
+                 group_counters=dend_counter.get('group_counters'),
+                 group_counters_available=dend_counter.get('group_counters_available'),
+                 hit_groups=_netem_hit_groups(dend_counter),
+                 loss_pct=NETEM_LOSS_PCT, loss_defaulted=True,
+                 responsibility_layer=NETEM_RESPONSIBILITY_LAYER,
+                 hit_semantics=netem_hit_semantics(scope),
+                 restore_receipt=dend)
+        restore_event = emit('delivery_netem_end', receipt=dend,
+                             mutation_receipt=dict(receipt), segment='post_restore_delivery')
+        restore_ref = restore_event['raw_event_ref']
+        restore_index = restore_event.get('namespace_event_index')
+        delivery_restore_wall_ns, delivery_restore_mono_ns = time.time_ns(), time.monotonic_ns()
+        delivery_boundary = emit(
+            'delivery_restore_boundary', restored=delivery_restored,
+            netem_was_installed=True, netem_installed=False,
+            netem_neutral_spec=spec['neutral'], carrier='discovery_netem',
+            segment='post_restore_delivery',
+            post_restore_unix_ns=delivery_restore_wall_ns,
+            post_restore_monotonic_ns=delivery_restore_mono_ns,
+            clock_guard_ns=CLOCK_GUARD_NS,
+            activity_since_unix_ns=delivery_restore_wall_ns + CLOCK_GUARD_NS,
+            stimulus_boundary_ref=boundary_ref,
+            delivery_window_refs={'open_event_ref': delivery['open_ref'],
+                                  'close_event_ref': delivery['close_ref']})
+        delivery_boundary_ref = delivery_boundary['raw_event_ref']
+        delivery_boundary_index = delivery_boundary.get('namespace_event_index')
+        # The final graph snapshot must be anchored after the last restore.
+        restore_wall_ns, restore_mono_ns = delivery_restore_wall_ns, delivery_restore_mono_ns
+        restored = bool(restored and delivery_restored)
     receipt['hit'] = bool(mutation_active and counters_hit)
     if mutation_active:
         # netem matched-packet counters are carrier evidence only; they can
@@ -1468,28 +1607,105 @@ def _run_netem_window(c, active, receipt, emit, step, activity, activity_is_pair
         receipt['effect_observed'] = bool(receipt['hit'] and restored and activity_ok and fresh_recovery)
     else:
         receipt['effect_observed'] = bool(activity_ok and fresh_recovery)
+    if covers_delivery:
+        # The delivery segment installed its own qdisc, so its final snapshot is
+        # the data-plane count for the judged delivery only, never the stimulus
+        # segment's packets.
+        delivery_counter = last_counter
+        data_counters_hit = bool(_netem_counter_hit(delivery_counter, 'data'))
     data_plane_known = bool(data_scope and installed
                             and (last_counter or {}).get('group_counters_available') is True)
+    if covers_delivery:
+        emit('netem_delivery_overlap', delivery_inside_mutation_window=True,
+             install_event_ref=install_ref, delivery_open_ref=delivery['open_ref'],
+             delivery_close_ref=delivery['close_ref'], restore_event_ref=restore_ref,
+             boundary_event_ref=delivery_boundary_ref,
+             stimulus_install_ref=stimulus_manifest['install_ref'],
+             stimulus_restore_ref=stimulus_manifest['restore_ref'],
+             stimulus_boundary_ref=stimulus_manifest['boundary_ref'],
+             install_event_index=install_index,
+             delivery_open_event_index=delivery['open_event_index'],
+             delivery_close_event_index=delivery['close_event_index'],
+             restore_event_index=restore_index, boundary_event_index=delivery_boundary_index,
+             chronology='install<delivery_open<delivery_close<restore<boundary',
+             origin='runtime.netem_covers_delivery',
+             is_candidate_adjudication=False)
     emit('window_close', window='discovery_netem', active_mutation=mutation_active,
          netem_installed=installed, neutral_spec=spec['neutral'], scope=scope,
          data_plane_counter_hit=(bool(data_counters_hit) if data_plane_known else None),
-         hit_groups=_netem_hit_groups(last_counter) if data_scope else None,
+         hit_groups=_netem_hit_groups(stimulus_counter) if data_scope else None,
          mutation_receipt=dict(receipt))
-    emit('mutation_effect' if mutation_active else 'neutral_control_observation',
-         effect_id='discovery_netem_then_restore', mutation_receipt=dict(receipt),
-         discovery_activity_observed=activity_ok, fresh_count_graph=fresh_recovery,
-         netem_last_counter=last_counter, restore_boundary_ref=boundary['raw_event_ref'],
-         scope=scope,
-         data_plane_counter_hit=(bool(data_counters_hit) if data_plane_known else None),
-         neutral_no_op=not mutation_active)
-    return {'mutation_active': mutation_active, 'installed': installed,
-            'neutral_spec': spec['neutral'], 'restored': restored if installed else None,
-            'counter_hit': bool(receipt['hit']), 'activity_ok': activity_ok,
-            'fresh_recovery': fresh_recovery, 'last_counter': last_counter,
-            'window_sec': window_sec, 'spec': spec, 'begin': begin,
-            'restore_mono_ns': restore_mono_ns,
-            'scope': scope,
-            'data_plane_counter_hit': (bool(data_counters_hit) if data_plane_known else None)}
+    effect = emit('mutation_effect' if mutation_active else 'neutral_control_observation',
+                  effect_id='discovery_netem_then_restore', mutation_receipt=dict(receipt),
+                  discovery_activity_observed=activity_ok, fresh_count_graph=fresh_recovery,
+                  netem_last_counter=stimulus_counter, restore_boundary_ref=boundary['raw_event_ref'],
+                  scope=scope,
+                  data_plane_counter_hit=(bool(data_counters_hit) if data_plane_known else None),
+                  neutral_no_op=not mutation_active)
+    if covers_delivery:
+        emit('netem_delivery_effect', effect_ref=effect['raw_event_ref'],
+             delivery_restore_boundary_ref=delivery_boundary_ref,
+             delivery_inside_mutation_window=True,
+             is_candidate_adjudication=False)
+    result = {'mutation_active': mutation_active, 'installed': installed,
+              'neutral_spec': spec['neutral'], 'restored': restored if installed else None,
+              'counter_hit': bool(receipt['hit']), 'activity_ok': activity_ok,
+              'fresh_recovery': fresh_recovery, 'last_counter': last_counter,
+              'window_sec': window_sec, 'spec': spec, 'begin': begin,
+              'restore_mono_ns': restore_mono_ns,
+              'scope': scope,
+              'data_plane_counter_hit': (bool(data_counters_hit) if data_plane_known else None)}
+    if covers_delivery:
+        # Additive receipts for the covered-delivery contract only.  The
+        # legacy shape keeps its result payload unchanged.
+        result.update(
+            covers_delivery=True, delivery=delivery,
+            delivery_inside_mutation_window=True,
+            delivery_window_refs={'open_event_ref': delivery['open_ref'],
+                                  'close_event_ref': delivery['close_ref']},
+            netem_install_ref=install_ref, netem_restore_ref=restore_ref,
+            netem_boundary_ref=delivery_boundary_ref,
+            delivery_boundary_ref=delivery_boundary_ref,
+            stimulus_netem_manifest=stimulus_manifest,
+            data_group_counters_available=(last_counter or {}).get('group_counters_available')
+            if (data_scope and installed) else None,
+            data_group_packets=(_data_group_counter(last_counter)['packets']
+                                if _data_group_counter(last_counter) is not None else None))
+    return result
+
+
+def _run_post_restore_delivery(c, emit, pool, events, pause):
+    """The single bounded post-restore delivery sequence.
+
+    Both the legacy (window strictly after restore) and the
+    ``netem_covers_delivery`` (window opened while the tc class is still
+    installed) callers run this one implementation, so send/receive tokens,
+    the delivery contract and the window events cannot drift apart.
+    """
+    expected = list(range(c['pre_match_count'], c['pre_match_count'] + c['post_match_count']))
+    omitted = expected[len(expected) // 2] if c['fault_id'] else None
+    emit('delivery_contract', expected_sequences=expected, sentinel_sequence=expected[-1], phase='post_restore',
+         fault_id=c['fault_id'], contract_includes_harness_omission=True, prejoin_in_delivery_contract=False, qos=c['qos'])
+    opening = emit('window_open', window='post_restore_delivery', expected_sequences=expected)
+    for sequence in expected:
+        cid = pool.command('writer', 'publish', send_sequence=sequence, phase='post_restore', omit=sequence == omitted)
+        pool.wait(lambda cid=cid: sum(e['event'] == 'command_done' and e.get('role') == 'writer' and e.get('command_id') == cid for e in events) == 1,
+                  c['startup_timeout_sec'], 'postrestore_publish_ack')
+        pause(c['publish_interval_sec'])
+    def delivered():
+        received = {e['send_sequence'] for e in events if e['event'] == 'receive' and e.get('phase') == 'post_restore'}
+        return set(expected) - ({omitted} if omitted is not None else set()) <= received
+    timed_out = False
+    try:
+        pool.wait(delivered, c['delivery_timeout_sec'], 'postrestore_delivery_deadline')
+    except TimeoutError:
+        timed_out = True
+    closing = emit('window_close', window='post_restore_delivery', deadline_expired=timed_out)
+    return {'expected_sequences': expected, 'omitted_sequence': omitted,
+            'timed_out': timed_out,
+            'open_ref': opening['raw_event_ref'], 'close_ref': closing['raw_event_ref'],
+            'open_event_index': opening.get('namespace_event_index'),
+            'close_event_index': closing.get('namespace_event_index')}
 
 
 def _body(request, owner_channel):
@@ -1509,6 +1725,9 @@ def _body(request, owner_channel):
               'effective_rmws': effective_rmws_receipt(c)}
     pool = observer = carrier = None
     trajectories = []
+    netem_delivery = None
+    netem_overlap_facts = None
+    data_plane_facts = (None, None)
     counter_hit = restored = activity_ok = fresh_recovery = drop_activity_ok = False
     carrier_kind = discovery_carrier_kind(c)
     implementation = c.get('carrier_implementation', IMPLEMENTATION)
@@ -1663,6 +1882,34 @@ def _body(request, owner_channel):
                                       carrier, pool, events, endpoints, matched,
                                       precondition, match_receipt)
             counter_hit = bool(netem['counter_hit'])
+            netem_covers = bool(netem.get('covers_delivery'))
+            netem_delivery = netem['delivery'] if netem_covers else None
+            if netem_covers:
+                netem_overlap_facts = {
+                    'inside': netem['delivery_inside_mutation_window'],
+                    'window_refs': netem['delivery_window_refs'],
+                    'install_ref': netem['netem_install_ref'],
+                    'restore_ref': netem['netem_restore_ref'],
+                    'boundary_ref': netem['netem_boundary_ref'],
+                    'chronology': 'install<delivery_open<delivery_close<restore<boundary'}
+            if netem_covers and netem['scope'] in ('data', 'both'):
+                # Only the covered-delivery contract reports a data-plane
+                # observation: the legacy shape must stay byte-identical.
+                if netem.get('data_group_counters_available') is False:
+                    # No trustworthy per-group attribution.  Never collapse this
+                    # into mutation_ineffective: it is an observation limit.
+                    data_plane_facts = (False, 'tc_action_group_counters_unavailable')
+                elif netem['data_group_packets']:
+                    data_plane_facts = (True, None)
+                else:
+                    # The window really covered the delivery, so a zero
+                    # data-group count means the samples went over another
+                    # transport (e.g. SHM) or were not attributable to these
+                    # UDP ports.  This is an observation limit, not a
+                    # mutation_ineffective verdict.
+                    data_plane_facts = (
+                        False, 'data_plane_not_observed_inside_covered_window:'
+                               'possibly_shm_or_non_udp_transport')
             restored = netem['restored']
             activity_ok = bool(netem['activity_ok'])
             fresh_recovery = bool(netem['fresh_recovery'])
@@ -1677,12 +1924,24 @@ def _body(request, owner_channel):
                 'mutation_active': netem['mutation_active'],
                 'netem_installed': netem['installed'],
                 'scope': netem['scope'],
-                'data_plane_counter_hit': netem['data_plane_counter_hit'],
                 'hit_semantics': netem_hit_semantics(netem['scope']),
                 'responsibility_layer': NETEM_RESPONSIBILITY_LAYER,
                 'loss_pct': NETEM_LOSS_PCT, 'loss_defaulted': True,
                 'begin_receipt': netem['begin'],
-                'last_counter': netem['last_counter']}
+                'last_counter': netem['last_counter'],
+                'covers_delivery': netem_covers,
+                'data_plane_counter_hit': netem['data_plane_counter_hit']}
+            if netem_covers:
+                result['environment']['discovery_netem'].update(
+                    delivery_inside_mutation_window=netem['delivery_inside_mutation_window'],
+                    delivery_window_refs=netem['delivery_window_refs'],
+                    netem_install_ref=netem['netem_install_ref'],
+                    netem_restore_ref=netem['netem_restore_ref'],
+                    netem_boundary_ref=netem['netem_boundary_ref'],
+                    data_plane_observed=(None if netem['data_group_counters_available'] is None
+                                         else bool(netem['data_plane_counter_hit'])),
+                    data_plane_observation_reason=data_plane_facts[1],
+                    data_group_packets=netem['data_group_packets'])
         elif not c.get('window_chain_requested'):
             # Legacy single-window path: behaviour is preserved, including the
             # restore-in-finally drop loop that its AST contract test inspects
@@ -1785,25 +2044,12 @@ def _body(request, owner_channel):
                  effect_id='discovery_interruption_then_restore', mutation_receipt=dict(receipt),
                  discovery_activity_observed=activity_ok, fresh_count_graph=fresh_recovery,
                  window_hits=window_hits)
-        expected = list(range(c['pre_match_count'], c['pre_match_count'] + c['post_match_count']))
-        omitted = expected[len(expected) // 2] if c['fault_id'] else None
-        emit('delivery_contract', expected_sequences=expected, sentinel_sequence=expected[-1], phase='post_restore',
-             fault_id=c['fault_id'], contract_includes_harness_omission=True, prejoin_in_delivery_contract=False, qos=c['qos'])
-        emit('window_open', window='post_restore_delivery', expected_sequences=expected)
-        for sequence in expected:
-            cid = pool.command('writer', 'publish', send_sequence=sequence, phase='post_restore', omit=sequence == omitted)
-            pool.wait(lambda cid=cid: sum(e['event'] == 'command_done' and e.get('role') == 'writer' and e.get('command_id') == cid for e in events) == 1,
-                      c['startup_timeout_sec'], 'postrestore_publish_ack')
-            pause(c['publish_interval_sec'])
-        def delivered():
-            received = {e['send_sequence'] for e in events if e['event'] == 'receive' and e.get('phase') == 'post_restore'}
-            return set(expected) - ({omitted} if omitted is not None else set()) <= received
-        timed_out = False
-        try:
-            pool.wait(delivered, c['delivery_timeout_sec'], 'postrestore_delivery_deadline')
-        except TimeoutError:
-            timed_out = True
-        emit('window_close', window='post_restore_delivery', deadline_expired=timed_out)
+        if netem_delivery is not None:
+            # netem_covers_delivery already ran the delivery inside the installed
+            # class; the delivery/overlap receipts came from that same call.
+            omitted = netem_delivery['omitted_sequence']
+        else:
+            omitted = _run_post_restore_delivery(c, emit, pool, events, pause)['omitted_sequence']
         try:
             if window_records:
                 final_restore_mono_ns = window_records[-1]['restore_boundary_monotonic_ns']
@@ -1871,7 +2117,10 @@ def _body(request, owner_channel):
             neutral_spec=bool(carrier_kind == 'discovery_netem'
                               and c['environment_mutation']['spec']['neutral']),
             netem_scope=(_netem_scope(c['environment_mutation']['spec'])
-                         if carrier_kind == 'discovery_netem' else None))
+                         if carrier_kind == 'discovery_netem' else None),
+            delivery_overlap=netem_overlap_facts,
+            data_plane_observed=data_plane_facts[0],
+            data_plane_reason=data_plane_facts[1])
         if window_records:
             result['facts'].update(discovery_windows=window_records,
                 discovery_window_count=len(window_records),
