@@ -647,3 +647,65 @@ git diff --check
 - “已批准开工”“已派遣”“已实现”“已真实执行”“已审核候选”“已成熟”是五个不同状态，文档与汇报不得合并。
 
 本次计划文档检查只验证章节、路径、任务／测试编号、依赖和来源说明；没有新业务实现或 DDS 执行。相较前版，工程范围没有扩回“大平台”，只是将最小 fuzz 闭环细化到能够派工、集成和逐项验收的程度，并区分“已获准开工”与“已完成”。
+
+## 执行状态更新（2026-11-17，HEAD d748be1）
+
+本节只记录真实完成与真实缺陷，不构成 seal 或成熟声明。
+
+### 已完成并真实执行
+
+| 能力 | 状态 | 真实证据 |
+|---|---|---|
+| 宽采样 `mutate_wide`（boundary/representative/log_uniform/linear_uniform/neighbor/jump） | 已实现且已接线 runner | `results/fuzz-cli/wide-chain-1`：6 条真实 running，4 条 judged/pass，`sampling_kind` 覆盖 jump/linear_uniform/boundary；2 条 zero-delay 正确落 `reached`（0 延迟无可观测时机效果，非缺陷） |
+| 多层变异链 `compose_chain`（1..4 层） | 已实现且已接线 | 同 run 每行 `chain_depth=2`、2 条 operations；单一 `effective_input_sha256`、单一 capsule、单一 config |
+| 覆盖账 | 已实现 | `run_report.exploratory_coverage_table` 按 target×surface×sampling_kind×chain_depth 分档；corpus bucket key 同步纳入，避免不同采样类互相压掉 |
+| endpoint churn（reader2..reader9、创建/销毁、writer2） | 已实现 | `tests/test_fuzz_runtime_lifecycle.py` 13 项；`results/fuzz-cli/churn-deep-005` 真实 judged/pass（双 RMW、3 代 reader + 1 次销毁 + writer2 churn + 256 包 burst） |
+| 多窗 E02/E03（1..3 窗、逐窗 delta） | runner 与 adapter 已实现 | `tests/test_fuzz_multiwindow_admission.py` 22 项；真实多窗尚未执行 |
+| netem carrier（discovery 面） | 已实现 + 真实自检 | `scripts/check_discovery_netem.py`：隔离 netns 内 delay 50.187ms、duplicate 2 copies、reorder 9 inversions、restore 后 clean |
+| netem carrier（data 面） | 已实现 + 真实自检 | `scripts/check_netem_data_scope.py`：data 端口 delay 50.07ms、duplicate 2、reorder 10 inversions、restore clean |
+| mixed-vendor（writer/reader 不同 RMW） | 已实现 | `tests/test_runtime_mixed_vendor.py` 27 项；真实跨厂商互操作尚未执行 |
+
+### 本轮修复的真实缺陷（均由真实运行暴露，非离线构造）
+
+1. **window-chain facts 缺 match proof**：多窗路径未写 `facts['match']`，导致 recovery oracle 全部 unknown。修复后 `results/fuzz-cli/churn-deep-005` 真实 pass。
+2. **primary 窗口取错**：曾用「中断开始」当交付窗口起点，导致 `boundary < activity <= window.start` 必然不成立。修为 post-restore 交付窗口。
+3. **match 证明须在最终 restore 之后**：pre-window 快照不能替代恢复后重建；改为以最终 `discovery_restore_boundary` 为 anchor。
+4. **netem 单窗被误拒**：`environment_windows` 存在即拒绝，而 runner 对 recovery 总会生成单窗，导致 netem 路径完全不可用。改为只拒绝 >1 窗。
+5. **netem restore 边界变量未初始化**：`_run_netem_window` 分支下 `restore_mono_ns` 未定义，真实运行 `UnboundLocalError`。修为把 netem 自身边界传给共享 final graph step。
+6. **carrier 实现硬编码**：adapter 把 carrier 实现写死为 nft drop，netem 恒被拒。改为按 implementation 选择对应 receipt 契约。
+7. **窗口名不匹配**：adapter 期望 `discovery_netem_window`，运行期实际发 `discovery_netem`。
+8. **netem 时序**：netem 窗口 `install < open < restore < close`，与 drop 的 `install < open < close < restore` 不同；adapter 现按 carrier 区分。
+9. **namespace readiness 用 drop schema 校验 netem**：netem setup 没有 `drop_installed`/`initial_nft`。改为按 carrier 校验各自的 neutral 证据。
+10. **data 面 netem 从未覆盖交付流量**（本轮最重要）：真实 raw 证明 netem 窗口 1.08s 结束于交付发布之前，交付的 128 条消息全部在窗口外，data 组仅 3–6 个stimulus 包。这不是「变异无效」，而是工具缺陷。已实现 `netem_covers_delivery`：stimulus 段之后另起一段覆盖真实交付窗口的 netem，并新增 `netem_delivery_overlap` 证明 `install < delivery_open < delivery_close < restore < boundary`。
+11. **观察限制被误报为 `mutation_ineffective`**：FastDDS 数据面计数为 0 时被记成「变异无效」，会误导归因。现区分 `data_plane_observed=false` + `data_plane_observation_reason`，并写入 `observation_limit` 字段。
+12. **host 侧 summary 重建抹掉 carrier facts**：`_body` 算好的 netem 事实在 host finally 重新 `summarize_discovery` 时被丢弃。修为保留 `delivery_overlap` 与 `data_plane_*`。
+
+### 真实运行汇总（截至 d748be1）
+
+```text
+judged/pass      137
+judged/unknown    12   （均为 adapter 修复前的历史 run，raw 保留）
+aborted/unknown   47   （均为工具缺陷，已逐项定位并修复；raw 保留）
+reached/n-a       28   （zero-delay 等语义正确分支）
+planned/unknown   15   （planning-only 样本）
+自然候选           0
+```
+
+`results/fuzz-cli/netem-delivery-extreme-4` 是本轮最有价值的一次真实运行：
+
+```text
+CycloneDDS: delivery_inside_mutation_window=True, data_plane_observed=True,
+            data_netem_delivery packets=258（真实业务包经过 netem），
+            oracle pass（128/128 有序、无重复）
+FastDDS:    delivery_inside_mutation_window=True, data_plane_observed=False,
+            reason=data_plane_not_observed_inside_covered_window:possibly_shm_or_non_udp_transport
+```
+
+结论：在 400ms 延迟 / 100% 重排 / 100% 重复下，CycloneDDS 仍满足可靠有序交付合同——这是**正确的 DDS 行为**，不是漏检；oracle 已被真实压到。
+
+### 仍未完成
+
+- **多 endpoint 的 S1 发现图**：`builtin.discovery_projection_reconciliation` 仍硬编码 1 writer + 1 reader（`projection_adapter.py:138` 要求 `len(items)==1`）。S1 的定义核心是发现图投影，单端点对无法覆盖多 endpoint 的遗漏/重复/身份混淆。这是当前最可能产出真实候选的缺口。
+- FastDDS 数据面端口推导：实测其 user-data socket 落在 `PB+DG*domain+11+2p`，但 tc 计数为 0，说明其实际流量路径与推导不一致或走了 SHM；已在 facts 中如实记录为观察限制，未伪判。
+- 真实多窗（E02/E03）运行、mixed-vendor 真实互操作、netem 与 churn 组合的真实运行。
+- 自然候选仍为 0；不得用任何控制/工具错误凑数。
