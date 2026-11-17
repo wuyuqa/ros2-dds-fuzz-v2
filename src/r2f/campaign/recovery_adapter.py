@@ -624,7 +624,12 @@ def _multi_window_recovery_facts(events, runtime, config):
         facts['match'] = {'writer_id': tokens['writer']['endpoint_gid'],
                           'reader_id': tokens['reader']['endpoint_gid'],
                           'at_ns': match_ns}
-        _window_one(events, 'window_open', 0, window='discovery_interruption')
+        # The netem carrier opens a single named window; a drop chain opens one
+        # interruption window per planned index. Both must still be present.
+        if runtime.get('carrier_implementation') == NETEM_IMPLEMENTATION:
+            _one(events, 'window_open', window='discovery_netem_window')
+        else:
+            _window_one(events, 'window_open', 0, window='discovery_interruption')
         if not (_window_one(events, 'discovery_window_restore_verified',
                             len(plans) - 1)['event_index'] < opening['event_index']
                 < closing['event_index']):
