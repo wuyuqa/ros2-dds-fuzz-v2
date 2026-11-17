@@ -270,7 +270,12 @@ def projection_endpoint_inventory(tokens, snapshots, config, wire_by_role):
             'type': row.get('topic_type') if row else config['message_type'],
             'qos': observed_qos,
             'expected_qos': expected_qos,
-            'qos_equal': observed_qos == expected_qos if observed_qos is not None else None,
+            # Compare only the fields this endpoint contract declares.  The
+            # public graph also reports at least ``history``, which is not a
+            # submitted field here; including it would mark every honest
+            # endpoint unequal and would turn a real observation into noise.
+            'qos_equal': ({key: observed_qos.get(key) for key in expected_qos}
+                          == expected_qos) if observed_qos is not None else None,
             'observed_in_graph': row is not None,
             'wire_seen': wire.get('lifecycle') == 'alive' if wire else False,
             'wire_topic': (wire_fields.get('topic') or {}).get('value'),
