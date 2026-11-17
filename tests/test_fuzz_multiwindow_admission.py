@@ -252,6 +252,26 @@ class WindowChainFixture:
             'initial_nft': {'nftables': []}})
         for token in self.tokens.values():
             token['created_monotonic_ns'] = token['monotonic_ns']
+        # The primary oracle consumes the identity-correlated match proof, so the
+        # fixture must carry the same request -> snapshot -> ACK chain real raw has.
+        reader_created = self.tokens['reader']['created_monotonic_ns']
+        for number, role in enumerate(('writer', 'reader')):
+            command_id = 10 + number
+            token = self.tokens[role]
+            request = self.emit('match_snapshot_requested', role=role,
+                                command_id=command_id,
+                                requested_monotonic_ns=reader_created + 1,
+                                reader_created_monotonic_ns=reader_created)
+            self.emit('match_snapshot', role=role, command_id=command_id,
+                      matched_count=1, endpoint_gid=token['endpoint_gid'],
+                      sampled_monotonic_ns=request['monotonic_ns'],
+                      count_api=('get_subscription_count' if role == 'writer'
+                                 else 'get_publisher_count'),
+                      pid=token['pid'], endpoint_generation=token['endpoint_generation'],
+                      rmw_identifier=token['rmw_identifier'])
+            self.emit('command_done', role=role, command_id=command_id,
+                      pid=token['pid'], endpoint_generation=token['endpoint_generation'],
+                      rmw_identifier=token['rmw_identifier'])
         self.snapshot = self.emit('discovery_precondition_snapshot',
                                   bindings=self._bindings(),
                                   worker_pids={'writer': 301, 'reader': 302})
