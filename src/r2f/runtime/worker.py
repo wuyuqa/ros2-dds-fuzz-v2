@@ -17,7 +17,9 @@ def emit_snapshot(endpoint, role, command_id, endpoint_gid, graph, emit):
     reader process. A later explicit query establishes a comparable observation
     without changing the original count-transition timestamp.
     """
-    api = ('get_subscription_count' if role in ('writer', 'writer2')
+    # Endpoint kind, not a fixed role list: writerN publishes, readerN and
+    # probe subscribe.
+    api = ('get_subscription_count' if role.startswith('writer') or role == 'probe'
            else 'get_publisher_count')
     sampled_ns = time.monotonic_ns()
     count = getattr(endpoint, api)()
@@ -208,7 +210,8 @@ def main():
             executor.spin_once(timeout_sec=0.02)
             now = time.monotonic_ns()
             count = (endpoint.get_subscription_count()
-                     if endpoint_role in ('writer', 'probe') else endpoint.get_publisher_count())
+                     if endpoint_role == 'writer' or endpoint_role == 'probe'
+                     else endpoint.get_publisher_count())
             if count != last_count:
                 emit('match', matched_count=count, endpoint_gid=local_gid)
                 emit('graph_snapshot', **graph())
