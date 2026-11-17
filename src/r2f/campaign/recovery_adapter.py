@@ -15,6 +15,11 @@ from r2f.modules.s1.facts import integer
 from .runtime_adapter import _one, _iso, fresh_match_proof
 
 IMPLEMENTATION = 'isolated_netns_nft_discovery_udp_drop'
+NETEM_IMPLEMENTATION = 'isolated_netns_tc_netem_discovery_udp'
+#: Each carrier has its own reviewed setup/restore receipt schema.  Selecting
+#: by implementation keeps the drop contract byte-identical and never lets one
+#: carrier's receipt satisfy the other's checks.
+CARRIER_IMPLEMENTATIONS = (IMPLEMENTATION, NETEM_IMPLEMENTATION)
 
 #: Reader generations reader2..reader9 are additional discovery stimuli.
 MAX_RECREATED_READERS = 8
@@ -540,7 +545,7 @@ def _multi_window_recovery_facts(events, runtime, config):
                 or len(probe_workers) > 1
                 or any(w.get('returncode') != 0 for w in workers)
                 or _one(events, 'namespace_controller_exited').get('returncode') != 0
-                or runtime.get('carrier_implementation') != IMPLEMENTATION
+                or runtime.get('carrier_implementation') not in CARRIER_IMPLEMENTATIONS
                 or any(e['event'] in ('worker_error', 'worker_unexpected_exit',
                                       'runtime_abort', 'owned_worker_cleanup_signal')
                        for e in events)):
@@ -549,8 +554,18 @@ def _multi_window_recovery_facts(events, runtime, config):
         admission = _one(events, 'namespace_host_admission_verified')
         isolation = _isolation(admission['isolation'])
         setup = _one(events, 'discovery_network_setup')['receipt']
-        if setup.get('health_ok') is not True or setup.get('drop_installed') is not False:
-            raise ValueError('discovery namespace initial state not healthy/neutral')
+        if setup.get('health_ok') is not True:
+            raise ValueError('discovery namespace initial state not healthy')
+        if runtime.get('carrier_implementation') == IMPLEMENTATION:
+            # Drop carrier: the initial state must be an untouched nft ruleset.
+            if setup.get('drop_installed') is not False:
+                raise ValueError('discovery namespace initial state not neutral')
+        else:
+            # netem carrier: the initial state must have no installed qdisc or
+            # filter, which it reports instead of the nft fields.
+            if (setup.get('mutation_installed') is not False
+                    or setup.get('initial_filter') not in ([], None)):
+                raise ValueError('discovery netem carrier initial state not neutral')
         tokens = {r: _one(events, 'endpoint_created', role=r) for r in ('writer', 'reader')}
         if len({t['pid'] for t in tokens.values()}) != 2 or len({t['endpoint_gid'] for t in tokens.values()}) != 2:
             raise ValueError('independent endpoint process/GID identity missing')
@@ -729,7 +744,7 @@ def recovery_facts(events, runtime, config):
                 or len(probe_workers) > 1
                 or any(w.get('returncode') != 0 for w in workers)
                 or _one(events, 'namespace_controller_exited').get('returncode') != 0
-                or runtime.get('carrier_implementation') != IMPLEMENTATION
+                or runtime.get('carrier_implementation') not in CARRIER_IMPLEMENTATIONS
                 or any(e['event'] in ('worker_error', 'worker_unexpected_exit', 'runtime_abort', 'owned_worker_cleanup_signal') for e in events)):
             raise ValueError('discovery pair/controller lifecycle incomplete')
         if probe_workers and any(w.get('pid') in {p['pid'] for p in pair_workers} for w in probe_workers):
@@ -739,10 +754,17 @@ def recovery_facts(events, runtime, config):
         isolation = _isolation(admission['isolation'])
         setup_event = _one(events, 'discovery_network_setup')
         setup = setup_event['receipt']
-        if setup.get('health_ok') is not True or setup.get('drop_installed') is not False:
-            raise ValueError('discovery namespace initial state not healthy/neutral')
-        if any('table' in e for e in setup['initial_nft']['nftables']):
-            raise ValueError('discovery namespace had preexisting nft rules')
+        if setup.get('health_ok') is not True:
+            raise ValueError('discovery namespace initial state not healthy')
+        if runtime.get('carrier_implementation') == IMPLEMENTATION:
+            if setup.get('drop_installed') is not False:
+                raise ValueError('discovery namespace initial state not neutral')
+            if any('table' in e for e in setup['initial_nft']['nftables']):
+                raise ValueError('discovery namespace had preexisting nft rules')
+        else:
+            if (setup.get('mutation_installed') is not False
+                    or setup.get('initial_filter') not in ([], None)):
+                raise ValueError('discovery netem carrier initial state not neutral')
         tokens = {r: _one(events, 'endpoint_created', role=r) for r in ('writer', 'reader')}
         # F3: recreated readers are additional discovery stimuli only.  The
         # original writer/reader pair stays the delivery and binding contract;
