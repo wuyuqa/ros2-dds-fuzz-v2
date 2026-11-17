@@ -54,7 +54,11 @@ def _lifecycle(events, runtime, config, observation):
                     raise ValueError('projection lifecycle process differs:'+key)
             if binding['generation'] != event.get('generation', event.get('endpoint_generation')):
                 raise ValueError('projection lifecycle generation differs')
-        expected_qos = config.get(role+'_qos', config['qos'])
+        # Per-role QoS overlays are submitted input too: a role declared in
+        # ``projection_role_qos`` must be checked against that overlay, not
+        # only against the base profile.
+        overlay = (config.get('projection_role_qos') or {}).get(role) or {}
+        expected_qos = {**config.get(role + '_qos', config['qos']), **overlay}
         if any(e.get('qos') != expected_qos or e.get('topic') != config['topic'] or e.get('message_type') != config['message_type'] for e in (call, returned)):
             raise ValueError('actual create-call input differs from capsule')
         if not begin['monotonic_ns'] < call['monotonic_ns'] <= returned['monotonic_ns']:
