@@ -946,7 +946,8 @@ def window_churn_schedule(c, drop_duration_sec):
 def run_window_churn(pool, schedule, events, *, window_start_ns,
                      window_duration_sec, startup_timeout_sec, emit,
                      pre_match_count, publish_burst_count,
-                     publish_burst_interval_sec, config=None):
+                     publish_burst_interval_sec, config=None,
+                     prior_created=(), prior_destroyed=()):
     """Execute one validated create/destroy timeline inside a drop window.
 
     window_start_ns is the monotonic instant the window opened; each item's
@@ -957,8 +958,11 @@ def run_window_churn(pool, schedule, events, *, window_start_ns,
     token. The original pair roles are never referenced here.
     """
     pending = list(schedule)
-    created_roles = set()
-    destroyed_roles = set()
+    # Chain-level state: a role created in an earlier window is still live, and
+    # one destroyed there must not be silently recreated by a later window's
+    # identical schedule.
+    created_roles = set(prior_created)
+    destroyed_roles = set(prior_destroyed)
     deadline_ns = window_start_ns + int(window_duration_sec * 1_000_000_000)
     while pending and time.monotonic_ns() < deadline_ns:
         item = pending[0]
@@ -1082,6 +1086,7 @@ def _run_window_chain(c, active, receipt, emit, step, activity, activity_is_pair
     ledger = WindowLedger(plans)
     previous_recovery_ref = precondition['raw_event_ref']
     counter_hit = False
+    chain_created, chain_destroyed = set(), set()
     try:
         if active:
             receipt.update(submitted=True, carrier_admitted=True)
@@ -1138,9 +1143,11 @@ def _run_window_chain(c, active, receipt, emit, step, activity, activity_is_pair
                 pre_match_count=c['pre_match_count'],
                 publish_burst_count=c.get('publish_burst_count', 32),
                 publish_burst_interval_sec=c.get('publish_burst_interval_sec', 0.0),
-                config=c)
+                config=c, prior_created=chain_created, prior_destroyed=chain_destroyed)
             created_roles = set(churn_result['created_roles'])
             destroyed_roles = set(churn_result['destroyed_roles'])
+            chain_created |= created_roles
+            chain_destroyed |= destroyed_roles
             if active and c.get('publish_burst_in_window', False):
                 burst_count = c.get('publish_burst_count', 32)
                 if type(burst_count) is not int or not 1 <= burst_count <= MAX_PUBLISH_BURST_COUNT:
