@@ -1487,6 +1487,7 @@ def _run_netem_window(c, active, receipt, emit, step, activity, activity_is_pair
             'counter_hit': bool(receipt['hit']), 'activity_ok': activity_ok,
             'fresh_recovery': fresh_recovery, 'last_counter': last_counter,
             'window_sec': window_sec, 'spec': spec, 'begin': begin,
+            'restore_mono_ns': restore_mono_ns,
             'scope': scope,
             'data_plane_counter_hit': (bool(data_counters_hit) if data_plane_known else None)}
 
@@ -1666,6 +1667,10 @@ def _body(request, owner_channel):
             activity_ok = bool(netem['activity_ok'])
             fresh_recovery = bool(netem['fresh_recovery'])
             drop_activity_ok = activity_ok
+            # The netem window owns its own restore boundary; the shared final
+            # graph step must use it instead of the drop-chain local, which is
+            # never assigned on this branch.
+            final_restore_mono_ns = netem['restore_mono_ns']
             result['environment']['discovery_netem'] = {
                 'spec': netem['spec'], 'window_sec': netem['window_sec'],
                 'neutral_spec': netem['neutral_spec'],
@@ -1802,8 +1807,6 @@ def _body(request, owner_channel):
         try:
             if window_records:
                 final_restore_mono_ns = window_records[-1]['restore_boundary_monotonic_ns']
-            else:
-                final_restore_mono_ns = restore_mono_ns
             step('observe_final_graph', ['verify_namespace_bindings'],
                  lambda: snapshot_pair(final_restore_mono_ns), observation=True)
         except (TimeoutError, RuntimeError) as exc:
