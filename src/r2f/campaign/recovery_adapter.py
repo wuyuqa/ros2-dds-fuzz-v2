@@ -645,7 +645,7 @@ def _multi_window_recovery_facts(events, runtime, config):
         # The netem carrier opens a single named window; a drop chain opens one
         # interruption window per planned index. Both must still be present.
         if runtime.get('carrier_implementation') == NETEM_IMPLEMENTATION:
-            _one(events, 'window_open', window='discovery_netem_window')
+            _one(events, 'window_open', window='discovery_netem')
         else:
             _window_one(events, 'window_open', 0, window='discovery_interruption')
         if not (_window_one(events, 'discovery_window_restore_verified',
@@ -886,7 +886,7 @@ def recovery_facts(events, runtime, config):
         opening = _one(events, 'window_open', window='post_restore_delivery')
         closing = _one(events, 'window_close', window='post_restore_delivery')
         netem_carrier = runtime.get('carrier_implementation') == NETEM_IMPLEMENTATION
-        window_name = 'discovery_netem_window' if netem_carrier else 'discovery_interruption'
+        window_name = 'discovery_netem' if netem_carrier else 'discovery_interruption'
         inter_open = _one(events, 'window_open', window=window_name)
         inter_close = _one(events, 'window_close', window=window_name)
         boundary_mono = integer(boundary['post_restore_monotonic_ns'], 'restore boundary')
