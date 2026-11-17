@@ -674,12 +674,15 @@ def namespace_body(request, owner_channel):
                 'match_namespace_event_index': pair['snapshot']['namespace_event_index'],
                 'ack_namespace_event_index': pair['ack']['namespace_event_index']}
                 if roles == DEFAULT_PROJECTION_ROLES else
+                # Non-default role sets keep the same key names as the default
+                # path so one adapter contract reads both; only the role list
+                # differs, never the receipt schema.
                 {'role': role, 'command_id': pair['graph']['command_id'],
-                'request_index': next(e['namespace_event_index'] for e in events
+                'request_namespace_event_index': next(e['namespace_event_index'] for e in events
                     if e['event'] == 'graph_snapshot_requested' and e['role'] == role and e['command_id'] == pair['graph']['command_id']),
-                'match_index': pair['snapshot']['namespace_event_index'],
-                'snapshot_index': pair['graph']['namespace_event_index'],
-                'ack_index': pair['ack']['namespace_event_index']})
+                'match_namespace_event_index': pair['snapshot']['namespace_event_index'],
+                'snapshot_namespace_event_index': pair['graph']['namespace_event_index'],
+                'ack_namespace_event_index': pair['ack']['namespace_event_index']})
                 for role, pair in graph_proof.items()])
         projection_live_budget(pool, deadline_ns)
         window = {'start_ns': begin['time_ns'], 'end_ns': exported['time_ns']}

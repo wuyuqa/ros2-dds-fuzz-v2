@@ -293,7 +293,16 @@ def projection_graph_proof(events, config, observation, tokens):
     for proof in proofs:
         role = proof.get('role')
         token = tokens[role]
-        request, match, graph, ack = [events[proof[k + '_index']]
+        def bound(key):
+            # The runtime emits the long ``<key>_namespace_event_index`` form;
+            # older fixtures use the short ``<key>_index``.  Both name the same
+            # raw event, so accept either without inventing an index.
+            for candidate in (key + '_namespace_event_index', key + '_index'):
+                if candidate in proof:
+                    return events[proof[candidate]]
+            raise ValueError('projection graph receipt missing index:' + key)
+
+        request, match, graph, ack = [bound(k)
                                       for k in ('request', 'match', 'snapshot', 'ack')]
         if [e.get('event') for e in (request, match, graph, ack)] != [
                 'graph_snapshot_requested', 'match_snapshot', 'graph_snapshot', 'command_done']:
@@ -349,7 +358,14 @@ def projection_graph_proof(events, config, observation, tokens):
     offsets = [e['time_ns'] - e['monotonic_ns'] for e in (begin, exported, close)]
     if max(offsets) - min(offsets) > 50000000:
         raise ValueError('projection observation clock discontinuity')
-    counts = {proof['role']: events[proof['match_index']]['matched_count'] for proof in proofs}
+    def proof_index(proof, key):
+        for candidate in (key + '_namespace_event_index', key + '_index'):
+            if candidate in proof:
+                return proof[candidate]
+        raise ValueError('projection graph receipt missing index:' + key)
+
+    counts = {proof['role']: events[proof_index(proof, 'match')]['matched_count']
+              for proof in proofs}
     return {'counts': counts, 'reasons': sorted(set(reasons)), 'snapshots': snapshots}
 
 
