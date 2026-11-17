@@ -57,8 +57,7 @@ def _lifecycle(events, runtime, config, observation):
         # Per-role QoS overlays are submitted input too: a role declared in
         # ``projection_role_qos`` must be checked against that overlay, not
         # only against the base profile.
-        overlay = (config.get('projection_role_qos') or {}).get(role) or {}
-        expected_qos = {**config.get(role + '_qos', config['qos']), **overlay}
+        expected_qos = _expected_role_qos(config, role)
         if any(e.get('qos') != expected_qos or e.get('topic') != config['topic'] or e.get('message_type') != config['message_type'] for e in (call, returned)):
             raise ValueError('actual create-call input differs from capsule')
         if not begin['monotonic_ns'] < call['monotonic_ns'] <= returned['monotonic_ns']:
@@ -126,7 +125,13 @@ def _role_kind(role):
 
 
 def _expected_role_qos(config, role):
-    return config.get(role + '_qos', config['qos'])
+    """Base role QoS with the submitted per-role overlay applied.
+
+    ``projection_role_qos`` is a first-class submitted input; ignoring it here
+    made the inventory state an expectation the run never used.
+    """
+    overlay = (config.get('projection_role_qos') or {}).get(role) or {}
+    return {**config.get(role + '_qos', config['qos']), **overlay}
 
 
 def _graph_entries(graph, key, roles, tokens):
