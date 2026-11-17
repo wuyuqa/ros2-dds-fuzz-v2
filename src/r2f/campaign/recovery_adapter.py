@@ -597,12 +597,14 @@ def _multi_window_recovery_facts(events, runtime, config):
 
         opening = _one(events, 'window_open', window='post_restore_delivery')
         closing = _one(events, 'window_close', window='post_restore_delivery')
-        # The primary oracle requires the identity-correlated match proof.
-        # The per-window collector verifies it separately, but the shared
-        # PrimaryFacts schema still needs the match block itself.
+        # The recovery oracle needs a match proof established *after* the final
+        # restore boundary.  The pre-window snapshot only proves the session was
+        # healthy before the interruption and cannot stand in for re-establishment.
+        final_boundary = _window_one(events, 'discovery_restore_boundary', len(plans) - 1)
+        final_boundary_mono = integer(final_boundary.get('post_restore_monotonic_ns'),
+                                      'final window restore boundary')
         match_ns, match_proof = fresh_match_proof(
-            events, tokens, snapshot,
-            anchor_ns=tokens['reader']['created_monotonic_ns'])
+            events, tokens, opening, anchor_ns=final_boundary_mono)
         facts['match_snapshot_proof'] = match_proof
         facts['match'] = {'writer_id': tokens['writer']['endpoint_gid'],
                           'reader_id': tokens['reader']['endpoint_gid'],

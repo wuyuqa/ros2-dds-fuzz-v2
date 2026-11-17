@@ -386,12 +386,34 @@ class WindowChainFixture:
                       window_id=plan['window_id'], restored=True,
                       recovery_confirmed=True, counter_hit=True)
             previous = confirmed['raw_event_ref']
+            previous_boundary_mono = boundary['monotonic_ns']
+        reader_created = self.tokens['reader']['created_monotonic_ns']
+        requested_after_boundary = previous_boundary_mono + 1
         expected = list(range(self.config['pre_match_count'],
                               self.config['pre_match_count'] + self.config['post_match_count']))
         self.emit('delivery_contract', expected_sequences=expected,
                   sentinel_sequence=expected[-1], phase='post_restore',
                   fault_id=None, qos=self.config['qos'],
                   prejoin_in_delivery_contract=False)
+        # Post-restore re-establishment proof: a fresh paired count query after
+        # the final restore boundary, not a re-use of the pre-window snapshot.
+        for number, role in enumerate(('writer', 'reader')):
+            command_id = 40 + number
+            token = self.tokens[role]
+            request = self.emit('match_snapshot_requested', role=role,
+                                command_id=command_id,
+                                requested_monotonic_ns=requested_after_boundary,
+                                reader_created_monotonic_ns=reader_created)
+            self.emit('match_snapshot', role=role, command_id=command_id,
+                      matched_count=1, endpoint_gid=token['endpoint_gid'],
+                      sampled_monotonic_ns=request['monotonic_ns'],
+                      count_api=('get_subscription_count' if role == 'writer'
+                                 else 'get_publisher_count'),
+                      pid=token['pid'], endpoint_generation=token['endpoint_generation'],
+                      rmw_identifier=token['rmw_identifier'])
+            self.emit('command_done', role=role, command_id=command_id,
+                      pid=token['pid'], endpoint_generation=token['endpoint_generation'],
+                      rmw_identifier=token['rmw_identifier'])
         self.emit('window_open', window='post_restore_delivery', expected_sequences=expected)
         for sequence in expected:
             self.emit('send', role='writer', phase='post_restore',
