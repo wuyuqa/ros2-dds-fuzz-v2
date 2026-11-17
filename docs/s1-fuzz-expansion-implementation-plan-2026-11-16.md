@@ -732,3 +732,41 @@ FastDDS     w0 delta=332  w1 delta=66  w2 delta=66   restored=True ×3  activity
 
 13. **多窗下同名 churn 角色重复创建**：第一窗创建的 `reader2` 在第二窗被再次 start，产生两条 `endpoint_created`、两个 pid，且 `discovery_reader_recreated` 引用了上一代的 pid（身份证据错误）。修为链级 `prior_created/prior_destroyed` 状态 + 按 generation 绑定 token。
 14. **提交窗口与计划窗口不一致**：`config['environment_windows']` 用 runtime 形态覆盖了 plan 里的提交值，E01 变异出的 drop 时长没有进入窗口，binding 判为 `not_preserved`。修为以 plan 的窗口为唯一提交权威。
+
+### 多 endpoint S1 发现图（2026-11-17，HEAD f44f83b）
+
+这是用户明确要求、也是 S1 定义核心的能力，本轮首次真实跑通。
+
+实现（`projection_pair.py` / `projection_adapter.py` / `worker.py`）：
+- `projection_roles`：`writer|reader` + `writer2..writer4` + `reader2..reader4`，总数 2..8，唯一且有至少 1 writer + 1 reader。
+- `projection_role_qos`：逐角色 QoS 覆盖，作为提交输入参与 binding 与 create-call 校验。
+- 每个端点一条独立命令链 `graph_snapshot_requested → match_snapshot → graph_snapshot → command_done`，command_id 全局唯一，pid/generation 逐角色绑定。
+- 新增 `projection_endpoint_inventory`（gid/topic/type/qos/expected_qos/qos_equal/observed_in_graph/wire_seen）与 `projection_graph_reasons`（missing/extra/duplicate 端点）。
+
+真实运行结果：
+
+```text
+results/fuzz-cli/projection-multi-3        4 端点（2w+2r）     judged/pass
+results/fuzz-cli/projection-multi-8        6 端点（3w+3r）     judged/pass
+```
+
+6 端点实测（含逐角色 QoS 覆盖 `writer2=best_effort`、`writer3=depth 8`）：
+
+```text
+所有 6 个端点: observed_in_graph=True, wire_seen=True, qos_equal=True
+writer3 实际 depth=8（其余 64），wire 与 graph 均正确反映该值
+oracle: independent_projection_fields_agree（pass）
+```
+
+同轮暴露并修复的 6 个真实缺陷（全部只在多 endpoint 下出现）：
+
+15. `graph_receipts` 对非默认角色使用短键 `request_index`，与 adapter 的长键契约不一致 → 真实运行 `KeyError`。
+16. adapter 只读长键，兼容旧 fixture 的短键需要显式双读，不能靠猜。
+17. inventory 的 `qos_equal` 把 graph 额外报告的 `history` 计入比较，导致每个正常端点都被判“不相等”。修为只比较合同声明的字段。
+18. `self_qos_entry` 硬编码 `writer/writer2`，`writer3` 被当成 reader 查 subscriptions，QoS 观测恒空。
+19. `emit_snapshot` 与主循环的 match-count API 同样只认 `writer/writer2`，`writer3` 调用 `get_publisher_count` 直接 `AttributeError` 退出。
+20. `_expected_role_qos` 未应用 `projection_role_qos` 覆盖，inventory 的期望值与实际提交不符（会误导审核）。
+
+**Oracle 反向验证**：构造一个 `reliability` 不一致的 projection facts，`evaluate_primary` 返回 `fail / builtin_graph_field_mismatch`。因此本轮 6 端点的 pass 是「真的都一致」，不是漏检。
+
+**已知合同边界（不改，保留为规格差距）**：`PROJECTION_FIELDS` 固定 9 个字段且显式声明 `history_depth=not_applicable_by_endpoint_schema`；`depth` 不在 oracle 字段集内。若要让 `depth` 差异也进入主判定，需要一次显式的 projection 合同版本升级，不能静默加字段。
