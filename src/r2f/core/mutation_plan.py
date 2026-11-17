@@ -18,6 +18,8 @@ RULE_SPEC_SCHEMA = "r2f.rule-spec/v1"
 EFFECT_SPEC_SCHEMA = "r2f.effect-spec/v1"
 MUTATION_OPERATION_SCHEMA = "r2f.mutation-operation/v1"
 MUTATION_PLAN_SCHEMA = "r2f.mutation-plan/v1"
+MUTATION_CHAIN_SCHEMA = "r2f.mutation-chain/v1"
+MUTATION_CHAIN_MAX_LENGTH = 4
 RUNTIME_WINDOW_SCHEMA = "r2f.runtime-window/v1"
 
 RNG_ALGORITHM = "mt19937-v1"
@@ -577,6 +579,9 @@ class MutationPlan:
     final_config: dict
     runtime_windows: list
     contract_hash: str
+    #: Present only for explicitly requested chains.  ``None`` keeps the
+    #: pre-chain ``to_dict()``/hash bytes identical for every old caller.
+    chain: Any = None
 
     def __post_init__(self):
         if self.plan_version != MUTATION_PLAN_SCHEMA:
@@ -591,7 +596,31 @@ class MutationPlan:
             raise ValueError("operations must contain MutationOperation objects")
         self.final_config = _mapping(self.final_config, "final_config")
         self.runtime_windows = _validate_runtime_windows(self.runtime_windows)
+        if self.chain is not None:
+            self.chain = self._validate_chain(self.chain)
         self.validate()
+
+    def _validate_chain(self, chain):
+        chain = _exact(snapshot(chain), {
+            "schema", "chain_length", "proposal_order", "surface_order", "constraints",
+        }, "mutation_chain")
+        if chain["schema"] != MUTATION_CHAIN_SCHEMA:
+            raise ValueError("unsupported mutation chain schema")
+        integer(chain["chain_length"], "mutation_chain.chain_length", minimum=1)
+        if chain["chain_length"] > MUTATION_CHAIN_MAX_LENGTH:
+            raise ValueError(f"mutation chain length exceeds {MUTATION_CHAIN_MAX_LENGTH}")
+        if chain["chain_length"] != len(self.operations):
+            raise ValueError("mutation chain length does not match operations")
+        for key in ("proposal_order", "surface_order"):
+            chain[key] = _string_list(chain[key], f"mutation_chain.{key}", allow_empty=False)
+            if len(chain[key]) != chain["chain_length"]:
+                raise ValueError(f"mutation chain {key} length mismatch")
+        if [operation.surface_id for operation in self.operations] != chain["surface_order"]:
+            raise ValueError("mutation chain surface_order does not match operations")
+        if [operation.op_id for operation in self.operations] != chain["proposal_order"]:
+            raise ValueError("mutation chain proposal_order does not match operations")
+        chain["constraints"] = _mapping(chain["constraints"], "mutation_chain.constraints")
+        return chain
 
     def validate(self, contract=None):
         op_ids = [op.op_id for op in self.operations]
@@ -629,6 +658,7 @@ class MutationPlan:
             "final_config": snapshot(self.final_config),
             "runtime_windows": snapshot(self.runtime_windows),
             "contract_hash": self.contract_hash,
+            **({"chain": snapshot(self.chain)} if self.chain is not None else {}),
         })
 
     def plan_hash(self):
@@ -638,20 +668,27 @@ class MutationPlan:
         })
 
     def to_dict(self):
-        return snapshot({
+        data = {
             "plan_version": self.plan_version, "rng_algorithm": self.rng_algorithm,
             "rng_seed": self.rng_seed, "parent_content_sha256": self.parent_content_sha256,
             "operations": [operation.to_dict() for operation in self.operations],
             "final_config": self.final_config, "runtime_windows": self.runtime_windows,
             "contract_hash": self.contract_hash,
-        })
+        }
+        if self.chain is not None:
+            data["chain"] = snapshot(self.chain)
+        return snapshot(data)
 
     @classmethod
     def from_dict(cls, data):
-        return cls(**_exact(snapshot(data), {
+        data = snapshot(data)
+        if not isinstance(data, dict):
+            raise ValueError("mutation_plan must be a dict")
+        chain = data.pop("chain", None)
+        return cls(**_exact(data, {
             "plan_version", "rng_algorithm", "rng_seed", "parent_content_sha256",
             "operations", "final_config", "runtime_windows", "contract_hash",
-        }, "mutation_plan"))
+        }, "mutation_plan"), chain=chain)
 
 
 @dataclass
@@ -787,13 +824,30 @@ def _apply_changes(data, changes):
 
 
 def compose(parent, proposals, contract, *, rng_seed=0, rng_algorithm=RNG_ALGORITHM,
-            runtime_windows=None, allow_override=False):
+            runtime_windows=None, allow_override=False, chain_length=None):
     """Compose pure proposals into one versioned plan.
 
     Field conflicts are rejected unless the later proposal explicitly overrides
     (or the caller passes allow_override).  An overridden operation remains in
     the plan for provenance but is excluded from required hit aggregation.
+
+    ``chain_length`` is the explicit multi-layer mode: it must equal the number
+    of proposals (1..4), enforces every declared ``conflicts_with`` and
+    ``order_after`` constraint, and records the guard decisions under an
+    additive ``chain`` object.  When it is omitted (the legacy call shape) the
+    plan carries no ``chain`` key at all, so ``to_dict()`` and every historical
+    hash stay byte-identical.
     """
+    if chain_length is not None:
+        if type(chain_length) is not int or not 1 <= chain_length <= MUTATION_CHAIN_MAX_LENGTH:
+            raise CompositionRejection(
+                "chain_length must be an integer within 1.."
+                f"{MUTATION_CHAIN_MAX_LENGTH}", {"chain_length": chain_length})
+        if not isinstance(proposals, list) or len(proposals) != chain_length:
+            raise CompositionRejection(
+                "chain_length does not match proposal count",
+                {"chain_length": chain_length,
+                 "proposals": len(proposals) if isinstance(proposals, list) else None})
     if not isinstance(contract, ExplorationContract):
         contract = ExplorationContract.from_dict(contract)
     contract.validate()
@@ -815,21 +869,29 @@ def compose(parent, proposals, contract, *, rng_seed=0, rng_algorithm=RNG_ALGORI
         raise CompositionRejection("duplicate proposal/op id")
     positions = {p.surface_id: index for index, p in enumerate(proposals)}
 
+    constraints = {"conflicts_with": [], "order_after": [], "field_conflicts": []}
     for index, proposal in enumerate(proposals):
         surface = surfaces[proposal.surface_id]
         for dependency in surface.order_after:
-            if dependency in positions and positions[dependency] > index:
-                raise CompositionRejection(
-                    f"order dependency violated: {surface.surface_id} must follow {dependency}")
+            if dependency in positions:
+                constraints["order_after"].append(
+                    {"surface": surface.surface_id, "after": dependency})
+                if positions[dependency] > index:
+                    raise CompositionRejection(
+                        f"order dependency violated: {surface.surface_id} must follow {dependency}",
+                        {"surface": surface.surface_id, "after": dependency,
+                         "position": index, "dependency_position": positions[dependency]})
 
     for i, left in enumerate(proposals):
         left_surface = surfaces[left.surface_id]
         for right in proposals[i + 1:]:
             right_surface = surfaces[right.surface_id]
-            both = {left.surface_id, right.surface_id}
             if right.surface_id in left_surface.conflicts_with or left.surface_id in right_surface.conflicts_with:
                 raise CompositionRejection(
-                    f"surface conflict: {left.surface_id} conflicts with {right.surface_id}")
+                    f"surface conflict: {left.surface_id} conflicts with {right.surface_id}",
+                    {"pair": sorted([left.surface_id, right.surface_id])})
+            constraints["conflicts_with"].append(
+                {"pair": [left.surface_id, right.surface_id], "decision": "allowed"})
             if left_surface.allowed_with and right.surface_id not in left_surface.allowed_with:
                 raise CompositionRejection(
                     f"surface {left.surface_id} does not allow {right.surface_id}")
@@ -844,6 +906,8 @@ def compose(parent, proposals, contract, *, rng_seed=0, rng_algorithm=RNG_ALGORI
             common = set(left.changes) & set(right.changes)
             if not common:
                 continue
+            constraints["field_conflicts"].append(
+                {"fields": sorted(common), "left": op_ids[i], "right": op_ids[j]})
             if allow_override or right.override:
                 override_map[i] = op_ids[j]
             else:
@@ -875,10 +939,220 @@ def compose(parent, proposals, contract, *, rng_seed=0, rng_algorithm=RNG_ALGORI
         operations.append(operation)
         current = after
 
+    chain = None
+    if chain_length is not None:
+        # Applied in proposal order; every layer saw the previous layer's
+        # output as its own ``input_before`` after this re-application.
+        chain = {
+            "schema": MUTATION_CHAIN_SCHEMA,
+            "chain_length": chain_length,
+            "proposal_order": [proposal.proposal_id or op_ids[index]
+                               for index, proposal in enumerate(proposals)],
+            "surface_order": [proposal.surface_id for proposal in proposals],
+            "constraints": snapshot(constraints),
+        }
     plan = MutationPlan(
         plan_version=MUTATION_PLAN_SCHEMA, rng_algorithm=rng_algorithm, rng_seed=rng_seed,
         parent_content_sha256=canonical_hash(parent), operations=operations,
         final_config=current, runtime_windows=windows, contract_hash=contract.contract_hash(),
+        chain=chain,
     )
     plan.validate(contract=contract)
     return plan
+
+
+def compose_chain(plans_or_proposals, contract, *, parent=None, rng_seed=0,
+                  rng_algorithm=RNG_ALGORITHM, runtime_windows=None,
+                  allow_override=False):
+    """Compose a bounded (1..4) multi-layer chain.
+
+    Each layer is applied to the previous layer's output; the resulting plan
+    records every layer as an ``operation`` plus an audit-only ``chain``
+    object.  Two layer shapes are accepted:
+
+    * ``MutationProposal`` — applied through its declared ``changes``, which is
+      the precise multi-layer form.
+    * a single-operation ``MutationPlan`` — re-expressed as its net leaf diff
+      against the current effective config.  Plans with more than one operation
+      are refused: their per-layer changes are not recoverable from hashes
+      alone, so nothing is silently collapsed or invented.
+
+    Conflicts are hard rejections.  Two layers writing the same final path with
+    different values raise ``CompositionRejection`` with ``reason=conflict``.
+    ``order_after`` / ``conflicts_with`` declared on the surfaces are enforced
+    by ``compose`` and their decisions are recorded for audit.  Layer order is
+    the caller's order; nothing is re-sorted.
+    """
+    if not isinstance(plans_or_proposals, (list, tuple)) or not plans_or_proposals:
+        raise CompositionRejection("compose_chain requires 1..4 layers",
+                                   {"chain_length": 0})
+    if len(plans_or_proposals) > MUTATION_CHAIN_MAX_LENGTH:
+        raise CompositionRejection(
+            f"compose_chain supports at most {MUTATION_CHAIN_MAX_LENGTH} layers",
+            {"chain_length": len(plans_or_proposals)})
+
+    current = _mapping(parent, "parent") if parent is not None else None
+    if current is None:
+        first = plans_or_proposals[0]
+        if isinstance(first, MutationProposal):
+            current = first.input_before
+        else:
+            # A plan only carries hashes for its parent; use its final config
+            # as the starting point is wrong, so require an explicit parent.
+            raise CompositionRejection(
+                "a plan-only chain requires an explicit parent config",
+                {"reason": "parent_required"})
+    current = _mapping(current, "parent")
+
+    imported_windows = []
+    rebased = []
+    for layer in plans_or_proposals:
+        if isinstance(layer, MutationProposal):
+            changes = snapshot(layer.changes)
+            proposal = layer
+        elif isinstance(layer, MutationPlan):
+            if len(layer.operations) != 1:
+                # A plan stores only per-operation hashes, so a multi-operation
+                # layer cannot be re-applied layer by layer.  Collapsing it to
+                # a net diff would lose per-layer provenance; refuse instead.
+                raise CompositionRejection(
+                    "a plan layer must have exactly one operation; pass "
+                    "MutationProposal layers for multi-layer chains",
+                    {"reason": "plan_layer_not_decomposable",
+                     "operations": len(layer.operations)})
+            changes = _net_leaf_changes(current, layer.final_config)
+            imported_windows.extend(layer.runtime_windows)
+            last = layer.operations[0]
+            proposal = MutationProposal(
+                surface_id=last.surface_id, mutator_id=last.mutator_id,
+                parameters={"recomposed_from_plan": True,
+                            "net_changes": sorted(changes)},
+                changes=changes, input_before=snapshot(current),
+                input_after=_apply_changes(current, changes),
+                application_phase=last.application_phase,
+                applicability_result=last.applicability_result,
+                notes={"recomposed_from_plan": True, "operation_count": 1},
+            )
+        else:
+            raise CompositionRejection(
+                "compose_chain layers must be MutationProposal or MutationPlan",
+                {"reason": "bad_layer_type", "type": type(layer).__name__})
+        rebased.append(_rebased_proposal(proposal, current, changes))
+        current = _apply_changes(current, changes)
+
+    # Declared *surface* constraints are checked before same-field conflicts so
+    # an order/conflicts_with violation is reported as such, not masked by a
+    # field collision.  ``compose`` re-checks them when building operations.
+    _precheck_chain_constraints(rebased, contract)
+    repeated = _reject_chain_field_conflicts(rebased)
+    if repeated:
+        # A repeated write of the *same* value is not a conflict, but it is not
+        # a second hit either: the later layer is marked overridden (audit only).
+        rebased = [
+            MutationProposal(
+                surface_id=p.surface_id, mutator_id=p.mutator_id,
+                parameters=p.parameters, changes=p.changes,
+                input_before=p.input_before, input_after=p.input_after,
+                application_phase=p.application_phase,
+                applicability_result=p.applicability_result,
+                runtime_windows=p.runtime_windows, override=True,
+                notes=p.notes, proposal_id=p.proposal_id)
+            if index in repeated else p
+            for index, p in enumerate(rebased)]
+    if imported_windows:
+        # Imported plan layers keep their declared windows; they are never
+        # dropped.  ``validate_plan`` still reports multi-window as an
+        # unsupported capability until a runner is wired.
+        merged = list(runtime_windows or []) + imported_windows
+        runtime_windows = _validate_runtime_windows(merged)
+    return compose(parent, rebased, contract, rng_seed=rng_seed,
+                   rng_algorithm=rng_algorithm, runtime_windows=runtime_windows,
+                   allow_override=allow_override, chain_length=len(rebased))
+
+
+def _net_leaf_changes(before, after, prefix=""):
+    """Leaf-level diff; lists/scalars replace, mappings recurse."""
+    if isinstance(before, dict) and isinstance(after, dict):
+        changes = {}
+        for key in sorted(set(before) | set(after)):
+            path = f"{prefix}.{key}" if prefix else key
+            if key not in before:
+                changes[path] = snapshot(after[key])
+            elif key not in after:
+                # A plan layer cannot express a removal through dotted set
+                # paths; refuse instead of writing a bogus ``null`` value.
+                raise CompositionRejection(
+                    "plan layer would remove a key; pass MutationProposal layers",
+                    {"reason": "unsupported_removal", "field": path})
+            elif before[key] != after[key]:
+                changes.update(_net_leaf_changes(before[key], after[key], path))
+        return changes
+    if before == after:
+        return {}
+    return {prefix: snapshot(after)}
+
+
+def _rebased_proposal(proposal, parent, changes):
+    before = snapshot(parent)
+    after = _apply_changes(before, changes)
+    return MutationProposal(
+        surface_id=proposal.surface_id, mutator_id=proposal.mutator_id,
+        parameters=proposal.parameters, changes=changes,
+        input_before=before, input_after=after,
+        application_phase=proposal.application_phase,
+        applicability_result=proposal.applicability_result,
+        runtime_windows=proposal.runtime_windows, override=proposal.override,
+        notes=proposal.notes, proposal_id=proposal.proposal_id,
+    )
+
+
+def _precheck_chain_constraints(proposals, contract):
+    if not isinstance(contract, ExplorationContract):
+        contract = ExplorationContract.from_dict(contract)
+    surfaces = contract.surface_by_id
+    positions = {p.surface_id: index for index, p in enumerate(proposals)}
+    for index, proposal in enumerate(proposals):
+        surface = surfaces[proposal.surface_id]
+        for dependency in surface.order_after:
+            if dependency in positions and positions[dependency] > index:
+                raise CompositionRejection(
+                    f"order dependency violated: {surface.surface_id} must follow {dependency}",
+                    {"surface": surface.surface_id, "after": dependency,
+                     "position": index, "dependency_position": positions[dependency]})
+    for i, left in enumerate(proposals):
+        left_surface = surfaces[left.surface_id]
+        for right in proposals[i + 1:]:
+            right_surface = surfaces[right.surface_id]
+            if right.surface_id in left_surface.conflicts_with \
+                    or left.surface_id in right_surface.conflicts_with:
+                raise CompositionRejection(
+                    f"surface conflict: {left.surface_id} conflicts with {right.surface_id}",
+                    {"pair": sorted([left.surface_id, right.surface_id])})
+            if left_surface.allowed_with and right.surface_id not in left_surface.allowed_with:
+                raise CompositionRejection(
+                    f"surface {left.surface_id} does not allow {right.surface_id}")
+            if right_surface.allowed_with and left.surface_id not in right_surface.allowed_with:
+                raise CompositionRejection(
+                    f"surface {right.surface_id} does not allow {left.surface_id}")
+
+
+def _reject_chain_field_conflicts(proposals):
+    """Reject differing same-path writes; return indices of benign repeats."""
+    seen = {}
+    repeated = set()
+    for index, proposal in enumerate(proposals):
+        for path, value in proposal.changes.items():
+            if path not in seen:
+                seen[path] = (index, value)
+                continue
+            first_index, first_value = seen[path]
+            if canonical_hash(first_value) == canonical_hash(value):
+                repeated.add(index)
+                continue
+            raise CompositionRejection(
+                "conflict: two chain layers write the same final path with different values",
+                {"reason": "conflict", "field": path,
+                 "layers": [first_index, index],
+                 "surfaces": [proposals[first_index].surface_id, proposal.surface_id],
+                 "values": [snapshot(first_value), snapshot(value)]})
+    return repeated

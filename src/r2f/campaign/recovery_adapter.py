@@ -16,6 +16,9 @@ from .runtime_adapter import _one, _iso, fresh_match_proof
 
 IMPLEMENTATION = 'isolated_netns_nft_discovery_udp_drop'
 
+#: Reader generations reader2..reader9 are additional discovery stimuli.
+MAX_RECREATED_READERS = 8
+
 
 def _ref(event):
     return event.get('raw_event_ref', event['event_index'])
@@ -351,7 +354,349 @@ def _counter(receipt, table, ports, isolation):
     return counts['packets']
 
 
+def _multi_window_chain(events, config):
+    """Whether raw/config describe the explicit window-chain path.
+
+    The legacy single-window runtime never emits ``discovery_window_begin``.
+    Its facts must stay byte-identical, so only the explicit chain (including
+    a one-window explicit plan) enters the per-window collector.
+    """
+    if any(e.get('event') == 'discovery_window_begin' for e in events):
+        return True
+    windows = config.get('environment_windows')
+    return isinstance(windows, list) and len(windows) > 1
+
+
+def _window_one(events, name, index, **fields):
+    found = [e for e in events if e.get('event') == name
+             and e.get('window_index') == index
+             and all(e.get(k) == v for k, v in fields.items())]
+    if len(found) != 1:
+        raise ValueError(f'window[{index}]: {name} evidence absent or ambiguous')
+    return found[0]
+
+
+def _window_fact(events, index, plan, tokens, isolation, config, previous_ref,
+                 capture, ports, pair_bindings, guard):
+    begin_event = _window_one(events, 'discovery_window_begin', index)
+    if (begin_event.get('window_id') != plan['window_id']
+            or begin_event.get('trigger_anchor') != plan['trigger_anchor']):
+        raise ValueError('window declaration differs from the submitted plan')
+    if index == 0:
+        if plan['trigger_anchor'] != 'fresh_match':
+            raise ValueError('first window is not anchored on fresh_match')
+    elif plan['trigger_anchor'] != 'previous_restore_confirmed':
+        raise ValueError('later window is not anchored on previous_restore_confirmed')
+    snapshot = _one(events, 'discovery_precondition_snapshot')
+    expected_anchor = snapshot['raw_event_ref'] if index == 0 else previous_ref
+    if begin_event.get('anchor_ref') != expected_anchor:
+        raise ValueError('window anchor does not cite the required prior evidence')
+
+    dropped = _window_one(events, 'discovery_drop_begin', index)
+    dr = dropped['receipt']
+    if (dr.get('scope') != 'ros2_pair' or dr.get('ros2_execution') is not True
+            or dr.get('configured') is not True or dr.get('applied') is not True):
+        raise ValueError('window drop was not actually applied to this pair')
+    _bindings(dr['pair_bindings'], tokens, isolation, config['domain_id'])
+    if dr.get('precondition', {}).get('evidence_ref') != expected_anchor:
+        raise ValueError('window drop precondition is not bound to the required anchor')
+    _command(dr['install_command'], ['nft', '-f', '-'], isolation)
+    if 'counter_snapshot' not in dr:
+        raise ValueError('window drop begin counter snapshot missing')
+
+    inter_open = _window_one(events, 'window_open', index, window='discovery_interruption')
+    inter_close = _window_one(events, 'window_close', index, window='discovery_interruption')
+    restored = _window_one(events, 'discovery_drop_end', index)
+    rr = restored['receipt']
+    if (rr.get('restored') is not True or rr.get('table_absent') is not True
+            or rr.get('table') != dr.get('table')):
+        raise ValueError('window restore is not verified')
+    if 'counter_snapshot' not in rr:
+        raise ValueError('window drop end counter snapshot missing')
+    _command(rr['delete_command'], ['nft', 'delete', 'table', 'inet', rr['table']], isolation)
+    _command(rr['verify_command'], ['nft', '-j', 'list', 'ruleset'], isolation)
+    if (json.loads(rr['verify_command']['stdout']) != rr['final_nft']
+            or any(e.get('table', {}).get('name') == rr['table']
+                   for e in rr['final_nft'].get('nftables', []))):
+        raise ValueError('window restore left the drop table installed')
+
+    from r2f.runtime.discovery_network import window_counter_delta
+    delta = window_counter_delta(dr, rr)
+    # The runtime emits one delta immediately after this window's verified
+    # restore.  The receipt itself carries no window_index, so bind it by the
+    # window's own raw event interval instead of by global position.
+    boundary_event = _window_one(events, 'discovery_restore_boundary', index)
+    counter_events = [e for e in events if e.get('event') == 'discovery_window_counter'
+                      and dropped['event_index'] < e['event_index'] < boundary_event['event_index']]
+    if len(counter_events) != 1:
+        raise ValueError('window counter delta receipt absent or duplicated')
+    emitted = counter_events[0]
+    for key in ('table', 'packets_before', 'packets_after', 'bytes_before',
+                'bytes_after', 'packets_delta', 'bytes_delta',
+                'counter_observed', 'hit', 'counter_semantics'):
+        if emitted.get(key) != delta.get(key):
+            raise ValueError('window emitted counter delta differs from raw begin/end')
+    if emitted.get('window_index') not in (None, index):
+        raise ValueError('window emitted counter index differs from its plan')
+
+    boundary = _window_one(events, 'discovery_restore_boundary', index)
+    boundary_mono = integer(boundary.get('post_restore_monotonic_ns'), 'window restore boundary')
+    boundary_wall = integer(boundary.get('post_restore_unix_ns'), 'window restore realtime boundary')
+    if (boundary.get('restored') is not True or boundary.get('drop_installed') is not False
+            or boundary.get('clock_guard_ns') != guard
+            or boundary.get('activity_since_unix_ns') != boundary_wall + guard
+            or rr.get('drop_end_monotonic_ns') is None
+            or rr['drop_end_monotonic_ns'] > boundary_mono):
+        raise ValueError('window restore boundary is not after the verified delete')
+    if not (begin_event['event_index'] < inter_open['event_index']
+            < inter_close['event_index'] < boundary['event_index']
+            and inter_close['monotonic_ns'] <= boundary_mono <= boundary['monotonic_ns']
+            and inter_close['monotonic_ns'] - inter_open['monotonic_ns']
+                >= plan['drop_duration_sec'] * 10**9):
+        raise ValueError('window drop/restore chronology is invalid')
+
+    verified = _window_one(events, 'discovery_window_restore_verified', index)
+    activities = [e for e in events if e.get('event') == 'discovery_activity_observation'
+                  and e.get('window') == 'post_restore_%d' % index
+                  and e['event_index'] < verified['event_index']]
+    if not activities:
+        raise ValueError('window post-restore activity evidence absent')
+    confirmed = _window_one(events, 'discovery_recovery_confirmed', index)
+    cr = confirmed['receipt']
+    activity_ref = cr.get('activity_receipt', {}).get('evidence_ref')
+    bound = [e for e in activities if e['raw_event_ref'] == activity_ref]
+    if len(bound) != 1:
+        raise ValueError('window recovery confirmation lacks one bound activity observation')
+    activity_event = bound[0]
+    if activity_event is not activities[-1]:
+        raise ValueError('window recovery confirmation cites a superseded activity sample')
+    if (activity_event.get('after_monotonic_ns') != boundary_mono
+            or activity_event.get('clock_guard_ns') != guard):
+        raise ValueError('window activity is not strictly after this restore boundary')
+    # The observer's summary window may extend beyond the packet observation.
+    # Packet evidence itself is still required to be strictly after boundary.
+    activity_proof = _activity(activity_event, capture, tokens, boundary_wall + guard,
+                               activity_event['activity']['until_ns'], ports, pair_bindings,
+                               after_ns=boundary_mono)
+    if activity_proof['unix_ns'] < boundary_wall:
+        raise ValueError('window activity realtime stamp precedes restoration')
+    if abs((activity_event['time_ns'] - activity_event['monotonic_ns'])
+           - (boundary_wall - boundary_mono)) > guard:
+        raise ValueError('window clocks changed offset')
+    activity_ns = activity_proof['received_monotonic_ns']
+    if (cr.get('recovery_verified') is not True
+            or cr.get('restore_end_monotonic_ns') != rr.get('drop_end_monotonic_ns')):
+        raise ValueError('window recovery confirmation lacks independent activity binding')
+    _bindings(cr['pair_bindings'], tokens, isolation, config['domain_id'])
+    if cr['pair_bindings'].get('worker_start_ticks') != snapshot['bindings'].get('worker_start_ticks'):
+        raise ValueError('window endpoint process generation changed')
+    if verified.get('restored') is not True or verified.get('recovery_confirmed') is not True:
+        raise ValueError('window restore verification receipt is incomplete')
+
+    return {
+        'window_id': plan['window_id'], 'window_index': index,
+        'trigger_anchor': plan['trigger_anchor'],
+        'trigger_offset_sec': plan['trigger_offset_sec'],
+        'drop_duration_sec': plan['drop_duration_sec'],
+        'restore_interval_sec': plan['restore_interval_sec'],
+        'complete': True,
+        'drop': {'active': True, 'configured': True, 'applied': True,
+                 'pair_bound': True, 'counter_observed': True,
+                 'packets_before': delta['packets_before'],
+                 'packets_after': delta['packets_after'],
+                 'packets_delta': delta['packets_delta'],
+                 'bytes_before': delta['bytes_before'],
+                 'bytes_after': delta['bytes_after'],
+                 'bytes_delta': delta['bytes_delta'],
+                 'hit': delta['hit'],
+                 'counter_semantics': 'per_window_delta_only', 'table': delta['table']},
+        'boundary_ns': boundary_mono, 'boundary_event_ref': _ref(boundary),
+        'restored': True, 'restore_verified': True,
+        'activity_observed': True, 'activity_ns': activity_ns,
+        'activity_event_ref': _ref(activity_event),
+        'recovery_confirmed': True,
+        'recovery_event_ref': _ref(confirmed),
+        'drop_event_ref': _ref(dropped), 'restore_event_ref': _ref(restored),
+    }
+
+
+def _multi_window_recovery_facts(events, runtime, config):
+    facts = {'schema_version': 1,
+             'environment_healthy': runtime.get('environment', {}).get('ok') is True,
+             'process_healthy': False, 'preconditions_reached': False,
+             'endpoint_identity_complete': False, 'observed_effects': [],
+             'sent': [], 'received': [], 'windows': []}
+    try:
+        plans = config.get('environment_windows')
+        if not isinstance(plans, list) or not 1 <= len(plans) <= 3:
+            raise ValueError('window plan must contain 1..3 windows')
+        metadata = runtime.get('execution_metadata') or {}
+        workers = metadata.get('workers', [])
+        writer_workers = [w for w in workers if w.get('role') == 'writer']
+        reader_workers = [w for w in workers if w.get('role') in ('reader', 'reader2')]
+        probe_workers = [w for w in workers if w.get('role') == 'probe']
+        pair_workers = writer_workers[-1:] + [w for w in reader_workers if w.get('role') == 'reader'][-1:]
+        if (len(pair_workers) != 2 or len({w['pid'] for w in pair_workers}) != 2
+                or len(probe_workers) > 1
+                or any(w.get('returncode') != 0 for w in workers)
+                or _one(events, 'namespace_controller_exited').get('returncode') != 0
+                or runtime.get('carrier_implementation') != IMPLEMENTATION
+                or any(e['event'] in ('worker_error', 'worker_unexpected_exit',
+                                      'runtime_abort', 'owned_worker_cleanup_signal')
+                       for e in events)):
+            raise ValueError('discovery pair/controller lifecycle incomplete')
+        facts['process_healthy'] = True
+        admission = _one(events, 'namespace_host_admission_verified')
+        isolation = _isolation(admission['isolation'])
+        setup = _one(events, 'discovery_network_setup')['receipt']
+        if setup.get('health_ok') is not True or setup.get('drop_installed') is not False:
+            raise ValueError('discovery namespace initial state not healthy/neutral')
+        tokens = {r: _one(events, 'endpoint_created', role=r) for r in ('writer', 'reader')}
+        if len({t['pid'] for t in tokens.values()}) != 2 or len({t['endpoint_gid'] for t in tokens.values()}) != 2:
+            raise ValueError('independent endpoint process/GID identity missing')
+        for role, token in tokens.items():
+            if (token.get('rmw_identifier') != config['rmw'] or token.get('topic') != config['topic']
+                    or token.get('qos') != config['qos'] or token.get('message_type') != config['message_type']
+                    or not token.get('endpoint_generation')):
+                raise ValueError('discovery endpoint submitted identity/config mismatch')
+            facts[role] = {'id': token['endpoint_gid'], 'generation': token['endpoint_generation'],
+                           'created_ns': token['created_monotonic_ns']}
+        snapshot = _one(events, 'discovery_precondition_snapshot')
+        ports = _bindings(snapshot['bindings'], tokens, isolation, config['domain_id'])
+        from r2f.runtime.discovery_profiles import CYCLONE_XML, FAST_XML
+        profiles = runtime['environment']['discovery_namespace']['profiles']
+        hashes = {}
+        for number, role in enumerate(('writer', 'reader')):
+            record = profiles[role]
+            path = _artifact(runtime, record['path'])
+            verify_raw(path, record['sha256'])
+            expected_profile = CYCLONE_XML if config['rmw'] == 'rmw_cyclonedds_cpp'                 else FAST_XML.format(role=role, index=number)
+            if path.read_bytes() != expected_profile.encode():
+                raise ValueError('actual discovery transport profile differs from reviewed semantic carrier')
+            hashes[role] = record['sha256']
+        facts['transport_profile_sha256'] = hashes
+
+        capture = _capture(events, runtime, config, isolation)
+        guard = 50_000_000
+        previous_ref = snapshot['raw_event_ref']
+        for index, plan in enumerate(plans):
+            fact = _window_fact(events, index, plan, tokens, isolation, config, previous_ref,
+                                capture, ports, snapshot['bindings']['bindings'], guard)
+            if index:
+                prior = facts['windows'][index - 1]
+                if fact['drop_event_ref'] and prior['recovery_event_ref']:
+                    prior_event = _resolve(events, prior['recovery_event_ref'])
+                    drop_event = _resolve(events, fact['drop_event_ref'])
+                    if not prior_event['event_index'] < drop_event['event_index']:
+                        raise ValueError('window[%d]: drop does not follow the previous recovery' % index)
+                    if drop_event['monotonic_ns'] - prior_event['monotonic_ns'] \
+                            < plans[index - 1]['restore_interval_sec'] * 10**9:
+                        raise ValueError('window[%d]: restore_interval_sec not honoured before next drop' % index)
+            facts['windows'].append(fact)
+            previous_ref = fact['recovery_event_ref']
+
+        opening = _one(events, 'window_open', window='post_restore_delivery')
+        closing = _one(events, 'window_close', window='post_restore_delivery')
+        first_interruption = _window_one(events, 'window_open', 0, window='discovery_interruption')
+        if not (_window_one(events, 'discovery_window_restore_verified',
+                            len(plans) - 1)['event_index'] < opening['event_index']
+                < closing['event_index']):
+            raise ValueError('postrestore delivery window is not closed after the final window')
+        expected = list(range(config['pre_match_count'],
+                              config['pre_match_count'] + config['post_match_count']))
+        contract = _one(events, 'delivery_contract')
+        if (contract.get('expected_sequences') != expected
+                or contract.get('sentinel_sequence') != expected[-1]
+                or contract.get('phase') != 'post_restore'
+                or contract.get('qos') != config['qos']
+                or contract.get('prejoin_in_delivery_contract') is not False):
+            raise ValueError('postrestore delivery contract differs from submitted config')
+        sent = [e for e in events if e['event'] == 'send' and e.get('phase') == 'post_restore']
+        received = [e for e in events if e['event'] == 'receive' and e.get('phase') == 'post_restore']
+        if [e.get('send_sequence') for e in sent] != expected:
+            raise ValueError('postrestore send obligations are incomplete')
+        for event in sent:
+            if (not opening['event_index'] < event['event_index'] < closing['event_index']
+                    or event.get('writer_gid') != tokens['writer']['endpoint_gid']
+                    or event.get('endpoint_generation') != tokens['writer']['endpoint_generation']
+                    or event.get('publish_returned') is not True):
+                raise ValueError('postrestore send identity/window proof incomplete')
+        for event in received:
+            if (not opening['event_index'] < event['event_index'] < closing['event_index']
+                    or event.get('reader_gid') != tokens['reader']['endpoint_gid']
+                    or event.get('endpoint_generation') != tokens['reader']['endpoint_generation']
+                    or event.get('payload_run_id') != config['run_id']):
+                raise ValueError('postrestore receive identity/window proof incomplete')
+        if not received:
+            raise ValueError('no bounded delivery identity witness')
+        direct = all(e.get('publisher_gid') is not None for e in received)
+        graphs = {}
+        for role in tokens:
+            after = [e for e in events if e['event'] == 'graph_snapshot'
+                     and e.get('role') == role and e['monotonic_ns'] >= closing['monotonic_ns']]
+            if (not after
+                    or {x['endpoint_gid'] for x in after[0]['publishers']} != {tokens['writer']['endpoint_gid']}
+                    or {x['endpoint_gid'] for x in after[0]['subscriptions']} != {tokens['reader']['endpoint_gid']}):
+                raise ValueError('postrestore graph identity has no closing boundary')
+            graphs[role] = {'after_index': after[0]['event_index']}
+        for event in sent:
+            facts['sent'].append({'sequence': event['send_sequence'], 'at_ns': event['monotonic_ns'],
+                                  'writer_id': event.get('writer_gid') or tokens['writer']['endpoint_gid'],
+                                  'generation': tokens['writer']['endpoint_generation']})
+        for event in received:
+            facts['received'].append({'sequence': event['send_sequence'], 'at_ns': event['monotonic_ns'],
+                                      'writer_id': event.get('publisher_gid') or tokens['writer']['endpoint_gid'],
+                                      'writer_generation': tokens['writer']['endpoint_generation'],
+                                      'reader_id': event['reader_gid'],
+                                      'reader_generation': event['endpoint_generation']})
+        cleanup = _one(events, 'discovery_cleanup_restore')['receipt']
+        if cleanup.get('restored') is not True:
+            raise ValueError('discovery cleanup restore not verified')
+        for observed_step in runtime.get('observation_receipts', []):
+            _step_evidence(events, observed_step)
+        total_hit = all(w['drop']['hit'] for w in facts['windows'])
+        facts.update(
+            endpoint_identity_complete=True,
+            preconditions_reached=len(runtime.get('precondition_receipts', [])) == 3,
+            identity_proof={'basis': 'message_info_gid' if direct else 'endpoint_correlated',
+                            'direct_gid_match': all(e.get('publisher_gid') == tokens['writer']['endpoint_gid']
+                                                    for e in received) if direct else None,
+                            'publisher_gid_status': 'available' if direct else 'unavailable_api',
+                            'graph_boundary_receipts': graphs},
+            drop={'active': True, 'configured': True, 'applied': True, 'hit': total_hit,
+                  'pair_bound': True, 'counter_observed': True,
+                  'packets': max(w['drop']['packets_delta'] for w in facts['windows'])},
+            recovery={'boundary_ns': facts['windows'][-1]['boundary_ns'],
+                      'activity_ns': facts['windows'][-1]['activity_ns'],
+                      'activity_identity_correlated': True, 'fresh_match_and_graph': True,
+                      'rules_restored': True, 'identity_stable': True,
+                      'match_continuity': 'retained',
+                      'match_continuity_scope': 'observed_public_count_samples',
+                      'clock_translation': 'kernel_realtime_plus_independent_receive_monotonic',
+                      'window_count': len(facts['windows']),
+                      'per_window_independent': True},
+            observed_effects=['discovery_temporarily_unavailable', 'discovery_restored'],
+            window={'start_ns': first_interruption['monotonic_ns'],
+                    'end_ns': closing['monotonic_ns'], 'complete': True},
+            window_complete=True,
+            window_completion={'complete': True, 'window_count': len(facts['windows'])},
+        )
+    except (KeyError, ValueError, TypeError, IndexError, OSError, struct.error) as exc:
+        message = str(exc)
+        if not message.startswith('window['):
+            message = 'window[%d]: %s' % (len(facts.get('windows', [])), message)
+        facts['evidence_error'] = message
+        facts['endpoint_identity_complete'] = False
+        facts['window'] = {'complete': False}
+        facts['window_complete'] = False
+        facts['window_completion'] = {'complete': False, 'reason': message,
+                                      'completed_windows': len(facts.get('windows', []))}
+    return facts
+
+
 def recovery_facts(events, runtime, config):
+    if _multi_window_chain(events, config):
+        return _multi_window_recovery_facts(events, runtime, config)
     facts = {'schema_version': 1, 'environment_healthy': runtime.get('environment', {}).get('ok') is True,
              'process_healthy': False, 'preconditions_reached': False, 'endpoint_identity_complete': False,
              'observed_effects': [], 'sent': [], 'received': []}
@@ -384,12 +729,13 @@ def recovery_facts(events, runtime, config):
         if any('table' in e for e in setup['initial_nft']['nftables']):
             raise ValueError('discovery namespace had preexisting nft rules')
         tokens = {r: _one(events, 'endpoint_created', role=r) for r in ('writer', 'reader')}
-        # F3: an explicit reader generation created inside the window becomes
-        # the active reader for post-restore evidence; the original reader is
-        # retained in raw history and never re-labelled.
+        # F3: recreated readers are additional discovery stimuli only.  The
+        # original writer/reader pair stays the delivery and binding contract;
+        # extras are recorded separately and never re-labelled as the reader.
         recreates = [e for e in events if e.get('event') == 'discovery_reader_recreated']
-        if len(recreates) > 2:
-            raise ValueError('at most two reader recreations are supported in one window')
+        if len(recreates) > MAX_RECREATED_READERS:
+            raise ValueError('at most %d reader recreations are supported in one window'
+                             % MAX_RECREATED_READERS)
         if recreates:
             # Recreated readers are explicit additional generations used to
             # stimulate discovery.  The original writer/reader pair remains the
@@ -405,8 +751,22 @@ def recovery_facts(events, runtime, config):
                 extras.append({'role': role_name, 'endpoint_gid': token.get('endpoint_gid'),
                                'generation': token.get('endpoint_generation'),
                                'pid': token.get('pid'), 'pair_member': False,
-                               'recreate_index': recreate.get('recreate_index')})
+                               'recreate_index': recreate.get('recreate_index'),
+                               'destroyed': False})
+            destroyed = {e.get('role') for e in events
+                         if e.get('event') == 'discovery_reader_destroyed'}
+            for extra in extras:
+                extra['destroyed'] = extra['role'] in destroyed
             facts['recreated_readers'] = extras
+        destroyed_readers = [e.get('role') for e in events
+                             if e.get('event') == 'discovery_reader_destroyed']
+        if destroyed_readers:
+            facts['destroyed_readers'] = destroyed_readers
+        writer_churn = [{'role': e.get('role'), 'generation': e.get('generation'),
+                         'pid': e.get('pid'), 'pair_member': False}
+                        for e in events if e.get('event') == 'discovery_writer_recreated']
+        if writer_churn:
+            facts['churned_writers'] = writer_churn
         if len({t['pid'] for t in tokens.values()}) != 2 or len({t['endpoint_gid'] for t in tokens.values()}) != 2:
             raise ValueError('independent endpoint process/GID identity missing')
         for role, token in tokens.items():

@@ -91,8 +91,20 @@ def content_sha256(entry):
 
 
 def bucket_key(entry):
+    """Retention bucket: target × boundary × edge × sampling class × depth.
+
+    Sampling class and chain depth are input-selection provenance, so two
+    distinct samplers or chain depths must not evict each other merely because
+    they share a boundary label.  Missing values stay ``""`` so pre-T-E records
+    keep their historical bucket grouping (and bucket_limit/capacity semantics).
+    """
     edge = entry.get("observed_edge") or ""
-    return (entry.get("target_id"), entry.get("boundary_class") or "", edge)
+    kind = entry.get("sampling_kind") or ""
+    depth = entry.get("chain_depth")
+    if type(depth) is not int:
+        depth = ""
+    return (entry.get("target_id"), entry.get("boundary_class") or "", edge,
+            kind, depth)
 
 
 def semantic_key(entry):

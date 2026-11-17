@@ -1,6 +1,7 @@
 """Registry-based finite campaign runner for declared normal ROS2 API checks."""
 from pathlib import Path
 import json
+import math
 import re
 import uuid
 
@@ -213,8 +214,10 @@ import os as _os
 import tempfile as _tempfile
 
 from r2f.core.evidence import INPUT_SCHEMA_V2, effective_input_hash
-from r2f.core.mutators import MUTATORS, make_rng, mutate
-from r2f.core.mutation_plan import compose
+from r2f.core.mutators import (
+    MUTATORS, WIDE_SAMPLING_KINDS, _wide_kinds, make_rng, mutate, mutate_wide,
+)
+from r2f.core.mutation_plan import compose, compose_chain
 from r2f.core.scenario import Scenario
 from r2f.modules.s1.module import register_exploratory
 from r2f.modules.s1.targets import EXPLORATORY_TARGET_ORDER
@@ -320,7 +323,81 @@ def _load_profile(profile):
     for key in ("target_ids", "surfaces", "rmws"):
         if not isinstance(profile.get(key), list) or not profile[key]:
             raise ExploratoryCycleError("profile " + key + " is required")
+    _profile_wide_settings(profile)
     return json.loads(json.dumps(profile))
+
+
+def _profile_wide_settings(profile):
+    """Validate T-E optional fields without adding defaults to the profile.
+
+    Absence of every T-E field must leave the profile document (and therefore
+    its manifest bytes) exactly as it was.  Validation is therefore a pure
+    read; a missing field is never materialised here.
+    """
+    keys = {"sampling_kinds", "sampling_weight", "chain_length"} & set(profile)
+    if not keys:
+        return None, None, 1
+    if "sampling_weight" in profile and "sampling_kinds" not in profile:
+        raise ExploratoryCycleError("sampling_weight requires sampling_kinds")
+    kinds = profile.get("sampling_kinds")
+    weights = None
+    if kinds is not None:
+        if not isinstance(kinds, list) or not kinds:
+            raise ExploratoryCycleError("sampling_kinds must be a nonempty list")
+        if any(not isinstance(kind, str) or not kind for kind in kinds):
+            raise ExploratoryCycleError("sampling_kinds must contain nonempty strings")
+        if len(set(kinds)) != len(kinds):
+            raise ExploratoryCycleError("sampling_kinds contains duplicates")
+        unknown = sorted(set(kinds) - set(WIDE_SAMPLING_KINDS))
+        if unknown:
+            raise ExploratoryCycleError("unsupported sampling kind(s): " + ",".join(unknown))
+        raw = profile.get("sampling_weight") or {}
+        if not isinstance(raw, dict):
+            raise ExploratoryCycleError("sampling_weight must be an object")
+        unknown = sorted(set(raw) - set(kinds))
+        if unknown:
+            raise ExploratoryCycleError(
+                "sampling_weight names undeclared kind(s): " + ",".join(unknown))
+        weights = {}
+        for kind in kinds:
+            weight = raw.get(kind, 1)
+            if type(weight) is not int or weight < 0:
+                raise ExploratoryCycleError(
+                    "sampling_weight must be nonnegative integers")
+            weights[kind] = weight
+        if not any(weights.values()):
+            raise ExploratoryCycleError("sampling_weight must not be all zero")
+    chain_length = profile.get("chain_length", 1)
+    if type(chain_length) is not int or not 1 <= chain_length <= 4:
+        raise ExploratoryCycleError("chain_length must be an integer within 1..4")
+    return kinds, weights, chain_length
+
+
+def _sync_sampling(scheduler, profile):
+    """Bind the opt-in profile sampling config to the caller's scheduler.
+
+    The runner is the only authority for what a profile declares; a scheduler
+    built with a different (or missing) sampling config is refused instead of
+    silently selecting kinds the profile never asked for.
+    """
+    kinds, weights, _ = _profile_wide_settings(profile)
+    if kinds is None:
+        if scheduler.sampling_kinds is not None:
+            raise ExploratoryCycleError(
+                "scheduler declares sampling kinds that the profile does not")
+        return
+    if scheduler.sampling_kinds is None:
+        if scheduler.selection_log:
+            raise ExploratoryCycleError(
+                "scheduler already selected entries before sampling was configured")
+        try:
+            scheduler.configure_sampling(kinds, weights)
+        except ValueError as exc:
+            raise ExploratoryCycleError(str(exc)) from exc
+        return
+    if scheduler.sampling_kinds != list(kinds) or scheduler.sampling_weight != weights:
+        raise ExploratoryCycleError(
+            "scheduler sampling config differs from the profile declaration")
 
 
 def _application_phase(surface):
@@ -370,6 +447,126 @@ def _flatten_surface_values(surface, config):
         if current is not None:
             values[path] = current
     return values
+
+
+def _wide_generation_requested(profile):
+    """True only when the profile explicitly opts into T-E generation.
+
+    An explicit ``chain_length=1`` alone selects nothing new: the historical
+    single-mutation path is kept byte for byte.  Chains are multi-layer by
+    definition (``chain_length > 1``), and ``sampling_kinds`` always opts in.
+    """
+    if profile.get("sampling_kinds") is not None:
+        return True
+    depth = profile.get("chain_length")
+    return type(depth) is int and depth > 1
+
+
+def _reject_all_zero_supported(profile, surface, parent):
+    """True when the profile weight excludes every kind this surface supports."""
+    kinds, weights, _ = _profile_wide_settings(profile)
+    if kinds is None:
+        return False
+    supported = set(_wide_kinds(surface, parent))
+    return not [kind for kind in kinds
+                if kind in supported and weights.get(kind, 1) > 0]
+
+
+def _layer_rng(rng_seed, layer_index, surface_id):
+    """Per-layer RNG derived from the case seed; never shared across layers."""
+    material = canonical_hash({"rng_seed": rng_seed, "layer_index": layer_index,
+                               "surface_id": surface_id})
+    return make_rng(int(material[:16], 16))
+
+
+def _chain_surfaces(contract, surface, chain_length):
+    """Deterministic ordered layer surfaces for one chain length.
+
+    The entry surface is always layer 0.  Additional layers are the other
+    declared surfaces that compose with every already-chosen layer, in sorted
+    surface-id order.  When the contract cannot supply enough compatible
+    layers the request is rejected explicitly rather than repeating a surface or
+    silently shortening the chain.
+    """
+    if type(chain_length) is not int or not 1 <= chain_length <= 4:
+        raise ExploratoryCycleError("chain_length must be an integer within 1..4")
+    order = [surface]
+    if chain_length == 1:
+        return order
+    others = sorted(s for s in contract.surface_by_id if s != surface.surface_id)
+    while len(order) < chain_length:
+        selected = None
+        from r2f.core.mutation_plan import (
+            CompositionRejection, _precheck_chain_constraints,
+        )
+        for candidate in others:
+            if candidate in {item.surface_id for item in order}:
+                continue
+            probe = order + [contract.surface_by_id[candidate]]
+            try:
+                _precheck_chain_constraints(probe, contract)
+            except CompositionRejection:
+                continue
+            selected = candidate
+            break
+        if selected is None:
+            raise ExploratoryCycleError(
+                "unsupported_capability:chain_length_not_composable:"
+                f"{surface.surface_id}:{chain_length}")
+        order.append(contract.surface_by_id[selected])
+    return order
+
+
+def _layer_mutator(surface, entry, layer_index, sampling_kind=None):
+    """Pick one mutator compatible with the layer's sampling class.
+
+    The wide namespace is explicit about which mutator may emit a class:
+    M01 only produces ``boundary``; M03 produces the numeric classes; M02 emits
+    enum representatives; M04 emits relation boundaries.  Layer 0 otherwise
+    keeps the runner's historical entry-mutator choice, and later layers use the
+    first registered mutator the layer surface declares.  A chain is therefore
+    a fixed function of the contract, entry and requested sampling class.
+    """
+    available = [mid for mid in surface.mutator_ids if mid in MUTATORS]
+    if surface.surface_kind == "relation" and "M04" in surface.mutator_ids:
+        if sampling_kind is None or sampling_kind == "boundary":
+            return "M04"
+        raise ExploratoryCycleError(
+            "unsupported_capability:relation_surface_kind:" + str(sampling_kind))
+    if surface.surface_kind == "parameter_enum" and "M02" in available:
+        if sampling_kind is None or sampling_kind == "representative":
+            return "M02"
+        raise ExploratoryCycleError(
+            "unsupported_capability:enum_surface_kind:" + str(sampling_kind))
+    if not available:
+        raise ExploratoryCycleError(
+            "unsupported_capability:no_implemented_mutator:" + surface.surface_id)
+    if sampling_kind == "boundary":
+        return "M01" if "M01" in available else available[0]
+    if sampling_kind in {"representative", "log_uniform", "linear_uniform",
+                        "neighbor", "jump"}:
+        return "M03" if "M03" in available else available[0]
+    if layer_index == 0:
+        requested = entry.get("mutator_id")
+        if requested in available:
+            return requested
+        boundary = entry.get("boundary_class")
+        preferred = "M03" if boundary in {"log_range", "sampled"} else "M01"
+        if preferred in available:
+            return preferred
+    return available[0]
+
+
+def _layer_context(entry, layer_index, sampling_kind):
+    context = {"application_phase": "compile_time",
+               "boundary_class": entry.get("boundary_class")}
+    if layer_index > 0:
+        # Later layers must not reuse a parent boundary class that belongs to
+        # another surface; a wide class is chosen explicitly instead.
+        context.pop("boundary_class", None)
+    if sampling_kind is not None:
+        context["sampling_kind"] = sampling_kind
+    return context
 
 
 def _route(target_id):
@@ -428,13 +625,120 @@ def _adapt_parent(target_id, route, parent):
     return adapted, receipt
 
 
-def _recovery_windows(drop_duration_sec):
-    """Single-window drop->restore derived from the mutated drop duration.
+_RUNTIME_WINDOW_FIELDS = frozenset({
+    "schema", "window_id", "window_index", "trigger_anchor",
+    "trigger_offset_sec", "drop_duration_sec", "restore_interval_sec",
+})
 
-    One window only: E02/E03 multi-window generation stays capability pending.
-    Two shapes are produced from the same numbers because the core plan schema
-    and the namespace validator require different window documents.
+
+def _validate_explicit_recovery_windows(windows, *, recovery_timeout_sec=None,
+                                        max_seconds=None):
+    """Validate a 1..3 window plan from M07 and normalize its indices.
+
+    The core plan schema accepts any integer window_index, while the namespace
+    validator requires positions 0..n-1.  Explicit plans may be written from
+    either 0 or 1; both are accepted, and the returned plan is normalized to
+    0-based positions so the two emitted shapes agree.  Every failure names the
+    offending field; no plan is silently truncated or repaired.
     """
+    if not isinstance(windows, (list, tuple)):
+        raise ValueError("runtime_windows must be a list of 1..3 windows")
+    if not 1 <= len(windows) <= 3:
+        raise ValueError("runtime_windows must contain 1..3 windows")
+    if recovery_timeout_sec is not None and (
+            type(recovery_timeout_sec) not in (int, float)
+            or isinstance(recovery_timeout_sec, bool)
+            or not 0 <= recovery_timeout_sec <= 120):
+        raise ValueError("recovery_timeout_sec must be a number in [0,120]")
+
+    result = []
+    for position, window in enumerate(windows):
+        if not isinstance(window, dict):
+            raise ValueError(f"runtime_window[{position}] must be a dict")
+        unknown = sorted(set(window) - _RUNTIME_WINDOW_FIELDS)
+        if unknown:
+            raise ValueError("runtime_window." + unknown[0] + " is not supported")
+        schema = window.get("schema")
+        if schema is not None and schema != "r2f.runtime-window/v1":
+            raise ValueError("runtime_window.schema must be r2f.runtime-window/v1")
+        window_id = window.get("window_id")
+        if not isinstance(window_id, str) or not window_id.strip():
+            raise ValueError("runtime_window.window_id must be a nonempty string")
+        index = window.get("window_index")
+        if type(index) is not int or isinstance(index, bool):
+            raise ValueError("runtime_window.window_index must be an integer")
+        anchor = window.get("trigger_anchor")
+        if not isinstance(anchor, str) or not anchor:
+            raise ValueError("runtime_window.trigger_anchor is required")
+        if position == 0 and anchor != "fresh_match":
+            raise ValueError("runtime_window.trigger_anchor must be fresh_match for the first window")
+        if position > 0 and anchor != "previous_restore_confirmed":
+            raise ValueError("runtime_window.trigger_anchor must be previous_restore_confirmed after the first window")
+        values = {}
+        for key in ("trigger_offset_sec", "drop_duration_sec", "restore_interval_sec"):
+            value = window.get(key)
+            if type(value) not in (int, float) or isinstance(value, bool):
+                raise ValueError(f"runtime_window.{key} must be a number")
+            if not math.isfinite(value):
+                raise ValueError(f"runtime_window.{key} must be finite")
+            values[key] = value
+        if not 0 < values["drop_duration_sec"] <= 8:
+            raise ValueError("runtime_window.drop_duration_sec must be in (0,8]")
+        if not 0 <= values["trigger_offset_sec"] <= 8:
+            raise ValueError("runtime_window.trigger_offset_sec must be in [0,8]")
+        if not 0 <= values["restore_interval_sec"] <= 8:
+            raise ValueError("runtime_window.restore_interval_sec must be in [0,8]")
+        result.append({"window_id": window_id, "window_index": index, "trigger_anchor": anchor,
+                       **values})
+
+    base = result[0]["window_index"]
+    if base not in (0, 1):
+        raise ValueError("runtime_window.window_index must be consecutive from 0 or 1")
+    for position, window in enumerate(result):
+        if window["window_index"] != base + position:
+            raise ValueError("runtime_window.window_index must be consecutive from 0 or 1")
+    ids = [window["window_id"] for window in result]
+    if len(ids) != len(set(ids)):
+        raise ValueError("runtime_window.window_id must be unique")
+
+    if max_seconds is not None:
+        if type(max_seconds) not in (int, float) or isinstance(max_seconds, bool) \
+                or not math.isfinite(max_seconds) or max_seconds < 0:
+            raise ValueError("max_seconds must be a non-negative finite number")
+        timeout = float(recovery_timeout_sec or 0.0)
+        duration = sum(window["trigger_offset_sec"] + window["drop_duration_sec"]
+                       + window["restore_interval_sec"] for window in result)
+        budget = duration + timeout * len(result)
+        if budget > max_seconds:
+            raise ValueError(
+                "runtime_windows budget exceeds config max_seconds:"
+                f" budget={budget}, max_seconds={max_seconds}")
+
+    return [{"window_id": window["window_id"], "window_index": position,
+             "trigger_anchor": window["trigger_anchor"],
+             "trigger_offset_sec": window["trigger_offset_sec"],
+             "drop_duration_sec": window["drop_duration_sec"],
+             "restore_interval_sec": window["restore_interval_sec"]}
+            for position, window in enumerate(result)]
+
+
+def _recovery_windows(drop_duration_sec, windows=None, *, recovery_timeout_sec=None,
+                      max_seconds=None):
+    """Build the core/runtime window documents.
+
+    With no explicit plan the historical single-window return shape is kept
+    byte-for-byte: ``(core_window, runtime_window)``.  With an M07
+    ``proposal.runtime_windows`` plan this returns two 1..3 element lists.
+    The two shapes differ only by the core-only schema field.
+    """
+    if windows is not None:
+        normalized = _validate_explicit_recovery_windows(
+            windows, recovery_timeout_sec=recovery_timeout_sec,
+            max_seconds=max_seconds)
+        core_windows = [{"schema": "r2f.runtime-window/v1", **window}
+                        for window in normalized]
+        runtime_windows = [dict(window) for window in normalized]
+        return core_windows, runtime_windows
     if type(drop_duration_sec) not in (int, float) or isinstance(drop_duration_sec, bool) \
             or not 0 < drop_duration_sec <= 8.0:
         raise ValueError("recovery drop_duration_sec must be a positive finite window")
@@ -472,6 +776,8 @@ def run_exploratory_cycle(output_dir, *, corpus, feedback, scheduler, profile, r
     if execute and not callable(runtime):
         raise ExploratoryCycleError("execute=True requires an injected runtime callable")
     profile = _load_profile(profile)
+    _sync_sampling(scheduler, profile)
+    sampling_kinds, sampling_weight, chain_length = _profile_wide_settings(profile)
 
     repo = Path(repo or Path(__file__).resolve().parents[3]).resolve()
     output_dir = Path(output_dir).resolve()
@@ -581,17 +887,36 @@ def run_exploratory_cycle(output_dir, *, corpus, feedback, scheduler, profile, r
                     else:
                         mutator_id = requested if requested in mutator_ids else (
                             preferred if preferred in mutator_ids else (mutator_ids[0] if mutator_ids else None))
-                    if not mutator_ids:
-                        row = reject(sequence, entry,
-                                     "unsupported_capability:no_implemented_mutator")
-                    elif mutator_id not in mutator_ids:
-                        row = reject(sequence, entry, "mutator_not_declared:" + str(mutator_id))
-                    else:
-                        row = _generate_case(sequence, entry, target, contract, surface,
-                                            parent, mutator_id, target_id, rmw, selection,
-                                            scheduler, source, repo, run_id, profile,
-                                            domain_id, registry, output_dir, budget,
-                                            execute, runtime, corpus, feedback)
+                    row = None
+                    wide_profile = _wide_generation_requested(profile)
+                    declared_kinds, _, declared_depth = _profile_wide_settings(profile)
+                    if wide_profile and declared_kinds is not None:
+                        supported = set(_wide_kinds(surface, parent))
+                        if not [kind for kind in declared_kinds if kind in supported]:
+                            row = reject(
+                                sequence, entry,
+                                "unsupported_capability:no_declared_sampling_kind_for_surface")
+                        elif _reject_all_zero_supported(profile, surface, parent):
+                            row = reject(
+                                sequence, entry,
+                                "unsupported_capability:all_supported_sampling_kinds_zero_weight")
+                    if row is None and wide_profile and declared_depth > 1:
+                        try:
+                            _chain_surfaces(contract, surface, declared_depth)
+                        except ExploratoryCycleError as exc:
+                            row = reject(sequence, entry, str(exc))
+                    if row is None:
+                        if not mutator_ids:
+                            row = reject(sequence, entry,
+                                         "unsupported_capability:no_implemented_mutator")
+                        elif mutator_id not in mutator_ids:
+                            row = reject(sequence, entry, "mutator_not_declared:" + str(mutator_id))
+                        else:
+                            row = _generate_case(sequence, entry, target, contract, surface,
+                                                parent, mutator_id, target_id, rmw, selection,
+                                                scheduler, source, repo, run_id, profile,
+                                                domain_id, registry, output_dir, budget,
+                                                execute, runtime, corpus, feedback)
         if row is None:
             stop_reason = "generation_failed"
             break
@@ -654,20 +979,82 @@ def _generate_case(sequence, entry, target, contract, surface, parent, mutator_i
 
     adapted_parent, adaptation = _adapt_parent(target_id, route, parent)
     rng_seed = _derive_rng_seed(scheduler, selection, entry)
-    rng = make_rng(rng_seed)
-    proposal = mutate(adapted_parent, surface, rng,
-                      context={"application_phase": _application_phase(surface),
-                               "boundary_class": entry.get("boundary_class")},
-                      mutator_id=mutator_id)
+    sampling_kinds, sampling_weight, chain_length = _profile_wide_settings(profile)
+    wide = _wide_generation_requested(profile)
+    sampling_kind = selection.get("sampling_kind") if wide else None
+    sampling_filtered = []
+    if wide:
+        supported = set(_wide_kinds(surface, adapted_parent))
+        if sampling_kinds is not None:
+            # A profile may declare kinds this surface cannot honour.  Every
+            # such kind is filtered (recorded, never attempted) while the
+            # scheduler still picks from the supported subset.
+            sampling_filtered = [kind for kind in sampling_kinds
+                                 if kind not in supported]
+        if sampling_kind is not None and sampling_kind not in supported:
+            sampling_kind = None
+        if sampling_kind is None and sampling_kinds is not None \
+                and selection.get("sampling_error") is None \
+                and selection.get("sampling_kind") is not None:
+            # The scheduler always chooses a supported kind for this surface;
+            # a mismatch means the declaration and corpus disagree.
+            raise ExploratoryCycleError(
+                "sampling kind was filtered but the scheduler declared one")
+        layer_surfaces = _chain_surfaces(contract, surface, profile.get("chain_length", 1))
+        proposals = []
+        current = adapted_parent
+        for index, layer_surface in enumerate(layer_surfaces):
+            layer_kind = sampling_kind if index == 0 else None
+            layer_mutator = _layer_mutator(layer_surface, entry, index, layer_kind)
+            proposal = mutate_wide(
+                current, layer_surface, _layer_rng(rng_seed, index, layer_surface.surface_id),
+                context=_layer_context(entry, index, layer_kind),
+                mutator_id=layer_mutator)
+            proposals.append(proposal)
+            current = proposal.input_after
+        proposal = proposals[0]
+        mutator_id = proposal.mutator_id
+        sampling_kind = proposal.parameters.get("sampling_kind")
+    else:
+        rng = make_rng(rng_seed)
+        proposal = mutate(adapted_parent, surface, rng,
+                          context={"application_phase": _application_phase(surface),
+                                   "boundary_class": entry.get("boundary_class")},
+                          mutator_id=mutator_id)
 
     windows, runtime_windows = [], []
     if route["backend"] == "discovery_namespace":
+        explicit = proposal.runtime_windows or None
         dropped = proposal.input_after.get("drop_duration_sec")
-        core_window, runtime_window = _recovery_windows(dropped)
-        windows, runtime_windows = [core_window], [runtime_window]
+        recovery_timeout = proposal.input_after.get(
+            "recovery_timeout_sec", adapted_parent.get("recovery_timeout_sec"))
+        max_seconds = (profile.get("budget") or {}).get("max_seconds")
+        if max_seconds is None:
+            max_seconds = adapted_parent.get("max_seconds")
+        built = _recovery_windows(
+            dropped, explicit, recovery_timeout_sec=recovery_timeout,
+            max_seconds=max_seconds)
+        if isinstance(built[0], dict):
+            windows, runtime_windows = [built[0]], [built[1]]
+        else:
+            windows, runtime_windows = built
         adaptation["runtime_windows"] = runtime_windows
-    plan = compose(adapted_parent, [proposal], contract, rng_seed=rng_seed,
-                   runtime_windows=windows)
+        adaptation["runtime_window_source"] = "m07_explicit" if explicit else "single_window_default"
+    if wide:
+        # The runner is the single authority that normalizes the explicit plan
+        # to 0-based core/runtime shapes; strip proposal windows so they are not
+        # appended twice by compose_chain.
+        from dataclasses import replace as _replace
+        proposals = [_replace(item, runtime_windows=[]) for item in proposals]
+        plan = compose_chain(proposals, contract, parent=adapted_parent,
+                             rng_seed=rng_seed, runtime_windows=windows)
+    else:
+        compose_proposal = proposal
+        if windows:
+            from dataclasses import replace as _replace
+            compose_proposal = _replace(proposal, runtime_windows=[])
+        plan = compose(adapted_parent, [compose_proposal], contract, rng_seed=rng_seed,
+                       runtime_windows=windows)
     scenario = Scenario(target, rmw, "mutated", 0, rng_seed,
                         {"mutation_kind": mutation_kind, "carrier": carrier,
                          "mutation_parameters": plan.final_config}, plan)
@@ -734,6 +1121,23 @@ def _generate_case(sequence, entry, target, contract, surface, parent, mutator_i
         "runtime_route": route,
         "parent_adaptation": adaptation,
     }
+    if wide:
+        # Additive provenance appears only when the profile opts into T-E, so
+        # the undeclared (legacy) config/row keeps its historical bytes.
+        supported = sorted(set(_wide_kinds(surface, adapted_parent)))
+        config["fuzz_generation"] = {
+            "wide": True,
+            "declared_sampling_kinds": (list(sampling_kinds)
+                                        if sampling_kinds is not None else None),
+            "supported_sampling_kinds": supported,
+            "sampling_weight": (dict(sampling_weight)
+                                if sampling_weight is not None else None),
+            "filtered_sampling_kinds": sampling_filtered,
+            "chain_length": chain_length,
+            "chain_surfaces": [op.surface_id for op in plan.operations],
+        }
+        config["sampling_kind"] = sampling_kind
+        config["chain_depth"] = len(plan.operations)
     config.update(json.loads(json.dumps(plan.final_config)))
     # F3 exploratory stimulus: start a second reader generation inside the
     # drop window.  This is a runtime action, not part of the submitted config
@@ -806,6 +1210,10 @@ def _generate_case(sequence, entry, target, contract, surface, parent, mutator_i
                 config['publish_burst_count'] = profile['publish_burst_count']
             if 'publish_burst_interval_sec' in profile:
                 config['publish_burst_interval_sec'] = profile['publish_burst_interval_sec']
+            for key in ('reader_recreate_fractions', 'reader_destroy_fractions',
+                        'writer_churn_in_window', 'environment_mutation'):
+                if key in profile:
+                    config[key] = profile[key]
         binding = {"status": "preserved", "silent_normalization": False,
                    "submitted_config_sha256": canonical_hash(plan.final_config),
                    "normalized_config_sha256": canonical_hash(normalized),
@@ -847,6 +1255,12 @@ def _generate_case(sequence, entry, target, contract, surface, parent, mutator_i
             ("planned", "submitted", "carrier_admitted", "configured",
              "applied", "hit", "effect_observed"), False),
     }
+    if wide:
+        # T-E coverage fields are additive opt-in: the legacy row stays byte
+        # identical when neither sampling_kinds nor chain_length is declared.
+        row["sampling_kind"] = sampling_kind
+        row["chain_depth"] = len(plan.operations)
+        row["fuzz_generation"] = dict(config["fuzz_generation"])
 
     _atomic_json(plan_path, plan.to_dict())
     _atomic_json(capsule_path, capsule.to_dict())
@@ -905,6 +1319,10 @@ def _generate_case(sequence, entry, target, contract, surface, parent, mutator_i
         "binding": binding,
         "evidence_origin": _evidence_origin(runtime_result),
     })
+    if wide:
+        row.update({"sampling_kind": sampling_kind,
+                    "chain_depth": len(plan.operations),
+                    "fuzz_generation": dict(config["fuzz_generation"])})
     if row.get("actual_run") is True:
         try:
             capsule.record_execution(row)
@@ -923,18 +1341,24 @@ def _generate_case(sequence, entry, target, contract, surface, parent, mutator_i
         row["observed_edge"] = observed[1] if observed else None
     except (ValueError, KeyError, TypeError):
         complete = False
+    offer_record = {
+        "target_id": target_id, "target_revision": target.target_revision,
+        "rmw": rmw, "contract_hash": contract.contract_hash(),
+        "surface_id": surface.surface_id, "boundary_class": row["boundary_class"],
+        "relation_class": entry.get("relation_class"),
+        "contract_branch": entry.get("contract_branch"),
+        "seed_id": entry.get("seed_id"),
+        "parent_content_sha256": entry["content_sha256"],
+        "final_config": plan.final_config, "mutation_plan": plan.to_dict(),
+        "operations": [op.to_dict() for op in plan.operations],
+        "runtime_windows": plan.runtime_windows,
+        "cost": len(plan.operations), "executable": True,
+    }
+    if wide:
+        offer_record.update({"sampling_kind": sampling_kind,
+                             "chain_depth": len(plan.operations)})
     offer = corpus.offer(
-        {"target_id": target_id, "target_revision": target.target_revision,
-         "rmw": rmw, "contract_hash": contract.contract_hash(),
-         "surface_id": surface.surface_id, "boundary_class": row["boundary_class"],
-         "relation_class": entry.get("relation_class"),
-         "contract_branch": entry.get("contract_branch"),
-         "seed_id": entry.get("seed_id"),
-         "parent_content_sha256": entry["content_sha256"],
-         "final_config": plan.final_config, "mutation_plan": plan.to_dict(),
-         "operations": [op.to_dict() for op in plan.operations],
-         "runtime_windows": plan.runtime_windows,
-         "cost": len(plan.operations), "executable": True},
+        offer_record,
         executed=row.get("actual_run") is True, evidence_complete=complete,
         observed_edge=row.get("observed_edge"),
         oracle_verdict=row.get("oracle_verdict"), tool_error=tool_error(row))

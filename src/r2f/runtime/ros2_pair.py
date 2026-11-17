@@ -21,6 +21,233 @@ from .process import WorkerPool
 
 RECEIPT_KEYS = ('planned', 'submitted', 'carrier_admitted', 'configured', 'applied', 'hit', 'effect_observed')
 
+#: Roles with an explicit RMW identity contract.  reader2/reader3 are the
+#: recreation roles used by the recovery target; writer2/probe are aliases that
+#: inherit the writer vendor and never change the mixed-vendor decision.
+EFFECTIVE_RMW_ROLES = ('writer', 'reader', 'reader2', 'reader3')
+
+
+def _role_alias(role):
+    if role in ('writer', 'writer2', 'probe'):
+        return 'writer'
+    if role in ('reader', 'reader2', 'reader3'):
+        # reader2/reader3 have their own (possibly explicit) vendor rows and
+        # only fall back to reader during effective_rmws resolution.
+        return role
+    if role.startswith('reader') and role[6:].isdigit():
+        return 'reader'
+    return role
+
+
+def effective_rmws(config):
+    """Resolve the per-role vendor map without inventing a third RMW.
+
+    Absent ``rmws`` preserves the historical single-vendor contract exactly:
+    every role resolves to ``config['rmw']``.  When the field is present, a
+    missing writer/reader falls back to ``config['rmw']``; a missing reader2/3
+    falls back to the effective reader vendor.  Values are validated in
+    ``normalize_config`` so this function is also usable on already normalized
+    configs.
+    """
+    base = config.get('rmw', 'rmw_cyclonedds_cpp')
+    raw = config.get('rmws')
+    if raw is None:
+        writer = reader = base
+    else:
+        _validate_rmws(raw)
+        writer = raw.get('writer', base)
+        reader = raw.get('reader', base)
+    result = {'writer': writer, 'reader': reader,
+              'reader2': raw.get('reader2', reader) if isinstance(raw, dict) else reader,
+              'reader3': raw.get('reader3', reader) if isinstance(raw, dict) else reader}
+    return result
+
+
+def role_rmw(config, role):
+    """Vendor for any WorkerPool role, including writer2/probe/reader4..9."""
+    values = effective_rmws(config)
+    alias = _role_alias(role)
+    if alias in values:
+        return values[alias]
+    return config.get('rmw', 'rmw_cyclonedds_cpp')
+
+
+def is_mixed_rmws(config):
+    return len(set(effective_rmws(config).values())) > 1
+
+
+def pair_is_mixed(config):
+    values = effective_rmws(config)
+    return values['writer'] != values['reader']
+
+
+def role_rmw_differs_from_config(config):
+    """True when any explicit role vendor differs from the global default."""
+    return any(role_rmw(config, role) != config.get('rmw') for role in EFFECTIVE_RMW_ROLES)
+
+
+def observation_uses_single_vendor_contract(config):
+    """The passive sidecar only knows the writer/reader pair vendors."""
+    return pair_is_mixed(config)
+
+
+def mixed_base_environment(environment):
+    """Remove single-vendor profile/transport selectors before role overlays.
+
+    A base environment that still names one vendor's XML or QoS override would
+    apply to every role, including the other vendor.  The per-role overlays are
+    the only authority once any role overrides the global vendor.
+    """
+    env = dict(environment)
+    for key in ('CYCLONEDDS_URI', 'FASTRTPS_DEFAULT_PROFILES_FILE',
+                'FASTDDS_DEFAULT_PROFILES_FILE', 'RMW_FASTRTPS_USE_QOS_FROM_XML',
+                'ROS_DISCOVERY_SERVER'):
+        env.pop(key, None)
+    return env
+
+
+def role_rmw_environments(config, role_environments=None):
+    """Inject per-role RMW_IMPLEMENTATION through the existing role_env path.
+
+    When ``rmws`` is absent the input mapping is returned unchanged.  This keeps
+    the default environment byte-for-byte compatible with the single-vendor
+    path, including dict key insertion order.
+    """
+    environments = {role: dict(env) for role, env in (role_environments or {}).items()}
+    if 'rmws' not in config:
+        return environments
+    for role in ('writer', 'writer2', 'probe', 'reader', 'reader2', 'reader3',
+                 'reader4', 'reader5', 'reader6', 'reader7', 'reader8', 'reader9'):
+        environments.setdefault(role, {})['RMW_IMPLEMENTATION'] = role_rmw(config, role)
+    return environments
+
+
+def mixed_worker_start_failure(config, reason):
+    """Name a per-vendor worker startup failure as blocked, never a retry.
+
+    A worker exiting before any endpoint exists is the only observable a
+    load/initialization failure leaves.  For an explicit ``rmws`` map this is
+    surfaced with a stable ``blocked:`` prefix so it cannot be mistaken for a
+    SUT failure or a healthy single-vendor fallback.
+    """
+    if ('rmws' in config and isinstance(reason, str)
+            and (reason.startswith('worker_exited')
+                 or reason.startswith('worker_cleanup_error:worker_exited'))):
+        return 'blocked:mixed_vendor_worker_start_failed:' + reason
+    return reason
+
+
+def require_role_rmw(config, role, token):
+    """Fail closed with an explicit role/expected/observed reason."""
+    expected = role_rmw(config, role)
+    observed = token.get('rmw_identifier') if isinstance(token, dict) else None
+    if observed != expected:
+        raise RuntimeError('rmw_identity_mismatch:' + role + ':expected=' + expected
+                           + ':observed=' + str(observed))
+    return expected
+
+
+def require_rmws_available(environment, config):
+    """Fail closed when a configured vendor library is known unavailable.
+
+    ``check_environment`` probes both reviewed RMW libraries.  A missing reader
+    vendor is a blocked capability, never a silent fallback to the writer's
+    vendor.  Test stubs without the probe keep their historical behaviour.
+    """
+    probed = environment.get('rmw') if isinstance(environment, dict) else None
+    if not isinstance(probed, dict) or not probed:
+        return
+    for role, rmw in effective_rmws(config).items():
+        record = probed.get(rmw)
+        if isinstance(record, dict) and record.get('available') is False:
+            raise RuntimeError('blocked:rmw_unavailable:' + role + ':' + rmw)
+
+
+def observed_rmws_from_events(events):
+    observed = {}
+    for role in EFFECTIVE_RMW_ROLES:
+        token = next((event for event in events
+                      if event.get('event') == 'endpoint_created' and event.get('role') == role), None)
+        if token is not None:
+            observed[role] = token
+    return observed
+
+
+def effective_rmws_receipt(config, observed=None):
+    """Raw/result receipt: per-role configured RMW and observed identifier."""
+    expected = effective_rmws(config)
+    observed = observed or {}
+    roles = {}
+    for role in EFFECTIVE_RMW_ROLES:
+        token = observed.get(role)
+        if isinstance(token, dict):
+            identifier = token.get('rmw_identifier')
+        elif isinstance(token, str):
+            identifier = token
+        else:
+            identifier = None
+        roles[role] = {'rmw': expected[role],
+                       'observed_rmw_identifier': identifier,
+                       'match': None if identifier is None else identifier == expected[role]}
+    return {'schema': 'r2f.effective-rmws/v1',
+            'configured': 'rmws' in config,
+            'mixed': len(set(expected.values())) > 1,
+            'roles': roles}
+
+
+class _MixedObservationContext:
+    """Explicit absence sidecar for mixed-vendor runs.
+
+    ``instrumentation_bridge.prepare`` derives one vendor profile policy from
+    ``config['rmw']`` and its capture identity requires every worker to report
+    that same RMW.  Claiming it observed a mixed pair would be false.  This
+    context keeps the base environment clean and reports the limitation as an
+    unknown observation, never as a SUT defect or a failed run.
+    """
+
+    def __init__(self, config, base_env):
+        from r2f.instrumentation.cyclonedds import environment_for_mode
+        self.config = dict(config)
+        self.base_env = mixed_base_environment(environment_for_mode(base_env, mode='blackbox'))
+        self.role_env = role_rmw_environments(config, {})
+
+    def capture_worker(self, role, pid, endpoint_event):
+        return {'accepted': False, 'reason': 'mixed_vendor_passive_sidecar_unsupported'}
+
+    def capture_graph(self, graph, ack):
+        return {'accepted': False, 'reason': 'mixed_vendor_passive_sidecar_unsupported'}
+
+    def collect(self, result):
+        return {'schema': 'r2f.runtime-instrumentation/v1',
+                'observation_mode': 'blackbox',
+                'status': 'incomplete', 'verdict': 'unknown',
+                'reason': 'mixed_vendor_passive_sidecar_unsupported',
+                'intake': [], 'candidate_count': 0,
+                'execution_metadata_only': True}
+
+
+class RoleRmwWorkerPool(WorkerPool):
+    """Apply the role vendor through WorkerPool while preserving process.py.
+
+    WorkerPool.start currently writes RMW_IMPLEMENTATION from config['rmw']
+    after role_environments.  Passing a per-role config view during that one
+    call makes the existing global write role-correct without changing the
+    process ownership or lifecycle code.  The role_env still carries the same
+    RMW_IMPLEMENTATION for audit and for any future reordering.
+    """
+
+    def start(self, role):
+        original = self.config
+        per_role = role_rmw(original, role)
+        if per_role == original.get('rmw'):
+            return super().start(role)
+        self.config = {**original, 'rmw': per_role}
+        try:
+            return super().start(role)
+        finally:
+            self.config = original
+
+
 EXPLORATORY_TARGETS = {
     'discovery.late_endpoint.fuzz_v1': {
         'runtime_capability': 'public_endpoint_pair_fuzz',
@@ -82,12 +309,13 @@ EXPLORATORY_BINDINGS = {
 }
 W01_EXTRA_FIELDS = ('pre_match_count', 'post_match_count')
 
-#: F1 recovery fuzz admits exactly the single-window E01 duration surface.
-#: E02/E03 (multi-window and anchor offset) remain declared but capability
-#: pending; admitting their config shape here would execute an unverified
-#: surface.  The chain implementation exists offline but is not live-admitted.
+#: F2 recovery fuzz admits the environment surface family E01/E02/E03 with a
+#: 1..3 window chain.  Admission checks only input shape and declared surfaces;
+#: it is not execution evidence and cannot turn a planned chain into a hit.
+#: G01 and every other surface stay outside this target's admission.
 RECOVERY_FUZZ_TARGET = 'discovery.interruption_recovery.fuzz_v1'
-RECOVERY_FUZZ_ADMITTED_SURFACES = frozenset({'E01'})
+RECOVERY_FUZZ_ADMITTED_SURFACES = frozenset({'E01', 'E02', 'E03'})
+MAX_RECOVERY_WINDOWS = 3
 
 
 def recovery_fuzz_admission_error(config):
@@ -95,7 +323,9 @@ def recovery_fuzz_admission_error(config):
 
     This is an input-admission gate, not execution evidence.  It never claims a
     run happened; it only refuses configs whose declared surfaces/window shape
-    are outside the target's reviewed F1 contract.
+    are outside the target's reviewed contract.  The target id is never
+    rewritten, so a config that mixes another target's surface (e.g. G01) is
+    refused by the binding check or here.
     """
     if config.get('target_id') != RECOVERY_FUZZ_TARGET:
         return None
@@ -104,8 +334,19 @@ def recovery_fuzz_admission_error(config):
     if pending:
         return 'unsupported_capability:surface_not_admitted:' + ','.join(pending)
     windows = config.get('environment_windows')
-    if isinstance(windows, (list, tuple)) and len(windows) > 1:
-        return 'unsupported_capability:multi_window_not_admitted'
+    if windows is not None:
+        if not isinstance(windows, (list, tuple)):
+            return 'unsupported_capability:environment_windows_not_a_list'
+        if not 1 <= len(windows) <= MAX_RECOVERY_WINDOWS:
+            return ('unsupported_capability:window_count_not_admitted:'
+                    + str(len(windows)))
+        # Admission is shape-only; the window contract itself is validated by
+        # the namespace normalizer before any carrier action.  Reject an
+        # obviously invalid first anchor here so admission never returns None
+        # for a shape the runtime must refuse.
+        first = windows[0]
+        if isinstance(first, dict) and first.get('trigger_anchor') not in (None, 'fresh_match'):
+            return 'unsupported_capability:first_window_trigger_anchor_not_fresh_match'
     return None
 
 
@@ -224,6 +465,25 @@ def exploratory_runtime_capabilities():
             for target_id, spec in EXPLORATORY_TARGETS.items()}
 
 
+def _validate_rmws(value):
+    """Strict schema for the optional mixed-vendor map.
+
+    Only writer/reader/reader2/reader3 may be named, and every supplied value
+    must be one of the two reviewed RMWs.  Missing keys are resolved later by
+    ``effective_rmws``; they are never silently replaced with a third vendor.
+    """
+    if not isinstance(value, dict):
+        raise ValueError('invalid_rmws:rmws:must_be_dict')
+    unknown = set(value) - {'writer', 'reader', 'reader2', 'reader3'}
+    if unknown:
+        raise ValueError('unsupported_rmws_role:rmws.' + ','.join(sorted(unknown)))
+    for role, rmw in value.items():
+        if not isinstance(rmw, str) or not rmw:
+            raise ValueError('unsupported_rmw:rmws.' + role + ':empty')
+        if rmw not in RMW_NAMES:
+            raise ValueError('unsupported_rmw:rmws.' + role + ':' + rmw)
+
+
 def normalize_config(config):
     if not isinstance(config, dict):
         raise ValueError('config must be a dictionary')
@@ -238,8 +498,10 @@ def normalize_config(config):
     if not isinstance(c['run_id'], str) or not re.fullmatch(r'[A-Za-z0-9_.-]{1,128}', c['run_id']):
         raise ValueError('run_id must contain 1..128 safe identifier characters')
     c.setdefault('rmw', 'rmw_cyclonedds_cpp')
-    if c['rmw'] not in RMW_NAMES:
-        raise ValueError('unsupported_rmw:' + str(c['rmw']))
+    if not isinstance(c['rmw'], str) or c['rmw'] not in RMW_NAMES:
+        raise ValueError('unsupported_rmw:rmw:' + str(c['rmw']))
+    if 'rmws' in c:
+        _validate_rmws(c['rmws'])
     c.setdefault('target_id', 'discovery.late_endpoint')
     c.setdefault('target_revision', 0)
     c.setdefault('arm', 'mutated')
@@ -641,6 +903,12 @@ def run_pair(config: dict, output_dir: Path) -> dict:
     if c['target_id'] in EXPLORATORY_TARGETS and c.get('runtime_windows'):
         result['reason'] = 'blocked:endpoint_pair_does_not_apply_discovery_windows'
         return result
+    if observation_uses_single_vendor_contract(c) and c.get('observation_mode', 'blackbox') == 'instrumentation':
+        # Explicit vendor tracing is Cyclone-only and its capture identity
+        # assumes one RMW for every role. Refuse rather than present half-pair
+        # evidence; this also covers rmws that only overrides reader2/reader3.
+        result['reason'] = 'blocked:mixed_vendor_instrumentation_not_supported'
+        return result
     # Refuse to overwrite any evidence from an earlier invocation.
     raw_path = output_dir / 'raw.jsonl'
     try:
@@ -649,6 +917,9 @@ def run_pair(config: dict, output_dir: Path) -> dict:
         result['reason'] = 'blocked:state_directory_already_executed'
         return result
     result['raw_path'] = str(raw_path)
+    # The receipt is a fact about configuration until workers report; observed
+    # identifiers stay null, never filled from the requested value.
+    result['effective_rmws'] = effective_rmws_receipt(c)
     exploratory = c['target_id'] in EXPLORATORY_TARGETS
     receipts = result['precondition_receipts']
     observation_receipts = result['observation_receipts']
@@ -675,6 +946,11 @@ def run_pair(config: dict, output_dir: Path) -> dict:
         raw.write(json.dumps(value, sort_keys=True) + '\n')
         if event == 'endpoint_created':
             result['real_execution'] = True
+
+    # Record the configured (pre-observation) receipt in raw before any
+    # preflight can block, so a blocked mixed run is still auditable.
+    emit('effective_rmws', receipt=result['effective_rmws'],
+         mixed=result['effective_rmws']['mixed'])
 
     def observe(method, *args):
         # Observation errors are sidecar diagnostics, not primary SUT failures.
@@ -727,18 +1003,49 @@ def run_pair(config: dict, output_dir: Path) -> dict:
         emit('environment_preflight', ok=environment['ok'], reason=environment.get('reason'))
         if not environment['ok']:
             raise IsolationError(environment.get('reason', 'environment_preflight_failed'))
+        require_rmws_available(environment, c)
         _, child_environment = activated_environment(c)
         # prepare must succeed before worker creation: never fall back to an
         # unsanitized environment after a blackbox preparation failure.
-        observation = prepare(c, output_dir, child_environment)
-        pool = WorkerPool(c, observation.base_env, output_dir, emit,
-                          role_environments=observation.role_env)
+        if observation_uses_single_vendor_contract(c):
+            # The passive observation bridge currently has a single-vendor
+            # profile contract. Mixed vendor runs still execute through the
+            # public API, but the sidecar is explicitly unavailable rather than
+            # pretending one vendor's SEDP trace observed both.
+            observation = _MixedObservationContext(c, child_environment)
+            role_env = role_rmw_environments(c, observation.role_env)
+            # Each role keeps only its own vendor's profile variable; a leftover
+            # variable from the other vendor would redirect transport selection.
+            for role, env in role_env.items():
+                rmw = role_rmw(c, role)
+                if rmw != 'rmw_cyclonedds_cpp':
+                    env.pop('CYCLONEDDS_URI', None)
+                if rmw != 'rmw_fastrtps_cpp':
+                    env.pop('FASTRTPS_DEFAULT_PROFILES_FILE', None)
+                    env.pop('FASTDDS_DEFAULT_PROFILES_FILE', None)
+            emit('mixed_vendor_observation_unsupported',
+                 reason='single_vendor_passive_sidecar_contract')
+            pool = RoleRmwWorkerPool(c, observation.base_env, output_dir, emit,
+                                     role_environments=role_env)
+        else:
+            observation = prepare(c, output_dir, child_environment)
+            role_env = role_rmw_environments(c, observation.role_env)
+            pool_class = RoleRmwWorkerPool if role_rmw_differs_from_config(c) else WorkerPool
+            pool = pool_class(c, observation.base_env, output_dir, emit,
+                              role_environments=role_env)
         emit('window_open', window='before_reader_match')
         step('writer_created', lambda: has('endpoint_created', 'writer'), lambda: pool.start('writer'),
              c['startup_timeout_sec'], ['environment_ok', 'locks_held'])
         writer_token = next(e for e in events if e['event'] == 'endpoint_created' and e['role'] == 'writer')
-        if writer_token['rmw_identifier'] != c['rmw'] or not writer_token.get('endpoint_gid'):
+        require_role_rmw(c, 'writer', writer_token)
+        if not writer_token.get('endpoint_gid'):
             raise RuntimeError('writer_identity_or_rmw_incomplete')
+        observed_rmws = {'writer': writer_token}
+        result['effective_rmws'] = effective_rmws_receipt(c, observed_rmws)
+        emit('effective_rmws_observed', role='writer',
+             expected=role_rmw(c, 'writer'),
+             observed=writer_token.get('rmw_identifier'),
+             receipt=result['effective_rmws'])
         observe('capture_worker', 'writer', writer_token['pid'], writer_token)
         step('writer_prejoin_published', lambda: sum(e['event'] == 'send' and e.get('phase') == 'prejoin' for e in events) == c['pre_match_count'],
              lambda: [publish(i, 'prejoin') for i in range(c['pre_match_count'])], c['startup_timeout_sec'], ['writer_created'])
@@ -764,8 +1071,15 @@ def run_pair(config: dict, output_dir: Path) -> dict:
         step('reader_created', lambda: has('endpoint_created', 'reader'), lambda: pool.start('reader'),
              c['startup_timeout_sec'], ['writer_created', 'writer_prejoin_published'], observation=True)
         reader_token = next(e for e in events if e['event'] == 'endpoint_created' and e['role'] == 'reader')
-        if reader_token['rmw_identifier'] != c['rmw'] or not reader_token.get('endpoint_gid') or reader_token['pid'] == writer_token['pid']:
+        require_role_rmw(c, 'reader', reader_token)
+        if not reader_token.get('endpoint_gid') or reader_token['pid'] == writer_token['pid']:
             raise RuntimeError('reader_identity_or_process_isolation_incomplete')
+        observed_rmws['reader'] = reader_token
+        result['effective_rmws'] = effective_rmws_receipt(c, observed_rmws)
+        emit('effective_rmws_observed', role='reader',
+             expected=role_rmw(c, 'reader'),
+             observed=reader_token.get('rmw_identifier'),
+             receipt=result['effective_rmws'])
         observe('capture_worker', 'reader', reader_token['pid'], reader_token)
         actual_delay = reader_token['created_monotonic_ns'] - writer_token['created_monotonic_ns']
         if actual_delay <= 0:
@@ -895,9 +1209,12 @@ def run_pair(config: dict, output_dir: Path) -> dict:
             raise RuntimeError('source_identity_changed_during_execution')
         result.update(runtime_status='completed', status='completed', reason=None)
     except (IsolationError, OSError, RuntimeError, TimeoutError, ValueError) as exc:
+        reason = str(exc) if result['real_execution'] else mixed_worker_start_failure(c, str(exc))
+        if reason != str(exc):
+            emit('mixed_vendor_worker_failure_blocked', original_reason=str(exc), reason=reason)
         result.update(runtime_status='failed' if result['real_execution'] else 'blocked',
-                      status='failed' if result['real_execution'] else 'blocked', reason=str(exc))
-        emit('runtime_abort', reason=str(exc))
+                      status='failed' if result['real_execution'] else 'blocked', reason=reason)
+        emit('runtime_abort', reason=reason)
     finally:
         if pool is not None:
             try:
@@ -915,9 +1232,13 @@ def run_pair(config: dict, output_dir: Path) -> dict:
                           reason='source_identity_changed_during_execution')
             emit('runtime_abort', reason=result['reason'])
         result['facts'] = summarize_events(events)
+        observed = observed_rmws_from_events(events)
+        if observed:
+            result['effective_rmws'] = effective_rmws_receipt(c, observed)
         if result['real_execution']:
             result['execution'] = {'real_execution': True, 'run_id': c['run_id'], 'target_id': c['target_id'],
                                    'target_revision': c['target_revision'], 'rmw': c['rmw'], 'domain_id': c['domain_id'],
+                                   'effective_rmws': result['effective_rmws'],
                                    'arm': c['arm'], 'repeat': c['repeat'], 'runtime_status': result['runtime_status'],
                                    'started_monotonic_ns': started_ns, 'finished_monotonic_ns': time.monotonic_ns(),
                                    'workers': pool.metadata if pool else [], 'source': before_source, 'source_after': final_source,

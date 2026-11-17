@@ -17,7 +17,8 @@ def emit_snapshot(endpoint, role, command_id, endpoint_gid, graph, emit):
     reader process. A later explicit query establishes a comparable observation
     without changing the original count-transition timestamp.
     """
-    api = 'get_subscription_count' if role == 'writer' else 'get_publisher_count'
+    api = ('get_subscription_count' if role in ('writer', 'writer2')
+           else 'get_publisher_count')
     sampled_ns = time.monotonic_ns()
     count = getattr(endpoint, api)()
     emit('match_snapshot', command_id=command_id, matched_count=count,
@@ -69,7 +70,7 @@ def create_public_qos(q):
 
 def self_qos_entry(graph, role, endpoint_gid):
     """Return the SDK-reported graph entry for this worker's own endpoint."""
-    rows = graph['publishers'] if role == 'writer' else graph['subscriptions']
+    rows = graph['publishers'] if role in ('writer', 'writer2') else graph['subscriptions']
     for item in rows:
         if item.get('endpoint_gid') == endpoint_gid:
             return item
@@ -107,9 +108,12 @@ def main():
         print(json.dumps(value, sort_keys=True), flush=True)
         return value
 
-    # Recreated reader generations use an explicit role alias but the same
-    # reader endpoint semantics and QoS contract.
-    endpoint_role = 'reader' if role in ('reader', 'reader2', 'reader3') else role
+    # Recreated reader/writer generations use explicit role aliases but the
+    # same endpoint semantics and QoS contract as their base role.  Keep this
+    # mapping in one place so reader2..reader9 and writer2 cannot drift.
+    import re
+    match = re.fullmatch(r'(reader|writer)([2-9])', role)
+    endpoint_role = match.group(1) if match else role
     q = config.get(endpoint_role + '_qos', config['qos'])
     qos = create_public_qos(q)
 
@@ -185,7 +189,7 @@ def main():
         emit('qos_binding_observed', requested=q,
              observed_self=own['qos'] if own else None,
              observed_self_gid=own['endpoint_gid'] if own else None,
-             observation_api='get_%s_info_by_topic' % ('publishers' if role == 'writer' else 'subscriptions'))
+             observation_api='get_%s_info_by_topic' % ('publishers' if endpoint_role in ('writer', 'probe') else 'subscriptions'))
     input_buffer = b''
     pending_commands = []
     last_count = None
@@ -220,7 +224,7 @@ def main():
             if command['command'] == 'snapshot':
                 emit_snapshot(endpoint, role, command['command_id'], local_gid, graph, emit)
                 emit('command_done', command_id=command['command_id'])
-            elif command['command'] == 'publish' and role == 'writer':
+            elif command['command'] == 'publish' and endpoint_role == 'writer':
                 sequence = command['send_sequence']
                 phase = command['phase']
                 if command.get('omit', False):
@@ -235,7 +239,7 @@ def main():
                     emit('send', send_sequence=sequence, phase=phase, writer_gid=local_gid,
                          publish_returned=True, payload_sha256=__import__('hashlib').sha256(message.data.encode()).hexdigest())
                 emit('command_done', command_id=command['command_id'])
-            elif command['command'] == 'publish_burst' and role == 'writer':
+            elif command['command'] == 'publish_burst' and endpoint_role == 'writer':
                 # Publish a bounded sequence without per-sample controller ACKs;
                 # one command_done closes the burst.  This creates real
                 # publish/creation overlap rather than a serialized schedule.

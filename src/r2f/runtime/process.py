@@ -18,6 +18,11 @@ class WorkerPool:
         self.role_environments = role_environments or {}
         self.command_serial = 0
         self.metadata = []
+        # Roles that were deliberately stopped by the controller.  Their clean
+        # rc0 exit is expected health state, never a worker crash.  This is
+        # keyed by role and generation so reader2..reader9 and writer2 churn
+        # share the same lifecycle contract.
+        self.stopped_roles = set()
 
     def start(self, role):
         env = dict(self.environment)
@@ -26,7 +31,16 @@ class WorkerPool:
                    ROS_LOCALHOST_ONLY='1', ROS_LOG_DIR=str(self.output_dir / 'ros_logs'),
                    PYTHONDONTWRITEBYTECODE='1', PYTHONUNBUFFERED='1')
         stderr_path = self.output_dir / f'{role}.stderr.log'
-        stderr = stderr_path.open('xb')
+        # Same-role restarts are explicit churn: never overwrite an earlier
+        # generation's stderr, suffix the new attempt instead.
+        attempt = 1
+        while True:
+            try:
+                stderr = stderr_path.open('xb')
+                break
+            except FileExistsError:
+                attempt += 1
+                stderr_path = self.output_dir / f'{role}.{attempt}.stderr.log'
         self.stderr_handles.append(stderr)
         process = subprocess.Popen(['/usr/bin/python3', '-B', '-m', 'r2f.runtime.worker',
                                     json.dumps(self.config, sort_keys=True), role],
@@ -34,6 +48,7 @@ class WorkerPool:
                                    env=env, start_new_session=True, cwd=self.config['source_repo'])
         self.workers[role] = process
         self.buffers[role] = b''
+        self.stopped_roles.discard(role)
         os.set_blocking(process.stdout.fileno(), False)
         self.selector.register(process.stdout, selectors.EVENT_READ, role)
         self.metadata.append({'role': role, 'pid': process.pid, 'pgid': process.pid,
@@ -46,7 +61,12 @@ class WorkerPool:
         process = self.workers[role]
         process.stdin.write((json.dumps({'command': command, 'command_id': command_id, **fields}) + '\n').encode())
         process.stdin.flush()
+        if command == 'stop':
+            self.stopped_roles.add(role)
         return command_id
+
+    def is_stopped(self, role):
+        return role in self.stopped_roles
 
     def pump(self, timeout=0.05):
         for key, _ in self.selector.select(timeout):
@@ -76,10 +96,11 @@ class WorkerPool:
             if predicate():
                 return
             if check_health:
-                # A probe is deliberately stopped during the window; its clean
-                # exit (rc0) is expected.  Writer/reader must stay alive.
+                # A worker deliberately stopped by the controller may exit
+                # cleanly; any other exit, including a nonzero exit from a
+                # stopped worker, remains a health failure.
                 failed = [(role, p.returncode) for role, p in self.workers.items()
-                          if p.poll() is not None and not (role in ('probe', 'reader2', 'reader3') and p.returncode == 0)]
+                          if p.poll() is not None and not (role in self.stopped_roles and p.returncode == 0)]
                 if failed:
                     self.pump(0)
                     raise RuntimeError(f'worker_exited:{failed}')

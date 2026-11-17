@@ -38,12 +38,22 @@ def required_catalog_hash():
 
 
 class ExploratoryScheduler:
-    """Pure selection over one corpus snapshot and one ordered feedback log."""
+    """Pure selection over one corpus snapshot and one ordered feedback log.
+
+    ``sampling_kinds``/``sampling_weight`` are an additive opt-in layer.  When
+    neither is declared every selection event keeps the historical field set
+    and bytes; when declared, one supported kind is chosen after the corpus
+    entry and recorded as ``sampling_kind``.  The kind choice is deterministic
+    under the scheduler RNG seed and prioritises kinds with fewer selections in
+    this cycle (the same deficit-first shape as the existing uncovered pool).
+    """
 
     WEIGHTS = (("uniform", 20), ("uncovered", 40), ("rare_edge", 40))
     FALLBACK = ("uniform", "uncovered", "rare_edge")
+    _surface_cache = None
 
-    def __init__(self, corpus, feedback=None, *, rng_seed=0, warmup=10):
+    def __init__(self, corpus, feedback=None, *, rng_seed=0, warmup=10,
+                 sampling_kinds=None, sampling_weight=None):
         if not isinstance(corpus, Corpus):
             raise ValueError("exploratory scheduler requires a Corpus")
         if type(rng_seed) is not int or rng_seed < 0:
@@ -64,6 +74,122 @@ class ExploratoryScheduler:
         self.rng_seed = rng_seed
         self.warmup = warmup
         self.selection_log = []
+        self.sampling_kinds = None
+        self.sampling_weight = None
+        if sampling_kinds is not None or sampling_weight is not None:
+            self.configure_sampling(sampling_kinds, sampling_weight)
+
+    def configure_sampling(self, sampling_kinds, sampling_weight=None):
+        """Validate and install the opt-in sampling namespace.
+
+        No selection is made here.  ``sampling_kinds`` must name declared wide
+        classes; weights are nonnegative integers with at least one positive
+        entry.  A surface-specific subset that has no supported kind is reported
+        by ``next()`` and rejected by the runner, never silently replaced.
+        """
+        from r2f.core.mutators import WIDE_SAMPLING_KINDS
+        if not isinstance(sampling_kinds, list) or not sampling_kinds:
+            raise ValueError("sampling_kinds must be a nonempty list")
+        if any(not isinstance(kind, str) or not kind for kind in sampling_kinds):
+            raise ValueError("sampling_kinds must contain nonempty strings")
+        if len(set(sampling_kinds)) != len(sampling_kinds):
+            raise ValueError("sampling_kinds contains duplicates")
+        unknown = sorted(set(sampling_kinds) - set(WIDE_SAMPLING_KINDS))
+        if unknown:
+            raise ValueError("unsupported sampling kind(s): " + ",".join(unknown))
+        if sampling_weight is None:
+            sampling_weight = {}
+        if not isinstance(sampling_weight, dict):
+            raise ValueError("sampling_weight must be an object")
+        unknown_weight = sorted(set(sampling_weight) - set(sampling_kinds))
+        if unknown_weight:
+            raise ValueError("sampling_weight names undeclared kind(s): "
+                             + ",".join(unknown_weight))
+        normalized = {}
+        for kind in sampling_kinds:
+            weight = sampling_weight.get(kind, 1)
+            if type(weight) is not int or weight < 0:
+                raise ValueError("sampling_weight must be nonnegative integers")
+            normalized[kind] = weight
+        if not any(normalized.values()):
+            raise ValueError("sampling_weight must not be all zero")
+        self.sampling_kinds = list(sampling_kinds)
+        self.sampling_weight = normalized
+
+    def _supported_sampling_kinds(self, entry):
+        """Kinds the entry's catalog surface can actually generate.
+
+        Uses the same declared-domain logic as ``mutate_wide``; it never probes
+        a mutator or records a proposal.  Unknown/synthetic surfaces support no
+        wide kind and are reported rather than guessed.
+        """
+        from r2f.core.mutators import _wide_kinds
+        from r2f.modules.s1.targets import exploratory_target_declarations
+        if ExploratoryScheduler._surface_cache is None:
+            ExploratoryScheduler._surface_cache = {
+                (target_id, surface_id): surface
+                for target_id, target in exploratory_target_declarations().items()
+                if target.exploration_contract is not None
+                for surface_id, surface in target.exploration_contract.surface_by_id.items()
+            }
+        surface = ExploratoryScheduler._surface_cache.get(
+            (entry.get("target_id"), entry.get("surface_id")))
+        parent = entry.get("final_config")
+        if surface is None or not isinstance(parent, dict):
+            return []
+        try:
+            return _wide_kinds(surface, parent)
+        except (TypeError, ValueError):
+            return []
+
+    def _choose_sampling_kind(self, sequence, entry, token=None):
+        """Pick one configured kind supported by ``entry``.
+
+        Kinds selected fewer times in this cycle win first.  Among equals the
+        configured nonnegative weights are used.  A kind weighted zero is never
+        selected; if every supported kind is excluded the result is ``None`` so
+        the runner can reject the case.  All ordering is canonical.
+        """
+        supported = set(self._supported_sampling_kinds(entry))
+        eligible = [kind for kind in self.sampling_kinds if kind in supported]
+        if not eligible:
+            return None, {"declared": list(self.sampling_kinds), "supported": []}
+        # A zero weight is an exclusion, not just a lower preference.  If the
+        # surface only supports excluded kinds the runner must reject rather
+        # than silently sampling an excluded class.
+        positive = [kind for kind in eligible if self.sampling_weight.get(kind, 1) > 0]
+        if not positive:
+            return None, {"declared": list(self.sampling_kinds),
+                          "supported": sorted(supported), "eligible": [],
+                          "reason": "all_supported_kinds_zero_weight"}
+        eligible = positive
+        used = {}
+        for event in self.selection_log:
+            kind = event.get("sampling_kind")
+            if kind in eligible:
+                used[kind] = used.get(kind, 0) + 1
+        floor = min(used.get(kind, 0) for kind in eligible)
+        candidates = sorted(kind for kind in eligible if used.get(kind, 0) == floor)
+        weights = [self.sampling_weight.get(kind, 1) for kind in candidates]
+        if not any(weights):
+            weights = [1 for _ in candidates]
+        material = canonical_hash({
+            "rng_seed": self.rng_seed, "sequence": sequence,
+            "token": token, "pool": candidates,
+            "weights": weights, "feedback_identity": self.feedback.identity(),
+            "sampling_log": [[e.get("sampling_kind")] for e in self.selection_log],
+        })
+        rng = random.Random(int(material[:32], 16))
+        target = rng.randrange(sum(weights))
+        chosen = candidates[0]
+        for kind, weight in zip(candidates, weights):
+            if target < weight:
+                chosen = kind
+                break
+            target -= weight
+        return chosen, {"declared": list(self.sampling_kinds),
+                        "supported": sorted(supported), "eligible": candidates,
+                        "used_counts": used, "weights": dict(zip(candidates, weights))}
 
     def _rng(self, sequence, pool):
         material = canonical_hash({"rng_seed": self.rng_seed, "sequence": sequence,
@@ -151,6 +277,13 @@ class ExploratoryScheduler:
                      "weighted": True, "candidate_count": len(pool),
                      "seed_id": chosen.get("seed_id"), "content_sha256": chosen["content_sha256"],
                      "feedback_identity": self.feedback.identity()}
+        if self.sampling_kinds is not None:
+            sampling_kind, sampling_meta = self._choose_sampling_kind(
+                sequence, chosen, token=chosen["content_sha256"])
+            event["sampling_kind"] = sampling_kind
+            event["sampling"] = sampling_meta
+            if sampling_kind is None:
+                event["sampling_error"] = "no_supported_sampling_kind"
         event["selection_sha256"] = canonical_hash(event)
         self.selection_log.append(event)
         return dict(event, entry=self._record(chosen["content_sha256"]))
@@ -164,14 +297,18 @@ class ExploratoryScheduler:
         return [self.next() for _ in range(count)]
 
     def to_dict(self):
-        return {"schema": "r2f.s1-selection-log/v1", "rng_seed": self.rng_seed,
-                "warmup": self.warmup, "feedback_identity": self.feedback_identity_at_start,
-                "feedback_event_count": self.feedback_event_count,
-                "selection_identity": canonical_hash({"rng_seed": self.rng_seed, "warmup": self.warmup,
-                    "feedback_identity": self.feedback_identity_at_start,
-                    "feedback_event_count": self.feedback_event_count,
-                    "selections": [e["selection_sha256"] for e in self.selection_log]}),
-                "selections": list(self.selection_log)}
+        result = {"schema": "r2f.s1-selection-log/v1", "rng_seed": self.rng_seed,
+                  "warmup": self.warmup, "feedback_identity": self.feedback_identity_at_start,
+                  "feedback_event_count": self.feedback_event_count,
+                  "selection_identity": canonical_hash({"rng_seed": self.rng_seed, "warmup": self.warmup,
+                      "feedback_identity": self.feedback_identity_at_start,
+                      "feedback_event_count": self.feedback_event_count,
+                      "selections": [e["selection_sha256"] for e in self.selection_log]}),
+                  "selections": list(self.selection_log)}
+        if self.sampling_kinds is not None:
+            result["sampling"] = {"kinds": list(self.sampling_kinds),
+                                  "weight": dict(self.sampling_weight)}
+        return result
 
 
 def replay_selection(log, corpus, feedback_events):
@@ -188,7 +325,11 @@ def replay_selection(log, corpus, feedback_events):
     feedback = FeedbackLog.from_events(list(feedback_events)[:count])
     if feedback.identity() != log.get("feedback_identity"):
         raise ValueError("feedback order differs from recorded selection identity")
-    scheduler = ExploratoryScheduler(corpus, feedback, rng_seed=log["rng_seed"], warmup=log["warmup"])
+    sampling = log.get("sampling")
+    scheduler = ExploratoryScheduler(
+        corpus, feedback, rng_seed=log["rng_seed"], warmup=log["warmup"],
+        sampling_kinds=(sampling or {}).get("kinds"),
+        sampling_weight=(sampling or {}).get("weight"))
     rebuilt = scheduler.plan(len(log["selections"]))
     expected = [e.get("selection_sha256") for e in log["selections"]]
     actual = [e.get("selection_sha256") for e in rebuilt]

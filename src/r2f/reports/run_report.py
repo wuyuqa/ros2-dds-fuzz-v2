@@ -51,6 +51,70 @@ EXPLORATORY_SEAL = "not_applicable_exploratory"
 SUPPORTED_CAMPAIGN_KINDS = frozenset({"required", "exploratory"})
 
 
+def _coverage_hit(row):
+    """A hit is only the plan-bearing mutation receipt's own boolean."""
+    receipt = row.get("mutation_receipt")
+    return isinstance(receipt, dict) and receipt.get("hit") is True
+
+
+def exploratory_coverage_fields(report):
+    """Coverage summary for the exploratory report, or None for legacy reports.
+
+    An exploratory report only grows this field when at least one row carries a
+    T-E coverage identity (sampler or chain depth).  Reports generated before
+    T-E therefore keep their historical bytes, and a legacy audit never fails
+    because an additive field is absent.
+    """
+    rows = report.get("rows")
+    if not isinstance(rows, list):
+        return None
+    if not any(isinstance(row, dict) and ("sampling_kind" in row or "chain_depth" in row)
+               for row in rows):
+        return None
+    return exploratory_coverage_table(rows)
+
+
+def exploratory_coverage_table(rows):
+    """Additive coverage ledger keyed by target × surface × sampler × chain depth.
+
+    Four independent counters are reported and never merged:
+
+    * ``generated`` — a plan-bearing case was produced (not a rejected stub);
+    * ``executed`` — the row recorded a real runtime run;
+    * ``judged`` — the row reached ``execution_stage=judged`` after a real run;
+    * ``hit`` — the row's own mutation receipt reports a real hit.
+
+    A planned-only case therefore contributes to ``generated`` but never to the
+    other three.  Missing sampler/depth values are kept as ``None`` instead of
+    being guessed or folded into another class.
+    """
+    table = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        if row.get("mutation_plan") is None or row.get("generation_status") == "rejected":
+            # A rejected stub was never generated; it has no sampler/depth and
+            # belongs in the rejection list, not in the coverage counters.
+            continue
+        key = (row.get("target_id") or None, row.get("surface_id") or None,
+               row.get("sampling_kind"), row.get("chain_depth"))
+        entry = table.setdefault(key, {"target_id": key[0], "surface_id": key[1],
+                                       "sampling_kind": key[2], "chain_depth": key[3],
+                                       "generated": 0, "executed": 0,
+                                       "judged": 0, "hit": 0})
+        entry["generated"] += 1
+        if row.get("actual_run") is True:
+            entry["executed"] += 1
+        if row.get("execution_stage") == "judged" and row.get("actual_run") is True:
+            entry["judged"] += 1
+        if _coverage_hit(row):
+            entry["hit"] += 1
+    return sorted(table.values(), key=lambda item: (
+        item["target_id"] or "", item["surface_id"] or "",
+        item["sampling_kind"] or "", -1 if item["chain_depth"] is None
+        else item["chain_depth"]))
+
+
 def _empty_required_result(errors):
     return {"sealed": False, "errors": list(errors), "controls": {}, "unknown_gate": {},
             "required_expected": 18, "fault_expected": 6,
@@ -636,6 +700,9 @@ def audit_exploratory_report(report_path, *, report=None):
             coverage.append(row)
         details["coverage_entries"] = len(coverage)
         details["coverage_surfaces"] = sorted({s for row in coverage for s in (row.get("surface_ids") or [])})
+        coverage_table = exploratory_coverage_fields(report)
+        if coverage_table is not None:
+            details["coverage"] = coverage_table
         observed = [r for r in valid if r.get("execution_stage") == "judged"]
         details["unknown_count"] = sum(1 for r in observed if r.get("oracle_verdict") == "unknown")
         details["oracle_fail_count"] = sum(

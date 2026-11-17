@@ -410,28 +410,45 @@ class PlannedOnlyBackendTests(unittest.TestCase):
                 self.assertEqual(len(calls), 1)
 
 
-class PendingSurfaceTests(unittest.TestCase):
-    def test_e02_multi_window_is_not_admitted(self):
-        config = recovery_config(surfaces=('E02',), windows=[window(0), window(1, 0.1, 0.0, 0.02)])
-        with patch('r2f.runtime.namespace_pair.run_discovery_pair') as backend:
-            result = run_pair(config, state_dir())
-        self.assertEqual(result['reason'], 'unsupported_capability:surface_not_admitted:E02')
-        self.assertEqual(result['capability_status'], 'unsupported_capability')
-        backend.assert_not_called()
+class MultiWindowAdmissionTests(unittest.TestCase):
+    """Shape admission only; dispatch proves no live precondition was bypassed."""
 
-    def test_e03_anchor_offset_is_not_admitted(self):
-        config = recovery_config(surfaces=('E03',), windows=[window(0, offset=0.1)])
-        with patch('r2f.runtime.namespace_pair.run_discovery_pair') as backend:
-            result = run_pair(config, state_dir())
-        self.assertEqual(result['reason'], 'unsupported_capability:surface_not_admitted:E03')
-        backend.assert_not_called()
+    def test_e02_and_e03_window_plans_are_admitted(self):
+        for surface, windows in (('E02', [window(0), window(1, 0.1, 0.0, 0.02)]),
+                                 ('E03', [window(0, offset=0.1)])):
+            with self.subTest(surface=surface), \
+                 patch('r2f.runtime.namespace_pair.run_discovery_pair',
+                       return_value=sentinel('dispatched')) as backend:
+                result = run_pair(recovery_config(surfaces=(surface,), windows=windows),
+                                  state_dir())
+            self.assertEqual(result['sentinel'], 'dispatched')
+            self.assertEqual(backend.call_count, 1)
+            self.assertEqual(backend.call_args[0][0]['target_id'], RECOVERY_FUZZ)
 
-    def test_e01_with_two_windows_is_still_refused(self):
-        config = recovery_config(surfaces=('E01',), windows=[window(0), window(1, 0.1, 0.0, 0.02)])
-        with patch('r2f.runtime.namespace_pair.run_discovery_pair') as backend:
+    def test_e01_with_two_windows_is_admitted(self):
+        config = recovery_config(surfaces=('E01',),
+                                 windows=[window(0), window(1, 0.1, 0.0, 0.02)])
+        with patch('r2f.runtime.namespace_pair.run_discovery_pair',
+                   return_value=sentinel('dispatched')) as backend:
             result = run_pair(config, state_dir())
-        self.assertEqual(result['reason'], 'unsupported_capability:multi_window_not_admitted')
-        backend.assert_not_called()
+        self.assertEqual(result['sentinel'], 'dispatched')
+        backend.assert_called_once()
+
+    def test_cross_target_and_oversized_windows_are_refused(self):
+        for surfaces in (('E01', 'G01'),):
+            with self.subTest(surfaces=surfaces):
+                config = recovery_config(surfaces=surfaces)
+                self.assertIn('surface_not_admitted:G01',
+                              recovery_fuzz_admission_error(config))
+                result = run_pair(config, state_dir())
+                # Binding validation runs first and rejects the foreign surface
+                # before dispatch; admission would also refuse it.
+                self.assertIn('G01', result['reason'])
+                self.assertIn('blocked', result['reason'])
+        config = recovery_config(surfaces=('E02',),
+                                 windows=[window(i, 0.1, 0.0, 0.0) for i in range(4)])
+        self.assertIn('window_count_not_admitted:4',
+                      recovery_fuzz_admission_error(config))
 
     def test_admission_predicate_is_scoped_to_the_recovery_fuzz_target(self):
         self.assertIsNone(recovery_fuzz_admission_error({'target_id': LEGACY_RECOVERY}))

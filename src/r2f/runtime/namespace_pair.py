@@ -19,14 +19,23 @@ import subprocess
 import sys
 import time
 
-from .discovery_network import (DiscoveryDropController, WindowGateError, WindowLedger,
-                              assert_isolated_namespace, namespace_command, validate_window_plan)
+from .discovery_network import (DiscoveryDropController, DiscoveryNetemController,
+                              DiscoveryNetworkError, NETEM_IMPLEMENTATION, NETEM_LOSS_PCT,
+                              NETEM_RESPONSIBILITY_LAYER, NETEM_SCOPE_FIELD,
+                              NetemScopeError, WindowGateError, netem_hit_semantics,
+                              WindowLedger, assert_isolated_namespace, namespace_command,
+                              normalize_netem_spec, validate_window_plan)
 from .discovery_profiles import write_profiles
 from .domains import IsolationError, LeaseSet, probe_rtps_ports
 from .environment import REPO, activated_environment, check_environment, source_identity
 from .process import WorkerPool
+from .ros2_pair import (RoleRmwWorkerPool, effective_rmws_receipt, mixed_base_environment,
+                        mixed_worker_start_failure, observation_uses_single_vendor_contract,
+                        observed_rmws_from_events, require_role_rmw, role_rmw,
+                        role_rmw_differs_from_config, role_rmw_environments)
 
 IMPLEMENTATION = 'isolated_netns_nft_discovery_udp_drop'
+ENVIRONMENT_MUTATION_KINDS = ('discovery_drop', 'discovery_netem')
 CLOCK_GUARD_NS = 50_000_000
 RECOVERY_ACTIVITY_LIMIT = 32768
 
@@ -53,6 +62,44 @@ def same_source(before, after):
     return all(before.get(key) == after.get(key) for key in ('head', 'runtime_source_sha256', 'observer_source_sha256'))
 
 
+def normalize_environment_mutation(value):
+    """Select the discovery carrier. None/absent preserves the legacy nft drop.
+
+    Only ``discovery_drop`` and ``discovery_netem`` are defined. The netem spec
+    is fully validated here so a bad field fails before any namespace work.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError('environment_mutation must be a dict or null')
+    unknown = set(value) - {'kind', 'spec'}
+    if unknown:
+        raise ValueError('unknown environment_mutation field: ' + ','.join(sorted(unknown)))
+    kind = value.get('kind')
+    if kind not in ENVIRONMENT_MUTATION_KINDS:
+        raise ValueError('unsupported environment_mutation kind: ' + str(kind))
+    if kind == 'discovery_drop':
+        if set(value) != {'kind'}:
+            raise ValueError('discovery_drop environment_mutation accepts only kind')
+        return {'kind': 'discovery_drop'}
+    if 'spec' not in value:
+        raise ValueError('discovery_netem requires spec')
+    try:
+        spec = normalize_netem_spec(value['spec'])
+    except NetemScopeError as exc:
+        # Preserve the offending field name instead of collapsing it into a
+        # generic spec error; the dedicated carrier error carries it too.
+        raise ValueError(f'invalid_netem_spec: {exc.field}: {exc}') from exc
+    except DiscoveryNetworkError as exc:
+        raise ValueError('invalid_netem_spec: ' + str(exc)) from exc
+    return {'kind': 'discovery_netem', 'spec': spec}
+
+
+def discovery_carrier_kind(config):
+    environment_mutation = config.get('environment_mutation')
+    return 'discovery_drop' if environment_mutation is None else environment_mutation['kind']
+
+
 def normalize_discovery_config(config):
     c = dict(config)
     params = c['mutation_parameters']
@@ -77,6 +124,19 @@ def normalize_discovery_config(config):
             'restore_interval_sec': 0.0,
         }])
         c['window_chain_requested'] = False
+    validate_reader_churn_config(c)
+    c['environment_mutation'] = normalize_environment_mutation(c.get('environment_mutation'))
+    if (c['environment_mutation'] is not None
+            and c['environment_mutation']['kind'] == 'discovery_netem'
+            and windows is not None):
+        # The 1..3 window chain is a drop/recovery gate; a netem window has no
+        # drop semantics to chain. Refuse the combination instead of silently
+        # reinterpreting one carrier as the other.
+        raise ValueError('environment_windows_not_supported_for_discovery_netem')
+    c['carrier_implementation'] = (NETEM_IMPLEMENTATION
+                                   if c['environment_mutation'] is not None
+                                   and c['environment_mutation']['kind'] == 'discovery_netem'
+                                   else IMPLEMENTATION)
     c['window_budget_sec'] = (
         sum(w['trigger_offset_sec'] + w['drop_duration_sec'] + w['restore_interval_sec']
             for w in c['runtime_windows'])
@@ -158,7 +218,8 @@ def _supervise(c, output_dir, environment, lease, source, emit):
             parent.sendall(json.dumps(request, sort_keys=True).encode() + b'\n')
             emit('namespace_controller_started', controller_pid=process.pid, controller_pgid=process.pid,
                  implementation=('isolated_netns_passive_sedp_public_qos'
-                                 if c['target_id'].startswith('builtin.discovery_projection_reconciliation') else IMPLEMENTATION),
+                                 if c['target_id'].startswith('builtin.discovery_projection_reconciliation')
+                                 else c.get('carrier_implementation', IMPLEMENTATION)),
                  inherited_lease_count=len(lease.handles), stderr_path=str(stderr_path))
             os.set_blocking(process.stdout.fileno(), False)
             selector.register(process.stdout, selectors.EVENT_READ)
@@ -235,6 +296,38 @@ def _supervise(c, output_dir, environment, lease, source, emit):
                 process.stdout.close()
 
 
+def _write_role_profiles(output_dir, config):
+    """Write each role's transport profile for its own vendor.
+
+    The single-vendor helper is still used unchanged when ``rmws`` is absent.
+    For mixed runs, Cyclone roles receive the Cyclone loopback XML and FastDDS
+    roles receive the FastDDS profile; no role inherits another vendor's
+    configuration path.
+    """
+    from .discovery_profiles import CYCLONE_XML, FAST_XML
+    root = Path(output_dir) / 'profiles'
+    root.mkdir(exist_ok=True)
+    records, environments = {}, {}
+    # reader2..reader9 are churn roles; each receives its own resolved vendor
+    # profile so an explicit override never inherits a mismatched transport
+    # configuration from the base reader.
+    for index, role in enumerate(('writer', 'reader', 'reader2', 'reader3', 'reader4',
+                                  'reader5', 'reader6', 'reader7', 'reader8', 'reader9')):
+        rmw = role_rmw(config, role)
+        path = root / (role + '.xml')
+        if path.exists():
+            raise FileExistsError(str(path))
+        text = CYCLONE_XML if rmw == 'rmw_cyclonedds_cpp' else FAST_XML.format(role=role, index=index)
+        with path.open('x') as handle:
+            handle.write(text)
+        records[role] = {'path': str(path), 'sha256': hashlib.sha256(text.encode()).hexdigest(),
+                         'kind': 'explicit_loopback_udp_profile', 'rmw': rmw,
+                         'participant_index': 'auto' if rmw == 'rmw_cyclonedds_cpp' else index}
+        key = 'CYCLONEDDS_URI' if rmw == 'rmw_cyclonedds_cpp' else 'FASTRTPS_DEFAULT_PROFILES_FILE'
+        environments[role] = {key: str(path)}
+    return records, environments
+
+
 def run_discovery_pair(config, output_dir, result):
     """Host branch of the public run_pair entry; never called by the netns child."""
     from .ros2_pair import RECEIPT_KEYS
@@ -250,8 +343,18 @@ def run_discovery_pair(config, output_dir, result):
                 require_binding_preserved(expected, c)
                 result['exploratory_bindings'] = expected
                 result['runtime_capability'] = 'discovery_drop_window_chain'
-    except ValueError as exc:
+    except (ValueError, RuntimeError) as exc:
+        # New in-window lifecycle fields fail closed with RuntimeError so their
+        # field name is explicit; admission must surface it as blocked, never
+        # let an invalid stimulus escape as an unhandled host exception.
         result['reason'] = 'blocked:' + str(exc)
+        return result
+    result['effective_rmws'] = effective_rmws_receipt(c)
+    projection = c['target_id'].startswith('builtin.discovery_projection_reconciliation')
+    if projection and observation_uses_single_vendor_contract(c):
+        # The projection body hard-codes one vendor in its readiness policy and
+        # endpoint identity. Refuse before creating raw/state or any observer.
+        result['reason'] = 'blocked:mixed_vendor_projection_not_supported'
         return result
     raw_path = output_dir / 'raw.jsonl'
     try:
@@ -261,9 +364,13 @@ def run_discovery_pair(config, output_dir, result):
         return result
     events = result['events']
     result['raw_path'] = str(raw_path)
-    projection = c['target_id'].startswith('builtin.discovery_projection_reconciliation')
-    implementation = 'isolated_netns_passive_sedp_public_qos' if projection else IMPLEMENTATION
+    implementation = ('isolated_netns_passive_sedp_public_qos' if projection
+                      else c.get('carrier_implementation', IMPLEMENTATION))
+    # Host-branch carrier selector: the finally-block summary needs the same
+    # kind the netns body executed, so it cannot default to the drop facts.
+    carrier_kind = discovery_carrier_kind(c)
     result['carrier_implementation'] = implementation
+    result['carrier_kind'] = carrier_kind
     lease, source, started = None, execution_chain_identity(), time.monotonic_ns()
     def emit(event, **fields):
         token = {'event': event, 'role': 'host_controller', 'pid': os.getpid(), 'pgid': os.getpgrp(),
@@ -290,17 +397,30 @@ def run_discovery_pair(config, output_dir, result):
         lease = LeaseSet(Path(c.get('lock_root', f'/tmp/r2f-runtime-locks-{os.getuid()}')), output_dir, c['campaign_id'], c['domain_id'])
         lease.__enter__()
         emit('isolation_locks_acquired', locks=lease.receipts)
+        emit('effective_rmws', receipt=result['effective_rmws'],
+             mixed=result['effective_rmws']['mixed'])
         emit('runtime_source_snapshot', source=source)
         environment = check_environment(c)
         result['environment'] = environment
         emit('environment_preflight', ok=environment['ok'], reason=environment.get('reason'))
         if not environment['ok']:
             raise IsolationError(environment.get('reason', 'host_preflight_failed'))
+        from .ros2_pair import require_rmws_available
+        require_rmws_available(environment, c)
         _, child_environment = activated_environment(c)
         inner = _supervise(c, output_dir, child_environment, lease, source, emit)
+        for key in ('effective_rmws', 'effective_rmws_observed'):
+            if key in inner:
+                result[key] = inner[key]
         for key in ('runtime_status', 'reason', 'facts', 'precondition_receipts', 'observation_receipts', 'mutation_receipt'):
             result[key] = inner[key]
+        original_reason = result['reason']
+        result['reason'] = mixed_worker_start_failure(c, original_reason)
+        if result['reason'] != original_reason:
+            emit('mixed_vendor_worker_failure_blocked', original_reason=original_reason,
+                 reason=result['reason'])
         result['status'] = result['runtime_status']
+        result['effective_rmws'] = effective_rmws_receipt(c, observed_rmws_from_events(events))
         result['environment']['discovery_namespace'] = inner['environment']
         result['_workers'] = inner['workers']
         admitted = (len(inner['precondition_receipts']) == (2 if projection else 3)
@@ -312,9 +432,10 @@ def run_discovery_pair(config, output_dir, result):
                 admission_evidence_refs=[record['after'].get('raw_event_ref')
                                          for record in inner['precondition_receipts']])
     except (OSError, RuntimeError, TimeoutError, ValueError, subprocess.SubprocessError) as exc:
+        reason = str(exc) if result['real_execution'] else mixed_worker_start_failure(c, str(exc))
         result.update(runtime_status='failed' if result['real_execution'] else 'blocked',
-                      status='failed' if result['real_execution'] else 'blocked', reason=str(exc))
-        emit('runtime_abort', reason=str(exc), error_receipt=getattr(exc, 'receipt', None))
+                      status='failed' if result['real_execution'] else 'blocked', reason=reason)
+        emit('runtime_abort', reason=reason, error_receipt=getattr(exc, 'receipt', None))
     finally:
         after = execution_chain_identity()
         result['environment']['execution_chain_source_before'] = source
@@ -327,13 +448,19 @@ def run_discovery_pair(config, output_dir, result):
         if result['facts'] and not projection:
             previous = result['facts']
             result['facts'] = summarize_discovery(events,
-                active=previous['discovery_drop_applied'], counter_hit=previous['discovery_drop_counter_hit'],
+                active=(previous['discovery_carrier_mutation_applied']
+                        if carrier_kind == 'discovery_netem' else previous['discovery_drop_applied']),
+                counter_hit=(previous['discovery_netem_counter_hit']
+                             if carrier_kind == 'discovery_netem' else previous['discovery_drop_counter_hit']),
                 restored=previous['discovery_restore_verified'], activity_ok=previous['discovery_recovery_activity_observed'],
-                fresh_recovery=previous['recovery_fresh_count_graph'], drop_activity_ok=previous['discovery_drop_activity_observed'])
+                fresh_recovery=previous['recovery_fresh_count_graph'], drop_activity_ok=previous['discovery_drop_activity_observed'],
+                carrier_implementation=implementation, carrier_kind=carrier_kind,
+                neutral_spec=bool(previous.get('discovery_carrier_neutral_spec', False)))
         result['facts']['candidate_eligible'] = c['arm'] != 'negative'
         if result['real_execution']:
             result['execution'] = {'real_execution': True, 'run_id': c['run_id'], 'target_id': c['target_id'],
                 'target_revision': c['target_revision'], 'rmw': c['rmw'], 'domain_id': c['domain_id'], 'arm': c['arm'],
+                'effective_rmws': result.get('effective_rmws') or effective_rmws_receipt(c),
                 'repeat': c['repeat'], 'runtime_status': result['runtime_status'], 'started_monotonic_ns': started,
                 'finished_monotonic_ns': time.monotonic_ns(), 'source': source, 'source_after': after,
                 'workers': workers, 'carrier_implementation': implementation,
@@ -385,7 +512,9 @@ def acknowledged_graphs(events, matches, endpoints):
     return result
 
 
-def summarize_discovery(events, *, active, counter_hit, restored, activity_ok, fresh_recovery, drop_activity_ok):
+def summarize_discovery(events, *, active, counter_hit, restored, activity_ok, fresh_recovery, drop_activity_ok,
+                        carrier_implementation=IMPLEMENTATION, carrier_kind='discovery_drop',
+                        neutral_spec=False, netem_scope=None):
     from .ros2_pair import summarize_events
     # Reuse sequence/identity algebra, retaining original raw tokens and phase labels.
     normalized = []
@@ -397,21 +526,48 @@ def summarize_discovery(events, *, active, counter_hit, restored, activity_ok, f
             token['window'] = 'post_match_delivery'
         normalized.append(token)
     facts = summarize_events(normalized)
-    facts.update(discovery_drop_counter_hit=bool(counter_hit), discovery_drop_activity_observed=bool(drop_activity_ok),
-                 discovery_drop_applied=bool(active), discovery_restore_verified=restored if active else None,
+    netem = carrier_kind == 'discovery_netem'
+    if not netem:
+        # Legacy drop path: exact prior facts, byte-for-byte unchanged.
+        facts.update(discovery_drop_counter_hit=bool(counter_hit), discovery_drop_activity_observed=bool(drop_activity_ok),
+                     discovery_drop_applied=bool(active), discovery_restore_verified=restored if active else None,
+                     discovery_recovery_activity_observed=bool(activity_ok), recovery_fresh_count_graph=bool(fresh_recovery),
+                     post_restore_expected_sequences=facts['expected_post_match_sequences'],
+                     post_restore_sent_sequences=facts['post_match_sent_sequences'],
+                     post_restore_received_sequences=facts['post_match_received_sequences'],
+                     discovery_recovery_status='observed' if activity_ok and fresh_recovery and (restored or not active) else 'unknown',
+                     match_continuity_required=False, carrier_implementation=IMPLEMENTATION,
+                     recovery_basis='pair_discovery_traffic_and_fresh_public_graph_count_and_delivery',
+                     packet_observation_limit='AF_PACKET witnesses traffic, not delivery into DDS; combined with rule deletion and public endpoint evidence',
+                     neutral_control=not active)
+        return facts
+    facts.update(discovery_drop_counter_hit=False,
+                 discovery_drop_activity_observed=bool(drop_activity_ok),
+                 discovery_drop_applied=None,
+                 discovery_carrier='discovery_netem',
+                 discovery_carrier_mutation_applied=bool(active),
+                 discovery_carrier_neutral_spec=bool(neutral_spec),
+                 discovery_netem_counter_hit=bool(counter_hit),
+                 discovery_restore_verified=restored if active else None,
                  discovery_recovery_activity_observed=bool(activity_ok), recovery_fresh_count_graph=bool(fresh_recovery),
                  post_restore_expected_sequences=facts['expected_post_match_sequences'],
                  post_restore_sent_sequences=facts['post_match_sent_sequences'],
                  post_restore_received_sequences=facts['post_match_received_sequences'],
                  discovery_recovery_status='observed' if activity_ok and fresh_recovery and (restored or not active) else 'unknown',
-                 match_continuity_required=False, carrier_implementation=IMPLEMENTATION,
+                 match_continuity_required=False, carrier_implementation=carrier_implementation,
                  recovery_basis='pair_discovery_traffic_and_fresh_public_graph_count_and_delivery',
-                 packet_observation_limit='AF_PACKET witnesses traffic, not delivery into DDS; combined with rule deletion and public endpoint evidence',
-                 neutral_control=not active)
+                 packet_observation_limit='AF_PACKET witnesses traffic, not delivery into DDS; combined with tc netem qdisc removal and public endpoint evidence',
+                 neutral_control=bool(not active or neutral_spec),
+                 netem_hit_is_not_drop_hit=True)
+    if netem_scope is not None:
+        # Additive audit field: which port classes the netem class matched.
+        facts.update(discovery_netem_scope=netem_scope,
+                     discovery_netem_responsibility_layer=NETEM_RESPONSIBILITY_LAYER,
+                     discovery_netem_loss_pct=NETEM_LOSS_PCT)
     return facts
 
 
-class OwnerCheckedPool(WorkerPool):
+class OwnerCheckedPool(RoleRmwWorkerPool):
     def __init__(self, *args, owner_channel, **kwargs):
         super().__init__(*args, **kwargs)
         self.owner_channel = owner_channel
@@ -607,6 +763,247 @@ class _RecoveryMatchTrajectory:
                 'primary_verdict_input': False}
 
 
+MAX_READER_RECREATE_COUNT = 8
+MAX_PUBLISH_BURST_COUNT = 4096
+
+
+def _strict_fraction(value, field):
+    """Return a finite float in [0,1), rejecting bools and numeric strings."""
+    if isinstance(value, bool) or type(value) not in (int, float):
+        raise RuntimeError(field + ' must be a number in [0,1)')
+    value = float(value)
+    if not math.isfinite(value) or not 0 <= value < 1:
+        raise RuntimeError(field + ' must be in [0,1)')
+    return value
+
+
+def _strict_seconds(value, field):
+    if isinstance(value, bool) or type(value) not in (int, float):
+        raise RuntimeError(field + ' must be a nonnegative number')
+    value = float(value)
+    if not math.isfinite(value) or value < 0:
+        raise RuntimeError(field + ' must be nonnegative')
+    return value
+
+
+def reader_churn_plan(c, drop_duration_sec):
+    """Validate and fully resolve the in-window reader generation schedule.
+
+    The legacy reader_recreate_at_fraction/interval formula remains the
+    compatibility path.  reader_recreate_fractions, when present, is the
+    authoritative absolute relative schedule and must contain exactly one
+    strictly increasing fraction per generation.
+    """
+    if c.get('reader_recreate_in_window') is not True:
+        return []
+    count = c.get('reader_recreate_count', 1)
+    if isinstance(count, bool) or type(count) is not int or not 1 <= count <= MAX_READER_RECREATE_COUNT:
+        raise RuntimeError('reader_recreate_count must be an integer in 1..' + str(MAX_READER_RECREATE_COUNT))
+    fractions = c.get('reader_recreate_fractions')
+    if fractions is not None:
+        if not isinstance(fractions, list):
+            raise RuntimeError('reader_recreate_fractions must be a list')
+        if len(fractions) != count:
+            raise RuntimeError('reader_recreate_fractions length must equal reader_recreate_count')
+        parsed = [_strict_fraction(value, 'reader_recreate_fractions[%d]' % index)
+                  for index, value in enumerate(fractions)]
+        if any(left >= right for left, right in zip(parsed, parsed[1:])):
+            raise RuntimeError('reader_recreate_fractions must be strictly increasing')
+        delays = [drop_duration_sec * value for value in parsed]
+    else:
+        fraction = c.get('reader_recreate_at_fraction')
+        if fraction is not None:
+            base_delay = drop_duration_sec * _strict_fraction(fraction, 'reader_recreate_at_fraction')
+        else:
+            base_delay = _strict_seconds(c.get('reader_recreate_delay_sec', 0.0),
+                                         'reader_recreate_delay_sec')
+        interval = c.get('reader_recreate_interval_sec')
+        if interval is None:
+            interval = drop_duration_sec * 0.2
+        else:
+            interval = _strict_seconds(interval, 'reader_recreate_interval_sec')
+        # Preserve the legacy clamp exactly: generation 1 starts at base_delay
+        # and later generations are capped at 90% of the window.
+        delays = [base_delay if generation == 0 else min(
+            drop_duration_sec * 0.9, base_delay + generation * interval) for generation in range(count)]
+    return [{'role': 'reader%d' % (index + 2), 'generation': index + 1,
+             'delay_sec': delay, 'fraction': delay / drop_duration_sec}
+            for index, delay in enumerate(delays)]
+
+
+def reader_destroy_schedule(c, count):
+    """Validate which already-created readerN roles are destroyed in-window."""
+    destroy = c.get('reader_destroy_fractions')
+    if destroy is None:
+        return []
+    if not isinstance(destroy, list):
+        raise RuntimeError('reader_destroy_fractions must be a list')
+    if len(destroy) > count:
+        raise RuntimeError('reader_destroy_fractions length must not exceed reader_recreate_count')
+    parsed = [_strict_fraction(value, 'reader_destroy_fractions[%d]' % index)
+              for index, value in enumerate(destroy)]
+    if any(left >= right for left, right in zip(parsed, parsed[1:])):
+        raise RuntimeError('reader_destroy_fractions must be strictly increasing')
+    return [{'role': 'reader%d' % (index + 2), 'index': index, 'fraction': value}
+            for index, value in enumerate(parsed)]
+
+
+def validate_reader_churn_config(c):
+    """Fail closed on all new in-window fields; no silent no-op configs."""
+    plan = c.get('runtime_windows', [])
+    durations = [plan[0]['drop_duration_sec']] if plan else [float(c.get('drop_duration_sec', 3.0))]
+    # Validate each requested stimulus even when the arm is neutral: an invalid
+    # exploratory config must not appear as a healthy baseline/control run.
+    for duration in durations:
+        schedule = reader_churn_plan(c, duration)
+        destroys = reader_destroy_schedule(c, len(schedule))
+        created_at = {item['role']: item['fraction'] for item in schedule}
+        for item in destroys:
+            if item['fraction'] <= created_at[item['role']]:
+                raise RuntimeError('reader_destroy_fractions[%d] must be later than %s creation'
+                                   % (item['index'], item['role']))
+    writer_churn = c.get('writer_churn_in_window', False)
+    if type(writer_churn) is not bool:
+        raise RuntimeError('writer_churn_in_window must be a boolean')
+    burst_count = c.get('publish_burst_count', 32)
+    if type(burst_count) is not int or not 1 <= burst_count <= MAX_PUBLISH_BURST_COUNT:
+        raise RuntimeError('publish_burst_count must be an integer in 1..' + str(MAX_PUBLISH_BURST_COUNT))
+
+
+def _schedule_event(schedule, kind, fraction, role=None):
+    schedule.append({'kind': kind, 'fraction': fraction, 'role': role})
+
+
+def window_churn_schedule(c, drop_duration_sec):
+    """Build one ordered timeline for reader create/destroy and writer2 churn.
+
+    Every action is tied to its raw creation timestamp when it is emitted; the
+    schedule only decides due times here and never back-fills reached state.
+    """
+    if c.get('reader_recreate_in_window') is not True:
+        readers = []
+        destroys = []
+    else:
+        readers = reader_churn_plan(c, drop_duration_sec)
+        destroys = reader_destroy_schedule(c, len(readers))
+    schedule = []
+    for item in readers:
+        _schedule_event(schedule, 'reader_create', item['fraction'], item['role'])
+    for item in destroys:
+        _schedule_event(schedule, 'reader_destroy', item['fraction'], item['role'])
+    if c.get('writer_churn_in_window') is True:
+        _schedule_event(schedule, 'writer_create', 0.0, 'writer2')
+        _schedule_event(schedule, 'writer_publish', 0.0, 'writer2')
+        _schedule_event(schedule, 'writer_destroy', 0.9, 'writer2')
+    # Stable sort: for equal fractions creation (reader then writer2) occurs
+    # before destruction, and destruction preserves role order.  This is
+    # deterministic and therefore testable without a clock.
+    order = {'reader_create': 0, 'writer_create': 1, 'writer_publish': 2,
+             'reader_destroy': 3, 'writer_destroy': 4}
+    schedule.sort(key=lambda item: (item['fraction'], order[item['kind']],
+                                    item.get('role') or ''))
+    return schedule
+
+
+def run_window_churn(pool, schedule, events, *, window_start_ns,
+                     window_duration_sec, startup_timeout_sec, emit,
+                     pre_match_count, publish_burst_count,
+                     publish_burst_interval_sec, config=None):
+    """Execute one validated create/destroy timeline inside a drop window.
+
+    window_start_ns is the monotonic instant the window opened; each item's
+    fraction is resolved against window_duration_sec to an absolute due time.
+    No action is ever back-dated: the raw create/shutdown event remains the
+    authority, and requested_fraction is recorded as the plan reference only.
+    Destructive actions require a prior created role and a real worker_shutdown
+    token. The original pair roles are never referenced here.
+    """
+    pending = list(schedule)
+    created_roles = set()
+    destroyed_roles = set()
+    deadline_ns = window_start_ns + int(window_duration_sec * 1_000_000_000)
+    while pending and time.monotonic_ns() < deadline_ns:
+        item = pending[0]
+        due_ns = window_start_ns + int(item['fraction'] * window_duration_sec * 1_000_000_000)
+        if time.monotonic_ns() < due_ns:
+            pool.pump(min(0.05, max(0.0, (due_ns - time.monotonic_ns()) / 1e9)))
+            continue
+        pending.pop(0)
+        kind, role_name = item['kind'], item['role']
+        if kind == 'reader_create':
+            pool.start(role_name)
+            pool.wait(lambda role_name=role_name: any(
+                e['event'] == 'endpoint_created' and e.get('role') == role_name for e in events),
+                startup_timeout_sec, role_name + '_created')
+            token = next(e for e in events if e['event'] == 'endpoint_created'
+                         and e.get('role') == role_name)
+            if config is not None:
+                require_role_rmw(config, role_name, token)
+            created_roles.add(role_name)
+            emit('discovery_reader_recreated', reader_gid=token.get('endpoint_gid'),
+                 reader_pid=token.get('pid'), generation=token.get('endpoint_generation'),
+                 pair_member=False, role=role_name,
+                 recreate_index=int(role_name[len('reader'):]) - 1,
+                 requested_fraction=item['fraction'])
+        elif kind == 'reader_destroy':
+            if role_name not in created_roles or role_name in destroyed_roles:
+                raise RuntimeError('reader_destroy_before_create:' + role_name)
+            token = next(e for e in events if e['event'] == 'endpoint_created'
+                         and e.get('role') == role_name)
+            pool.command(role_name, 'stop')
+            pool.wait(lambda role_name=role_name: any(
+                e['event'] == 'worker_shutdown' and e.get('role') == role_name for e in events),
+                startup_timeout_sec, role_name + '_stop')
+            destroyed_roles.add(role_name)
+            emit('discovery_reader_destroyed', role=role_name,
+                 reader_gid=token.get('endpoint_gid'), reader_pid=token.get('pid'),
+                 generation=token.get('endpoint_generation'),
+                 reason='planned_in_window_churn', pair_member=False,
+                 requested_fraction=item['fraction'])
+        elif kind == 'writer_create':
+            pool.start(role_name)
+            pool.wait(lambda role_name=role_name: any(
+                e['event'] == 'endpoint_created' and e.get('role') == role_name for e in events),
+                startup_timeout_sec, role_name + '_created')
+            token = next(e for e in events if e['event'] == 'endpoint_created'
+                         and e.get('role') == role_name)
+            if config is not None:
+                require_role_rmw(config, role_name, token)
+            created_roles.add(role_name)
+            emit('discovery_writer_recreated', writer_gid=token.get('endpoint_gid'),
+                 writer_pid=token.get('pid'), generation=token.get('endpoint_generation'),
+                 pair_member=False, role=role_name)
+        elif kind == 'writer_publish':
+            if role_name not in created_roles:
+                raise RuntimeError('writer_publish_before_create:' + role_name)
+            sequences = list(range(pre_match_count, pre_match_count + publish_burst_count))
+            command_id = pool.command(role_name, 'publish_burst', sequences=sequences,
+                                      phase='writer2_churn',
+                                      interval_sec=publish_burst_interval_sec)
+            emit('publish_burst_submitted', command_id=command_id,
+                 sequences=sequences, phase='writer2_churn',
+                 controller_waits_for_ack=False, role=role_name, pair_member=False)
+        elif kind == 'writer_destroy':
+            if role_name not in created_roles or role_name in destroyed_roles:
+                raise RuntimeError('writer_destroy_before_create:' + role_name)
+            token = next(e for e in events if e['event'] == 'endpoint_created'
+                         and e.get('role') == role_name)
+            pool.command(role_name, 'stop')
+            pool.wait(lambda role_name=role_name: any(
+                e['event'] == 'worker_shutdown' and e.get('role') == role_name for e in events),
+                startup_timeout_sec, role_name + '_stop')
+            destroyed_roles.add(role_name)
+            emit('discovery_writer_destroyed', role=role_name,
+                 writer_gid=token.get('endpoint_gid'), writer_pid=token.get('pid'),
+                 generation=token.get('endpoint_generation'),
+                 reason='planned_in_window_churn', pair_member=False)
+        else:
+            raise RuntimeError('unknown_window_churn_action:' + str(kind))
+    if pending:
+        raise RuntimeError('window_churn_schedule_incomplete')
+    return {'created_roles': sorted(created_roles), 'destroyed_roles': sorted(destroyed_roles)}
+
+
 def _run_window_chain(c, active, receipt, emit, step, activity, activity_is_pair_observed,
                       snapshot_pair, pause, carrier, pool, events, endpoints, matched,
                       precondition, match_receipt, trajectories, window_records,
@@ -673,15 +1070,22 @@ def _run_window_chain(c, active, receipt, emit, step, activity, activity_is_pair
                      probe_pid=probe_token.get('pid'), probe_topic=c.get('probe_topic'),
                      pair_member=False)
             burst_command_id = None
-            if active and c.get('reader_recreate_in_window', False):
-                # Start the first recreated reader process before the burst so
-                # its rclpy/participant initialization genuinely overlaps the
-                # writer burst instead of starting after it.
-                pool.start('reader2')
+            churn = window_churn_schedule(c, plan['drop_duration_sec']) if active else []
+            churn_result = run_window_churn(
+                pool, churn, events, window_start_ns=time.monotonic_ns(),
+                window_duration_sec=plan['drop_duration_sec'],
+                startup_timeout_sec=c['startup_timeout_sec'], emit=emit,
+                pre_match_count=c['pre_match_count'],
+                publish_burst_count=c.get('publish_burst_count', 32),
+                publish_burst_interval_sec=c.get('publish_burst_interval_sec', 0.0),
+                config=c)
+            created_roles = set(churn_result['created_roles'])
+            destroyed_roles = set(churn_result['destroyed_roles'])
             if active and c.get('publish_burst_in_window', False):
                 burst_count = c.get('publish_burst_count', 32)
-                if type(burst_count) is not int or not 1 <= burst_count <= 512:
-                    raise RuntimeError('publish_burst_count must be 1..512')
+                if type(burst_count) is not int or not 1 <= burst_count <= MAX_PUBLISH_BURST_COUNT:
+                    raise RuntimeError('publish_burst_count must be an integer in 1..'
+                                       + str(MAX_PUBLISH_BURST_COUNT))
                 burst_sequences = list(range(c['pre_match_count'],
                                              c['pre_match_count'] + burst_count))
                 burst_command_id = pool.command('writer', 'publish_burst',
@@ -689,42 +1093,6 @@ def _run_window_chain(c, active, receipt, emit, step, activity, activity_is_pair
                 emit('publish_burst_submitted', command_id=burst_command_id,
                      sequences=burst_sequences, phase='window_burst',
                      controller_waits_for_ack=False)
-            if active and c.get('reader_recreate_in_window', False):
-                count = c.get('reader_recreate_count', 1)
-                if type(count) is not int or not 1 <= count <= 2:
-                    raise RuntimeError('reader_recreate_count must be 1 or 2')
-                fraction = c.get('reader_recreate_at_fraction')
-                if fraction is not None:
-                    if type(fraction) not in (int, float) or not 0 <= fraction < 1:
-                        raise RuntimeError('reader_recreate_at_fraction must be in [0,1)')
-                    base_delay = plan['drop_duration_sec'] * float(fraction)
-                else:
-                    base_delay = c.get('reader_recreate_delay_sec', 0.0)
-                for generation in range(1, count + 1):
-                    role_name = 'reader%d' % (generation + 1)
-                    # Spread multiple generations within the remaining window.
-                    interval = c.get('reader_recreate_interval_sec')
-                    if interval is None:
-                        interval = plan['drop_duration_sec'] * 0.2
-                    if type(interval) not in (int, float) or interval < 0:
-                        raise RuntimeError('reader_recreate_interval_sec must be nonnegative')
-                    step_delay = base_delay if generation == 1 else min(
-                        plan['drop_duration_sec'] * 0.9,
-                        base_delay + (generation - 1) * float(interval))
-                    if isinstance(step_delay, (int, float)) and 0 < step_delay < plan['drop_duration_sec']:
-                        delay_deadline = time.monotonic() + float(step_delay)
-                        while time.monotonic() < delay_deadline:
-                            pool.pump(min(0.05, max(0.0, delay_deadline - time.monotonic())))
-                    if role_name != 'reader2' or not pool.workers.get('reader2'):
-                        pool.start(role_name)
-                    pool.wait(lambda role_name=role_name: any(
-                        e['event'] == 'endpoint_created' and e.get('role') == role_name for e in events),
-                        c['startup_timeout_sec'], role_name + '_created')
-                    token = next(e for e in events if e['event'] == 'endpoint_created'
-                                 and e.get('role') == role_name)
-                    emit('discovery_reader_recreated', reader_gid=token.get('endpoint_gid'),
-                         reader_pid=token.get('pid'), generation=token.get('endpoint_generation'),
-                         pair_member=True, role=role_name, recreate_index=generation)
             trajectory_start_ns = time.monotonic_ns()
             deadline_ns = trajectory_start_ns + int(plan['drop_duration_sec'] * 10**9)
             trajectory = _RecoveryMatchTrajectory(events, endpoints, emit, trajectory_start_ns, deadline_ns, matched)
@@ -756,13 +1124,19 @@ def _run_window_chain(c, active, receipt, emit, step, activity, activity_is_pair
                 pool.command('probe', 'stop')
                 pool.wait(lambda: any(e['event'] == 'worker_shutdown' and e.get('role') == 'probe' for e in events),
                           c['startup_timeout_sec'], 'probe_stop')
-            if active and c.get('reader_recreate_in_window', False):
-                for role_name in ('reader2', 'reader3'):
-                    if role_name in pool.workers:
+            if active:
+                # Close the remainder of this window's optional generations.
+                # Roles already destroyed by the plan are not stopped twice,
+                # and neither optional generation is allowed to persist into
+                # the post-restore pair contract.
+                cleanup_roles = (set(created_roles) | {'writer2' if c.get('writer_churn_in_window') is True else ''}) - destroyed_roles
+                for role_name in sorted(role for role in cleanup_roles if role):
+                    if role_name in pool.workers and not pool.is_stopped(role_name):
                         pool.command(role_name, 'stop')
                         pool.wait(lambda role_name=role_name: any(
                             e['event'] == 'worker_shutdown' and e.get('role') == role_name for e in events),
                             c['startup_timeout_sec'], role_name + '_stop')
+                        destroyed_roles.add(role_name)
             window_restored.append(restored_this if active else None)
             window_hits.append(window_counter_hit)
             window_drop_activity.append(window_activity_ok)
@@ -849,6 +1223,272 @@ def _run_window_chain(c, active, receipt, emit, step, activity, activity_is_pair
     return ledger
 
 
+def _netem_scope(spec):
+    """Scope of an installed netem window; absent stays the legacy discovery one."""
+    return spec.get(NETEM_SCOPE_FIELD, 'discovery')
+
+
+def _data_group_counter(counter):
+    """Real data-group counter from a carrier receipt, or None if unavailable.
+
+    No number is synthesized: a missing group or unavailable grouping yields
+    None so the caller keeps hit=False instead of inventing packets.
+    """
+    if not isinstance(counter, dict) or counter.get('group_counters_available') is not True:
+        return None
+    groups = counter.get('group_counters')
+    if not isinstance(groups, dict):
+        return None
+    data = groups.get('data')
+    if not isinstance(data, dict):
+        return None
+    packets, byte_count = data.get('packets'), data.get('bytes')
+    if type(packets) is not int or type(byte_count) is not int or packets < 0 or byte_count < 0:
+        return None
+    return {'packets': packets, 'bytes': byte_count}
+
+
+def _netem_counter_hit(counter, scope, key='mutation_hit'):
+    """Real counted packets only; ``scope='data'`` requires the data group itself.
+
+    ``key`` lets legacy/mocked receipts (``{'mutation_hit': True}``) still be
+    read. A data-only window that cannot prove a data-group count never becomes
+    a hit; a ``both`` window counts the union, and the per-group numbers stay
+    available so no discovery packet is misreported as a data-plane match.
+    """
+    if not isinstance(counter, dict):
+        return False
+    if scope in ('data', 'both') and counter.get('group_counters_available') is False:
+        # Grouping failed: the flat class counter can no longer be attributed to
+        # the data plane, so a data-bearing scope must not claim a hit.
+        return False
+    if scope == 'data':
+        data = _data_group_counter(counter)
+        return bool(data is not None and data['packets'] > 0)
+    return bool(counter.get(key))
+
+
+def _netem_hit_groups(counter):
+    """Named port groups whose real counters are positive in this snapshot.
+
+    Unavailable grouping yields ``[]``: without a trustworthy per-group count
+    nothing may be listed as a counted group.
+    """
+    if not isinstance(counter, dict):
+        return []
+    if counter.get('group_counters_available') is False:
+        return []
+    groups = counter.get('group_counters')
+    if not isinstance(groups, dict):
+        return []
+    return sorted(group_id for group_id, value in groups.items()
+                  if isinstance(value, dict) and type(value.get('packets')) is int
+                  and value['packets'] > 0)
+
+
+def _run_netem_window(c, active, receipt, emit, step, activity, activity_is_pair_observed,
+                       snapshot_pair, pause, carrier, pool, events, endpoints, matched,
+                       precondition, match_receipt):
+    """Bounded delay/reorder/duplicate window over the spec's UDP port scope.
+
+    ``spec['scope']`` is passed through untouched to the carrier. With scope
+    ``discovery`` the emitted event set and receipt fields are exactly the
+    legacy ones. When the scope includes ``data``, the same window additionally
+    emits ``data_mutation_begin`` / ``data_mutation_counter`` /
+    ``data_mutation_end`` carrying the spec, labelled port groups, tc dump hashes
+    and the restore dump-after hash; those events are additive and never replace
+    the discovery events.
+
+    Under the mutated arm the transparent-class spec is still installed (audited
+    ``neutral=True``) but never reports ``applied`` or a hit, matching the D002
+    no-op branch. Non-mutated arms install nothing. Every installed window is
+    removed and then must show fresh independent pair activity plus a fresh
+    graph/count before it can be treated as recovered.
+
+    ``receipt['hit']`` stays one of the seven nested boolean fields and is set
+    only from real counted packets (>0) + a mutated arm + a non-neutral spec.
+    ``hit_semantics`` on the data events states that the hit is a data-plane
+    matched packet count, never a SUT defect; the oracle alone decides
+    candidates and nothing here interprets a wire reorder/duplicate as an
+    expected reader-side effect.
+    """
+    spec = c['environment_mutation']['spec']
+    scope = _netem_scope(spec)
+    data_scope = scope in ('data', 'both')
+    installed = bool(active)
+    mutation_active = bool(active and not spec['neutral'])
+    window_sec = c['drop_duration_sec']
+    if spec['restore_sec']:
+        window_sec = min(window_sec, spec['restore_sec'])
+    counters_hit = False
+    data_counters_hit = False
+    last_counter = None
+    restored = False
+    begin = None
+    drop_wall_ns = time.time_ns()
+    if installed:
+        receipt.update(submitted=True, carrier_admitted=True)
+        emit('mutation_begin', mutation_kind='discovery_netem', carrier='wire_proxy',
+             implementation=NETEM_IMPLEMENTATION, neutral_spec=spec['neutral'],
+             scope=scope,
+             precondition_snapshot_ref=precondition['raw_event_ref'],
+             mutation_receipt=dict(receipt))
+        begin = carrier.start(spec)
+        last_counter = begin.get('counter_snapshot')
+        counters_hit = counters_hit or _netem_counter_hit(last_counter, scope)
+        data_counters_hit = data_counters_hit or bool(
+            _netem_counter_hit(last_counter, 'data'))
+        receipt.update(configured=begin['configured'], applied=begin['applied'])
+        emit('discovery_netem_begin', receipt=begin, mutation_receipt=dict(receipt),
+             neutral=begin['neutral'], scope=scope)
+        if data_scope:
+            emit('data_mutation_begin', window='data_netem', scope=scope,
+                 spec=dict(spec),
+                 port_groups=begin.get('groups'),
+                 port_group_ids=[group['group_id'] for group in begin.get('groups') or []],
+                 tc_dump_sha256=begin.get('tc_dump_sha256'),
+                 tc_dump=begin.get('tc_dump'),
+                 loss_pct=NETEM_LOSS_PCT, loss_defaulted=True,
+                 responsibility_layer=NETEM_RESPONSIBILITY_LAYER,
+                 hit_semantics=netem_hit_semantics(scope),
+                 counted_packet_scope=('user_data_destination_udp_ports' if scope == 'data'
+                                       else 'discovery_and_user_data_destination_udp_ports'),
+                 counter_snapshot=last_counter,
+                 mutation_receipt=dict(receipt))
+        drop_wall_ns = time.time_ns()
+    else:
+        emit('control_begin', control_kind=c['arm'], carrier='discovery_netem',
+             netem_installed=False, neutral_spec=spec['neutral'], scope=scope,
+             precondition_snapshot_ref=precondition['raw_event_ref'], mutation_receipt=dict(receipt))
+    emit('window_open', window='discovery_netem', active_mutation=mutation_active,
+         netem_installed=installed, neutral_spec=spec['neutral'], window_sec=window_sec,
+         scope=scope)
+    trajectory_start_ns = time.monotonic_ns()
+    deadline_ns = trajectory_start_ns + int(window_sec * 10**9)
+    trajectory = _RecoveryMatchTrajectory(events, endpoints, emit, trajectory_start_ns, deadline_ns, matched)
+    activity_ok = False
+    try:
+        while time.monotonic() < deadline_ns / 10**9:
+            if installed:
+                last_counter = carrier.counters()
+                counters_hit = counters_hit or _netem_counter_hit(last_counter, scope)
+                emit('discovery_netem_counter', receipt=last_counter)
+                if data_scope:
+                    data_counters_hit = data_counters_hit or bool(
+                        _netem_counter_hit(last_counter, 'data'))
+                    emit('data_mutation_counter', window='data_netem', scope=scope,
+                         port_groups=last_counter.get('port_groups'),
+                         port_group_ids=[group['group_id']
+                                         for group in last_counter.get('port_groups') or []],
+                         group_counters=last_counter.get('group_counters'),
+                         group_counters_available=last_counter.get('group_counters_available'),
+                         group_counters_reason=last_counter.get('group_counters_reason'),
+                         hit_groups=_netem_hit_groups(last_counter),
+                         expected_ports=last_counter.get('expected_ports'),
+                         affected_packets=last_counter.get('affected_packets'),
+                         affected_bytes=last_counter.get('affected_bytes'),
+                         loss_pct=NETEM_LOSS_PCT, loss_defaulted=True,
+                         hit_semantics=netem_hit_semantics(scope),
+                         responsibility_layer=NETEM_RESPONSIBILITY_LAYER,
+                         counter=last_counter)
+            trajectory.poll(pool)
+            pause(min(c['counter_interval_sec'], max(0, deadline_ns / 10**9 - time.monotonic()),
+                      max(0, (trajectory.next_due_ns - time.monotonic_ns()) / 10**9)))
+        during = activity(drop_wall_ns, 'discovery_netem_window')
+        activity_ok = activity_is_pair_observed(during['activity'])
+    finally:
+        trajectory.restore_started_ns = time.monotonic_ns()
+        if installed:
+            end = carrier.restore()
+            restored = end['restored'] is True
+            if mutation_active:
+                # A neutral transparent class must not flip applied on restore.
+                receipt['applied'] = bool(receipt['applied'] and restored)
+            emit('discovery_netem_end', receipt=end)
+            if data_scope:
+                end_counter = end.get('counter_snapshot') or {}
+                emit('data_mutation_end', window='data_netem', scope=scope,
+                     restored=restored,
+                     tc_dump_after_sha256=end.get('tc_dump_after_sha256'),
+                     tc_dump_sha256=(begin or {}).get('tc_dump_sha256'),
+                     residual_qdisc=end.get('residual_qdisc'),
+                     residual_filter=end.get('residual_filter'),
+                     only_noqueue_root=end.get('only_noqueue_root'),
+                     counter_snapshot=end.get('counter_snapshot'),
+                     counter_observed=end.get('counter_observed'),
+                     group_counters=end_counter.get('group_counters'),
+                     group_counters_available=end_counter.get('group_counters_available'),
+                     hit_groups=_netem_hit_groups(end_counter),
+                     port_groups=(begin or {}).get('groups'),
+                     port_group_ids=[group['group_id'] for group in (begin or {}).get('groups') or []],
+                     loss_pct=NETEM_LOSS_PCT, loss_defaulted=True,
+                     responsibility_layer=NETEM_RESPONSIBILITY_LAYER,
+                     hit_semantics=netem_hit_semantics(scope),
+                     restore_receipt=end)
+    restore_wall_ns, restore_mono_ns = time.time_ns(), time.monotonic_ns()
+    boundary = emit('discovery_restore_boundary', restored=restored if installed else None,
+                    neutral=not installed, netem_was_installed=installed,
+                    netem_installed=False, netem_neutral_spec=spec['neutral'],
+                    carrier='discovery_netem',
+                    post_restore_unix_ns=restore_wall_ns, post_restore_monotonic_ns=restore_mono_ns,
+                    clock_guard_ns=CLOCK_GUARD_NS, activity_since_unix_ns=restore_wall_ns + CLOCK_GUARD_NS)
+    trajectory.restore_boundary_ns = restore_mono_ns
+    recovery_deadline = time.monotonic() + c['recovery_timeout_sec']
+    activity_event, fresh_recovery, post_evidence = None, False, None
+    while time.monotonic() < recovery_deadline:
+        activity_event = activity(restore_wall_ns + CLOCK_GUARD_NS, 'post_restore',
+                                  after_monotonic_ns=restore_mono_ns)
+        clock_offset = time.time_ns() - time.monotonic_ns()
+        if abs(clock_offset - (restore_wall_ns - restore_mono_ns)) > CLOCK_GUARD_NS:
+            emit('discovery_observation_unknown', reason='realtime_monotonic_offset_discontinuity')
+            break
+        if activity_event['activity_observed']:
+            break
+        pause(0.2)
+    try:
+        post_evidence = step('observe_recovery_graph', ['verify_namespace_bindings'],
+                             lambda: snapshot_pair(restore_mono_ns), observation=True)
+        trajectory.after = post_evidence
+        fresh_recovery = True
+    except (TimeoutError, RuntimeError) as exc:
+        emit('discovery_observation_unknown', reason=str(exc))
+    activity_ok = bool(activity_event and activity_event['activity_observed'])
+    if installed and activity_ok and fresh_recovery:
+        recovery = carrier.confirm_recovery(activity_receipt={**match_receipt,
+            'monotonic_ns': time.monotonic_ns(), 'activity_observed': True,
+            'source': 'public_ros2_pair', 'evidence_ref': activity_event['raw_event_ref'],
+            'fresh_graph_count': post_evidence})
+        emit('discovery_netem_recovery_confirmed', receipt=recovery)
+    receipt['hit'] = bool(mutation_active and counters_hit)
+    if mutation_active:
+        # netem matched-packet counters are carrier evidence only; they can
+        # never be reported as a discovery_drop hit and never as a SUT defect.
+        receipt['effect_observed'] = bool(receipt['hit'] and restored and activity_ok and fresh_recovery)
+    else:
+        receipt['effect_observed'] = bool(activity_ok and fresh_recovery)
+    data_plane_known = bool(data_scope and installed
+                            and (last_counter or {}).get('group_counters_available') is True)
+    emit('window_close', window='discovery_netem', active_mutation=mutation_active,
+         netem_installed=installed, neutral_spec=spec['neutral'], scope=scope,
+         data_plane_counter_hit=(bool(data_counters_hit) if data_plane_known else None),
+         hit_groups=_netem_hit_groups(last_counter) if data_scope else None,
+         mutation_receipt=dict(receipt))
+    emit('mutation_effect' if mutation_active else 'neutral_control_observation',
+         effect_id='discovery_netem_then_restore', mutation_receipt=dict(receipt),
+         discovery_activity_observed=activity_ok, fresh_count_graph=fresh_recovery,
+         netem_last_counter=last_counter, restore_boundary_ref=boundary['raw_event_ref'],
+         scope=scope,
+         data_plane_counter_hit=(bool(data_counters_hit) if data_plane_known else None),
+         neutral_no_op=not mutation_active)
+    return {'mutation_active': mutation_active, 'installed': installed,
+            'neutral_spec': spec['neutral'], 'restored': restored if installed else None,
+            'counter_hit': bool(receipt['hit']), 'activity_ok': activity_ok,
+            'fresh_recovery': fresh_recovery, 'last_counter': last_counter,
+            'window_sec': window_sec, 'spec': spec, 'begin': begin,
+            'scope': scope,
+            'data_plane_counter_hit': (bool(data_counters_hit) if data_plane_known else None)}
+
+
 def _body(request, owner_channel):
     if request['config']['target_id'] in ('builtin.discovery_projection_reconciliation',
                                           'builtin.discovery_projection_reconciliation.fuzz_v1'):
@@ -862,10 +1502,13 @@ def _body(request, owner_channel):
     active = c['arm'] == 'mutated'
     receipt['planned'] = active
     result = {'runtime_status': 'failed', 'reason': None, 'facts': {}, 'environment': {}, 'workers': [],
-              'precondition_receipts': preconditions, 'observation_receipts': observations, 'mutation_receipt': receipt}
+              'precondition_receipts': preconditions, 'observation_receipts': observations, 'mutation_receipt': receipt,
+              'effective_rmws': effective_rmws_receipt(c)}
     pool = observer = carrier = None
     trajectories = []
     counter_hit = restored = activity_ok = fresh_recovery = drop_activity_ok = False
+    carrier_kind = discovery_carrier_kind(c)
+    implementation = c.get('carrier_implementation', IMPLEMENTATION)
     restored_aggregate = None
     window_records = []
     window_hits = []
@@ -932,10 +1575,17 @@ def _body(request, owner_channel):
         port_probe = probe_rtps_ports(c['domain_id'])
         if not port_probe['ok']:
             raise IsolationError('domain_conflict:namespace_rtps_port_block')
-        carrier = DiscoveryDropController(c['domain_id'])
+        carrier = (DiscoveryNetemController(c['domain_id']) if carrier_kind == 'discovery_netem'
+                   else DiscoveryDropController(c['domain_id']))
         setup = carrier.setup()
         setup_event = emit('discovery_network_setup', receipt=setup)
-        profile_records, role_env = write_profiles(output_dir, c['rmw'])
+        # Profiles are written per role; the legacy single-rmw call is kept for
+        # the exact same file layout and hashes when rmws is absent.
+        if role_rmw_differs_from_config(c):
+            profile_records, role_env = _write_role_profiles(output_dir, c)
+        else:
+            profile_records, role_env = write_profiles(output_dir, c['rmw'])
+        role_env = role_rmw_environments(c, role_env)
         identity = dict(proof)
         from r2f.instrumentation.sedp import PassiveSedpObserver
         spec = recovery_capture_spec(output_dir=output_dir / 'discovery-observer', run_id=c['run_id'],
@@ -950,8 +1600,16 @@ def _body(request, owner_channel):
              observer_ready_ref=ready_event['raw_event_ref'], isolation=proof)
         condition_refs['namespace_ready'] = namespace_ready['raw_event_ref']
         result['environment'].update(isolation=proof, namespace_rtps_probe=port_probe, setup=setup,
-                                     profiles=profile_records, observer_ready=ready, implementation=IMPLEMENTATION)
-        pool = OwnerCheckedPool(c, dict(os.environ), output_dir, emit, owner_channel=owner_channel, role_environments=role_env)
+                                     profiles=profile_records, observer_ready=ready,
+                                     implementation=implementation, carrier_kind=carrier_kind,
+                                     environment_mutation=c.get('environment_mutation'))
+        base_environment = dict(os.environ)
+        if role_rmw_differs_from_config(c):
+            # Per-role profile selectors are the only authority when any role
+            # overrides the global vendor.
+            base_environment = mixed_base_environment(base_environment)
+        pool = OwnerCheckedPool(c, base_environment, output_dir, emit,
+                                owner_channel=owner_channel, role_environments=role_env)
         def create():
             for role in ('writer', 'reader'):
                 if role == 'reader':
@@ -977,10 +1635,14 @@ def _body(request, owner_channel):
                           c['startup_timeout_sec'], role + '_created')
                 endpoints[role] = next(e for e in events if e['event'] == 'endpoint_created' and e.get('role') == role)
                 token = endpoints[role]
-                if not token.get('endpoint_gid') or token['rmw_identifier'] != c['rmw']:
+                require_role_rmw(c, role, token)
+                if not token.get('endpoint_gid'):
                     raise RuntimeError('endpoint_identity_incomplete:' + role)
             if endpoints['writer']['pid'] == endpoints['reader']['pid']:
                 raise RuntimeError('independent_worker_processes_required')
+            result['effective_rmws'] = effective_rmws_receipt(c, endpoints)
+            emit('effective_rmws_observed', receipt=result['effective_rmws'],
+                 mixed=result['effective_rmws']['mixed'])
             return {role: token['raw_event_ref'] for role, token in endpoints.items()}
         step('create_endpoints', ['environment_ok', 'locks_held', 'namespace_ready'], create)
         matched = step('establish_match', ['create_endpoints'], lambda: snapshot_pair(endpoints['reader']['created_monotonic_ns']))
@@ -992,7 +1654,29 @@ def _body(request, owner_channel):
         match_receipt = {'domain_id': c['domain_id'], 'match_established': True,
                          'evidence_ref': precondition['raw_event_ref'], 'worker_pids': pids,
                          **{role + '_gid': token['endpoint_gid'] for role, token in endpoints.items()}}
-        if not c.get('window_chain_requested'):
+        if carrier_kind == 'discovery_netem':
+            netem = _run_netem_window(c, active, receipt, emit, step, activity,
+                                      activity_is_pair_observed, snapshot_pair, pause,
+                                      carrier, pool, events, endpoints, matched,
+                                      precondition, match_receipt)
+            counter_hit = bool(netem['counter_hit'])
+            restored = netem['restored']
+            activity_ok = bool(netem['activity_ok'])
+            fresh_recovery = bool(netem['fresh_recovery'])
+            drop_activity_ok = activity_ok
+            result['environment']['discovery_netem'] = {
+                'spec': netem['spec'], 'window_sec': netem['window_sec'],
+                'neutral_spec': netem['neutral_spec'],
+                'mutation_active': netem['mutation_active'],
+                'netem_installed': netem['installed'],
+                'scope': netem['scope'],
+                'data_plane_counter_hit': netem['data_plane_counter_hit'],
+                'hit_semantics': netem_hit_semantics(netem['scope']),
+                'responsibility_layer': NETEM_RESPONSIBILITY_LAYER,
+                'loss_pct': NETEM_LOSS_PCT, 'loss_defaulted': True,
+                'begin_receipt': netem['begin'],
+                'last_counter': netem['last_counter']}
+        elif not c.get('window_chain_requested'):
             # Legacy single-window path: behaviour is preserved, including the
             # restore-in-finally drop loop that its AST contract test inspects
             # directly inside this function body.
@@ -1177,7 +1861,12 @@ def _body(request, owner_channel):
                                   if active else None)
         result['facts'] = summarize_discovery(events, active=receipt['applied'], counter_hit=counter_hit,
             restored=restored_aggregate if window_records else restored,
-            activity_ok=activity_ok, fresh_recovery=fresh_recovery, drop_activity_ok=drop_activity_ok)
+            activity_ok=activity_ok, fresh_recovery=fresh_recovery, drop_activity_ok=drop_activity_ok,
+            carrier_implementation=implementation, carrier_kind=carrier_kind,
+            neutral_spec=bool(carrier_kind == 'discovery_netem'
+                              and c['environment_mutation']['spec']['neutral']),
+            netem_scope=(_netem_scope(c['environment_mutation']['spec'])
+                         if carrier_kind == 'discovery_netem' else None))
         if window_records:
             result['facts'].update(discovery_windows=window_records,
                 discovery_window_count=len(window_records),

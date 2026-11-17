@@ -731,3 +731,342 @@ def make_rng(rng_seed, rng_algorithm=RNG_ALGORITHM):
     if type(rng_seed) is not int or rng_seed < 0:
         raise ValueError("rng_seed must be a non-negative integer")
     return random.Random(rng_seed)
+
+
+# ---------------------------------------------------------------------------
+# Wide sampling surface (T-B)
+#
+# ``mutate_wide`` is an independent sampling namespace layered on top of the
+# registered mutators.  It never widens ``MUTATOR_SPECS``, never changes
+# ``mutate()`` dispatch, and never promises execution: a proposal is still an
+# input document only.  Every numeric class is bounded by the surface's own
+# declared ``domain``; an undeclared domain is rejected instead of guessed.
+# ---------------------------------------------------------------------------
+
+WIDE_SAMPLING_KINDS = ("boundary", "representative", "log_uniform",
+                       "linear_uniform", "neighbor", "jump")
+WIDE_MAX_CHAIN_LENGTH = 4
+
+
+def _wide_error(surface, detail):
+    return ValueError(f"surface {surface.surface_id}: {detail}")
+
+
+def _tag_sampling(proposal, sampling_kind):
+    """Return a copy of ``proposal`` whose parameters/notes name the sampler."""
+    parameters = dict(proposal.parameters)
+    parameters["sampling_kind"] = sampling_kind
+    parameters["wide_sampling"] = True
+    notes = dict(proposal.notes)
+    notes["sampling_kind"] = sampling_kind
+    notes["wide_sampling"] = True
+    return MutationProposal(
+        surface_id=proposal.surface_id, mutator_id=proposal.mutator_id,
+        parameters=parameters, changes=proposal.changes,
+        input_before=proposal.input_before, input_after=proposal.input_after,
+        application_phase=proposal.application_phase,
+        applicability_result=proposal.applicability_result,
+        runtime_windows=proposal.runtime_windows, override=proposal.override,
+        notes=notes, proposal_id=proposal.proposal_id,
+    )
+
+
+def _wide_numeric_domain(surface):
+    domain = surface.domain
+    minimum, maximum = domain.get("min"), domain.get("max")
+    if type(minimum) not in (int, float) or type(maximum) not in (int, float):
+        raise _wide_error(surface, "numeric wide sampling requires declared domain.min/max")
+    if type(minimum) is bool or type(maximum) is bool:
+        raise _wide_error(surface, "numeric domain bounds must not be booleans")
+    if minimum > maximum:
+        raise _wide_error(surface, "numeric domain min exceeds max")
+    try:
+        step = _step(surface)
+    except ValueError as exc:
+        raise _wide_error(surface, str(exc)) from exc
+    return minimum, maximum, step
+
+
+def _wide_representatives(surface, minimum, maximum):
+    declared = []
+    raw = surface.domain.get("representatives")
+    if isinstance(raw, list):
+        declared.extend(raw)
+    for item in surface.special_values:
+        if isinstance(item, dict):
+            declared.append(item.get("value"))
+    result = []
+    for value in declared:
+        if type(value) in (int, float) and type(value) is not bool \
+                and value == value and minimum <= value <= maximum:
+            if value not in result:
+                result.append(value)
+    return result
+
+
+def _parent_numeric(before, surface):
+    path = surface.input_paths[0]
+    try:
+        current = _get_path(before, path)
+    except ValueError:
+        current = None
+    if type(current) not in (int, float) or type(current) is bool:
+        return None
+    return current
+
+
+#: Boundary classes M01 can actually honour today.
+M01_BOUNDARY_CLASSES = frozenset({
+    "min", "min_plus_one", "max_minus_one", "max",
+    "finite", "zero", "infinite", "quantized_neighbor",
+})
+
+
+def _m01_boundary_classes(surface):
+    if "M01" not in surface.mutator_ids:
+        return []
+    classes = [cls for cls in (surface.boundary_classes or ["min", "max"])
+               if cls in M01_BOUNDARY_CLASSES]
+    return classes
+
+
+def _wide_kinds(surface, before):
+    """Sampling classes actually declared for this surface and parent input."""
+    kinds = []
+    if _m01_boundary_classes(surface):
+        kinds.append("boundary")
+    try:
+        minimum, maximum, step = _wide_numeric_domain(surface)
+    except ValueError:
+        minimum = maximum = step = None
+    if minimum is not None:
+        if _wide_representatives(surface, minimum, maximum):
+            kinds.append("representative")
+        if minimum > 0 and maximum > minimum:
+            kinds.append("log_uniform")
+        if maximum > minimum:
+            kinds.append("linear_uniform")
+        current = _parent_numeric(before, surface)
+        if current is not None and minimum <= current <= maximum:
+            kinds.append("neighbor")
+            if _jump_decades(minimum, maximum, step, current):
+                kinds.append("jump")
+    elif surface.surface_kind == "parameter_enum" and "M02" in surface.mutator_ids:
+        kinds.append("representative")
+    return kinds
+
+
+def _jump_decades(minimum, maximum, step, current):
+    """Decades inside the declared domain that differ from the parent decade."""
+    positive = minimum if minimum > 0 else step
+    if positive <= 0 or maximum < positive or current <= 0:
+        return []
+    low = int(math.ceil(math.log10(positive)))
+    high = int(math.floor(math.log10(maximum)))
+    parent_decade = int(math.floor(math.log10(current)))
+    return [k for k in range(low, high + 1) if k != parent_decade]
+
+
+def _clamped_quantized(value, minimum, maximum, surface):
+    return min(max(_quantize(value, surface), minimum), maximum)
+
+
+def _wide_linear_uniform(surface, rng, context):
+    minimum, maximum, step = _wide_numeric_domain(surface)
+    fraction = context.get("fraction")
+    if fraction is None:
+        fraction = rng.random()
+    if type(fraction) not in (int, float) or not 0 <= fraction <= 1:
+        raise _wide_error(surface, "linear_uniform fraction must be within [0, 1]")
+    value = _clamped_quantized(minimum + float(fraction) * (maximum - minimum), minimum, maximum, surface)
+    return {"sampling_kind": "linear_uniform", "wide_sampling": True,
+            "min": minimum, "max": maximum,
+            "step": step, "fraction": round(float(fraction), 12)}, value
+
+
+def _wide_log_uniform(surface, rng, context):
+    minimum, maximum, step = _wide_numeric_domain(surface)
+    if minimum <= 0 or maximum <= minimum:
+        raise _wide_error(surface, "log_uniform requires declared min > 0 and max > min")
+    fraction = context.get("fraction")
+    if fraction is None:
+        fraction = rng.random()
+    if type(fraction) not in (int, float) or not 0 <= fraction <= 1:
+        raise _wide_error(surface, "log_uniform fraction must be within [0, 1]")
+    low, high = math.log10(minimum), math.log10(maximum)
+    value = _clamped_quantized(10 ** (low + float(fraction) * (high - low)), minimum, maximum, surface)
+    return {"sampling_kind": "log_uniform", "wide_sampling": True,
+            "min": minimum, "max": maximum,
+            "step": step, "fraction": round(float(fraction), 12)}, value
+
+
+def _wide_neighbor(surface, before, rng, context):
+    minimum, maximum, step = _wide_numeric_domain(surface)
+    current = _parent_numeric(before, surface)
+    if current is None:
+        raise _wide_error(surface, "neighbor sampling requires a numeric parent value")
+    multiplier = context.get("neighbor_multiplier")
+    if multiplier is None:
+        multiplier = (1, 2, 4)[rng.randrange(3)]
+    if multiplier not in (1, 2, 4):
+        raise _wide_error(surface, "neighbor_multiplier must be one of 1, 2, 4")
+    direction = context.get("neighbor_direction")
+    if direction is None:
+        direction = 1 if rng.randrange(2) else -1
+    if direction not in (-1, 1):
+        raise _wide_error(surface, "neighbor_direction must be -1 or 1")
+    value = _clamped_quantized(current + direction * multiplier * step, minimum, maximum, surface)
+    parameters = {"sampling_kind": "neighbor", "wide_sampling": True,
+                  "min": minimum, "max": maximum,
+                  "step": step, "parent": current, "multiplier": multiplier,
+                  "direction": direction,
+                  "clamped": value == minimum or value == maximum}
+    return parameters, value, value == current
+
+
+def _wide_jump(surface, before, rng, context):
+    minimum, maximum, step = _wide_numeric_domain(surface)
+    current = _parent_numeric(before, surface)
+    if current is None or current <= 0:
+        raise _wide_error(surface, "jump sampling requires a positive numeric parent value")
+    decades = _jump_decades(minimum, maximum, step, current)
+    if not decades:
+        raise _wide_error(surface, "jump sampling requires a second declared decade in domain")
+    decade = context.get("decade")
+    if decade is None:
+        decade = decades[rng.randrange(len(decades))]
+    if decade not in decades:
+        raise _wide_error(surface, f"decade {decade} is not declared inside domain")
+    fraction = context.get("fraction")
+    if fraction is None:
+        fraction = rng.random()
+    if type(fraction) not in (int, float) or not 0 <= fraction <= 1:
+        raise _wide_error(surface, "jump fraction must be within [0, 1]")
+    value = _clamped_quantized(10 ** (decade + float(fraction)), minimum, maximum, surface)
+    parameters = {"sampling_kind": "jump", "wide_sampling": True,
+                  "min": minimum, "max": maximum,
+                  "step": step, "parent": current, "parent_decade":
+                      int(math.floor(math.log10(current))),
+                  "decade": decade, "fraction": round(float(fraction), 12)}
+    return parameters, value, False
+
+
+def mutate_wide(input, surface, rng, context=None, mutator_id=None):
+    """Wide-domain pure sampling on top of the registered mutators.
+
+    Sampling namespaces are explicit (never inferred from ``mutate()``):
+
+    * ``boundary`` reuses the registered M01 boundary classes unchanged.
+    * ``representative`` picks a declared representative (or enum value).
+    * ``log_uniform`` / ``linear_uniform`` sample the declared numeric domain.
+    * ``neighbor`` walks +/- quantum * 1/2/4 around the parent value.
+    * ``jump`` moves to a different declared decade.
+
+    M04 (relation boundary) and M05 (special value) are exposed here with their
+    F2 semantics; M04 still does not enter the default ``MUTATORS`` table.
+    A surface without the requested declaration raises ``ValueError`` naming
+    the surface id.  No clock, file, socket, ROS, receipt or hit is involved.
+    """
+    _require_rng(rng)
+    surface = _surface(surface)
+    context = _context(context)
+    before = snapshot(input)
+
+    if mutator_id in ("M04", "M05"):
+        _spec(surface, mutator_id, F2_MUTATOR_SPECS)
+        proposal = F2_MUTATORS[mutator_id](before, surface, rng, context)
+        return _tag_sampling(proposal, "boundary" if mutator_id == "M04" else "representative")
+    if mutator_id is not None and mutator_id not in ("M01", "M02", "M03"):
+        raise ValueError(f"unknown wide mutator: {mutator_id}")
+
+    if surface.surface_kind == "relation":
+        if "M04" not in surface.mutator_ids:
+            raise _wide_error(surface, "relation surface does not declare M04")
+        proposal = F2_MUTATORS["M04"](before, surface, rng, context)
+        return _tag_sampling(proposal, "boundary")
+
+    if surface.surface_kind == "parameter_enum":
+        if mutator_id not in (None, "M02"):
+            raise _wide_error(
+                surface, f"enum surface only accepts M02, not {mutator_id}")
+        if "M02" not in surface.mutator_ids:
+            raise _wide_error(surface, "enum surface does not declare M02")
+        requested = context.get("sampling_kind")
+        if requested not in (None, "representative"):
+            raise _wide_error(
+                surface, f"enum surface declares only representative, not {requested}")
+        proposal = M02_enum_replace(before, surface, rng, context)
+        return _tag_sampling(proposal, "representative")
+
+    if surface.surface_kind not in ("parameter_numeric", "parameter_timing"):
+        raise _wide_error(surface, f"wide sampling does not accept surface kind {surface.surface_kind}")
+
+    available = _wide_kinds(surface, before)
+    requested = context.get("sampling_kind")
+    if mutator_id == "M01":
+        if requested not in (None, "boundary"):
+            raise _wide_error(
+                surface, f"M01 only produces boundary samples, not {requested}")
+        requested = "boundary"
+    if mutator_id == "M02":
+        raise ValueError(
+            f"mutate_wide: mutator M02 does not accept numeric surface {surface.surface_id}")
+    if mutator_id == "M03":
+        # The boundary class is M01's declaration; M03 must never emit a
+        # proposal labelled M01 through the wide namespace.
+        available = [kind for kind in available if kind != "boundary"]
+        if requested == "boundary":
+            raise _wide_error(surface, "M03 does not produce boundary samples")
+    if requested is None:
+        if not available:
+            raise _wide_error(surface, "no wide sampling class is declared by this surface")
+        kind = available[rng.randrange(len(available))]
+    else:
+        if requested not in WIDE_SAMPLING_KINDS:
+            raise ValueError(f"unsupported wide sampling kind: {requested}")
+        if requested not in available:
+            raise _wide_error(surface, f"wide sampling kind {requested} is not declared")
+        kind = requested
+
+    if kind == "boundary":
+        classes = _m01_boundary_classes(surface)
+        if not classes:
+            raise _wide_error(surface, "no M01-honourable boundary class is declared")
+        proposal = M01_boundary_pick(before, surface, rng, context)
+        return _tag_sampling(proposal, "boundary")
+
+    path = surface.input_paths[0]
+    if kind == "representative":
+        minimum, maximum, _ = _wide_numeric_domain(surface)
+        reps = _wide_representatives(surface, minimum, maximum)
+        index = context.get("representative_index")
+        if index is None:
+            value = reps[rng.randrange(len(reps))]
+        else:
+            if type(index) is not int or not 0 <= index < len(reps):
+                raise _wide_error(surface, "representative_index is outside the declared set")
+            value = reps[index]
+        parameters = {"sampling_kind": "representative", "wide_sampling": True,
+                      "declared_representatives": list(reps), "selected": value}
+        return _proposal(surface, "M03", parameters, before, {path: value}, context,
+                         notes={"sampling_kind": "representative", "wide_sampling": True})
+
+    if kind == "linear_uniform":
+        parameters, value = _wide_linear_uniform(surface, rng, context)
+        return _proposal(surface, "M03", parameters, before, {path: value}, context,
+                         notes={"sampling_kind": kind, "wide_sampling": True})
+    if kind == "log_uniform":
+        parameters, value = _wide_log_uniform(surface, rng, context)
+        return _proposal(surface, "M03", parameters, before, {path: value}, context,
+                         notes={"sampling_kind": kind, "wide_sampling": True})
+    if kind == "neighbor":
+        parameters, value, unchanged = _wide_neighbor(surface, before, rng, context)
+        return _proposal(surface, "M03", parameters, before, {path: value}, context,
+                         notes={"sampling_kind": kind, "wide_sampling": True},
+                         status="no_op" if unchanged else "applicable")
+    if kind == "jump":
+        parameters, value, unchanged = _wide_jump(surface, before, rng, context)
+        return _proposal(surface, "M03", parameters, before, {path: value}, context,
+                         notes={"sampling_kind": kind, "wide_sampling": True},
+                         status="no_op" if unchanged else "applicable")
+    raise AssertionError("unreachable wide sampling kind: " + kind)

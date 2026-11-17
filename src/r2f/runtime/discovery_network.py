@@ -37,12 +37,30 @@ across arms. A short drop with packets=0 stays hit=False; wait for real traffic
 or report no hit. Do not inject calibration packets into a ROS2 evidence run.
 Both endpoints must remain in this namespace; no setns, veth, host rule, NAT,
 external interface, native participant, payload mutation, or package install.
+
+A second, opt-in carrier (``DiscoveryNetemController``) applies bounded delay,
+reorder and duplication with ``tc`` netem on a prio qdisc whose filters match
+exact derived UDP destination ports (IPv4 and IPv6). The spec's ``scope`` field
+selects the port classes: ``discovery`` (default; the derived discovery ports,
+legacy behaviour), ``data`` (default-RTPS user-data ports via
+``rtps_user_data_ports``) or ``both`` (union, with each class kept as its own
+labelled group). It does not drop packets (``loss`` is always ``0%`` and is
+declared), never installs nft rules, and therefore cannot produce
+``discovery_drop`` counters or hits. A zero-delay/zero-reorder/zero-duplicate
+spec installs a transparent class and reports ``neutral=True``; that arm is a
+no-op control, not a mutation hit. This carrier is environmental capability
+only: it creates no SUT candidate and is not part of the 72-cell maturity
+denominator. Data-scope receipts carry ``hit_semantics =
+netem_matched_data_plane_packets_not_sut_defect`` and
+``responsibility_layer = environment_harness`` so a counted packet is never
+mistaken for a SUT defect.
 """
 from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
 import fcntl
+import hashlib
 import json
 import math
 import os
@@ -701,6 +719,676 @@ class DiscoveryDropController:
                 'restore_end_monotonic_ns': self._end['drop_end_monotonic_ns'],
                 'monotonic_ns': time.monotonic_ns(), 'activity_receipt': receipt,
                 'pair_bindings': pair_bindings}
+
+    def __enter__(self):
+        self.setup()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.restore()
+
+
+NETEM_IMPLEMENTATION = 'isolated_netns_tc_netem_discovery_udp'
+NETEM_SPEC_FIELDS = ('delay_ms', 'reorder_pct', 'duplicate_pct', 'restore_sec')
+#: ``scope`` selects which derived UDP destination ports the netem class matches.
+#: It is optional on input (absent means ``discovery``) and always echoed in the
+#: normalized spec so every receipt states exactly what was classified.
+NETEM_SCOPE_FIELD = 'scope'
+NETEM_SCOPES = ('discovery', 'data', 'both')
+DEFAULT_NETEM_SCOPE = 'discovery'
+NETEM_HANDLE = '2:'
+NETEM_PARENT = '1:2'
+# Local default RTPS mapping offsets (PB=7400, DG=250). They are the same
+# offsets already used by DiscoveryPorts, restated here so the user-data
+# derivation is auditable on its own instead of being implicit in `unicast + 1`.
+RTPS_USER_MULTICAST_OFFSET = 1     # PB + DG*domain + 1
+RTPS_USER_UNICAST_BASE_OFFSET = 11  # PB + DG*domain + 11 + 2*participant_id
+#: Applies to every netem receipt: the carrier is an environment harness effect.
+NETEM_RESPONSIBILITY_LAYER = 'environment_harness'
+#: Loss is deliberately absent from the spec fields and rendered as an explicit
+#: `loss 0%`. This carrier may only delay, reorder and duplicate packets.
+NETEM_LOSS_PCT = 0.0
+NETEM_SEMANTICS_NOTE = (
+    'Only network-layer delay/reorder/duplicate is applied and loss is fixed at '
+    '0%; these are environment effects, not SUT defects and not candidate '
+    'admission. For a reliable+ordered DDS contract, reordering and duplication '
+    'on the wire must not surface as reader-side order violations or duplicate '
+    'deliveries: the primary delivery oracle keeps delivery_order_violation and '
+    'duplicate sequences as real defect signals, and no adapter may relax those '
+    'residuals as "expected network effects". Candidates stay oracle-decided.'
+)
+
+
+def netem_hit_semantics(scope):
+    """Truthful hit wording for a scope: the counted packets are network effects.
+
+    A data window must name data-plane matched packets; ``both`` names the union
+    because its single netem class counts either port group, with per-group
+    attribution kept in ``group_counters``/``hit_groups``.
+    """
+    if scope == 'data':
+        return 'netem_matched_data_plane_packets_not_sut_defect'
+    if scope == 'both':
+        return 'netem_matched_discovery_and_data_plane_packets_not_sut_defect'
+    return 'netem_matched_packets_not_drop_hit'
+
+
+class NetemScopeError(DiscoveryNetworkError):
+    """Invalid ``scope`` value; carries the offending field name."""
+
+    def __init__(self, message, *, field=NETEM_SCOPE_FIELD, receipt=None):
+        super().__init__(message, receipt)
+        self.field = field
+        self.receipt = {'field': field, 'reason': message, **(receipt or {})}
+
+
+def _bounded_number(value, field, lower, upper):
+    if isinstance(value, bool) or type(value) not in (int, float):
+        raise DiscoveryNetworkError(f'{field} must be a number in {lower}..{upper}')
+    if not math.isfinite(float(value)) or not lower <= float(value) <= upper:
+        raise DiscoveryNetworkError(f'{field} must be in {lower}..{upper}')
+    return float(value)
+
+
+def rtps_user_data_ports(domain_id, participant_count):
+    """Auditable default-RTPS user-data port derivation; installs nothing.
+
+    The local RTPS mapping reserves PG=2 ports per participant, so with
+    PB=7400 and DG=250 the user-data block is::
+
+        multicast user port = PB + DG*domain + 1
+        unicast  user port   = PB + DG*domain + 11 + 2*participant_id
+
+    i.e. the multicast user port is ``PB + DG*domain + d1`` and the unicast
+    user ports are ``PB + DG*domain + d2 + 2*p`` for p in 0..count-1.  The
+    derivation is returned as a record (offsets, formulas, ports) so a receipt
+    can be recomputed from the domain id alone.  Interleaved discovery ports are
+    never included: the parity of discovery/unicast user ports differs.
+    """
+    ports = DiscoveryPorts(domain_id, participant_count)  # validates the range
+    multicast_port = ports.base + RTPS_USER_MULTICAST_OFFSET
+    unicast_ports = tuple(ports.base + RTPS_USER_UNICAST_BASE_OFFSET + 2 * p
+                          for p in range(participant_count))
+    selected = (multicast_port, *unicast_ports)
+    # Cross-check against the already-audited DiscoveryPorts mapping.
+    if selected != ports.user_data:
+        raise DiscoveryNetworkError('user_data derivation disagrees with DiscoveryPorts')
+    if not set(selected).isdisjoint(ports.discovery):
+        raise DiscoveryNetworkError('user_data derivation overlaps discovery ports')
+    if max(selected) > 65535:
+        raise DiscoveryNetworkError('user_data derivation exceeds UDP port 65535')
+    return {
+        'mapping': 'default_rtps_udp_user_data_ports',
+        'domain_id': domain_id, 'participant_count': participant_count,
+        'PB': 7400, 'DG': 250, 'PG': 2,
+        # d1 / d2 in PB + DG*domain + d1 (+ 2*p for d2): the offsets are named
+        # explicitly so the audit can recompute the set without this module.
+        'd1': RTPS_USER_MULTICAST_OFFSET,
+        'd2': RTPS_USER_UNICAST_BASE_OFFSET,
+        'user_multicast_offset': RTPS_USER_MULTICAST_OFFSET,
+        'user_unicast_base_offset': RTPS_USER_UNICAST_BASE_OFFSET,
+        'formulas': [
+            'multicast = PB + DG*domain_id + d1',
+            'unicast[p] = PB + DG*domain_id + d2 + 2*p',
+        ],
+        'participant_ids': list(range(participant_count)),
+        'multicast_port': multicast_port,
+        'unicast_ports': list(unicast_ports),
+        'ports': list(selected),
+        'port_count': len(selected),
+        'assumption': 'local default RTPS UDP mapping; no custom transport/discovery ports',
+    }
+
+
+def netem_port_groups(ports, scope):
+    """Explicit, labelled port groups for one ``scope`` value.
+
+    ``discovery`` and ``data`` are always separate group records and are never
+    merged into an indistinguishable set; ``both`` returns one record per group
+    so every filter and counter can be attributed to exactly one of them.
+    """
+    if not isinstance(ports, DiscoveryPorts):
+        raise DiscoveryNetworkError('DiscoveryPorts required')
+    if scope not in NETEM_SCOPES:
+        raise NetemScopeError('unsupported scope: ' + repr(scope),
+                              receipt={'scope': scope, 'allowed': list(NETEM_SCOPES)})
+    groups = []
+    if scope in ('discovery', 'both'):
+        groups.append({
+            'group_id': 'discovery', 'port_class': 'discovery_udp_ports',
+            'derivation': 'PB + DG*domain_id (multicast) and PB + DG*domain_id + 10 + 2*p (unicast)',
+            'ports': list(ports.discovery),
+        })
+    if scope in ('data', 'both'):
+        derivation = rtps_user_data_ports(ports.domain_id, ports.participant_count)
+        groups.append({
+            'group_id': 'data', 'port_class': 'user_data_udp_ports',
+            'derivation': ' + '.join(derivation['formulas']),
+            'derivation_receipt': derivation,
+            'ports': list(derivation['ports']),
+        })
+    seen = set()
+    for group in groups:
+        if not group['ports']:
+            raise DiscoveryNetworkError('empty netem port group: ' + group['group_id'])
+        if seen.intersection(group['ports']):
+            raise DiscoveryNetworkError('overlapping netem port groups: ' + group['group_id'])
+        seen.update(group['ports'])
+    return groups
+
+
+def normalize_netem_spec(spec):
+    """Validate a netem spec field by field; no defaults are invented.
+
+    Reorder needs a nonzero delay in netem itself, so that combination is
+    rejected here instead of failing later after a partial qdisc install.
+    ``restore_sec`` is a declared upper bound: 0 means the caller owns restore.
+    """
+    if not isinstance(spec, dict):
+        raise DiscoveryNetworkError('spec must be a dict')
+    # A receipt re-normalizes its own stored spec; 'neutral' is a derived flag
+    # and 'scope' is optional (absent == 'discovery', byte-identical legacy).
+    unknown = set(spec) - set(NETEM_SPEC_FIELDS) - {NETEM_SCOPE_FIELD, 'neutral'}
+    if unknown:
+        raise DiscoveryNetworkError('spec has unknown field: ' + ','.join(sorted(unknown)))
+    missing = [field for field in NETEM_SPEC_FIELDS if field not in spec]
+    if missing:
+        raise DiscoveryNetworkError('spec missing field: ' + ','.join(missing))
+    scope = spec.get(NETEM_SCOPE_FIELD, DEFAULT_NETEM_SCOPE)
+    if scope not in NETEM_SCOPES:
+        raise NetemScopeError('unsupported scope: ' + repr(scope),
+                              receipt={'scope': scope, 'allowed': list(NETEM_SCOPES)})
+    delay_ms = _bounded_number(spec['delay_ms'], 'delay_ms', 0, 2000)
+    reorder_pct = _bounded_number(spec['reorder_pct'], 'reorder_pct', 0, 100)
+    duplicate_pct = _bounded_number(spec['duplicate_pct'], 'duplicate_pct', 0, 100)
+    restore_sec = spec['restore_sec']
+    if isinstance(restore_sec, bool) or type(restore_sec) not in (int, float) \
+            or not math.isfinite(float(restore_sec)) or float(restore_sec) < 0:
+        raise DiscoveryNetworkError('restore_sec must be a finite number >= 0')
+    restore_sec = float(restore_sec)
+    if reorder_pct and not delay_ms:
+        raise DiscoveryNetworkError('reorder_pct requires delay_ms > 0')
+    return {'delay_ms': delay_ms, 'reorder_pct': reorder_pct,
+            'duplicate_pct': duplicate_pct, 'restore_sec': restore_sec,
+            'scope': scope,
+            'neutral': delay_ms == 0 and reorder_pct == 0 and duplicate_pct == 0}
+
+
+def netem_spec_is_neutral(spec):
+    return normalize_netem_spec(spec)['neutral']
+
+
+def build_netem_plan(ports, spec):
+    """Deterministic tc script and derivation receipt; applies nothing.
+
+    Filters are one exact dport match per selected port and address family. No
+    range or wildcard is used. With ``scope='discovery'`` (the default, and the
+    byte-identical legacy behaviour) the selected set is exactly the derived
+    discovery ports, so interleaved user-data ports are never classified into
+    the netem class. ``scope='data'`` selects only the derived user-data ports
+    and ``scope='both'`` selects the union while keeping one labelled group per
+    port class, so filters and counters stay attributable.
+    """
+    if not isinstance(ports, DiscoveryPorts):
+        raise DiscoveryNetworkError('DiscoveryPorts required')
+    normalized = normalize_netem_spec(spec)
+    scope = normalized[NETEM_SCOPE_FIELD]
+    delay = normalized['delay_ms'] / 1000.0
+    netem = f'netem limit 10000 delay {delay:g}s'
+    if normalized['reorder_pct']:
+        # Correlation is fixed at 0 rather than invented per spec: the reorder
+        # percentage is the only caller-controlled field.
+        netem += f' reorder {normalized["reorder_pct"]:g}% 0%'
+    if normalized['duplicate_pct']:
+        netem += f' duplicate {normalized["duplicate_pct"]:g}%'
+    netem += f' loss {NETEM_LOSS_PCT:g}%'
+    lines = [
+        'qdisc add dev lo root handle 1: prio bands 2 '
+        'priomap 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0',
+        f'qdisc add dev lo parent {NETEM_PARENT} handle {NETEM_HANDLE} {netem}',
+    ]
+    entries = []
+    groups = []
+    # prio must differ per protocol family: the kernel rejects two filter
+    # priorities bound to different protocols on the same parent.
+    for group in netem_port_groups(ports, scope):
+        ports_in_group = group['ports']
+        for port in ports_in_group:
+            for prio, family, key in ((1, 'ip', 'ip'), (2, 'ipv6', 'ip6')):
+                lines.append(
+                    f'filter add dev lo protocol {family} parent 1:0 prio {prio} u32 '
+                    f'match {key} protocol 17 0xff match {key} dport {port} 0xffff '
+                    f'flowid {NETEM_PARENT} action gact pass')
+                entries.append({'family': family, 'port': port, 'prio': prio,
+                                'group_id': group['group_id']})
+        groups.append({
+            'group_id': group['group_id'], 'port_class': group['port_class'],
+            'derivation': group['derivation'], 'ports': list(ports_in_group),
+            'filter_count_per_port': 2, 'filter_count': 2 * len(ports_in_group),
+            'class_id': NETEM_PARENT,
+            **({'derivation_receipt': group['derivation_receipt']}
+               if 'derivation_receipt' in group else {}),
+        })
+    selected = [port for group in groups for port in group['ports']]
+    data_selected = any(group['group_id'] == 'data' for group in groups)
+    if scope == 'discovery':
+        applies_to = 'udp_dport_exact_derived_discovery_ports_only'
+    elif scope == 'data':
+        applies_to = 'udp_dport_exact_derived_user_data_ports_only'
+    else:
+        applies_to = 'udp_dport_exact_derived_discovery_and_user_data_ports'
+    return {'lines': lines, 'script': '\n'.join(lines) + '\n',
+            'spec': {k: v for k, v in normalized.items()},
+            'netem_args': netem, 'entries': entries,
+            'scope': scope, 'groups': groups,
+            'matched_ports': selected,
+            'excluded_user_data_ports': [] if data_selected else list(ports.user_data),
+            'excluded_discovery_ports': [] if scope != 'data' else list(ports.discovery),
+            'implementation': NETEM_IMPLEMENTATION,
+            'applies_to': applies_to,
+            'loss_pct': NETEM_LOSS_PCT, 'loss_defaulted': True,
+            'responsibility_layer': NETEM_RESPONSIBILITY_LAYER,
+            'semantics_note': NETEM_SEMANTICS_NOTE,
+            'floor_default_class': '1:1'}
+
+
+def _tc_json(argv):
+    record = _execute(argv)
+    try:
+        payload = json.loads(record['stdout'])
+        if not isinstance(payload, list) or any(not isinstance(item, dict) for item in payload):
+            raise ValueError('expected a JSON list of objects')
+    except (KeyError, ValueError, TypeError) as exc:
+        raise DiscoveryNetworkError('invalid tc JSON', record) from exc
+    return payload, record
+
+
+def _qdisc_stats(entry):
+    stats = {}
+    for field in ('packets', 'bytes', 'drops', 'overlimits'):
+        value = entry.get(field, 0)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise DiscoveryNetworkError('invalid tc qdisc counter: ' + field)
+        stats[field] = value
+    return stats
+
+
+def parse_netem_counters(qdisc_payload, filter_payload, *, neutral, groups=None,
+                        scope=None):
+    """Real tc counters only. Missing data is an error, never a synthetic zero.
+
+    ``groups`` carries the labelled port groups that were actually installed
+    (``[{'group_id': 'discovery'|'data', 'ports': [...]}]``). When it is given,
+    every filter is attributed to exactly one group and per-group packets/bytes
+    are reported. When tc cannot support that attribution the receipt says
+    ``group_counters_available=False`` with a reason instead of inventing
+    numbers; the flat totals used by older receipts remain available.
+    """
+    netem = [entry for entry in qdisc_payload if entry.get('kind') == 'netem'
+             and entry.get('handle') == NETEM_HANDLE]
+    root = [entry for entry in qdisc_payload if entry.get('kind') == 'prio' and entry.get('root') is True]
+    if len(netem) != 1 or len(root) != 1:
+        raise DiscoveryNetworkError('expected exactly one prio root and one netem class')
+    netem_stats, root_stats = _qdisc_stats(netem[0]), _qdisc_stats(root[0])
+    if netem_stats['packets'] > root_stats['packets'] or netem_stats['bytes'] > root_stats['bytes']:
+        raise DiscoveryNetworkError('netem counter exceeds root counter')
+    default_stats = {field: root_stats[field] - netem_stats[field]
+                     for field in ('packets', 'bytes', 'drops', 'overlimits')}
+    entries, stats_available, totals = [], True, {'packets': 0, 'bytes': 0}
+    for entry in filter_payload:
+        options = entry.get('options')
+        if not isinstance(options, dict) or options.get('flowid') != NETEM_PARENT:
+            continue
+        match = options.get('match')
+        if not isinstance(match, dict) or not isinstance(match.get('value'), str):
+            raise DiscoveryNetworkError('owned netem filter without a dport match')
+        try:
+            port = int(match['value'], 16)
+        except ValueError as exc:
+            raise DiscoveryNetworkError('malformed dport match value') from exc
+        # Real tc -j nests action stats under options.actions; accept either
+        # placement but never synthesize missing counters.
+        actions = options.get('actions')
+        if actions is None:
+            actions = entry.get('actions')
+        record = {'family': entry.get('protocol'), 'port': port}
+        if isinstance(actions, list) and actions and isinstance(actions[0].get('stats'), dict):
+            action_stats = _qdisc_stats(actions[0]['stats'])
+            record.update(action_stats)
+            totals['packets'] += action_stats['packets']
+            totals['bytes'] += action_stats['bytes']
+        else:
+            stats_available = False
+        entries.append(record)
+    if not entries:
+        raise DiscoveryNetworkError('no owned netem filters observed')
+    scope = scope or (groups[0].get('group_id') if groups else DEFAULT_NETEM_SCOPE)
+    group_counters, group_available, group_reason = _group_counters(entries, groups)
+    receipt = {'classes': {NETEM_PARENT: netem_stats, '1:1': default_stats, 'root': root_stats},
+               'filter': {'entries': entries, 'stats_available': stats_available,
+                          'packets': totals['packets'] if stats_available else None,
+                          'bytes': totals['bytes'] if stats_available else None},
+               'affected_packets': netem_stats['packets'], 'affected_bytes': netem_stats['bytes'],
+               'drops': netem_stats['drops'], 'overlimits': netem_stats['overlimits'],
+               'neutral': bool(neutral), 'mutation_hit': bool(not neutral and netem_stats['packets'] > 0),
+               'hit_semantics': netem_hit_semantics(scope),
+               'scope': scope,
+               'group_counters': group_counters,
+               'group_counters_available': group_available,
+               'group_counters_reason': group_reason,
+               'responsibility_layer': NETEM_RESPONSIBILITY_LAYER,
+               'loss_pct': NETEM_LOSS_PCT, 'loss_defaulted': True,
+               'semantics_note': NETEM_SEMANTICS_NOTE}
+    return receipt
+
+
+def _group_counters(entries, groups):
+    """Attribute real filter action counters to declared, labelled port groups.
+
+    Returns ``(counters, available, reason)``. ``available`` is False whenever a
+    real number cannot be attributed (missing action stats, a filter on an
+    undeclared port, or a declared port with no filter), and the reason names
+    the defect. No zero is synthesized for a missing counter.
+    """
+    if not groups:
+        return {}, False, 'port_groups_not_declared'
+    port_group = {}
+    for group in groups:
+        group_id = group.get('group_id')
+        if group_id not in ('discovery', 'data'):
+            return {}, False, 'unknown_port_group_id'
+        for port in group.get('ports', []):
+            if port in port_group and port_group[port] != group_id:
+                return {}, False, 'port_assigned_to_multiple_groups'
+            port_group[port] = group_id
+    counters = {group['group_id']: {'packets': 0, 'bytes': 0, 'filter_entries': 0,
+                                    'ports_observed': [], 'ports_expected': list(group['ports']),
+                                    'changed_packets': 0}
+                for group in groups}
+    reason = None
+    for entry in entries:
+        port = entry['port']
+        group_id = port_group.get(port)
+        if group_id is None:
+            reason = 'filter_port_outside_declared_groups'
+            continue
+        counters[group_id]['filter_entries'] += 1
+        counters[group_id]['ports_observed'].append(port)
+        if 'packets' in entry and 'bytes' in entry:
+            counters[group_id]['packets'] += entry['packets']
+            counters[group_id]['bytes'] += entry['bytes']
+            if entry['packets'] > 0:
+                counters[group_id]['changed_packets'] += entry['packets']
+        else:
+            reason = reason or 'tc_action_counters_missing'
+    for group in groups:
+        observed = set(counters[group['group_id']]['ports_observed'])
+        if set(group['ports']) - observed:
+            reason = reason or 'declared_port_filter_missing'
+    available = reason is None
+    return counters, available, reason
+
+
+def _parse_noqueue(qdisc_text):
+    """Return residual qdisc descriptions; only a bare noqueue root is clean."""
+    residual = []
+    for line in str(qdisc_text).splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        fields = line.split()
+        if fields[:2] != ['qdisc', 'noqueue']:
+            residual.append(line)
+    return residual
+
+
+class DiscoveryNetemController:
+    """One bounded tc-netem window over derived discovery and/or data UDP ports.
+
+    Reuses the drop controller's namespace assertion, health gate and restore
+    discipline, but never installs nft rules and never reports a drop hit.
+    ``spec['scope']`` chooses the matched destination ports: ``discovery``
+    (default, byte-identical legacy behaviour), ``data`` (default-RTPS user-data
+    ports so the primary delivery oracle can be exercised) or ``both``. Each
+    port class is a separately labelled group in every receipt, so a data-plane
+    match is never confused with a discovery match.
+
+    Semantics contract (also embedded in receipts): only network-layer
+    delay/reorder/duplicate is applied, with loss fixed at 0% and declared.
+    These are environment-harness effects. A reliable+ordered DDS implementation
+    must not expose wire reordering or duplication as reader-side order
+    violations or duplicate deliveries, so the primary delivery oracle keeps
+    ``delivery_order_violation`` and duplicate sequences as real defect
+    signals; nothing in this adapter may reinterpret such residuals as an
+    expected network effect, and candidate admission stays oracle-decided.
+    A ``data``/``both`` hit therefore only proves that the harness classified
+    data-plane packets; it never pre-excludes or pre-admits a candidate.
+    """
+
+    def __init__(self, domain_id, participant_count=32):
+        self.ports = DiscoveryPorts(domain_id, participant_count)
+        self.health = None
+        self.spec = None
+        self.plan = None
+        self.active = False
+        self._attempted = False
+        self._begin = None
+        self._end = None
+
+    @property
+    def neutral(self):
+        return bool(self.spec and self.spec['neutral'])
+
+    def setup(self):
+        """Tool and namespace health only; installs no qdisc."""
+        if self._attempted:
+            raise DiscoveryNetworkError('restore before setup')
+        isolation = assert_isolated_namespace()
+        qdisc_payload, qdisc_command = _tc_json(['tc', '-j', 'qdisc', 'show', 'dev', 'lo'])
+        filter_payload, filter_command = _tc_json(['tc', '-j', 'filter', 'show', 'dev', 'lo'])
+        residual_qdisc = _parse_noqueue(
+            '\n'.join(f"qdisc {entry.get('kind')} {entry.get('handle')}" for entry in qdisc_payload))
+        if residual_qdisc or filter_payload:
+            raise DiscoveryNetworkError('initial loopback qdisc/filter is not empty',
+                                        {'residual_qdisc': residual_qdisc,
+                                         'residual_filter': filter_payload})
+        self.health = {
+            'event': 'discovery_netem_setup', 'health_ok': True,
+            'monotonic_ns': time.monotonic_ns(), 'isolation': isolation,
+            'ports': self.ports.receipt(), 'implementation': NETEM_IMPLEMENTATION,
+            'initial_qdisc': qdisc_payload, 'initial_filter': filter_payload,
+            'qdisc_command': qdisc_command, 'filter_command': filter_command,
+            'supported_scopes': list(NETEM_SCOPES),
+            'default_scope': DEFAULT_NETEM_SCOPE,
+            'user_data_derivation': rtps_user_data_ports(
+                self.ports.domain_id, self.ports.participant_count),
+            'responsibility_layer': NETEM_RESPONSIBILITY_LAYER,
+            'loss_pct': NETEM_LOSS_PCT,
+            'mutation_installed': False, 'hit': False, 'counter_observed': False,
+        }
+        return self.health
+
+    def pair_bindings(self, worker_pids):
+        """Delegate to the shared, read-only socket ownership proof."""
+        return DiscoveryDropController.pair_bindings(self, worker_pids)
+
+    def _dump(self):
+        qdisc_payload, qdisc_command = _tc_json(['tc', '-j', '-s', 'qdisc', 'show', 'dev', 'lo'])
+        filter_payload, filter_command = _tc_json(['tc', '-j', '-s', 'filter', 'show', 'dev', 'lo'])
+        dump = {'qdisc': qdisc_payload, 'filter': filter_payload}
+        digest = hashlib.sha256(json.dumps(dump, sort_keys=True).encode()).hexdigest()
+        return dump, digest, {'qdisc_command': qdisc_command, 'filter_command': filter_command}
+
+    def start(self, spec):
+        """Install the qdisc/filters once; validate the full spec before any tc call."""
+        if self.health is None or self._attempted:
+            raise DiscoveryNetworkError('setup required and previous window must be restored')
+        normalized = normalize_netem_spec(spec)
+        assert_isolated_namespace()
+        plan = build_netem_plan(self.ports, normalized)
+        self.spec, self.plan = normalized, plan
+        self._end = None
+        self._begin = {
+            'event': 'discovery_netem_begin', 'domain_id': self.ports.domain_id,
+            'implementation': NETEM_IMPLEMENTATION,
+            'netem_begin_monotonic_ns': time.monotonic_ns(),
+            'spec': {k: normalized[k] for k in (*NETEM_SPEC_FIELDS, NETEM_SCOPE_FIELD)},
+            'scope': plan['scope'],
+            'groups': plan['groups'],
+            'derivation': {'netem_args': plan['netem_args'],
+                           'entry_count': len(plan['entries']),
+                           'reorder_correlation_pct': 0.0,
+                           'applies_to': plan['applies_to'],
+                           'floor_default_class': plan['floor_default_class'],
+                           'matched_ports': plan['matched_ports'],
+                           'excluded_user_data_ports': plan['excluded_user_data_ports'],
+                           'excluded_discovery_ports': plan['excluded_discovery_ports'],
+                           'port_groups': [
+                               {key: group[key] for key in
+                                ('group_id', 'port_class', 'ports', 'filter_count',
+                                 'filter_count_per_port', 'class_id')}
+                               for group in plan['groups']],
+                           'loss_pct': plan['loss_pct'],
+                           'loss_defaulted': plan['loss_defaulted'],
+                           'responsibility_layer': plan['responsibility_layer'],
+                           'semantics_note': plan['semantics_note']},
+            'responsibility_layer': NETEM_RESPONSIBILITY_LAYER,
+            'loss_pct': NETEM_LOSS_PCT, 'loss_defaulted': True,
+            'hit_semantics': netem_hit_semantics(plan['scope']),
+            'semantics_note': NETEM_SEMANTICS_NOTE,
+            'configured': False, 'installed': False, 'applied': False,
+            'neutral': normalized['neutral'], 'hit': False, 'counter_observed': False,
+        }
+        self._attempted = True
+        try:
+            self._begin['install_command'] = _execute(['tc', '-batch', '-'], input_text=plan['script'])
+            self.active = True
+            self._begin.update(configured=True, installed=True,
+                               netem_applied_monotonic_ns=time.monotonic_ns())
+            self._begin['applied'] = not normalized['neutral']
+            if normalized['neutral']:
+                self._begin['no_op_reason'] = 'neutral_spec'
+            dump, digest, commands = self._dump()
+            self._begin.update(tc_dump=dump, tc_dump_sha256=digest, tc_commands=commands)
+            snapshot = self.counters()
+            self._begin['counter_snapshot'] = snapshot
+            self._begin['counter_observed'] = True
+            self._begin['hit'] = bool(snapshot['mutation_hit'])
+        except (DiscoveryNetworkError, NetworkIsolationError) as exc:
+            self._begin['error'] = str(exc)
+            self._begin['failed_command'] = getattr(exc, 'receipt', {})
+            try:
+                self._begin['restore_after_failure'] = self.restore()
+            except (DiscoveryNetworkError, NetworkIsolationError) as cleanup:
+                self._begin['restore_error'] = str(cleanup)
+                self._begin['restore_failure_receipt'] = getattr(cleanup, 'receipt', {})
+            raise DiscoveryNetworkError('discovery netem installation failed', self._begin) from exc
+        return self._begin
+
+    def counters(self):
+        assert_isolated_namespace()
+        if not self.active:
+            raise DiscoveryNetworkError('no installed netem window')
+        qdisc_payload, _ = _tc_json(['tc', '-j', '-s', 'qdisc', 'show', 'dev', 'lo'])
+        filter_payload, _ = _tc_json(['tc', '-j', '-s', 'filter', 'show', 'dev', 'lo'])
+        groups = (self.plan or {}).get('groups')
+        scope = (self.spec or {}).get(NETEM_SCOPE_FIELD, DEFAULT_NETEM_SCOPE)
+        parsed = parse_netem_counters(qdisc_payload, filter_payload, neutral=self.neutral,
+                                      groups=groups, scope=scope)
+        expected = (self.plan or {}).get('matched_ports', list(self.ports.discovery))
+        return {'event': 'discovery_netem_counter', 'monotonic_ns': time.monotonic_ns(),
+                'implementation': NETEM_IMPLEMENTATION, 'domain_id': self.ports.domain_id,
+                'scope': scope, 'port_groups': groups,
+                'spec': self.spec, 'counter_observed': True,
+                'expected_ports': list(expected), **parsed}
+
+    def restore(self):
+        isolation = assert_isolated_namespace()
+        if not self._attempted:
+            if self._end:
+                return dict(self._end, idempotent=True)
+            # Nothing was ever installed; still report real residual state.
+            try:
+                qdisc_payload, _ = _tc_json(['tc', '-j', 'qdisc', 'show', 'dev', 'lo'])
+                filter_payload, _ = _tc_json(['tc', '-j', '-s', 'filter', 'show', 'dev', 'lo'])
+                residual_qdisc = _parse_noqueue(
+                    '\n'.join(f"qdisc {e.get('kind')} {e.get('handle')}" for e in qdisc_payload))
+                dump = {'qdisc': qdisc_payload, 'filter': filter_payload}
+                dump_sha = hashlib.sha256(json.dumps(dump, sort_keys=True).encode()).hexdigest()
+            except DiscoveryNetworkError as exc:
+                residual_qdisc, filter_payload, dump_sha = [], [], None
+                observation_error = str(exc)
+            else:
+                observation_error = None
+            return {
+                'event': 'discovery_netem_end', 'restored': not residual_qdisc and not filter_payload,
+                'no_netem_attempted': True, 'implementation': NETEM_IMPLEMENTATION, 'neutral': None,
+                'residual_qdisc': residual_qdisc, 'residual_filter': filter_payload,
+                'tc_dump_after_sha256': dump_sha, 'observation_error': observation_error,
+                'counter_observed': False, 'recovery_verified': False, 'isolation': isolation,
+            }
+        end = {'event': 'discovery_netem_end', 'domain_id': self.ports.domain_id,
+               'implementation': NETEM_IMPLEMENTATION, 'neutral': self.neutral,
+               'netem_begin_monotonic_ns': self._begin['netem_begin_monotonic_ns'],
+               'restore_begin_monotonic_ns': time.monotonic_ns(), 'isolation': isolation,
+               'restored': False, 'residual_qdisc': [], 'residual_filter': [],
+               'counter_observed': False, 'recovery_verified': False}
+        if self.active:
+            try:
+                end['counter_snapshot'] = self.counters()
+                end['counter_observed'] = True
+            except DiscoveryNetworkError as exc:
+                end.update(counter_error=str(exc), counter_failure_receipt=exc.receipt)
+        try:
+            end['delete_command'] = _execute(['tc', 'qdisc', 'del', 'dev', 'lo', 'root'])
+        except DiscoveryNetworkError as exc:
+            end.update(delete_error=str(exc), delete_failure_receipt=exc.receipt)
+        try:
+            qdisc_payload, qdisc_command = _tc_json(['tc', '-j', 'qdisc', 'show', 'dev', 'lo'])
+            filter_payload, filter_command = _tc_json(['tc', '-j', '-s', 'filter', 'show', 'dev', 'lo'])
+            residual_qdisc = _parse_noqueue(
+                '\n'.join(f"qdisc {entry.get('kind')} {entry.get('handle')}" for entry in qdisc_payload))
+            dump = {'qdisc': qdisc_payload, 'filter': filter_payload}
+            end.update(final_qdisc=qdisc_payload, final_filter=filter_payload,
+                       qdisc_command=qdisc_command, filter_command=filter_command,
+                       residual_qdisc=residual_qdisc, residual_filter=filter_payload,
+                       tc_dump_after_sha256=hashlib.sha256(
+                           json.dumps(dump, sort_keys=True).encode()).hexdigest())
+            end['only_noqueue_root'] = (
+                len(qdisc_payload) == 1 and qdisc_payload[0].get('kind') == 'noqueue')
+            end['restored'] = end['only_noqueue_root'] and not filter_payload
+        except DiscoveryNetworkError as exc:
+            end.update(verify_error=str(exc), verify_failure_receipt=exc.receipt)
+        end['netem_end_monotonic_ns'] = time.monotonic_ns()
+        self._end = end
+        if not end['restored']:
+            raise DiscoveryNetworkError('namespace netem restoration not verified', end)
+        self.active = False
+        self._attempted = False
+        return end
+
+    def confirm_recovery(self, *, activity_receipt):
+        """Bounded post-restore gate; the caller still owns semantic adjudication."""
+        assert_isolated_namespace()
+        if not self._end or not self._end['restored'] or self._attempted:
+            raise DiscoveryNetworkError('verified restore required before recovery confirmation')
+        if not isinstance(activity_receipt, dict):
+            raise DiscoveryNetworkError('independent post-restore activity receipt required')
+        receipt = json.loads(json.dumps(activity_receipt, allow_nan=False))
+        observed = receipt.get('monotonic_ns')
+        if (receipt.get('activity_observed') is not True
+                or receipt.get('domain_id') != self.ports.domain_id
+                or receipt.get('source') not in ('public_ros2_pair', 'non_dds_loopback_udp')
+                or not isinstance(receipt.get('evidence_ref'), str) or not receipt['evidence_ref'].strip()
+                or isinstance(observed, bool) or not isinstance(observed, int)
+                or not self._end['netem_end_monotonic_ns'] < observed <= time.monotonic_ns()):
+            raise DiscoveryNetworkError('fresh post-restore activity and raw evidence_ref required')
+        return {'event': 'discovery_netem_recovery_confirmed', 'recovery_verified': True,
+                'implementation': NETEM_IMPLEMENTATION, 'neutral': self._end['neutral'],
+                'evidence_kind': 'caller_independent_activity', 's1_execution': False,
+                'requires_runtime_semantic_adjudication': True,
+                'restore_end_monotonic_ns': self._end['netem_end_monotonic_ns'],
+                'monotonic_ns': time.monotonic_ns(), 'activity_receipt': receipt}
 
     def __enter__(self):
         self.setup()
