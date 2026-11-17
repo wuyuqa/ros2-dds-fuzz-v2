@@ -885,8 +885,10 @@ def recovery_facts(events, runtime, config):
         boundary = _one(events, 'discovery_restore_boundary')
         opening = _one(events, 'window_open', window='post_restore_delivery')
         closing = _one(events, 'window_close', window='post_restore_delivery')
-        inter_open = _one(events, 'window_open', window='discovery_interruption')
-        inter_close = _one(events, 'window_close', window='discovery_interruption')
+        netem_carrier = runtime.get('carrier_implementation') == NETEM_IMPLEMENTATION
+        window_name = 'discovery_netem_window' if netem_carrier else 'discovery_interruption'
+        inter_open = _one(events, 'window_open', window=window_name)
+        inter_close = _one(events, 'window_close', window=window_name)
         boundary_mono = integer(boundary['post_restore_monotonic_ns'], 'restore boundary')
         boundary_wall = integer(boundary['post_restore_unix_ns'], 'restore realtime boundary')
         if (not begin['event_index'] < inter_open['event_index'] < inter_close['event_index'] < boundary['event_index'] < opening['event_index'] < closing['event_index']
@@ -920,7 +922,33 @@ def recovery_facts(events, runtime, config):
         # Preserve the realtime->monotonic boundary and its explicit uncertainty.
         if abs((observed['time_ns'] - observed['monotonic_ns']) - (boundary_wall - boundary_mono)) > 50_000_000:
             raise ValueError('recovery clocks changed offset')
-        if active:
+        if active and netem_carrier:
+            # netem installs a qdisc/filter, not an nft drop table. Its own
+            # receipt proves configure/apply/restore and grouped real counters;
+            # the primary delivery oracle still judges wire behaviour.
+            begin_receipt = _one(events, 'discovery_netem_begin')
+            end_receipt = _one(events, 'discovery_netem_end')
+            be, ee = begin_receipt['receipt'], end_receipt['receipt']
+            neutral_spec = be.get('neutral') is True
+            hit = bool(not neutral_spec and be.get('hit'))
+            if (be.get('implementation') != NETEM_IMPLEMENTATION
+                    or ee.get('restored') is not True
+                    or ee.get('only_noqueue_root') is not True
+                    or boundary.get('restored') is not True
+                    or boundary.get('neutral') is not False
+                    or not begin['event_index'] < begin_receipt['event_index'] < inter_open['event_index']
+                    or not inter_open['event_index'] < end_receipt['event_index'] < boundary['event_index']):
+                raise ValueError('real netem window install/verified restore evidence incomplete')
+            counters = [e['receipt'] for e in events if e['event'] == 'discovery_netem_counter'
+                        and inter_open['event_index'] < e['event_index'] < end_receipt['event_index']]
+            counters.append(ee.get('counter_snapshot') or {})
+            if not counters or not any(bool(c.get('hit') or c.get('mutation_hit')) for c in counters):
+                raise ValueError('netem window has no counted real hit')
+            packets = max(int(int((c.get('filter') or {}).get('packets') or 0)
+                              + int((c.get('group_counters', {}).get('data') or {}).get('packets') or 0))
+                          for c in counters)
+            active = True
+        elif active:
             dropped = _one(events, 'discovery_drop_begin')
             restored = _one(events, 'discovery_drop_end')
             dr, rr = dropped['receipt'], restored['receipt']
