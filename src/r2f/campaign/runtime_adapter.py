@@ -409,9 +409,27 @@ def ingest_execution(scenario, config, runtime, capsule, *, services=None):
                 # Submitted/applied but with no observable effect: keep the
                 # terminal state at reached and report mutation_ineffective.
                 # This is not a SUT failure and never advances to mutation_applied.
-                audit["mutation_ineffective"] = True
-                audit["mutation_ineffective_reason"] = config.get(
-                    "mutation_ineffective_reason", "no_observable_effect")
+                # A data-plane carrier whose window *did* cover the delivery but
+                # observed zero packets is an observation limit, not a mutation
+                # that failed to take: report it under its own reason so the two
+                # cannot be conflated in the coverage ledger.
+                if (facts.get('delivery_inside_mutation_window') is True
+                        and facts.get('data_plane_observed') is False):
+                    audit["mutation_ineffective"] = True
+                    audit["mutation_ineffective_reason"] = (
+                        'observation_limit:'
+                        + str(facts.get('data_plane_observation_reason')
+                              or 'data_plane_not_observed'))
+                    audit["observation_limit"] = {
+                        'kind': 'data_plane_not_observed_inside_covered_window',
+                        'reason': facts.get('data_plane_observation_reason'),
+                        'carrier': config.get('environment_mutation', {}).get('kind')
+                                   if isinstance(config.get('environment_mutation'), dict) else None,
+                    }
+                else:
+                    audit["mutation_ineffective"] = True
+                    audit["mutation_ineffective_reason"] = config.get(
+                        "mutation_ineffective_reason", "no_observable_effect")
                 row = record.to_dict()
                 row.update(audit, domain_id=config["domain_id"], typed_facts=facts,
                            oracle={"rule_id": scenario.target.rule_contract["primary_rule"],
