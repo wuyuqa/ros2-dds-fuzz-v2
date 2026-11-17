@@ -1214,6 +1214,10 @@ def _generate_case(sequence, entry, target, contract, surface, parent, mutator_i
                         'writer_churn_in_window', 'environment_mutation'):
                 if key in profile:
                     config[key] = profile[key]
+        # Carrier-scoped delivery coverage is independent of the reader-churn
+        # switch: a netem profile has no churn but still needs this flag.
+        if profile.get('netem_covers_delivery') is not None:
+            config['netem_covers_delivery'] = profile['netem_covers_delivery']
         binding = {"status": "preserved", "silent_normalization": False,
                    "submitted_config_sha256": canonical_hash(plan.final_config),
                    "normalized_config_sha256": canonical_hash(normalized),
