@@ -464,7 +464,19 @@ def run_discovery_pair(config, output_dir, result):
                 restored=previous['discovery_restore_verified'], activity_ok=previous['discovery_recovery_activity_observed'],
                 fresh_recovery=previous['recovery_fresh_count_graph'], drop_activity_ok=previous['discovery_drop_activity_observed'],
                 carrier_implementation=implementation, carrier_kind=carrier_kind,
-                neutral_spec=bool(previous.get('discovery_carrier_neutral_spec', False)))
+                neutral_spec=bool(previous.get('discovery_carrier_neutral_spec', False)),
+                # Re-deriving the summary must not erase carrier-level delivery
+                # facts the body already established (netem coverage and the
+                # data-plane observation limit).
+                delivery_overlap=(None if previous.get('delivery_inside_mutation_window') is None
+                                  else {'inside': bool(previous['delivery_inside_mutation_window']),
+                                        'window_refs': previous.get('delivery_window_refs'),
+                                        'install_ref': previous.get('netem_install_ref'),
+                                        'restore_ref': previous.get('netem_restore_ref'),
+                                        'boundary_ref': previous.get('netem_boundary_ref'),
+                                        'chronology': previous.get('delivery_overlap_chronology')}),
+                data_plane_observed=previous.get('data_plane_observed'),
+                data_plane_reason=previous.get('data_plane_observation_reason'))
         result['facts']['candidate_eligible'] = c['arm'] != 'negative'
         if result['real_execution']:
             result['execution'] = {'real_execution': True, 'run_id': c['run_id'], 'target_id': c['target_id'],
