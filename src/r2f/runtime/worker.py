@@ -110,11 +110,13 @@ def main():
 
     # Recreated reader/writer generations use explicit role aliases but the
     # same endpoint semantics and QoS contract as their base role.  Keep this
-    # mapping in one place so reader2..reader9 and writer2 cannot drift.
+    # mapping in one place so reader2..reader9 and writer2..writer4 cannot
+    # drift.  projection_pair supplies the exact per-role profile; direct
+    # worker invocations fall back to the base kind.
     import re
     match = re.fullmatch(r'(reader|writer)([2-9])', role)
     endpoint_role = match.group(1) if match else role
-    q = config.get(endpoint_role + '_qos', config['qos'])
+    q = config.get(role + '_qos', config.get(endpoint_role + '_qos', config['qos']))
     qos = create_public_qos(q)
 
     def gid(value):
