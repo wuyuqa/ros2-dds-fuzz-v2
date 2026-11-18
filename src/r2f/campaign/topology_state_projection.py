@@ -432,12 +432,106 @@ class _Projection:
                for role, t in (("writer", w), ("reader", r))):
             raise ValueError("delivery_window_old_generation_or_pair_mismatch")
 
+    def no_sends(self, w, r, boundary):
+        """Independently reconstruct the committed inventory, never trust a label.
+
+        No import of runtime validator, no open/close fabrication, no replacement
+        of per-peer match or endpoint health. Reuse is deliberately fail-closed.
+        """
+        prefix = self.prefix(boundary)
+        claims = [e for e in prefix if e["event"] == "topology_delivery_no_sends"
+                  and e.get("writer") == w["logical_id"] and e.get("reader") == r["logical_id"]]
+        if len(claims) != 1 or boundary.get("phase") != "after_program":
+            raise ValueError("no_sends_receipt_missing_duplicate_or_wrong_boundary")
+        claim = claims[0]
+        self.pair_bound(claim, w, r)
+        seals = [e for e in prefix if e["event"] == "topology_send_inventory_end"]
+        if len(seals) != 1:
+            raise ValueError("no_sends_inventory_end_missing_or_duplicate")
+        seal = seals[0]
+        end = seal["event_index"]
+        inventory = self.events[:end]
+        digest = hashlib.sha256(json.dumps(inventory, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        if (seal.get("schema") != "r2f.topology-send-inventory/v1" or seal.get("inventory_count") != end
+                or seal.get("inventory_sha256") != digest
+                or boundary.get("lifecycle_complete") is not True or boundary.get("observation_complete") is not True
+                or claim["event_index"] not in boundary.get("delivery_window_refs", [])
+                or any(e.get("event_index") != i or e.get("run_id") != w["run_id"]
+                       or type(e.get("monotonic_ns")) is not int for i, e in enumerate(self.events))):
+            raise ValueError("no_sends_inventory_or_lifecycle_incomplete")
+        actions = self.program["actions"]
+        begins = [e for e in inventory if e["event"] == "topology_action_begin"]
+        done = [e for e in inventory if e["event"] == "topology_action_done"]
+        if len(begins) != len(actions) or len(done) != len(actions):
+            raise ValueError("no_sends_action_chronology_incomplete")
+        for i, (action, begin, finish) in enumerate(zip(actions, begins, done)):
+            if (begin.get("action") != action or finish.get("action") != action
+                    or begin.get("action_index") != i or finish.get("action_index") != i
+                    or not begin["event_index"] < finish["event_index"] < end
+                    or (i and done[i-1]["event_index"] >= begin["event_index"])
+                    or finish.get("receipt", {}).get("satisfied") is not True):
+                raise ValueError("no_sends_action_terminal_not_raw_bound")
+            self.chain_order([begin, finish, seal])
+        if seal.get("action_done_refs") != [e["event_index"] for e in done]:
+            raise ValueError("no_sends_action_inventory_mismatch")
+        fields = ("logical_id", "generation", "endpoint_gid", "pid", "process_start_ticks", "endpoint_generation")
+        chains = {}
+        for token in (w, r):
+            history = [e for e in prefix if e.get("logical_id") == token["logical_id"]
+                       and e["event"] in {"endpoint_created", "endpoint_destroyed", "topology_endpoint_destroyed", "topology_generation_retired"}]
+            if len(history) != 1 or history[0] != token or token["generation"] != 1:
+                raise ValueError("no_sends_generation_history_not_unique")
+            chain = chains[token["logical_id"]] = self.snapshot_chain(token, boundary)
+            if any(any(row.get(k) != token[k] for k in fields if k != "endpoint_gid") for row in chain):
+                raise ValueError("no_sends_snapshot_identity_incomplete")
+            self.chain_order([token, seal, *chain, claim, boundary])
+            exits = [e for e in self.events if e["event"] == "topology_worker_exit"
+                     and e.get("logical_id") == token["logical_id"]]
+            if (len(exits) != 1 or exits[0].get("returncode") != 0
+                    or any(exits[0].get(k) != token[k] for k in fields)
+                    or exits[0]["event_index"] <= boundary["event_index"]):
+                raise ValueError("no_sends_generation_end_not_identity_bound")
+        ends = [e for e in self.events if e["event"] == "runtime_end"]
+        if (len(ends) != 1 or ends[0].get("cleanup_complete") is not True
+                or ends[0].get("status") != "executed" or ends[0]["event_index"] <= boundary["event_index"]):
+            raise ValueError("no_sends_complete_runtime_end_missing")
+        for e in self.events:
+            if e["event"] in {"runtime_abort", "worker_error", "worker_command_error", "topology_backend_blocked"}:
+                raise ValueError("no_sends_raw_worker_or_runtime_error")
+            if e["event"] == "send":
+                known = [t for t in self.events if t["event"] == "endpoint_created"
+                         and t.get("logical_id") == e.get("logical_id") and t.get("generation") == e.get("generation")]
+                if (len(known) != 1 or any(e.get(k) != known[0].get(k) for k in fields if k != "endpoint_gid")
+                        or e.get("logical_id") == w["logical_id"] or e.get("pid") == w["pid"]):
+                    raise ValueError("no_sends_writer_or_ambiguous_send_present")
+            if ((e.get("writer") == w["logical_id"] and e["event"].startswith("topology_delivery_window"))
+                    or ((e.get("action") if isinstance(e.get("action"), dict) else {}).get("endpoint_id") == w["logical_id"]
+                        and (e.get("action") if isinstance(e.get("action"), dict) else {}).get("op") == "publish_batch")
+                    or (e.get("logical_id") == w["logical_id"]
+                        and (e["event"] in {"publish", "publish_batch", "publish_batch_done"}
+                             or e.get("command") in {"publish", "publish_batch"}))):
+                raise ValueError("no_sends_publication_attempt_or_window_present")
+        expected = {"schema": "r2f.topology-delivery-no-sends/v1", "closure_status": "not_applicable_no_sends",
+                    "scope": "entire_writer_generation_through_send_phase_end", "inventory_end_ref": end,
+                    "inventory_count": end, "inventory_sha256": digest,
+                    "writer_identity": {k: w[k] for k in fields}, "reader_identity": {k: r[k] for k in fields},
+                    "writer_creation_ref": w["event_index"], "reader_creation_ref": r["event_index"],
+                    "snapshot_refs": {t["logical_id"]: [e["event_index"] for e in chains[t["logical_id"]]] for t in (w, r)},
+                    "expected_sequences": [], "received_sequences": [], "missing_sequences": [],
+                    "candidate_eligible": False, "mutation_hit": False, "semantic_effect": False}
+        if any(claim.get(k) != v for k, v in expected.items()):
+            raise ValueError("no_sends_receipt_contradicts_raw_inventory")
+        return "no_obligation", [w, r, seal, claim, *chains[w["logical_id"]], *chains[r["logical_id"]]], {
+            "expected": [], "received": [], "missing": [], "applicability_kind": "not_applicable_no_sends",
+            "no_sends_ref": self.ref(claim), "inventory_end_ref": self.ref(seal),
+            "inventory_sha256": digest, "generation_scope": expected["scope"]}
+
     def delivery(self, w, r, tokens, boundary):
         prefix = self.prefix(boundary)
         closes = [e for e in prefix if e["event"] == "topology_delivery_window_closed"
                   and e.get("writer") == w["logical_id"] and e.get("reader") == r["logical_id"]]
         if not closes:
-            raise ValueError("delivery_window_raw_missing")
+            return self.no_sends(w, r, boundary)
         close = closes[-1]
         self.pair_bound(close, w, r)
         opened = self.resolve(close.get("open_ref"), boundary=close)

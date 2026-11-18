@@ -437,6 +437,18 @@ def _delivery_window(audit, pair, deliveries):
     """
     component = pair["proofs"]["delivery_closure"]
     refs = [audit.resolve(r) for r in component.get("refs", [])]
+    detail = component.get("detail", {})
+    if detail.get("applicability_kind") == "not_applicable_no_sends":
+        claims = [e for e in refs if e["event"] == "topology_delivery_no_sends"]
+        seals = [e for e in refs if e["event"] == "topology_send_inventory_end"]
+        valid = (component.get("status") == "observed" and component.get("value") == "no_obligation"
+                 and pair.get("delivery_closure") == "no_obligation" and len(claims) == len(seals) == 1
+                 and detail.get("no_sends_ref") == audit.ref(claims[0])
+                 and detail.get("inventory_end_ref") == audit.ref(seals[0])
+                 and all(detail.get(k) == [] for k in ("expected", "received", "missing")))
+        return {"delivery_window_identity_complete": valid,
+                "delivery_closure": "no_obligation" if valid else "unknown",
+                "delivery_applicability": "not_applicable_no_sends" if valid else "unknown"}
     openings = [e for e in refs if e["event"] == "topology_delivery_window_open"]
     closings = [e for e in refs if e["event"] == "topology_delivery_window_closed"]
     if len(openings) != 1 or len(closings) != 1:
@@ -581,7 +593,8 @@ def facts_from_events(events, runtime, config):
         facts["pairs"] = _pair_facts(a, projection, facts["deliveries"])
         facts["unresolved_historical_obligations"] = [a.ref(s) for s in sends if not any(
             p["writer"] == s.get("logical_id") and p.get("writer_generation") == s.get("generation")
-            and p.get("delivery_closure") not in {"not_applicable", "no_obligation"}
+            and p.get("delivery_closure") in {"closed", "closed_with_gap", "open"}
+            and a.ref(s) in p.get("proofs", {}).get("delivery_closure", {}).get("refs", [])
             for p in facts["pairs"]) and not _no_obligation_send_covered(a, facts["pairs"], s)]
         facts["application_audit"] = _application(a)
         facts["source_provenance_qualified"] = _source_qualification(a)

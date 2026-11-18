@@ -42,6 +42,48 @@ REJECTION_REASONS = frozenset({
 # instruction.  All semantic hashes use an explicit new domain; old hashes
 # fail validation on load (no implicit migration of checkpoints/route anchors).
 CONTENT_IDENTITY_SCHEMA = "r2f.corpus-content/v2"
+# Only the known topology target/program changes domain. Generic F1 roots,
+# derived RNG anchors and historical goldens retain corpus-content/v2.
+TOPOLOGY_CONTENT_IDENTITY_SCHEMA = "r2f.corpus-content/topology-v3"
+
+
+def _topology_content_domain(entry, final):
+    return (entry.get("target_id") == "discovery.endpoint_topology.fuzz_v1"
+            and isinstance(final, dict) and set(final) == {"topology_program"}
+            and isinstance(final["topology_program"], dict)
+            and final["topology_program"].get("schema") == "r2f.s1-topology-program/v1")
+
+
+def _project_topology_depth_selector(op, parameters):
+    """Drop only the audited compile-time depth selection label on a copy.
+
+    The request remains lossless elsewhere (plan, receipts, effective identity).
+    Nested context.parameters is NOT handled: this compiler's numeric operator
+    reads context.boundary_class directly; nested selector semantics are unproven.
+    """
+    if (op["application_phase"] != "compile_time"
+            or op["surface_id"] != "S1.topology.program"
+            or op["mutator_id"] != "I2.topology_program.v1"
+            or set(op["parameters"]) != {"operator_id", "slot_id", "request", "seed", "input_layer_receipts"}):
+        return
+    request = parameters.get("request")
+    if not isinstance(request, dict) or set(request) - {"operator_id", "slot_id", "context"}:
+        return
+    if (parameters.get("operator_id") not in {"queue.depth", "param.boundary"}
+            or not isinstance(parameters.get("slot_id"), str)
+            or re.fullmatch(r"S1\.topology\.qos\.depth#(?:0|[1-9][0-9]*)", parameters["slot_id"]) is None
+            or request.get("operator_id") != parameters["operator_id"]
+            or request.get("slot_id") != "S1.topology.qos.depth"):
+        return
+    # _resolve_wildcard_slot binds depth to a concrete #endpoint index.
+    # Keep that resolved slot (and its index) in the semantic projection.
+    context = request.get("context", {})
+    # Unknown context/payload keys stay hashed, including nested parameters.
+    if isinstance(context, dict):
+        context.pop("boundary_class", None)
+        if not context:
+            request.pop("context", None)
+
 INPUT_IDENTITY_KEYS = (
     "target_id", "target_revision", "rmw", "contract_hash",
     "mutation_kind", "carrier", "mutation_parameters", "contract",
@@ -101,7 +143,7 @@ def _content_operation_parameters(parameters):
     return result
 
 
-def _content_operations(operations):
+def _content_operations(operations, *, topology_domain=False):
     from r2f.core.mutation_plan import MutationOperation
     if not isinstance(operations, list):
         raise ValueError("corpus operations must be a list")
@@ -117,6 +159,8 @@ def _content_operations(operations):
                 raise ValueError("unknown corpus overridden_by operation")
             status["overridden_by"] = ids[status["overridden_by"]]
         parameters = _content_operation_parameters(op["parameters"])
+        if topology_domain:
+            _project_topology_depth_selector(op, parameters)
         if op["application_phase"] == "compile_time":
             for key in _CONTENT_SELECTION_PARAMETERS.get(op["mutator_id"], ()):
                 parameters.pop(key, None)
@@ -180,8 +224,9 @@ def _content_layers(layers, operations=None):
 def content_identity(entry):
     """Hash final semantic input, not seed lineage or full replay provenance.
 
-    Version policy: all new inputs use CONTENT_IDENTITY_SCHEMA, independently
-    of optional provenance labels.  Existing stored hashes are never auto-migrated.
+    Version policy: only the exact known topology target/program uses the
+    topology-v3 domain, for roots AND derived inputs. Generic inputs retain v2.
+    Existing stored hashes are never auto-migrated.
     Full effective_input_hash, MutationPlan hashes and historical artifacts are
     intentionally untouched.  All payload dictionaries are copied losslessly.
     """
@@ -217,13 +262,16 @@ def content_identity(entry):
             raise ValueError("corpus mutation_plan/runtime_windows mismatch")
         operations, windows = plan_operations, plan.runtime_windows
     if operations is not None:
-        identity["operations"] = _content_operations(operations)
+        identity["operations"] = _content_operations(
+            operations, topology_domain=_topology_content_domain(entry, final))
     if windows is not None:
         from r2f.core.mutation_plan import _validate_runtime_windows
         identity["runtime_windows"] = _validate_runtime_windows(windows)
     if "input_layer_receipts" in entry:
         identity["input_layer_receipts"] = _content_layers(entry["input_layer_receipts"], operations)
-    return canonical_hash({"schema": CONTENT_IDENTITY_SCHEMA, "identity": identity})
+    schema = (TOPOLOGY_CONTENT_IDENTITY_SCHEMA if _topology_content_domain(entry, final)
+              else CONTENT_IDENTITY_SCHEMA)
+    return canonical_hash({"schema": schema, "identity": identity})
 
 
 def content_sha256(entry):

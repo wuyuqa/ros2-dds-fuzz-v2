@@ -109,6 +109,14 @@ def evaluate_topology(scenario, facts):
         else:
             graph_values.append(None)
             reasons.append("directed_peer_or_observed_contract_unknown")
+        applicability = pair.get("proofs", {}).get("delivery_closure", {}).get("detail", {}).get("applicability_kind")
+        if applicability == "not_applicable_no_sends":
+            if (closure == "no_obligation" and pair.get("delivery_window_identity_complete") is True
+                    and pair.get("delivery_applicability") == "not_applicable_no_sends"):
+                continue
+            delivery_values.append(None)
+            reasons.append("no_sends_applicability_not_independently_verified")
+            continue
         if closure == "not_applicable" or closure == "no_obligation":
             continue
         expected = pair.get("proofs", {}).get("delivery_closure", {}).get("detail", {}).get("expected", [])

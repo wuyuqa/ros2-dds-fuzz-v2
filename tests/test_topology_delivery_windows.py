@@ -260,9 +260,26 @@ def test_multiple_batches_use_current_generation_window_and_actual_send_inventor
 def test_no_send_and_no_reader_never_fabricate_completed_windows(tmp_path):
     program = _program()
     program["actions"] = [a for a in program["actions"] if a["op"] != "publish_batch"]
-    _, events, _, boundary = _run(tmp_path, program)
-    assert not any(e["event"] == "topology_delivery_window_open" for e in events)
-    assert not boundary["window_complete"]
+    result, events, projection, boundary = _run(tmp_path, program)
+    assert not any(e["event"] in {"send", "topology_delivery_window_open", "topology_delivery_window_closed"}
+                   for e in events)
+    claims = [e for e in events if e["event"] == "topology_delivery_no_sends"]
+    assert len(claims) == 1 and claims[0]["schema"] == "r2f.topology-delivery-no-sends/v1"
+    assert claims[0]["closure_status"] == "not_applicable_no_sends"
+    assert boundary["lifecycle_complete"] and boundary["observation_complete"] and boundary["window_complete"]
+    assert claims[0]["event_index"] in boundary["delivery_window_refs"]
+    seal = events[claims[0]["inventory_end_ref"]]
+    assert seal["event"] == "topology_send_inventory_end"
+    for refs in claims[0]["snapshot_refs"].values():
+        chain = [events[i] for i in refs]
+        assert [e["event"] for e in chain] == ["topology_snapshot_requested", "match_snapshot", "graph_snapshot", "command_done"]
+        assert seal["event_index"] < refs[0] < refs[1] < refs[2] < refs[3] < claims[0]["event_index"]
+    assert projection["state_after"]["pairs"][0]["delivery_closure"] == "no_obligation"
+    proof = projection["receipt"]["after"]["component_refs"]["/pairs/w0/r0/delivery_closure"]
+    assert proof["status"] == "observed"
+    assert proof["detail"]["applicability_kind"] == "not_applicable_no_sends"
+    assert proof["detail"]["no_sends_ref"] in proof["refs"]
+    assert result["runtime_status"] == "completed"
 
 
 def test_reader_generation_replacement_does_not_borrow_old_sentinel(tmp_path):
