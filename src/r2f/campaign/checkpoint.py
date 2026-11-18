@@ -19,10 +19,12 @@ from r2f.modules.s1.module import register_exploratory
 from r2f.modules.s1.fuzz_catalog import catalog_digest
 from .corpus import Corpus, corpus_from_profile, corpus_identity
 from .search_frontier import (_frontier_validation_scope,
-                              _remember_model_validated_frontier)
+                              _remember_model_validated_frontier, _memo_key,
+                              _hook_model_validation_scope)
 from .mutation_routes import (_route_validation_scope, has_routes, route_view, routes_enabled,
                               validate_route_entry, validate_route_selection)
-from .scheduler import ExploratoryScheduler, required_catalog_hash, validated_feedback
+from .scheduler import (ExploratoryScheduler, required_catalog_hash, validated_feedback,
+                        _restore_checkpoint_corpus)
 from .exploratory_input import (F2_WINDOWS_TARGET, F2_SURFACE_MUTATORS,
                                 validate_f2_profile, runtime_input)
 
@@ -135,9 +137,15 @@ def _serialized(value):
     return deepcopy(value.to_dict() if hasattr(value, "to_dict") else value)
 
 
-def _validate_corpus_binding(corpus, identity, seeds, registry):
+def _validate_corpus_binding(corpus, identity, seeds, registry, *, _records=None):
     allowed = {r["target_id"] for r in seeds.entries.values()}
     for record in corpus.entries.values():
+        # This set belongs to ONE _validate_state invocation: registry/profile/
+        # source are fixed, and every distinct full record is checked in full.
+        # Never skip the per-corpus pinned-seed/history checks below.
+        record_key = _memo_key(record, allow_alias=True) if _records is not None else None
+        if record_key is not None and record_key in _records:
+            continue
         if record["target_id"] not in allowed:
             raise ValueError("checkpoint corpus target/cycle mismatch")
         target = registry.get_target(record["target_id"])
@@ -174,6 +182,8 @@ def _validate_corpus_binding(corpus, identity, seeds, registry):
                         op.mutator_id != F2_SURFACE_MUTATORS[record["surface_id"]] or
                         op.applicability_status != "needs_observation" for op in plan.operations):
                     raise ValueError("checkpoint F2 operation/observation guard mismatch")
+        if record_key is not None:
+            _records.add(record_key)
     pinned = {d for d, r in corpus.entries.items() if r.get("pinned_seed")}
     if pinned != set(seeds.entries):
         raise ValueError("checkpoint fixed seed identities differ from profile")
@@ -206,7 +216,7 @@ def _validate_state(state, identity, seeds, registry):
         _remember_model_validated_frontier(state["scheduler"]["frontier"], verified_frontier)
         model_parents = {digest: deepcopy(node["entry"])
                          for digest, node in verified_frontier.nodes.items()}
-    corpus = Corpus.from_dict(state["corpus"], model_parents=model_parents)
+    corpus = _restore_checkpoint_corpus(state["corpus"], model_parents=model_parents)
     feedback_data = state["feedback"]
     feedback = validated_feedback(feedback_data.get("events"))
     if feedback.to_dict() != feedback_data:
@@ -233,10 +243,11 @@ def _validate_state(state, identity, seeds, registry):
         raise ValueError("checkpoint corpus supporting identity mismatch")
     if state.get("next_selection_sequence") != len(scheduler.selection_log):
         raise ValueError("checkpoint next sequence mismatch")
-    _validate_corpus_binding(corpus, identity, seeds, registry)
+    validated_records = set()
+    _validate_corpus_binding(corpus, identity, seeds, registry, _records=validated_records)
     for context in scheduler.selection_contexts:
-        _validate_corpus_binding(Corpus.from_dict(context["corpus"], model_parents=model_parents),
-                                identity, seeds, registry)
+        _validate_corpus_binding(_restore_checkpoint_corpus(context["corpus"], model_parents=model_parents),
+                                identity, seeds, registry, _records=validated_records)
     continuation = deepcopy(state.get("continuation"))
     if not isinstance(continuation, dict):
         raise ValueError("checkpoint continuation must be a dict")
@@ -364,6 +375,11 @@ def make_checkpoint_hook(output_dir, *, profile, cycle_id, source_manifest, cont
     identity, seeds, registry = _identity(profile, cycle_id, source_manifest)
     sequence, last_hash = 0, None
     inherited = deepcopy(continuation or {})
+    # Owned exclusively by this writer and fixed full source/profile/registry
+    # identity. It never grants acceptance to a supplied state. Cold loaders do
+    # not receive it, even if invoked from a writer's call stack.
+    model_memo = {"identity_key": _memo_key(identity, allow_alias=True),
+                  "plans": {}, "node": {}, "noop": {}}
 
     def hook(payload):
         nonlocal sequence, last_hash
@@ -388,7 +404,14 @@ def make_checkpoint_hook(output_dir, *, profile, cycle_id, source_manifest, cont
         elif next_state.get("pending_selection") is None:
             next_state["pending_attempt"] = None
         state["continuation"] = next_state
-        _validate_state(state, identity, seeds, registry)
+        try:
+            with _hook_model_validation_scope(model_memo):
+                _validate_state(state, identity, seeds, registry)
+        except BaseException:
+            # A failed write is never a trusted validation checkpoint.
+            for name in ("plans", "node", "noop"):
+                model_memo[name].clear()
+            raise
         envelope = {"schema": SCHEMA, "identity": identity, "state": state,
                     "snapshot_sequence": sequence, "previous_checkpoint_sha256": last_hash}
         envelope["checkpoint_sha256"] = canonical_hash(envelope)
@@ -432,7 +455,8 @@ def load_checkpoint(path, *, profile, cycle_id, source_manifest, output_dir):
     identity, seeds, registry = _identity(profile, cycle_id, source_manifest)
     if data.get("identity") != identity:
         raise ValueError("checkpoint source/target/profile/catalog identity mismatch")
-    corpus, feedback, scheduler, continuation = _validate_state(data["state"], identity, seeds, registry)
+    with _hook_model_validation_scope(None):
+        corpus, feedback, scheduler, continuation = _validate_state(data["state"], identity, seeds, registry)
     if continuation.get("pending_selection") is not None:
         reasons = _pending_refusal(continuation)
         if reasons:

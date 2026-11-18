@@ -15,15 +15,33 @@ from .corpus import content_identity
 from .mutation_routes import (canonical_route_record, has_routes, inherit_routes,
                               route_view, validate_route_entry)
 
-# Ephemeral deterministic work only: never retained across checkpoint validation,
-# source/profile identities, hooks, processes, or exceptions. Values are private
-# detached copies; callers cannot mutate a cached frontier through a return value.
+# Per-validation deterministic work. Full frontier/corpus restores never cross
+# validation calls. Only explicitly writer-owned node/noop/model work may persist
+# across hot snapshots under _HOOK_MODEL_MEMO's fixed source/profile identity.
+# All values are private detached copies; cold loaders never inherit hot work.
 _VALIDATION_MEMO = ContextVar("r2f_frontier_validation_memo", default=None)
+# Private trusted writer scope. Only pure model results/templates live here;
+# frontier, counts, journal, feedback and continuation are verified every time.
+# No process-global cache; load_checkpoint explicitly shadows this with None.
+_HOOK_MODEL_MEMO = ContextVar("r2f_hook_model_memo", default=None)
+
+
+@contextmanager
+def _hook_model_validation_scope(memo):
+    token = _HOOK_MODEL_MEMO.set(memo)
+    try:
+        yield
+    finally:
+        _HOOK_MODEL_MEMO.reset(token)
 
 
 @contextmanager
 def _frontier_validation_scope():
-    token = _VALIDATION_MEMO.set({"frontier": {}, "noop": {}, "node": {}})
+    trusted = _HOOK_MODEL_MEMO.get()
+    token = _VALIDATION_MEMO.set({
+        "frontier": {},
+        "noop": trusted["noop"] if trusted is not None else {},
+        "node": trusted["node"] if trusted is not None else {}})
     try:
         yield
     finally:
@@ -455,6 +473,23 @@ class InputSearchFrontier:
                 raise ValueError("input search target/contract/RMW mismatch")
             if self.topology_descriptor is not None:
                 from .topology_search import generate, task_requests
+                trusted = _HOOK_MODEL_MEMO.get()
+                # generate()/validate_task()/rejection_accounting consume the
+                # declared task inputs, not these frontier lifecycle outputs.
+                # All remaining full task fields are retained; no supplied
+                # content hash can stand in for parent/program/request values.
+                progress = {"status", "actual", "execution", "generated_record",
+                            "generation_outcome", "reason", "rejection",
+                            "chain_accounting", "applicability"}
+                generation_key = (_memo_key([
+                    parent, {k: v for k, v in task.items() if k not in progress},
+                    self.topology_descriptor], allow_alias=True)
+                    if trusted is not None else None)
+                cache_key = (trusted["identity_key"], generation_key) if generation_key is not None else None
+                if cache_key is not None and cache_key in trusted["plans"]:
+                    if event["action"] != "plan" or trusted["plans"][cache_key] != event["record"]:
+                        raise ValueError("topology child not model-generatable")
+                    continue
                 try:
                     regenerated = generate(parent, task, self.topology_descriptor)
                 except ValueError as exc:
@@ -463,8 +498,11 @@ class InputSearchFrontier:
                     if task.get("chain_schema") and task.get("chain_accounting") != getattr(exc, "accounting", None):
                         raise ValueError("topology chain rejection accounting not model-generatable")
                 else:
-                    if event["action"] != "plan" or derived_record(parent, regenerated) != event["record"]:
+                    expected_record = derived_record(parent, regenerated)
+                    if event["action"] != "plan" or expected_record != event["record"]:
                         raise ValueError("topology child not model-generatable")
+                    if cache_key is not None:
+                        trusted["plans"][cache_key] = deepcopy(expected_record)
                 continue
             validate_route_entry(parent, contract=contract, profile=profile)
             route = task["mutation_route"]

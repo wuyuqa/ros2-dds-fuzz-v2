@@ -23,6 +23,29 @@ from .mutation_routes import has_routes, route_view, validate_route_entry
 from .feedback import FeedbackLog, edge_id, feedback_identity, surface_class
 
 
+def _restore_checkpoint_corpus(data, *, model_parents=None):
+    """Reuse exact restores only within one complete checkpoint validation.
+
+    Full values (including parents and alias topology), not supplied hashes,
+    qualify a hit. First use always performs Corpus.from_dict; no result or
+    mutation of a returned object can affect the private detached snapshot.
+    Outside the checkpoint's context this is the original cold path.
+    """
+    from .search_frontier import _VALIDATION_MEMO, _memo_key
+    scope = _VALIDATION_MEMO.get()
+    if scope is None:
+        return Corpus.from_dict(data, model_parents=model_parents)
+    key = _memo_key([data, model_parents], allow_alias=True)
+    if key is None:
+        return Corpus.from_dict(data, model_parents=model_parents)
+    memo = scope.setdefault("corpus_restore", {})
+    if key in memo:
+        return deepcopy(memo[key])
+    restored = Corpus.from_dict(data, model_parents=model_parents)
+    memo[key] = deepcopy(restored)
+    return restored
+
+
 def first_slice_cells(target_id=EXECUTION_ORDER[0]):
     rows = []
     for rmw, arm, repeat in product(RMWS, ("baseline", "transparent", "mutated"), range(3)):
@@ -676,7 +699,7 @@ class ExploratoryScheduler:
             while last_epoch < epoch_id:
                 last_epoch += 1
                 scheduler.advance_feedback(validated_feedback(full.events[:epochs[last_epoch]["feedback_event_count"]]))
-            scheduler.corpus = Corpus.from_dict(context["corpus"], model_parents=model_parents)
+            scheduler.corpus = _restore_checkpoint_corpus(context["corpus"], model_parents=model_parents)
             sampling = context.get("sampling")
             if sampling is not None:
                 scheduler.configure_sampling(sampling["kinds"], sampling["weight"])

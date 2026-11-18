@@ -594,9 +594,7 @@ def _verify_topology_generation_rejection(root, row, report):
     not every frontier task. No runtime callable is invoked; missing runtime
     evidence alone is NOT rejection proof.
     """
-    from r2f.campaign.checkpoint import _identity, SCHEMA
-    from r2f.campaign.search_frontier import search_settings, derived_record
-    from r2f.campaign.topology_search import descriptor, selection_metadata, validate_task, generate, task_requests
+    from r2f.campaign.topology_search import generate, task_requests
     if (row.get("actual_run") is not False or row.get("mutation_plan") is not None
             or row.get("execution_stage") != "planned"
             or row.get("oracle_verdict") != "not_applicable"
@@ -649,6 +647,35 @@ def _verify_topology_generation_rejection(root, row, report):
         saved_row = json.loads(_path(root, str(case / "row.json")).read_text())
         if canonical_hash(saved_row) != canonical_hash(row):
             raise ValueError("topology_generation_rejection_saved_row_mismatch")
+    task, parent, history, desc = _topology_generation_provenance(root, row, report)
+    if [e["action"] for e in history] != ["select", "generation_rejected", "finish"]:
+        raise ValueError("topology_rejection_has_submission_or_plan_history")
+    try:
+        generate(parent, task, desc)
+    except ValueError as exc:
+        detail = str(exc)
+        if task.get("chain_schema") and task.get("chain_accounting") != getattr(exc, "accounting", None):
+            raise ValueError("topology_rejection_chain_accounting_not_model_generatable") from exc
+    else:
+        raise ValueError("topology_rejection_is_model_generatable")
+    if (row["reason_code"] != "topology_input_rejected:" + detail
+            or history[1].get("reason") != detail or history[1].get("attempts") != task_requests(task)
+            or history[2].get("reason") != row["reason_code"]
+            or history[2].get("rejected") is not True or history[2].get("actual") is not False
+            or history[2].get("execution") is not None
+            or task.get("rejection") != {"reason": detail, "attempts": task_requests(task)}):
+        raise ValueError("topology_rejection_model_reason_mismatch")
+    if (task.get("generation_outcome") != "generation_rejected"
+            or task.get("rejection", {}).get("attempts") != row.get("topology_generation_attempts")):
+        raise ValueError("topology_rejection_model_provenance_mismatch")
+
+
+def _topology_generation_provenance(root, row, report):
+    """Shared source/profile/task/parent proof, never execution qualification."""
+    from r2f.campaign.checkpoint import _identity, SCHEMA
+    from r2f.campaign.search_frontier import search_settings, derived_record
+    from r2f.campaign.topology_search import descriptor, selection_metadata, validate_task, generate
+    cell = row["cell_id"]
     checkpoint = json.loads(_path(root, "checkpoint.json").read_text())
     if (not isinstance(checkpoint, dict) or checkpoint.get("schema") != SCHEMA or checkpoint.get("checkpoint_sha256") !=
             canonical_hash({k: v for k, v in checkpoint.items() if k != "checkpoint_sha256"})):
@@ -736,23 +763,6 @@ def _verify_topology_generation_rejection(root, row, report):
     task = tasks[search["task_id"]]
     parent = checked_task(task)
     history = events.get(task["task_id"], [])
-    if [e["action"] for e in history] != ["select", "generation_rejected", "finish"]:
-        raise ValueError("topology_rejection_has_submission_or_plan_history")
-    try:
-        generate(parent, task, desc)
-    except ValueError as exc:
-        detail = str(exc)
-        if task.get("chain_schema") and task.get("chain_accounting") != getattr(exc, "accounting", None):
-            raise ValueError("topology_rejection_chain_accounting_not_model_generatable") from exc
-    else:
-        raise ValueError("topology_rejection_is_model_generatable")
-    if (row["reason_code"] != "topology_input_rejected:" + detail
-            or history[1].get("reason") != detail or history[1].get("attempts") != task_requests(task)
-            or history[2].get("reason") != row["reason_code"]
-            or history[2].get("rejected") is not True or history[2].get("actual") is not False
-            or history[2].get("execution") is not None
-            or task.get("rejection") != {"reason": detail, "attempts": task_requests(task)}):
-        raise ValueError("topology_rejection_model_reason_mismatch")
     if canonical_hash(row.get("topology_chain_accounting")) != canonical_hash(task.get("chain_accounting")):
         raise ValueError("topology_rejection_chain_accounting_mismatch")
     for key in ("target_id", "target_revision", "rmw"):
@@ -768,11 +778,77 @@ def _verify_topology_generation_rejection(root, row, report):
         raise ValueError("topology_rejection_input_search_mismatch")
     selections = [s for s in state["scheduler"]["selections"] if s.get("task_id") == task["task_id"]]
     if (len(selections) != 1 or cell != f"{row['run_id']}.{selections[0]['sequence']:04d}.rejected"
-            or task.get("generation_outcome") != "generation_rejected"
             or task.get("status") != "rejected" or task.get("actual") is not False
-            or task.get("execution") is not None or task.get("reason") != row["reason_code"]
-            or task.get("rejection", {}).get("attempts") != row.get("topology_generation_attempts")):
+            or task.get("execution") is not None or task.get("reason") != row["reason_code"]):
         raise ValueError("topology_rejection_model_provenance_mismatch")
+
+    return task, parent, history, desc
+
+
+def _verify_topology_model_terminal(root, row, report):
+    """Only the runner's unprepared generated-plan terminal shape is admitted.
+
+    Prepared duplicate_content/model_* rows carry config/capsule and are NOT
+    generation-guard stubs. They require their own prepared-artifact contract.
+    """
+    from r2f.campaign.topology_search import generate
+    from r2f.campaign.search_frontier import derived_record
+    from r2f.core.mutation_plan import mutation_plan_noop_reason
+    allowed = {"cell_id", "run_id", "target_id", "target_revision", "profile_id", "rmw",
+               "campaign_kind", "arm", "execution_stage", "actual_run", "oracle_verdict",
+               "control_kind", "mutation_plan", "input_layer_receipts", "binding",
+               "generation_status", "reason_code", "content_sha256", "parent_content_sha256",
+               "no_effective_input_reason", "candidate_eligible", "feedback_eligible",
+               "input_search", "topology_chain_accounting"}
+    if (set(row) - allowed or row.get("actual_run") is not False
+            or row.get("execution_stage") != "planned" or row.get("arm") != "mutated"
+            or row.get("control_kind") is not None or row.get("oracle_verdict") != "not_applicable"
+            or row.get("candidate_eligible") is not False or row.get("feedback_eligible") is not False
+            or row.get("input_layer_receipts") != [] or not isinstance(row.get("mutation_plan"), dict)
+            or row.get("reason_code") not in {"model_guard_terminal", "no_effective_input"}):
+        raise ValueError("topology_model_terminal_shape_invalid")
+    if row.get("binding") != {"status": "not_executed", "silent_normalization": False,
+                              "detail": row["reason_code"]}:
+        raise ValueError("topology_model_terminal_binding_invalid")
+    cell = row["cell_id"]
+    if Path(cell).name != cell or "\\" in cell or cell in {".", ".."}:
+        raise ValueError("topology_cell_identity_not_path_component")
+    case = Path(root) / "cases" / cell
+    if (case.is_symlink() or not case.is_dir()
+            or {p.name for p in case.iterdir()} != {"row.json", "mutation_plan.json"}):
+        raise ValueError("topology_model_terminal_has_prepared_or_execution_artifacts")
+    if canonical_hash(json.loads(_path(root, str(case / "row.json")).read_text())) != canonical_hash(row):
+        raise ValueError("topology_model_terminal_saved_row_mismatch")
+    task, parent, history, desc = _topology_generation_provenance(root, row, report)
+    if [e["action"] for e in history] != ["select", "plan", "finish"]:
+        raise ValueError("topology_model_terminal_has_submission_history")
+    plan = generate(parent, task, desc)
+    record = derived_record(parent, plan)
+    noop = mutation_plan_noop_reason(plan)
+    compile_noop = bool(record["operations"]) and all(
+        op["application_phase"] == "compile_time" and op["input_before_sha256"] == op["input_after_sha256"]
+        for op in record["operations"])
+    if record.get("executable") is False:
+        outcome, reason, detail = "guard_terminal", "model_guard_terminal", "topology_guard_terminal"
+    elif noop is not None:
+        outcome = ("compile_time_no_change" if compile_noop and
+                   record["runtime_windows"] == parent.get("runtime_windows", []) else "no_effective_input")
+        reason, detail = "no_effective_input", noop
+    else:
+        raise ValueError("topology_model_terminal_not_generated_guard_or_noop")
+    saved_plan = json.loads(_path(root, str(case / "mutation_plan.json")).read_text())
+    if (row["reason_code"] != reason or row.get("no_effective_input_reason") != detail
+            or task.get("generation_outcome") != outcome
+            or canonical_hash(saved_plan) != canonical_hash(plan.to_dict())
+            or canonical_hash(row["mutation_plan"]) != canonical_hash(plan.to_dict())
+            or canonical_hash(task.get("generated_record")) != canonical_hash(record)
+            or canonical_hash(history[1].get("record")) != canonical_hash(record)
+            or row.get("content_sha256") != record["content_sha256"]
+            or row.get("parent_content_sha256") != parent["content_sha256"]
+            or history[2].get("rejected") is not True or history[2].get("actual") is not False
+            or history[2].get("execution") is not None or history[2].get("reason") != reason):
+        raise ValueError("topology_model_terminal_regeneration_mismatch")
+
 
 
 def _topology_artifact_qualification(root, row, report):
@@ -898,7 +974,10 @@ def _verify_exploratory_row(root, row, report, errors):
         from r2f.modules.s1.topology_targets import TOPOLOGY_TARGET
         topology = row["target_id"] == TOPOLOGY_TARGET
         if topology and row.get("generation_status") == "rejected":
-            _verify_topology_generation_rejection(root, row, report)
+            if row.get("mutation_plan") is None:
+                _verify_topology_generation_rejection(root, row, report)
+            else:
+                _verify_topology_model_terminal(root, row, report)
             return True
         qualification = boundary_qualification_for_row(root, row, report)
         if qualification["status"] not in {"not_applicable", "qualified"}:
