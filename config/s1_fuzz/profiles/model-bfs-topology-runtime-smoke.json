@@ -1,0 +1,119 @@
+{
+  "schema_version": "r2f.s1-fuzz-profile/v1",
+  "profile_id": "model-bfs-topology-runtime-smoke",
+  "campaign_kind": "exploratory",
+  "activation": "F2",
+  "enabled": false,
+  "required_catalog_included": false,
+  "runtime_capability": "topology_v1",
+  "target_ids": [
+    "discovery.endpoint_topology.fuzz_v1"
+  ],
+  "surfaces": [
+    "S1.topology.program"
+  ],
+  "rmws": [
+    "rmw_cyclonedds_cpp"
+  ],
+  "seed_catalog_status": "authored_v2",
+  "source_schema": "r2f.s1-seed-corpus/v2",
+  "chain_length": 1,
+  "operator_whitelist": [
+    "endpoint.count",
+    "queue.depth",
+    "relation.pair"
+  ],
+  "mutator_whitelist": [
+    "I2.topology_program.v1"
+  ],
+  "budget": {
+    "max_inputs": 4,
+    "max_seconds": 180
+  },
+  "corpus": {
+    "capacity": 256,
+    "bucket_limit": 3
+  },
+  "seed_specs": [
+    {
+      "seed_id": "topology.multi_endpoint",
+      "target_id": "discovery.endpoint_topology.fuzz_v1",
+      "surface_id": "S1.topology.program",
+      "mutator_id": "I2.topology_program.v1",
+      "boundary_class": "authored_topology",
+      "expected_disposition": "expect_pass",
+      "executable": true
+    }
+  ],
+  "declared_seed_specs_union": [
+    {
+      "seed_id": "topology.multi_endpoint",
+      "target_id": "discovery.endpoint_topology.fuzz_v1",
+      "surface_id": "S1.topology.program",
+      "mutator_id": "I2.topology_program.v1",
+      "boundary_class": "authored_topology",
+      "expected_disposition": "expect_pass",
+      "executable": true
+    }
+  ],
+  "cycles": [
+    {
+      "cycle_id": "topology-authored",
+      "target_id": "discovery.endpoint_topology.fuzz_v1",
+      "surfaces": [
+        "S1.topology.program"
+      ],
+      "seed_specs": [
+        {
+          "seed_id": "topology.multi_endpoint",
+          "target_id": "discovery.endpoint_topology.fuzz_v1",
+          "surface_id": "S1.topology.program",
+          "mutator_id": "I2.topology_program.v1",
+          "boundary_class": "authored_topology",
+          "expected_disposition": "expect_pass",
+          "executable": true
+        }
+      ]
+    }
+  ],
+  "description": "Offline explicit single-request topology BFS; applicability ledger includes every declared pair. No runtime qualification.",
+  "execution_boundary": "No runner activation or live permission. Main integrates profile consumption separately.",
+  "scheduler_policy": "bfs",
+  "search": {
+    "schema": "r2f.input-search-config/v1",
+    "mode": "input_search_bfs",
+    "max_depth": 2,
+    "max_nodes": 16,
+    "max_tasks": 64,
+    "samples_per_class": 1
+  },
+  "topology_search": {
+    "schema": "r2f.topology-search/v1",
+    "samples": [
+      {
+        "operator_id": "endpoint.count",
+        "slot_id": "S1.topology.endpoints",
+        "class_id": "add",
+        "context": {
+          "direction": "add"
+        }
+      },
+      {
+        "operator_id": "queue.depth",
+        "slot_id": "S1.topology.qos.depth",
+        "class_id": "one",
+        "context": {
+          "boundary_class": "one"
+        }
+      },
+      {
+        "operator_id": "relation.pair",
+        "slot_id": "S1.topology.qos.reliability",
+        "class_id": "RR",
+        "context": {
+          "pair": "RR"
+        }
+      }
+    ]
+  }
+}

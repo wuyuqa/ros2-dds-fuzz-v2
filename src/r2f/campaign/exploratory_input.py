@@ -39,7 +39,7 @@ PROFILE_METADATA_FIELDS = frozenset({
     'declared_seed_specs_union', 'pending_seed_ids', 'pending_surfaces',
     'sampling_kinds', 'sampling_weight', 'chain_length',
     'activation', 'cycle_id', 'runner_slice', 'mutator_whitelist',
-    'search', 'scheduler_policy',
+    'search', 'scheduler_policy', 'topology_search',
 })
 
 
@@ -52,6 +52,8 @@ def validate_search_profile(profile):
     policy = profile.get('scheduler_policy')
     if 'scheduler_policy' in profile and policy not in ('feedback', 'fair', 'bfs'):
         raise ValueError('unsupported profile scheduler_policy')
+    if 'topology_search' in profile and 'search' not in profile:
+        raise ValueError('topology_search requires explicit bounded search')
     if 'search' not in profile:
         if policy == 'bfs':
             raise ValueError('bfs profile requires explicit search settings')
@@ -61,6 +63,16 @@ def validate_search_profile(profile):
     from .search_frontier import search_settings
     from .mutation_routes import routes_enabled
     search_settings(profile['search'])
+    if 'topology_search' in profile:
+        from .topology_search import descriptor, validate_chain_length
+        from r2f.modules.s1.topology_targets import TOPOLOGY_TARGET
+        if profile.get('target_ids') != [TOPOLOGY_TARGET]:
+            raise ValueError('topology_search requires exact topology target')
+        desc = descriptor(profile['topology_search'], profile.get('operator_whitelist', []))
+        validate_chain_length(profile, desc)
+        if 'sampling_kinds' in profile or 'sampling_weight' in profile:
+            raise ValueError('topology_search uses explicit classes, not F1 sampling kinds')
+        return
     if not routes_enabled(profile):
         raise ValueError('input_search_bfs currently requires declared F1 mutation routes')
     if not isinstance(profile.get('sampling_kinds'), list) or not profile['sampling_kinds']:

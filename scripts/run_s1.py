@@ -88,12 +88,21 @@ def main(argv=None):
                 policy_options = {} if scheduler_policy is None else {"policy": scheduler_policy}
                 if scheduler_policy == "bfs":
                     from r2f.campaign.search_frontier import search_settings
-                    policy_options.update(search=search_settings(profile.get("search")),
-                                          sampling_kinds=profile.get("sampling_kinds"),
-                                          sampling_weight=profile.get("sampling_weight"))
+                    bounds = search_settings(profile.get("search"))
+                    # Topology tasks carry an explicit model descriptor, not
+                    # F1 mutation routes or sampling classes. Initialize the
+                    # same scheduler first, then freeze that descriptor below.
+                    if "topology_search" not in profile:
+                        policy_options.update(search=bounds,
+                                              sampling_kinds=profile.get("sampling_kinds"),
+                                              sampling_weight=profile.get("sampling_weight"))
                 scheduler = ExploratoryScheduler(corpus, feedback,
                     rng_seed=args["seed"] if args["seed"] is not None else 0, warmup=warmup,
                     **policy_options)
+                if scheduler_policy == "bfs" and "topology_search" in profile:
+                    from r2f.campaign.topology_search import descriptor
+                    scheduler.configure_search(bounds, descriptor(
+                        profile["topology_search"], profile["operator_whitelist"]))
             checkpoint_hook = make_checkpoint_hook(args["output_dir"], profile=profile,
                 cycle_id=cycle_id, source_manifest=source, continuation=continuation)
         except (ValueError, KeyError, OSError) as error:

@@ -18,6 +18,8 @@ from r2f.core.evidence import canonical_hash
 from r2f.modules.s1.module import register_exploratory
 from r2f.modules.s1.fuzz_catalog import catalog_digest
 from .corpus import Corpus, corpus_from_profile, corpus_identity
+from .search_frontier import (_frontier_validation_scope,
+                              _remember_model_validated_frontier)
 from .mutation_routes import (_route_validation_scope, has_routes, route_view, routes_enabled,
                               validate_route_entry, validate_route_selection)
 from .scheduler import ExploratoryScheduler, required_catalog_hash, validated_feedback
@@ -185,6 +187,7 @@ def _validate_corpus_binding(corpus, identity, seeds, registry):
 
 
 @_route_validation_scope()
+@_frontier_validation_scope()
 def _validate_state(state, identity, seeds, registry):
     if not isinstance(state, dict):
         raise ValueError("checkpoint state must be a dict")
@@ -194,10 +197,13 @@ def _validate_state(state, identity, seeds, registry):
         raise ValueError("checkpoint scheduler policy differs from profile search declaration")
     if state["scheduler"].get("policy") == "bfs":
         from .search_frontier import InputSearchFrontier
+        from .exploratory_input import validate_search_profile
+        validate_search_profile(identity["profile"])
         verified_frontier = InputSearchFrontier.from_dict(state["scheduler"].get("frontier"))
         # Qualification order matters: hashes alone do not prove generation.
         # No caller-supplied external parent is trusted before this succeeds.
         verified_frontier.validate_model(profile=identity["profile"], seeds=seeds, registry=registry)
+        _remember_model_validated_frontier(state["scheduler"]["frontier"], verified_frontier)
         model_parents = {digest: deepcopy(node["entry"])
                          for digest, node in verified_frontier.nodes.items()}
     corpus = Corpus.from_dict(state["corpus"], model_parents=model_parents)
@@ -272,7 +278,7 @@ def _validate_state(state, identity, seeds, registry):
             raise ValueError("checkpoint input search actual-task budget mismatch")
         executable_generated = sum(t.get("generated_record") is not None and
                                    t.get("generation_outcome") not in
-                                   {"compile_time_no_change", "no_effective_input"} for t in tasks)
+                                   {"compile_time_no_change", "no_effective_input", "guard_terminal"} for t in tasks)
         if executable_generated != budget["generated"]:
             raise ValueError("checkpoint input search generated-task budget mismatch")
         for task in tasks:
@@ -328,11 +334,16 @@ def _validate_state(state, identity, seeds, registry):
 
 def _atomic_json(path, value):
     path.parent.mkdir(parents=True, exist_ok=True)
+    _atomic_text(path, json.dumps(value, sort_keys=True, indent=2, allow_nan=False) + "\n")
+
+
+def _atomic_text(path, encoded):
+    """Write pre-encoded JSON without changing atomic replace/fsync semantics."""
+    path.parent.mkdir(parents=True, exist_ok=True)
     fd, temporary = tempfile.mkstemp(prefix=".checkpoint-", suffix=".tmp", dir=path.parent)
     try:
         with os.fdopen(fd, "w") as stream:
-            json.dump(value, stream, sort_keys=True, indent=2, allow_nan=False)
-            stream.write("\n")
+            stream.write(encoded)
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temporary, path)
@@ -390,8 +401,11 @@ def make_checkpoint_hook(output_dir, *, profile, cycle_id, source_manifest, cont
         archive = output / "checkpoints" / f"{sequence:08d}-{next_state['phase']}.json"
         if archive.exists():
             raise ValueError("checkpoint immutable snapshot already exists")
-        _atomic_json(archive, envelope)
-        _atomic_json(path, envelope)
+        # Both durable destinations contain exactly the same envelope bytes.
+        # Encode once; do not stream/re-encode the full growing frontier twice.
+        encoded = json.dumps(envelope, sort_keys=True, indent=2, allow_nan=False) + "\n"
+        _atomic_text(archive, encoded)
+        _atomic_text(path, encoded)
         sequence += 1
         last_hash = envelope["checkpoint_sha256"]
         return path

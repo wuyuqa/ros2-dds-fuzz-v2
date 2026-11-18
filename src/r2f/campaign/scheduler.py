@@ -127,12 +127,14 @@ class ExploratoryScheduler:
         if search is not None:
             self.configure_search(search)
 
-    def configure_search(self, search):
+    def configure_search(self, search, topology_descriptor=None):
         from .search_frontier import InputSearchFrontier, search_settings
         if self.policy != "bfs":
             raise ValueError("search settings require explicit bfs policy")
         settings = search_settings(search)
         if self.frontier is not None:
+            if topology_descriptor != self.frontier.topology_descriptor:
+                raise ValueError("input search descriptor cannot drift")
             if settings != self.frontier.settings:
                 raise ValueError("input search bounds cannot change after initialization")
             if (self.sampling_kinds != self.frontier.sampling_kinds or
@@ -143,7 +145,7 @@ class ExploratoryScheduler:
             raise ValueError("cannot initialize input search after selection")
         self.frontier = InputSearchFrontier(self.corpus.selectable(), settings,
             rng_seed=self.rng_seed, sampling_kinds=self.sampling_kinds,
-            sampling_weight=self.sampling_weight)
+            sampling_weight=self.sampling_weight, topology_descriptor=topology_descriptor)
 
     def _next_bfs(self):
         if self.frontier is None:
@@ -155,16 +157,18 @@ class ExploratoryScheduler:
                  if key not in {"status", "execution", "actual"}}
         event.update(sequence=len(self.selection_log), policy="bfs", mode="input_search_bfs",
                      content_sha256=task["parent_content_sha256"], seed_id=chosen.get("seed_id"),
-                     phase="input_search", pool="declared_route_sample_slots",
-                     route_selection={"schema": chosen["mutation_routes_schema"],
-                                      "policy": "input_search_bfs", "selected": deepcopy(task["mutation_route"])})
+                     phase="input_search", pool=("explicit_topology_requests" if task.get("task_kind") == "topology_request" else "declared_route_sample_slots"),
+                     **({} if task.get("task_kind") == "topology_request" else {"route_selection": {
+                         "schema": chosen["mutation_routes_schema"], "policy": "input_search_bfs",
+                         "selected": deepcopy(task["mutation_route"])}}))
         event["selection_sha256"] = canonical_hash(event)
         self.selection_log.append(event)
         context = {"sequence": event["sequence"], "policy": "bfs",
                    "feedback_epoch": len(self.feedback_epochs) - 1, **self._epoch(),
                    "selection_sha256": event["selection_sha256"],
                    "corpus": self.corpus.to_dict(), "frontier_journal_count": frontier_journal_count,
-                   "sampling": {"kinds": list(self.sampling_kinds), "weight": dict(self.sampling_weight)}}
+                   "sampling": ({"kinds": list(self.sampling_kinds), "weight": dict(self.sampling_weight)}
+                                if self.sampling_kinds is not None else None)}
         context["context_sha256"] = canonical_hash(context)
         self.selection_contexts.append(context)
         return dict(deepcopy(event), entry=chosen)

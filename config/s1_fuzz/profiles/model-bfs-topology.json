@@ -1,0 +1,499 @@
+{
+  "schema_version": "r2f.s1-fuzz-profile/v1",
+  "profile_id": "s1-model-bfs-topology",
+  "campaign_kind": "exploratory",
+  "activation": "F2",
+  "enabled": false,
+  "required_catalog_included": false,
+  "runtime_capability": "topology_v1",
+  "target_ids": [
+    "discovery.endpoint_topology.fuzz_v1"
+  ],
+  "surfaces": [
+    "S1.topology.program"
+  ],
+  "rmws": [
+    "rmw_cyclonedds_cpp",
+    "rmw_fastrtps_cpp"
+  ],
+  "seed_catalog_status": "authored_v2",
+  "source_schema": "r2f.s1-seed-corpus/v2",
+  "chain_length": 1,
+  "operator_whitelist": [
+    "action.delete",
+    "action.insert",
+    "action.swap",
+    "endpoint.count",
+    "env.delay",
+    "env.health",
+    "env.lease_expiry",
+    "env.lease_refresh",
+    "env.resource",
+    "filter.expr",
+    "generation.action",
+    "guard.dependency",
+    "guard.environment",
+    "guard.parameter",
+    "guard.structure",
+    "lease.value",
+    "param.boundary",
+    "param.enum",
+    "queue.depth",
+    "relation.pair",
+    "timing.shift"
+  ],
+  "mutator_whitelist": [
+    "I2.topology_program.v1"
+  ],
+  "budget": {
+    "max_inputs": 4,
+    "max_seconds": 30
+  },
+  "corpus": {
+    "capacity": 256,
+    "bucket_limit": 3
+  },
+  "seed_specs": [
+    {
+      "seed_id": "topology.empty_roles",
+      "target_id": "discovery.endpoint_topology.fuzz_v1",
+      "surface_id": "S1.topology.program",
+      "mutator_id": "I2.topology_program.v1",
+      "boundary_class": "authored_topology",
+      "expected_disposition": "expect_pass",
+      "executable": true
+    },
+    {
+      "seed_id": "topology.writer_only",
+      "target_id": "discovery.endpoint_topology.fuzz_v1",
+      "surface_id": "S1.topology.program",
+      "mutator_id": "I2.topology_program.v1",
+      "boundary_class": "authored_topology",
+      "expected_disposition": "expect_pass",
+      "executable": true
+    },
+    {
+      "seed_id": "topology.reader_only",
+      "target_id": "discovery.endpoint_topology.fuzz_v1",
+      "surface_id": "S1.topology.program",
+      "mutator_id": "I2.topology_program.v1",
+      "boundary_class": "authored_topology",
+      "expected_disposition": "expect_pass",
+      "executable": true
+    },
+    {
+      "seed_id": "topology.multi_endpoint",
+      "target_id": "discovery.endpoint_topology.fuzz_v1",
+      "surface_id": "S1.topology.program",
+      "mutator_id": "I2.topology_program.v1",
+      "boundary_class": "authored_topology",
+      "expected_disposition": "expect_pass",
+      "executable": true
+    },
+    {
+      "seed_id": "topology.complex_actions",
+      "target_id": "discovery.endpoint_topology.fuzz_v1",
+      "surface_id": "S1.topology.program",
+      "mutator_id": "I2.topology_program.v1",
+      "boundary_class": "authored_topology",
+      "expected_disposition": "expect_pass",
+      "executable": true
+    },
+    {
+      "seed_id": "topology.structure_duplicate",
+      "target_id": "discovery.endpoint_topology.fuzz_v1",
+      "surface_id": "S1.topology.program",
+      "mutator_id": "I2.topology_program.v1",
+      "boundary_class": "authored_topology",
+      "expected_disposition": "expect_guard_reject",
+      "executable": false
+    },
+    {
+      "seed_id": "topology.dependency_missing",
+      "target_id": "discovery.endpoint_topology.fuzz_v1",
+      "surface_id": "S1.topology.program",
+      "mutator_id": "I2.topology_program.v1",
+      "boundary_class": "authored_topology",
+      "expected_disposition": "expect_guard_reject",
+      "executable": false
+    },
+    {
+      "seed_id": "topology.environment_fault",
+      "target_id": "discovery.endpoint_topology.fuzz_v1",
+      "surface_id": "S1.topology.program",
+      "mutator_id": "I2.topology_program.v1",
+      "boundary_class": "authored_topology",
+      "expected_disposition": "expect_guard_reject",
+      "executable": false
+    }
+  ],
+  "declared_seed_specs_union": [
+    {
+      "seed_id": "topology.empty_roles",
+      "target_id": "discovery.endpoint_topology.fuzz_v1",
+      "surface_id": "S1.topology.program",
+      "mutator_id": "I2.topology_program.v1",
+      "boundary_class": "authored_topology",
+      "expected_disposition": "expect_pass",
+      "executable": true
+    },
+    {
+      "seed_id": "topology.writer_only",
+      "target_id": "discovery.endpoint_topology.fuzz_v1",
+      "surface_id": "S1.topology.program",
+      "mutator_id": "I2.topology_program.v1",
+      "boundary_class": "authored_topology",
+      "expected_disposition": "expect_pass",
+      "executable": true
+    },
+    {
+      "seed_id": "topology.reader_only",
+      "target_id": "discovery.endpoint_topology.fuzz_v1",
+      "surface_id": "S1.topology.program",
+      "mutator_id": "I2.topology_program.v1",
+      "boundary_class": "authored_topology",
+      "expected_disposition": "expect_pass",
+      "executable": true
+    },
+    {
+      "seed_id": "topology.multi_endpoint",
+      "target_id": "discovery.endpoint_topology.fuzz_v1",
+      "surface_id": "S1.topology.program",
+      "mutator_id": "I2.topology_program.v1",
+      "boundary_class": "authored_topology",
+      "expected_disposition": "expect_pass",
+      "executable": true
+    },
+    {
+      "seed_id": "topology.complex_actions",
+      "target_id": "discovery.endpoint_topology.fuzz_v1",
+      "surface_id": "S1.topology.program",
+      "mutator_id": "I2.topology_program.v1",
+      "boundary_class": "authored_topology",
+      "expected_disposition": "expect_pass",
+      "executable": true
+    },
+    {
+      "seed_id": "topology.structure_duplicate",
+      "target_id": "discovery.endpoint_topology.fuzz_v1",
+      "surface_id": "S1.topology.program",
+      "mutator_id": "I2.topology_program.v1",
+      "boundary_class": "authored_topology",
+      "expected_disposition": "expect_guard_reject",
+      "executable": false
+    },
+    {
+      "seed_id": "topology.dependency_missing",
+      "target_id": "discovery.endpoint_topology.fuzz_v1",
+      "surface_id": "S1.topology.program",
+      "mutator_id": "I2.topology_program.v1",
+      "boundary_class": "authored_topology",
+      "expected_disposition": "expect_guard_reject",
+      "executable": false
+    },
+    {
+      "seed_id": "topology.environment_fault",
+      "target_id": "discovery.endpoint_topology.fuzz_v1",
+      "surface_id": "S1.topology.program",
+      "mutator_id": "I2.topology_program.v1",
+      "boundary_class": "authored_topology",
+      "expected_disposition": "expect_guard_reject",
+      "executable": false
+    }
+  ],
+  "cycles": [
+    {
+      "cycle_id": "topology-authored",
+      "target_id": "discovery.endpoint_topology.fuzz_v1",
+      "surfaces": [
+        "S1.topology.program"
+      ],
+      "seed_specs": [
+        {
+          "seed_id": "topology.empty_roles",
+          "target_id": "discovery.endpoint_topology.fuzz_v1",
+          "surface_id": "S1.topology.program",
+          "mutator_id": "I2.topology_program.v1",
+          "boundary_class": "authored_topology",
+          "expected_disposition": "expect_pass",
+          "executable": true
+        },
+        {
+          "seed_id": "topology.writer_only",
+          "target_id": "discovery.endpoint_topology.fuzz_v1",
+          "surface_id": "S1.topology.program",
+          "mutator_id": "I2.topology_program.v1",
+          "boundary_class": "authored_topology",
+          "expected_disposition": "expect_pass",
+          "executable": true
+        },
+        {
+          "seed_id": "topology.reader_only",
+          "target_id": "discovery.endpoint_topology.fuzz_v1",
+          "surface_id": "S1.topology.program",
+          "mutator_id": "I2.topology_program.v1",
+          "boundary_class": "authored_topology",
+          "expected_disposition": "expect_pass",
+          "executable": true
+        },
+        {
+          "seed_id": "topology.multi_endpoint",
+          "target_id": "discovery.endpoint_topology.fuzz_v1",
+          "surface_id": "S1.topology.program",
+          "mutator_id": "I2.topology_program.v1",
+          "boundary_class": "authored_topology",
+          "expected_disposition": "expect_pass",
+          "executable": true
+        },
+        {
+          "seed_id": "topology.complex_actions",
+          "target_id": "discovery.endpoint_topology.fuzz_v1",
+          "surface_id": "S1.topology.program",
+          "mutator_id": "I2.topology_program.v1",
+          "boundary_class": "authored_topology",
+          "expected_disposition": "expect_pass",
+          "executable": true
+        },
+        {
+          "seed_id": "topology.structure_duplicate",
+          "target_id": "discovery.endpoint_topology.fuzz_v1",
+          "surface_id": "S1.topology.program",
+          "mutator_id": "I2.topology_program.v1",
+          "boundary_class": "authored_topology",
+          "expected_disposition": "expect_guard_reject",
+          "executable": false
+        },
+        {
+          "seed_id": "topology.dependency_missing",
+          "target_id": "discovery.endpoint_topology.fuzz_v1",
+          "surface_id": "S1.topology.program",
+          "mutator_id": "I2.topology_program.v1",
+          "boundary_class": "authored_topology",
+          "expected_disposition": "expect_guard_reject",
+          "executable": false
+        },
+        {
+          "seed_id": "topology.environment_fault",
+          "target_id": "discovery.endpoint_topology.fuzz_v1",
+          "surface_id": "S1.topology.program",
+          "mutator_id": "I2.topology_program.v1",
+          "boundary_class": "authored_topology",
+          "expected_disposition": "expect_guard_reject",
+          "executable": false
+        }
+      ]
+    }
+  ],
+  "description": "Offline explicit single-request topology BFS; applicability ledger includes every declared pair. No runtime qualification.",
+  "execution_boundary": "No runner activation or live permission. Main integrates profile consumption separately.",
+  "scheduler_policy": "bfs",
+  "search": {
+    "schema": "r2f.input-search-config/v1",
+    "mode": "input_search_bfs",
+    "max_depth": 2,
+    "max_nodes": 64,
+    "max_tasks": 2048,
+    "samples_per_class": 1
+  },
+  "topology_search": {
+    "schema": "r2f.topology-search/v1",
+    "samples": [
+      {
+        "operator_id": "endpoint.count",
+        "slot_id": "S1.topology.endpoints",
+        "class_id": "add",
+        "context": {
+          "direction": "add"
+        }
+      },
+      {
+        "operator_id": "endpoint.count",
+        "slot_id": "S1.topology.endpoints",
+        "class_id": "remove",
+        "context": {
+          "direction": "remove"
+        }
+      },
+      {
+        "operator_id": "action.insert",
+        "slot_id": "S1.topology.actions",
+        "class_id": "handler_rng_v1",
+        "context": {}
+      },
+      {
+        "operator_id": "action.insert",
+        "slot_id": "S1.topology.endpoints",
+        "class_id": "handler_rng_v1",
+        "context": {}
+      },
+      {
+        "operator_id": "action.delete",
+        "slot_id": "S1.topology.actions",
+        "class_id": "handler_rng_v1",
+        "context": {}
+      },
+      {
+        "operator_id": "action.swap",
+        "slot_id": "S1.topology.actions",
+        "class_id": "handler_rng_v1",
+        "context": {}
+      },
+      {
+        "operator_id": "param.enum",
+        "slot_id": "S1.topology.qos.reliability",
+        "class_id": "handler_rng_v1",
+        "context": {}
+      },
+      {
+        "operator_id": "param.enum",
+        "slot_id": "S1.topology.qos.liveliness",
+        "class_id": "handler_rng_v1",
+        "context": {}
+      },
+      {
+        "operator_id": "queue.depth",
+        "slot_id": "S1.topology.qos.depth",
+        "class_id": "one",
+        "context": {
+          "boundary_class": "one"
+        }
+      },
+      {
+        "operator_id": "queue.depth",
+        "slot_id": "S1.topology.qos.depth",
+        "class_id": "neighbor",
+        "context": {
+          "boundary_class": "neighbor"
+        }
+      },
+      {
+        "operator_id": "param.boundary",
+        "slot_id": "S1.topology.qos.depth",
+        "class_id": "one",
+        "context": {
+          "boundary_class": "one"
+        }
+      },
+      {
+        "operator_id": "param.boundary",
+        "slot_id": "S1.topology.qos.depth",
+        "class_id": "neighbor",
+        "context": {
+          "boundary_class": "neighbor"
+        }
+      },
+      {
+        "operator_id": "relation.pair",
+        "slot_id": "S1.topology.qos.reliability",
+        "class_id": "RR",
+        "context": {
+          "pair": "RR"
+        }
+      },
+      {
+        "operator_id": "relation.pair",
+        "slot_id": "S1.topology.qos.reliability",
+        "class_id": "RB",
+        "context": {
+          "pair": "RB"
+        }
+      },
+      {
+        "operator_id": "relation.pair",
+        "slot_id": "S1.topology.qos.reliability",
+        "class_id": "BB",
+        "context": {
+          "pair": "BB"
+        }
+      },
+      {
+        "operator_id": "relation.pair",
+        "slot_id": "S1.topology.qos.reliability",
+        "class_id": "BR",
+        "context": {
+          "pair": "BR"
+        }
+      },
+      {
+        "operator_id": "generation.action",
+        "slot_id": "S1.topology.generation",
+        "class_id": "next",
+        "context": {
+          "variant": "next"
+        }
+      },
+      {
+        "operator_id": "generation.action",
+        "slot_id": "S1.topology.actions",
+        "class_id": "next",
+        "context": {
+          "variant": "next"
+        }
+      },
+      {
+        "operator_id": "generation.action",
+        "slot_id": "S1.topology.generation",
+        "class_id": "stale",
+        "context": {
+          "variant": "stale"
+        }
+      },
+      {
+        "operator_id": "generation.action",
+        "slot_id": "S1.topology.actions",
+        "class_id": "stale",
+        "context": {
+          "variant": "stale"
+        }
+      },
+      {
+        "operator_id": "filter.expr",
+        "slot_id": "S1.topology.filter",
+        "class_id": "valid",
+        "context": {
+          "filter_variant": "valid"
+        }
+      },
+      {
+        "operator_id": "filter.expr",
+        "slot_id": "S1.topology.filter",
+        "class_id": "invalid",
+        "context": {
+          "filter_variant": "invalid"
+        }
+      },
+      {
+        "operator_id": "filter.expr",
+        "slot_id": "S1.topology.filter",
+        "class_id": "empty",
+        "context": {
+          "filter_variant": "empty"
+        }
+      },
+      {
+        "operator_id": "timing.shift",
+        "slot_id": "S1.topology.qos.deadline",
+        "class_id": "positive_offset",
+        "context": {
+          "offset_sec": 0.05
+        }
+      },
+      {
+        "operator_id": "lease.value",
+        "slot_id": "S1.topology.qos.lease",
+        "class_id": "finite",
+        "context": {
+          "special_class": "finite"
+        }
+      },
+      {
+        "operator_id": "lease.value",
+        "slot_id": "S1.topology.qos.lease",
+        "class_id": "zero",
+        "context": {
+          "special_class": "zero"
+        }
+      }
+    ]
+  }
+}

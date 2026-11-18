@@ -1310,6 +1310,14 @@ def _persist_topology_exploratory_report(output_dir, cycle, registry):
     return path
 
 
+def _persist_exploratory_report(output_dir, cycle, registry):
+    """One report/ledger protocol; preserve the existing topology contract."""
+    if cycle["profile"].get("runtime_capability") == TOPOLOGY_CAPABILITY:
+        return _persist_topology_exploratory_report(output_dir, cycle, registry)
+    from r2f.reports.exploratory_builder import persist_f1_exploratory_report
+    return persist_f1_exploratory_report(output_dir, cycle, registry)
+
+
 def run_exploratory_cycle(output_dir, *, corpus, feedback, scheduler, profile, runtime=None,
                           execute=False, repo=None, run_id=None, max_inputs=None,
                           domain_id=173, continuation=None, checkpoint_hook=None,
@@ -1374,7 +1382,11 @@ def run_exploratory_cycle(output_dir, *, corpus, feedback, scheduler, profile, r
     if profile.get("scheduler_policy", scheduler.policy) != scheduler.policy:
         raise ExploratoryCycleError("scheduler policy differs from profile declaration")
     if scheduler.policy == "bfs":
-        scheduler.configure_search(profile.get("search"))
+        topology_descriptor = None
+        if "topology_search" in profile:
+            from .topology_search import descriptor
+            topology_descriptor = descriptor(profile["topology_search"], profile["operator_whitelist"])
+        scheduler.configure_search(profile.get("search"), topology_descriptor)
     elif "search" in profile:
         raise ExploratoryCycleError("search profile requires bfs scheduler policy")
     sampling_kinds, sampling_weight, chain_length = _profile_wide_settings(profile)
@@ -1499,6 +1511,8 @@ def run_exploratory_cycle(output_dir, *, corpus, feedback, scheduler, profile, r
                 "row_count": len(rows), "stop_reason": stop_reason,
             })
 
+    from .topology_search import selection_metadata
+
     def planned(row, selection):
         nonlocal pending, last_case_ref, submission_state
         if scheduler.policy == "bfs":
@@ -1511,10 +1525,13 @@ def run_exploratory_cycle(output_dir, *, corpus, feedback, scheduler, profile, r
             row["input_search"] = {"mode": "input_search_bfs", "task_id": selection["task_id"],
                 "baseline_content_sha256": selection["baseline_content_sha256"],
                 "parent_content_sha256": selection["parent_content_sha256"],
-                "mutation_route": deepcopy(selection["mutation_route"]),
-                "sampling_kind": selection["sampling_kind"],
+                **(selection_metadata(selection)
+                   if selection.get("task_kind") == "topology_request" else {
+                       "mutation_route": deepcopy(selection["mutation_route"]), "sampling_kind": selection["sampling_kind"]}),
                 "derivation_depth": selection["derivation_depth"], "sample_slot": selection["sample_slot"],
                 "rng_seed": selection["rng_seed"], "status": "planned", "actual": False, "execution": None}
+            if selection.get("chain_schema"):
+                row["topology_chain_accounting"] = deepcopy(scheduler.frontier.task(selection["task_id"])["chain_accounting"])
             _atomic_json(output_dir / "cases" / row["cell_id"] / "row.json", row)
         pending = deepcopy(selection)
         case = output_dir / "cases" / row["cell_id"]
@@ -1712,6 +1729,8 @@ def run_exploratory_cycle(output_dir, *, corpus, feedback, scheduler, profile, r
                                                     deadline_reached=update_elapsed,
                                                     runtime_boundary=runtime_boundary)
                             except _TopologyInputRejection as exc:
+                                if selection.get("task_kind") == "topology_request":
+                                    scheduler.frontier.generation_rejected(selection["task_id"], str(exc), exc.attempts)
                                 row = reject(sequence, entry, "topology_input_rejected:" + str(exc))
                                 row.update(topology_generation_attempts=exc.attempts,
                                            candidate_eligible=False, attribution="harness_input_generation")
@@ -1722,7 +1741,7 @@ def run_exploratory_cycle(output_dir, *, corpus, feedback, scheduler, profile, r
                                 # prepared capsule, submission or execution.
                                 from .search_frontier import derived_record
                                 record = derived_record(entry, exc.plan)
-                                row = reject(sequence, entry, "no_effective_input")
+                                row = reject(sequence, entry, "model_guard_terminal" if str(exc) == "topology_guard_terminal" else "no_effective_input")
                                 row.update(mutation_plan=exc.plan.to_dict(),
                                            content_sha256=record["content_sha256"],
                                            parent_content_sha256=entry["content_sha256"],
@@ -1752,11 +1771,14 @@ def run_exploratory_cycle(output_dir, *, corpus, feedback, scheduler, profile, r
             row["input_search"] = {"mode": "input_search_bfs", "task_id": selection["task_id"],
                 "baseline_content_sha256": selection["baseline_content_sha256"],
                 "parent_content_sha256": selection["parent_content_sha256"],
-                "mutation_route": deepcopy(selection["mutation_route"]),
-                "sampling_kind": selection["sampling_kind"],
+                **(selection_metadata(selection)
+                   if selection.get("task_kind") == "topology_request" else {
+                       "mutation_route": deepcopy(selection["mutation_route"]), "sampling_kind": selection["sampling_kind"]}),
                 "derivation_depth": selection["derivation_depth"], "sample_slot": selection["sample_slot"],
                 "rng_seed": selection["rng_seed"], "status": "rejected" if rejected_task else "completed",
                 "actual": actual, "execution": execution}
+        if selection.get("chain_schema"):
+            row["topology_chain_accounting"] = deepcopy(scheduler.frontier.task(selection["task_id"])["chain_accounting"])
         row_sequences.append({"cycle_row_index": len(rows), "selection_sequence": sequence,
                               "cell_id": row["cell_id"]})
         rows.append(row)
@@ -1875,8 +1897,9 @@ def run_exploratory_cycle(output_dir, *, corpus, feedback, scheduler, profile, r
     _atomic_json(output_dir / "selection_log.json", scheduler.to_dict())
     _atomic_json(output_dir / "feedback.json", feedback.to_dict())
     _atomic_json(output_dir / "corpus.json", corpus.to_dict())
-    if profile.get("runtime_capability") == TOPOLOGY_CAPABILITY:
-        result["report_path"] = str(_persist_topology_exploratory_report(output_dir, result, registry))
+    if (profile.get("runtime_capability") == TOPOLOGY_CAPABILITY
+            or set(profile["target_ids"]).issubset(_F1_CYCLE_TARGETS)):
+        result["report_path"] = str(_persist_exploratory_report(output_dir, result, registry))
     _atomic_json(output_dir / "cycle.json", result)
     return result
 
@@ -1923,7 +1946,31 @@ def _build_case_plan(entry, target, contract, surface, parent, mutator_id,
     if topology:
         if entry.get("executable") is False or entry.get("case_kind") == "guard_negative":
             raise _TopologyInputRejection("topology_guard_seed_non_executable", [])
-        plan, topology_generation = _topology_generation(adapted_parent, profile, rng_seed)
+        if "topology_search" in profile:
+            from .topology_search import descriptor, generate, validate_chain_length, task_requests, is_chain, plan_accounting
+            desc = descriptor(profile["topology_search"], profile["operator_whitelist"])
+            validate_chain_length(profile, desc)
+            if selection.get("task_kind") != "topology_request":
+                raise _TopologyInputRejection("topology_search requires exact declared task", [])
+            try:
+                plan = generate(entry, selection, desc)
+            except ValueError as exc:
+                rejection = _TopologyInputRejection(str(exc), task_requests(selection))
+                if is_chain(desc):
+                    rejection.chain_accounting = getattr(exc, "accounting", None)
+                raise rejection from exc
+            from .search_frontier import derived_record
+            if derived_record(entry, plan).get("executable") is False:
+                raise _NoEffectiveInputRejection("topology_guard_terminal", plan)
+            topology_generation = ({"schema": "r2f.topology-explicit-chain-generation/v1",
+                "requests": task_requests(selection), "layer_samples": deepcopy(selection["layer_samples"]),
+                "chain_accounting": plan_accounting(plan, desc["chain_length"]),
+                "task_id": selection["task_id"], "execution_evidence": False, "fallback": False}
+                if is_chain(desc) else {"schema": "r2f.topology-explicit-generation/v1",
+                "request": deepcopy(selection["mutation_request"]), "task_id": selection["task_id"],
+                "execution_evidence": False, "fallback": False})
+        else:
+            plan, topology_generation = _topology_generation(adapted_parent, profile, rng_seed)
         proposal = plan.operations[0]  # metadata only; actual plan is core-authored
         mutator_id = TOPOLOGY_MUTATOR
     elif wide:
@@ -2275,7 +2322,7 @@ def _generate_case(sequence, entry, target, contract, surface, parent, mutator_i
         planned_hook(row, selection)
     if scheduler.policy == "bfs":
         outcome = scheduler.frontier.task(selection["task_id"]).get("generation_outcome")
-        if outcome in {"compile_time_no_change", "duplicate_content"}:
+        if outcome in {"compile_time_no_change", "duplicate_content", "guard_terminal"}:
             reason = "model_" + outcome
             row.update(generation_status="rejected", reason_code=reason,
                        blocked_reason=reason, candidate_eligible=False)

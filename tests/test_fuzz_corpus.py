@@ -33,7 +33,9 @@ def entry(index, *, seed_id=None, boundary=None, relation=None, edge=None, targe
 class FuzzCorpusContracts(unittest.TestCase):
     def test_profiles_explicit_exploratory_disabled_and_not_required_catalog(self):
         expected = {"parameter", "environment", "composed", "f2-windows",
-                    "endpoint-chains", "topology-chains", "common-baseline-routes", "model-bfs-routes"}
+                    "endpoint-chains", "topology-chains", "common-baseline-routes", "model-bfs-routes",
+                    "model-bfs-topology", "model-bfs-topology-operators",
+                    "model-bfs-topology-runtime-smoke", "model-bfs-topology-combinations"}
         f2_target = "discovery.interruption_recovery.fuzz_windows_v1"
         f2_mutators = {"E02": ["M07"], "E03": ["M06"]}
         seen = set()
@@ -84,6 +86,9 @@ class FuzzCorpusContracts(unittest.TestCase):
                 self.assertEqual([spec for cycle in data["cycles"] for spec in cycle["seed_specs"]],
                                  data["declared_seed_specs_union"])
                 validate_profile_fields(data)
+            elif path.stem in {"model-bfs-topology", "model-bfs-topology-operators",
+                               "model-bfs-topology-runtime-smoke", "model-bfs-topology-combinations"}:
+                self._assert_model_topology_profile(path.stem, data)
             else:
                 self.assertNotIn("runtime_capability", data)
                 self.assertNotIn(f2_target, data["target_ids"])
@@ -115,6 +120,97 @@ class FuzzCorpusContracts(unittest.TestCase):
                 self.assertEqual(data["composition"]["environment_surfaces"], [])
                 self.assertEqual(data["composition"]["max_environment_windows"], 0)
         self.assertEqual(seen, expected)
+
+    def _assert_model_topology_profile(self, basename, data):
+        # Exact opt-ins, not a blanket capability exception or a filename glob.
+        contracts = {
+            "model-bfs-topology": ("s1-model-bfs-topology", "r2f.topology-search/v1", 1, 64, 2048, 26, 30),
+            "model-bfs-topology-operators": ("s1-model-bfs-topology-operators", "r2f.topology-search/operators-v1", 1, 64, 2048, 64, 30),
+            "model-bfs-topology-runtime-smoke": ("model-bfs-topology-runtime-smoke", "r2f.topology-search/v1", 1, 16, 64, 3, 180),
+            "model-bfs-topology-combinations": ("s1-model-bfs-topology-combinations", "r2f.topology-search/chains-v1", 4, 32, 256, 13, 120),
+        }
+        profile_id, schema, length, nodes, tasks, samples, seconds = contracts[basename]
+        self.assertEqual(data["profile_id"], profile_id)
+        self.assertEqual(data["schema_version"], "r2f.s1-fuzz-profile/v1")
+        self.assertEqual(data["campaign_kind"], "exploratory")
+        self.assertEqual(data["activation"], "F2")
+        self.assertIs(data["enabled"], False)
+        self.assertIs(data["required_catalog_included"], False)
+        self.assertEqual(data["runtime_capability"], "topology_v1")
+        self.assertEqual(data["target_ids"], ["discovery.endpoint_topology.fuzz_v1"])
+        self.assertEqual(data["surfaces"], ["S1.topology.program"])
+        self.assertEqual(data["mutator_whitelist"], ["I2.topology_program.v1"])
+        self.assertIs(type(data["chain_length"]), int)
+        self.assertEqual(data["chain_length"], length)
+        self.assertEqual(data["scheduler_policy"], "bfs")
+        self.assertEqual(data["search"], {
+            "schema": "r2f.input-search-config/v1", "mode": "input_search_bfs",
+            "max_depth": 2, "max_nodes": nodes, "max_tasks": tasks, "samples_per_class": 1,
+        })
+        search = data["topology_search"]
+        self.assertEqual(search["schema"], schema)
+        self.assertEqual(set(search), {"schema", "samples", "chain_length"} if length == 4
+                         else {"schema", "samples"})
+        self.assertEqual(len(search["samples"]), samples)
+        if length == 4:
+            self.assertIs(type(search["chain_length"]), int)
+            self.assertEqual(search["chain_length"], 4)
+        smoke = basename == "model-bfs-topology-runtime-smoke"
+        operators = (["endpoint.count", "queue.depth", "relation.pair"] if smoke else [
+            "action.delete", "action.insert", "action.swap", "endpoint.count",
+            "env.delay", "env.health", "env.lease_expiry", "env.lease_refresh", "env.resource",
+            "filter.expr", "generation.action", "guard.dependency", "guard.environment",
+            "guard.parameter", "guard.structure", "lease.value", "param.boundary",
+            "param.enum", "queue.depth", "relation.pair", "timing.shift",
+        ])
+        self.assertEqual(data["operator_whitelist"], operators)
+        self.assertEqual(data["rmws"], ["rmw_cyclonedds_cpp"] if smoke else
+                         ["rmw_cyclonedds_cpp", "rmw_fastrtps_cpp"])
+        self.assertEqual(data["budget"], {"max_inputs": 4, "max_seconds": seconds})
+        self.assertEqual(data["corpus"], {"capacity": 256, "bucket_limit": 3})
+        self.assertEqual(data["source_schema"], "r2f.s1-seed-corpus/v2")
+        self.assertEqual(data["seed_catalog_status"], "authored_v2")
+        self.assertEqual(data["seed_specs"], data["declared_seed_specs_union"])
+        self.assertEqual([spec for cycle in data["cycles"] for spec in cycle["seed_specs"]],
+                         data["declared_seed_specs_union"])
+        seed_ids = (["topology.multi_endpoint"] if smoke else [
+            "topology.empty_roles", "topology.writer_only", "topology.reader_only",
+            "topology.multi_endpoint", "topology.complex_actions", "topology.structure_duplicate",
+            "topology.dependency_missing", "topology.environment_fault",
+        ])
+        self.assertEqual([spec["seed_id"] for spec in data["seed_specs"]], seed_ids)
+        self.assertEqual(len(data["cycles"]), 1)
+        self.assertEqual(data["cycles"][0], {
+            "cycle_id": "topology-authored", "target_id": "discovery.endpoint_topology.fuzz_v1",
+            "surfaces": ["S1.topology.program"], "seed_specs": data["seed_specs"],
+        })
+        self.assertNotIn("sampling_kinds", data)
+        self.assertNotIn("sampling_weight", data)
+        # Delegate semantic/schema/seed binding validation to the real consumer.
+        # This accepts declarations only, not runtime qualification or effects.
+        validate_profile_fields(data)
+
+    def test_model_topology_profiles_reject_capability_and_catalog_contamination(self):
+        profiles = REPO / "config/s1_fuzz/profiles"
+        damage = {
+            "enabled": True,
+            "required_catalog_included": True,
+            "runtime_capability": "f2_windows_v1",
+            "target_ids": ["discovery.interruption_recovery.fuzz_windows_v1"],
+            "surfaces": ["E02"],
+            "source_schema": "r2f.s1-seed-corpus/v1",
+            "sampling_kinds": ["boundary"],
+            "declared_seed_specs_union": [],
+        }
+        for basename in ("model-bfs-topology", "model-bfs-topology-operators",
+                         "model-bfs-topology-runtime-smoke", "model-bfs-topology-combinations"):
+            data = json.loads((profiles / (basename + ".json")).read_text())
+            for key, value in damage.items():
+                with self.subTest(profile=basename, damaged_field=key):
+                    trial = deepcopy(data)
+                    trial[key] = deepcopy(value)
+                    with self.assertRaises(ValueError):
+                        validate_profile_fields(trial)
 
     def test_topology_chain_lengths_1_to_4_do_not_widen_f2_chain1(self):
         profiles = REPO / "config/s1_fuzz/profiles"

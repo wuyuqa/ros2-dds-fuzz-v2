@@ -616,6 +616,39 @@ def _topology_artifact_qualification(root, row, report):
     return qualified
 
 
+def _f1_adapter_artifact_qualification(root, row, report):
+    """Strict additive F1 receipt check; never trust saved qualification labels.
+
+    All paths retain the existing caller-owned report-root containment gate.
+    This does not grant an external historical report a path exemption.
+    """
+    from r2f.campaign.runner import _F1_CYCLE_TARGETS
+    binding = row.get("binding")
+    model = report.get("model")
+    targets = model.get("targets") if isinstance(model, dict) else {}
+    marked = ("generation_binding" in row
+              or isinstance(binding, dict) and binding.get("schema") == "r2f.f1-adapter-binding/v1"
+              or isinstance(targets, dict) and row.get("target_id") in targets)
+    observed = (row.get("actual_run") is True
+                or row.get("execution_stage") in {"effect_observed", "judged"})
+    if row.get("target_id") not in _F1_CYCLE_TARGETS or not (marked or observed):
+        return None  # Legacy unexecuted plans do not grant live/candidate status.
+    from r2f.reports.exploratory_builder import qualify_f1_artifacts
+    if "generation_binding" not in row:
+        raise ValueError("f1_generation_binding_missing")
+    proof = qualify_f1_artifacts(root, row, report)
+    saved = (report.get("artifact_qualifications") or {}).get(row.get("cell_id"))
+    if canonical_hash(saved) != canonical_hash(proof):
+        raise ValueError("f1_reopened_artifact_proof_mismatch")
+    qualified = proof["qualification"]
+    if not qualified["real_ros_execution"]:
+        if any(row.get(key) is True for key in ("candidate_eligible", "feedback_eligible", "seal_eligible")):
+            raise ValueError("f1_unqualified_execution_claims_eligibility")
+        if row.get("actual_run") is True or row.get("execution_stage") in {"effect_observed", "judged"}:
+            raise ValueError("f1_execution_not_qualified:" + ",".join(qualified["qualification_errors"]))
+    return qualified
+
+
 def _verify_exploratory_row(root, row, report, errors):
     cell = row.get("cell_id", "<missing>")
     try:
@@ -647,6 +680,7 @@ def _verify_exploratory_row(root, row, report, errors):
                     raise ValueError("topology_generation_rejection_claim_invalid")
                 return True
             _topology_artifact_qualification(root, row, report)
+        _f1_adapter_artifact_qualification(root, row, report)
         plan = row.get("mutation_plan")
         if plan is not None:
             if not isinstance(plan, dict):
@@ -807,6 +841,7 @@ def _audit_exploratory_ledger(root, report, rows, errors, details):
                                    "raw_sha256": row.get("raw_sha256"),
                                    "qualification_errors": qualified["qualification_errors"]})
                 continue
+        _f1_adapter_artifact_qualification(root, row, report)
         eligible_rows.append(row)
     expected = exploratory_candidate_ledger(eligible_rows, reviews=report.get("review_records") or [])
     if exclusions and ledger.get("execution_exclusions") != exclusions:
