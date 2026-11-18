@@ -7,7 +7,7 @@ from unittest.mock import Mock
 
 import pytest
 
-from test_exploratory_checkpoint import CYCLE, REPO, SOURCE, profile, run_cycle
+from test_exploratory_checkpoint import CYCLE, REPO, SOURCE, legacy_noop_profile, profile, run_cycle
 
 
 @pytest.fixture
@@ -121,7 +121,8 @@ def test_cli_uncertain_pending_emits_audit_without_runner_callback(cli, tmp_path
     def stop(hook):
         def wrapped(payload):
             hook(payload)
-            raise PlannedStop()
+            if payload["phase"] == "planned":
+                raise PlannedStop()
         return wrapped
 
     with pytest.raises(PlannedStop):
@@ -137,3 +138,18 @@ def test_cli_uncertain_pending_emits_audit_without_runner_callback(cli, tmp_path
     callback.assert_not_called()
     audit = json.loads((tmp_path / "new/resume-refusal.json").read_text())
     assert audit["reason_code"] == "resume_pending_execution_uncertain"
+
+
+def test_cli_legacy_noop_checkpoint_has_no_generated_capsule(cli, tmp_path):
+    doc = legacy_noop_profile()
+    assert cli.main(arguments(tmp_path, doc) + ["--max-inputs", "1"]) == 0
+    out = tmp_path / "new"
+    result = json.loads((out / "cycle.json").read_text())
+    assert result["budget"]["selected"] == len(result["rejected"]) == 1
+    for key in ("generated", "attempted", "actual", "executed"):
+        assert result["budget"][key] == 0
+    assert result["rows"][0]["reason_code"] == "no_effective_input"
+    assert result["feedback"]["events"] == []
+    assert not list(out.rglob("capsule.json"))
+    checkpoint = json.loads((out / "checkpoint.json").read_text())
+    assert checkpoint["state"]["continuation"]["pending_attempt"] is None

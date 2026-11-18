@@ -8,7 +8,8 @@ from unittest.mock import patch
 from r2f.campaign.feedback import FeedbackLog
 from r2f.campaign.runner import ExploratoryCycleError, run_exploratory_cycle
 from r2f.campaign.scheduler import ExploratoryScheduler
-from test_fuzz_feedback_loop import make_corpus, profile
+from test_fuzz_feedback_loop import (make_effective_corpus as make_corpus,
+                                     make_corpus as authored_corpus, profile)
 from test_feedback_epoch_runner import FIXTURE_SOURCE, adapter_runtime
 
 
@@ -122,6 +123,30 @@ class CycleBudget(unittest.TestCase):
         self.assertEqual(result["budget"]["generated"], 2)
         self.assertEqual(result["budget"]["unique_inputs"], 1)
         self.assertEqual(result["budget"]["unique_actual"], 0)
+
+    def test_repeated_authored_noop_is_not_generated_or_a_distinct_input(self):
+        corpus = authored_corpus()
+        record = next(r for r in corpus.entries.values()
+                      if r["surface_id"] == "P01" and r["boundary_class"] == "finite")
+        corpus.entries = {record["content_sha256"]: record}
+        calls = []
+        def forbidden(config, output_dir):
+            calls.append(config)
+            raise AssertionError("repeated no-op cannot invoke runtime")
+        with patch("r2f.campaign.runner._derive_rng_seed", return_value=123):
+            result = self.run_cycle(corpus=corpus, max_inputs=2,
+                                    execute=True, runtime=forbidden)
+        self.assertEqual(calls, [])
+        self.assertEqual(len(result["rows"]), 2)
+        self.assertEqual(result["rejected"], result["rows"])
+        self.assertEqual(result["budget"]["selected"], 2)
+        self.assertEqual(result["budget"]["planned"], 2)
+        for key in ("generated", "unique_inputs", "attempted", "actual", "unique_actual"):
+            self.assertEqual(result["budget"][key], 0, key)
+        self.assertTrue(all(r["reason_code"] == "no_effective_input" and
+                            r["binding"]["status"] == "not_executed" and
+                            not r["actual_run"] for r in result["rows"]))
+        self.assertFalse(list(self.root.rglob("capsule.json")))
 
     def test_invalid_budgets_fail_closed(self):
         for budget in ({"max_inputs": 0}, {"max_inputs": True}, {"max_seconds": 0},

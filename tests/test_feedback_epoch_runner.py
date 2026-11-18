@@ -10,6 +10,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+from r2f.campaign.corpus import Corpus
 from r2f.campaign.feedback import FeedbackLog
 from r2f.campaign.runner import run_exploratory_cycle
 from r2f.campaign.scheduler import ExploratoryScheduler
@@ -17,6 +18,20 @@ from r2f.core.evidence import raw_sha256
 from r2f.core.state_signature import observation_edge
 from test_campaign_evidence import fixture_pair
 from test_fuzz_feedback_loop import make_corpus, profile
+
+
+def changing_corpus():
+    """Keep the four finite parents, explicitly use local range sampling.
+
+    M01 finite is a valid no-change witness, not a generated execution case.
+    These split/resume fixtures exercise actual raw-backed feedback instead.
+    """
+    corpus = Corpus()
+    for parent in make_corpus().selectable():
+        entry = copy.deepcopy(parent)
+        entry["mutator_id"] = "M03"
+        corpus.add_seed(entry)
+    return corpus
 
 
 def adapter_runtime(config, output_dir):
@@ -107,11 +122,11 @@ class FeedbackEpochRunner(unittest.TestCase):
         self.assertLess(second["candidate_count"], len(make_corpus().selectable()))
 
     def test_split_cycle_continues_global_sequence_and_same_inputs(self):
-        full_c, full_f = make_corpus(), FeedbackLog()
+        full_c, full_f = changing_corpus(), FeedbackLog()
         full_s = ExploratoryScheduler(full_c, full_f, rng_seed=7, warmup=1)
         full = self.run_cycle("full", full_c, full_f, full_s, execute=True,
                               runtime=adapter_runtime, max_inputs=4)
-        c, f = make_corpus(), FeedbackLog()
+        c, f = changing_corpus(), FeedbackLog()
         s = ExploratoryScheduler(c, f, rng_seed=7, warmup=1)
         first = self.run_cycle("first", c, f, s, execute=True, runtime=adapter_runtime, max_inputs=2)
         restored = ExploratoryScheduler.from_dict(s.to_dict(), c, f)

@@ -1,0 +1,119 @@
+{
+  "schema_version": "r2f.s1-fuzz-profile/v1",
+  "profile_id": "s1-fuzz-model-bfs-routes",
+  "campaign_kind": "exploratory",
+  "enabled": false,
+  "seed_catalog_status": "authored_t02",
+  "description": "Opt-in input_search_bfs over declared F1 routes and finite RNG sample slots; not an ArmGo action/state planner or a reached SUT state. No claim of exhaustive continuous values or F2/topology support.",
+  "required_catalog_included": false,
+  "target_ids": [
+    "discovery.late_endpoint.fuzz_v1"
+  ],
+  "surfaces": [
+    "P01",
+    "W02"
+  ],
+  "seed_specs": [
+    {
+      "seed_id": "P01",
+      "target_id": "discovery.late_endpoint.fuzz_v1",
+      "boundary_class": "finite",
+      "executable": true,
+      "mutation_routes": [
+        {
+          "surface_id": "P01",
+          "boundary_class": "finite",
+          "mutator_id": "M03"
+        },
+        {
+          "surface_id": "W02",
+          "boundary_class": "finite",
+          "mutator_id": "M03"
+        }
+      ]
+    }
+  ],
+  "declared_seed_specs_union": [
+    {
+      "seed_id": "P01",
+      "target_id": "discovery.late_endpoint.fuzz_v1",
+      "boundary_class": "finite",
+      "executable": true,
+      "mutation_routes": [
+        {
+          "surface_id": "P01",
+          "boundary_class": "finite",
+          "mutator_id": "M03"
+        },
+        {
+          "surface_id": "W02",
+          "boundary_class": "finite",
+          "mutator_id": "M03"
+        }
+      ]
+    }
+  ],
+  "cycles": [
+    {
+      "cycle_id": "common-baseline",
+      "target_id": "discovery.late_endpoint.fuzz_v1",
+      "surfaces": [
+        "P01",
+        "W02"
+      ],
+      "runner_slice": "endpoint_pair_slice",
+      "seed_specs": [
+        {
+          "seed_id": "P01",
+          "target_id": "discovery.late_endpoint.fuzz_v1",
+          "boundary_class": "finite",
+          "executable": true,
+          "mutation_routes": [
+            {
+              "surface_id": "P01",
+              "boundary_class": "finite",
+              "mutator_id": "M03"
+            },
+            {
+              "surface_id": "W02",
+              "boundary_class": "finite",
+              "mutator_id": "M03"
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "composition": {
+    "mutation_routes_schema": "r2f.mutation-routes/v1",
+    "mode": "baseline_then_declared_route",
+    "status": "offline_planning_only"
+  },
+  "rmws": [
+    "rmw_cyclonedds_cpp",
+    "rmw_fastrtps_cpp"
+  ],
+  "budget": {
+    "max_inputs": 32,
+    "warmup_inputs": 0,
+    "max_seconds": 1200
+  },
+  "corpus": {
+    "capacity": 256,
+    "bucket_limit": 3
+  },
+  "sampling_kinds": [
+    "neighbor"
+  ],
+  "chain_length": 1,
+  "execution_boundary": "offline planning only; disabled opt-in; no ROS/DDS, hit, candidate or maturity claim",
+  "search": {
+    "schema": "r2f.input-search-config/v1",
+    "mode": "input_search_bfs",
+    "max_depth": 3,
+    "max_nodes": 64,
+    "samples_per_class": 2,
+    "max_tasks": 512
+  },
+  "scheduler_policy": "bfs"
+}

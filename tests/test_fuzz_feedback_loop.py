@@ -114,13 +114,34 @@ def make_corpus():
 
 
 
-def synthetic_observation(content, *, boundary, edge):
+def make_effective_corpus():
+    """Explicit changing fixtures: P01 zero, W02 quantized local samples.
+
+    Keep make_corpus() unchanged as the authored finite/no-op counterexample and
+    for callers that intentionally test its legacy fixture semantics.
+    """
+    corpus = Corpus()
+    for index, (surface, config) in enumerate([
+            ("P01", parent_config(0.15)), ("P01", parent_config(0.25)),
+            # Valid duration parents between the M03 output quanta guarantee
+            # the sampled output differs even when it picks the nearest value.
+            ("W02", dict(parent_config(), publish_interval_sec=0.0105)),
+            ("W02", dict(parent_config(), publish_interval_sec=0.0505))], 1):
+        entry = seed(f"E{index:02d}", surface,
+                     "zero" if surface == "P01" else "finite", config)
+        entry["mutator_id"] = "M01" if surface == "P01" else "M03"
+        corpus.add_seed(entry)
+    assert len(corpus.entries) == 4
+    return corpus
+
+
+def synthetic_observation(content, *, boundary, edge, surface="P01"):
     """Labelled synthetic feedback for scheduler tests only. Never evidence."""
     from test_observation_status import projected_record
     record = projected_record()
     record.update(content_sha256=content, run_id="synthetic-feedback-fixture",
                   target_id=TARGET, evidence_origin="synthetic_feedback_fixture",
-                  surface_id="P01", boundary_class=boundary, parameter_class=boundary)
+                  surface_id=surface, boundary_class=boundary, parameter_class=boundary)
     return record
 
 
@@ -185,7 +206,7 @@ class ExploratoryFeedbackLoop(unittest.TestCase):
     # -- selection ----------------------------------------------------------
 
     def test_two_rounds_selection_follows_feedback_and_content_really_changes(self):
-        corpus = make_corpus()
+        corpus = make_effective_corpus()
         feedback = FeedbackLog()
         first_scheduler = ExploratoryScheduler(corpus, feedback, rng_seed=11, warmup=0)
         _, first = self.cycle("round1", corpus, feedback, first_scheduler)
@@ -195,16 +216,19 @@ class ExploratoryFeedbackLoop(unittest.TestCase):
 
         parent = first_row["parent_content_sha256"]
         self.assertEqual(first["selection_log"]["selections"][0]["content_sha256"], parent)
-        # A finite boundary may legally preserve the authored parent value
-        # (no-op).  The real requirement is that selection can produce a
-        # genuine content change, checked across the two rounds.
+        # This feedback test uses explicit changing boundaries. Authored finite
+        # no-op inputs are tested separately and must never reach feedback.
         parent_config_value = next(rec["final_config"] for rec in corpus.entries.values()
                                    if rec["content_sha256"] == parent)
+
+        self.assertNotEqual(first_row["final_input"], parent_config_value)
 
         # Changing only seed_id/boundary labels must not create new content.
         relabelled = dict(seed("L99", "P01", "another-label", parent_config()),
                           seed_id="L99")
         self.assertEqual(content_sha256(relabelled), content_identity(relabelled))
+        self.assertEqual(content_identity(seed("L01", "P01", "finite", parent_config())),
+                         content_identity(relabelled))
 
         # Synthetic feedback (explicitly labelled; never evidence) covers the
         # executed surface x boundary class and the rest of that surface, so the
@@ -217,7 +241,7 @@ class ExploratoryFeedbackLoop(unittest.TestCase):
         self.assertTrue(observed_boundaries)
         for boundary in observed_boundaries:
             feedback.record(synthetic_observation(
-                first_row["content_sha256"], boundary=boundary, edge="edge-" + boundary))
+                first_row["content_sha256"], boundary=boundary, edge="edge-" + boundary, surface=observed_surface))
         self.assertTrue(feedback.events)
         self.assertTrue(all(e["coverage"] for e in feedback.events))
 

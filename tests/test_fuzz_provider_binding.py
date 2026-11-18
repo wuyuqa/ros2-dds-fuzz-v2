@@ -289,9 +289,23 @@ class DeterministicPlanConsumption(unittest.TestCase):
             with self.subTest(surface=surface_id, mutator=mutator_id):
                 plan = _plan(self.provider, target_id, surface_id, mutator_id, base)
                 self.assertTrue(plan.operations)
-                # An individual seed may legally select an equal value (no-op);
-                # the suite below verifies at least one real content change per
-                # surface family instead of requiring every draw to differ.
+                if canonical_hash(plan.final_config) == canonical_hash(base):
+                    # Keep the original infinite-deadline case and prove its
+                    # rejection: M01 seed7 selects that same infinite value.
+                    self.assertEqual((surface_id, mutator_id), ("P04", "M01"))
+                    self.assertEqual(plan.operations[0].applicability_status, "no_op")
+                    self.assertEqual(validate_plan(plan, contract=self.provider.contract_for(target_id)).status,
+                                     "invalid")
+                    with self.assertRaisesRegex(ExploratoryInputError, "active no_op"):
+                        self.provider.prepare(_scenario(self.targets[target_id], plan))
+                    # Separately exercise a truly changed P04 input.  This is
+                    # an explicit finite-parent fixture, not a replacement of
+                    # the original CASES entry or a bypass of its no-op check.
+                    finite_base = copy.deepcopy(base)
+                    finite_base["qos"]["deadline_ns"] = 0
+                    plan = _plan(self.provider, target_id, surface_id, mutator_id, finite_base)
+                    self.assertNotEqual(plan.final_config, finite_base)
+                    self.assertEqual(plan.operations[0].applicability_status, "applicable")
                 prepared = self.provider.prepare(_scenario(self.targets[target_id], plan))
                 self.assertEqual(prepared["plan_status"], "valid")
                 self.assertEqual(canonical_hash(prepared["final_input"]),
@@ -312,6 +326,20 @@ class DeterministicPlanConsumption(unittest.TestCase):
             with self.subTest(surface=surface_id):
                 plan = _plan(self.provider, target_id, surface_id, mutator_id, base)
                 scenario = _scenario(self.targets[target_id], plan)
+                if canonical_hash(plan.final_config) == canonical_hash(base):
+                    self.assertEqual((surface_id, mutator_id), ("P04", "M01"))
+                    self.assertEqual(plan.operations[0].applicability_status, "no_op")
+                    # Rejection is deterministic too, including a copied
+                    # provider/scenario; preserve the original infinite case.
+                    for provider in (self.provider, copy.deepcopy(self.provider)):
+                        with self.assertRaisesRegex(ExploratoryInputError, "active no_op"):
+                            provider.prepare(copy.deepcopy(scenario))
+                    finite_base = copy.deepcopy(base)
+                    finite_base["qos"]["deadline_ns"] = 0
+                    plan = _plan(self.provider, target_id, surface_id, mutator_id, finite_base)
+                    self.assertNotEqual(plan.final_config, finite_base)
+                    self.assertEqual(plan.operations[0].applicability_status, "applicable")
+                    scenario = _scenario(self.targets[target_id], plan)
                 first = self.provider.prepare(scenario)
                 second = copy.deepcopy(self.provider).prepare(copy.deepcopy(scenario))
                 self.assertEqual(first, second)

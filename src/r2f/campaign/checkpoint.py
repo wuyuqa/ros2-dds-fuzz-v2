@@ -18,7 +18,7 @@ from r2f.core.evidence import canonical_hash
 from r2f.modules.s1.module import register_exploratory
 from r2f.modules.s1.fuzz_catalog import catalog_digest
 from .corpus import Corpus, corpus_from_profile, corpus_identity
-from .mutation_routes import (has_routes, route_view, routes_enabled,
+from .mutation_routes import (_route_validation_scope, has_routes, route_view, routes_enabled,
                               validate_route_entry, validate_route_selection)
 from .scheduler import ExploratoryScheduler, required_catalog_hash, validated_feedback
 from .exploratory_input import (F2_WINDOWS_TARGET, F2_SURFACE_MUTATORS,
@@ -184,10 +184,23 @@ def _validate_corpus_binding(corpus, identity, seeds, registry):
         raise ValueError("checkpoint initial corpus history differs from profile")
 
 
+@_route_validation_scope()
 def _validate_state(state, identity, seeds, registry):
     if not isinstance(state, dict):
         raise ValueError("checkpoint state must be a dict")
-    corpus = Corpus.from_dict(state["corpus"])
+    model_parents = None
+    profile_policy = identity["profile"].get("scheduler_policy", "bfs" if "search" in identity["profile"] else None)
+    if profile_policy is not None and state["scheduler"].get("policy") != profile_policy:
+        raise ValueError("checkpoint scheduler policy differs from profile search declaration")
+    if state["scheduler"].get("policy") == "bfs":
+        from .search_frontier import InputSearchFrontier
+        verified_frontier = InputSearchFrontier.from_dict(state["scheduler"].get("frontier"))
+        # Qualification order matters: hashes alone do not prove generation.
+        # No caller-supplied external parent is trusted before this succeeds.
+        verified_frontier.validate_model(profile=identity["profile"], seeds=seeds, registry=registry)
+        model_parents = {digest: deepcopy(node["entry"])
+                         for digest, node in verified_frontier.nodes.items()}
+    corpus = Corpus.from_dict(state["corpus"], model_parents=model_parents)
     feedback_data = state["feedback"]
     feedback = validated_feedback(feedback_data.get("events"))
     if feedback.to_dict() != feedback_data:
@@ -203,7 +216,8 @@ def _validate_state(state, identity, seeds, registry):
             observed = observation_edge(provenance.get("observation") or {})
             if not observed or observed[1] != event["edge_id"]:
                 raise ValueError("checkpoint feedback edge provenance mismatch")
-    scheduler = ExploratoryScheduler.from_dict(state["scheduler"], corpus, feedback)
+    scheduler = ExploratoryScheduler.from_dict(state["scheduler"], corpus, feedback,
+                                               model_parents=model_parents)
     expected_warmup = identity["profile"].get("budget", {}).get("warmup_inputs", scheduler.warmup)
     if scheduler.warmup != expected_warmup:
         raise ValueError("checkpoint warmup differs from profile budget")
@@ -215,7 +229,8 @@ def _validate_state(state, identity, seeds, registry):
         raise ValueError("checkpoint next sequence mismatch")
     _validate_corpus_binding(corpus, identity, seeds, registry)
     for context in scheduler.selection_contexts:
-        _validate_corpus_binding(Corpus.from_dict(context["corpus"]), identity, seeds, registry)
+        _validate_corpus_binding(Corpus.from_dict(context["corpus"], model_parents=model_parents),
+                                identity, seeds, registry)
     continuation = deepcopy(state.get("continuation"))
     if not isinstance(continuation, dict):
         raise ValueError("checkpoint continuation must be a dict")
@@ -251,6 +266,22 @@ def _validate_state(state, identity, seeds, registry):
     actual = budget.get("actual", budget["executed"])
     if type(actual) is not int or not budget["executed"] <= actual <= budget["attempted"]:
         raise ValueError("checkpoint actual execution budget mismatch")
+    if scheduler.policy == "bfs":
+        tasks = scheduler.frontier.tasks
+        if sum(t["actual"] for t in tasks) != actual:
+            raise ValueError("checkpoint input search actual-task budget mismatch")
+        executable_generated = sum(t.get("generated_record") is not None and
+                                   t.get("generation_outcome") not in
+                                   {"compile_time_no_change", "no_effective_input"} for t in tasks)
+        if executable_generated != budget["generated"]:
+            raise ValueError("checkpoint input search generated-task budget mismatch")
+        for task in tasks:
+            if task["actual"]:
+                execution = task.get("execution")
+                if (task["status"] != "completed" or not isinstance(execution, dict) or
+                        not isinstance(execution.get("cell_id"), str) or
+                        execution.get("content_sha256") != task["generated_record"]["content_sha256"]):
+                    raise ValueError("checkpoint input search execution/task binding mismatch")
     if (budget.get("unique_inputs", 0) > budget["generated"] or
             budget.get("unique_actual", 0) > actual):
         raise ValueError("checkpoint unique/generated/actual budget mismatch")
@@ -268,10 +299,16 @@ def _validate_state(state, identity, seeds, registry):
         if phase not in {"planned", "final"} or not scheduler.selection_log:
             raise ValueError("invalid checkpoint pending phase")
         expected = deepcopy(scheduler.selection_log[-1])
-        snapshot = scheduler.selection_contexts[-1]["corpus"]
-        expected["entry"] = next(r for r in snapshot["entries"] if r["content_sha256"] == expected["content_sha256"])
-        if "mutation_route" in expected:
-            expected["entry"] = route_view(expected["entry"], expected["mutation_route"])
+        if scheduler.policy == "bfs":
+            expected["entry"] = scheduler.frontier.entry(expected)
+            task = scheduler.frontier.task(expected["task_id"])
+            if task["status"] not in {"planned", "submitted"}:
+                raise ValueError("checkpoint pending input search task is not planned/submitted")
+        else:
+            snapshot = scheduler.selection_contexts[-1]["corpus"]
+            expected["entry"] = next(r for r in snapshot["entries"] if r["content_sha256"] == expected["content_sha256"])
+            if "mutation_route" in expected:
+                expected["entry"] = route_view(expected["entry"], expected["mutation_route"])
         if pending != expected:
             raise ValueError("checkpoint pending selection identity mismatch")
         if phase == "final" and continuation.get("stop_reason") not in {"resume_pending_execution_uncertain", "cycle_deadline_reached"}:
@@ -280,6 +317,12 @@ def _validate_state(state, identity, seeds, registry):
             raise ValueError("checkpoint pending attempt provenance missing")
     elif phase == "planned":
         raise ValueError("planned checkpoint is missing pending selection")
+    if scheduler.policy == "bfs":
+        active = [t for t in scheduler.frontier.tasks if t["status"] in {"selected", "planned", "submitted"}]
+        if len(active) != (1 if pending is not None else 0):
+            raise ValueError("checkpoint input search active task/pending mismatch")
+        if pending is not None and active[0]["task_id"] != pending["task_id"]:
+            raise ValueError("checkpoint input search pending task identity mismatch")
     return corpus, feedback, scheduler, continuation
 
 
@@ -322,8 +365,7 @@ def make_checkpoint_hook(output_dir, *, profile, cycle_id, source_manifest, cont
             if field in payload and payload[field] != identity[field]:
                 raise ValueError("checkpoint " + field + " differs from registry")
         state = {k: _serialized(payload[k]) for k in ("corpus", "feedback", "scheduler")}
-        corpus = Corpus.from_dict(state["corpus"])
-        state["corpus_identity"] = corpus_identity(corpus)
+        state["corpus_identity"] = corpus_identity(state["corpus"])
         state["next_selection_sequence"] = len(state["scheduler"]["selections"])
         next_state = deepcopy(inherited)
         for key, value in payload.items():

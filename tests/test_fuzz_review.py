@@ -11,6 +11,12 @@ import pathlib
 import tempfile
 import unittest
 
+from r2f.core import CandidateLifecycle, Registry
+from r2f.core.evidence import canonical_hash
+from r2f.core.mutation_plan import MutationProposal, compose, mutation_plan_noop_reason
+from r2f.modules.s1 import fuzz_catalog
+from r2f.modules.s1.module import register_exploratory
+
 from r2f.reports.candidate_report import (
     REVIEW_PACKET_SCHEMA, REVIEW_RECORD_SCHEMA,
     append_review_record, exploratory_candidate_ledger, read_review_records,
@@ -34,8 +40,78 @@ class ReviewPacketContracts(unittest.TestCase):
                        supporting_rule_ids=["discovery.late_endpoint.match_required"],
                        mutator_id="M01", window_complete=True,
                        negative_explanations=["negative control explains delivery loss"])
+        # The shared audit fixture's abbreviated plan is intentionally not an
+        # admissible MutationPlan.  Review tests need to reach triage before
+        # testing the independent-review gate, so supply a structurally valid,
+        # explicitly effective plan.  All receipts/raw remain synthetic; this
+        # exercises lifecycle contracts, not a naturally observed SUT defect.
+        registry = Registry()
+        register_exploratory(registry, include_required=False)
+        contract = registry.get_target("discovery.late_endpoint.fuzz_v1").exploration_contract
+        parent = copy.deepcopy(fuzz_catalog.load_seeds()["seeds"]["P01"]["logical_config"])
+        parent["reader_delay_sec"] = 0.15
+        after = dict(parent, reader_delay_sec=0.2)
+        proposal = MutationProposal(
+            "P01", "M01", {"boundary_class": "finite"},
+            {"reader_delay_sec": 0.2}, parent, after, "compile_time",
+            {"status": "applicable"})
+        plan = compose(parent, [proposal], contract, rng_seed=0)
+        self.assertIsNone(mutation_plan_noop_reason(plan))
+        row.update(mutation_plan=plan.to_dict(), mutation_plan_sha256=canonical_hash(plan.to_dict()))
         row.update(changes)
         return row
+
+    def test_original_abbreviated_plan_is_rejected_before_sut_triage(self):
+        row = base_row(self.root, "invalid-original", verdict="fail")
+        candidate = exploratory_candidate_ledger([row])["candidates"][0]
+        self.assertEqual(candidate["candidate_status"], "observed")
+        self.assertIn("mutation_plan missing field(s)", candidate["admission_error"])
+        self.assertNotIn("triaged", [event["event"] for event in candidate["history"]])
+
+    def test_equal_parent_plan_cannot_borrow_fixture_hit_or_supporting_review(self):
+        row = self.row()
+        data = copy.deepcopy(row["mutation_plan"])
+        # Retain the effective fixture's final config as an explicit parent:
+        # this is a valid descriptive plan, but not an effective mutation.
+        registry = Registry()
+        register_exploratory(registry, include_required=False)
+        contract = registry.get_target("discovery.late_endpoint.fuzz_v1").exploration_contract
+        parent = copy.deepcopy(data["final_config"])
+        proposal = MutationProposal("P01", "M01", {"boundary_class": "finite"},
+                                    {"reader_delay_sec": 0.2}, parent, parent,
+                                    "compile_time", {"status": "applicable"})
+        plan = compose(parent, [proposal], contract)
+        self.assertIsNotNone(mutation_plan_noop_reason(plan))
+        row.update(mutation_plan=plan.to_dict(), mutation_plan_sha256=canonical_hash(plan.to_dict()))
+        row["confirmation"] = {"adjudicator_id": "reviewer-1",
+                               "adjudication_method": "peer_review",
+                               "confirmation_basis": "evidence_packet",
+                               "reason": "synthetic review gate regression"}
+        reviews = [{"candidate_id": "audit-run:candidate-1", "reviewer_id": "reviewer-1",
+                    "conclusion": "supported", "evidence_refs": self.refs(),
+                    "independent_of": ["trigger-author"]}]
+        ledger = exploratory_candidate_ledger([row], reviews=reviews)
+        candidate = ledger["candidates"][0]
+        self.assertEqual(candidate["candidate_status"], "observed")
+        self.assertEqual(ledger["natural_candidate_count"], 0)
+        self.assertEqual(ledger["confirmed_candidates"], 0)
+        self.assertIn("effective input generation", candidate["admission_error"])
+        self.assertIn("sut triage", candidate["confirmation_error"].lower())
+        self.assertNotIn("triaged", [event["event"] for event in candidate["history"]])
+
+    def test_effective_fixture_reaches_triage_but_raw_and_provenance_stay_required(self):
+        row = self.row()
+        candidate = exploratory_candidate_ledger([row])["candidates"][0]
+        self.assertIsNone(candidate["admission_error"])
+        self.assertEqual(candidate["candidate_status"], "triaged")
+        self.assertEqual(candidate["responsibility_layer"], "sut")
+        invalid = copy.deepcopy(row)
+        invalid["provenance"] = {}
+        with self.assertRaisesRegex(ValueError, "provenance"):
+            CandidateLifecycle("missing-provenance", invalid).admit()
+        pathlib.Path(row["raw_path"]).write_text('{"event":"tampered"}\n')
+        with self.assertRaisesRegex(ValueError, "SHA256|raw"):
+            CandidateLifecycle("tampered-raw", row).admit()
 
     def refs(self):
         capsule = self.root / "capsule.json"

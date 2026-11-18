@@ -24,6 +24,15 @@ def cli(monkeypatch):
 def args_for(tmp_path, output, *, maximum=3):
     doc = profile()
     doc["budget"] = {"max_inputs": 4, "warmup_inputs": 1}
+    # Keep the strategy/resume zero-boundary setup; profile() now supplies
+    # an explicit changing M03 route rather than the M01 identity witness.
+    for spec in doc["seed_specs"] + doc.get("declared_seed_specs_union", []):
+        if spec["seed_id"] == "P01":
+            spec["boundary_class"] = "zero"
+    for cycle in doc["cycles"]:
+        for spec in cycle["seed_specs"]:
+            if spec["seed_id"] == "P01":
+                spec["boundary_class"] = "zero"
     path = tmp_path / "profile.json"
     path.write_text(json.dumps(doc))
     return ["--output-dir", str(tmp_path / output), "--exploratory-profile", str(path),
@@ -126,7 +135,66 @@ def test_cli_resume_policy_mismatch_fails_before_runtime_or_checkpoint_write(
 
 
 def test_cli_rejects_noncanonical_policy(cli, tmp_path):
+    # bfs is now a declared opt-in policy; keep testing a truly unknown value.
+    with pytest.raises(SystemExit) as exc:
+        cli.main(args_for(tmp_path, "new") + ["--scheduler-policy", "bfs-invalid"])
+    assert exc.value.code == 2
+    assert not (tmp_path / "new").exists()
+
+
+def test_cli_bfs_without_search_settings_is_error_before_output(cli, tmp_path):
     with pytest.raises(SystemExit) as exc:
         cli.main(args_for(tmp_path, "new") + ["--scheduler-policy", "bfs"])
     assert exc.value.code == 2
     assert not (tmp_path / "new").exists()
+
+
+@pytest.mark.parametrize("policy", [None, "fair", "feedback"])
+@pytest.mark.parametrize("execute", [False, True])
+def test_cli_core_noop_rejected_with_plan_audit_before_prepare_or_runtime(
+        cli, tmp_path, monkeypatch, policy, execute):
+    from r2f.campaign.corpus import corpus_from_profile
+    from r2f.modules.s1.providers import S1ExploratoryMutationProvider
+
+    doc = profile()
+    # One explicit P01 finite baseline equal to the M01 representative.
+    spec = {"seed_id": "P01", "target_id": "discovery.late_endpoint.fuzz_v1",
+            "boundary_class": "finite", "executable": True,
+            "mutation_routes": [{"surface_id": "P01", "boundary_class": "finite",
+                                 "mutator_id": "M01"}],
+            "overrides": {"logical_config": {"reader_delay_sec": 0.01}}}
+    doc["seed_specs"] = [deepcopy(spec)]
+    doc["declared_seed_specs_union"] = [deepcopy(spec)]
+    doc["cycles"] = [dict(next(c for c in doc["cycles"] if c["cycle_id"] == CYCLE),
+                          seed_specs=[deepcopy(spec)])]
+    doc["budget"] = {"max_inputs": 3, "warmup_inputs": 1}
+    # Validate this is a declared applicable baseline, not a malformed fixture.
+    assert len(corpus_from_profile(doc, cycle_id=CYCLE).entries) > 0
+    path = tmp_path / "noop-profile.json"
+    path.write_text(json.dumps(doc))
+    runtime = Mock(side_effect=AssertionError("no-op must not reach runtime"))
+    prepare = Mock(side_effect=AssertionError("no-op must not be prepared"))
+    monkeypatch.setattr(cli, "runtime_for_boundary", lambda _boundary: runtime)
+    monkeypatch.setattr(S1ExploratoryMutationProvider, "prepare_plan", prepare)
+    argv = ["--output-dir", str(tmp_path / "noop"), "--exploratory-profile", str(path),
+            "--cycle-id", CYCLE, "--max-inputs", "3"]
+    if policy is not None:
+        argv += ["--scheduler-policy", policy]
+    if execute:
+        argv += ["--execute"]
+    assert cli.main(argv) == (1 if execute else 0)
+    data = json.loads((tmp_path / "noop/cycle.json").read_text())
+    assert not data["abort"] and len(data["rows"]) == len(data["rejected"]) == 3
+    assert data["budget"]["planned"] == 3
+    assert data["budget"]["generated"] == data["budget"]["unique_inputs"] == 0
+    assert data["budget"]["attempted"] == data["budget"]["actual"] == data["budget"]["executed"] == 0
+    assert not data["feedback"]["events"]
+    for row in data["rows"]:
+        assert row["generation_status"] == "rejected" and row["reason_code"] == "no_effective_input"
+        assert row["mutation_plan"] and row["actual_run"] is False
+        case = tmp_path / "noop/cases" / row["cell_id"]
+        assert json.loads((case / "mutation_plan.json").read_text()) == row["mutation_plan"]
+        assert not (case / "capsule.json").exists()
+        assert not (case / "submission_intent.json").exists()
+    runtime.assert_not_called()
+    prepare.assert_not_called()

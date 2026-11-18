@@ -4,6 +4,8 @@ Fair is an input/model selection baseline for a fixed corpus, not a BFS/DFS
 state planner. These tests do not disable the separate corpus admission path.
 """
 from copy import deepcopy
+import json
+from pathlib import Path
 from unittest.mock import Mock, patch
 
 import pytest
@@ -17,7 +19,7 @@ from r2f.campaign.runner import (
 from r2f.campaign.scheduler import ExploratoryScheduler, validated_feedback
 from r2f.core.evidence import canonical_hash
 from test_exploratory_checkpoint import CYCLE, SOURCE, profile as checkpoint_profile
-from test_fuzz_feedback_loop import make_corpus, profile as cycle_profile
+from test_fuzz_feedback_loop import make_effective_corpus as make_corpus, profile as cycle_profile
 from test_scheduler_feedback_epoch import observation
 
 
@@ -40,11 +42,25 @@ def different_feedback(corpus, variant):
 
 
 def input_projection(result):
-    return [{key: deepcopy(row.get(key)) for key in (
-        "parent_content_sha256", "seed", "sampling_kind", "chain_depth",
-        "mutation_plan", "mutation_plan_sha256", "input_layer_receipts",
-        "final_input", "content_sha256", "effective_input_sha256",
-    )} for row in result["rows"]]
+    projected = []
+    for row in result["rows"]:
+        item = {key: deepcopy(row.get(key)) for key in (
+            "parent_content_sha256", "seed", "sampling_kind", "chain_depth",
+            "mutation_plan", "mutation_plan_sha256", "input_layer_receipts",
+            "final_input", "content_sha256", "effective_input_sha256",
+            "target_id", "target_revision", "rmw", "arm", "generation_status",
+            "reason_code", "binding", "oracle_verdict", "actual_run", "execution_stage",
+            "candidate_eligible", "feedback_eligible", "no_effective_input_reason",
+            "mutation_receipt",
+        )}
+        if "normalized_config_sha256" in item["binding"]:
+            # This is a runtime envelope digest (run_id/cell_id included), NOT
+            # input identity. Verify it against its own persisted bytes before
+            # comparing the remaining stable binding semantics across runs.
+            config = json.loads(Path(row["runtime_config_path"]).read_text())
+            assert item["binding"].pop("normalized_config_sha256") == canonical_hash(config)
+        projected.append(item)
+    return projected
 
 
 def plan_cycle(out, doc, state, *, maximum=None, hook_wrapper=None):
@@ -96,6 +112,10 @@ def test_fair_unified_cycle_feedback_independent_inputs_sampling_and_rng(tmp_pat
         assert not result["rejected"] and len(result["rows"]) == 8
         assert all(row["execution_stage"] == "planned" and not row["actual_run"]
                    for row in result["rows"])
+        for row in result["rows"]:
+            assert row["final_input"] != corpus.entries[row["parent_content_sha256"]]["final_config"]
+            assert all(op["input_before_sha256"] != op["input_after_sha256"]
+                       for op in row["mutation_plan"]["operations"])
         assert corpus.to_dict() == before  # fixed corpus is the comparison condition
         assert feedback.events == feedback_before
         assert not result["abort"]
@@ -203,8 +223,13 @@ def test_feedback_rng_keeps_original_hash_material(policy):
 
 
 @pytest.mark.parametrize("policy", [None, "fair", "feedback"])
-def test_policy_planning_interrupt_resume_matches_continuous_inputs(tmp_path, policy):
-    doc = checkpoint_profile()
+@pytest.mark.parametrize("authored_noop", [False, True])
+def test_policy_planning_interrupt_resume_matches_continuous_inputs(tmp_path, policy, authored_noop):
+    # Mendel owns checkpoint_profile(). Independently retain the original on-disk
+    # finite/no-op recipe as a mixed rejected+pending continuation regression.
+    doc = (json.loads((Path(__file__).resolve().parents[1] /
+            "config/s1_fuzz/profiles/parameter.json").read_text())
+           if authored_noop else checkpoint_profile())
     doc["budget"] = {"max_inputs": 5, "warmup_inputs": 1}
     doc.update(sampling_kinds=["representative", "boundary"],
                sampling_weight={"representative": 1, "boundary": 2})
@@ -213,10 +238,23 @@ def test_policy_planning_interrupt_resume_matches_continuous_inputs(tmp_path, po
     class Interrupted(BaseException):
         pass
 
+    recorded_prefix = []
+    pending_sequence = []
+
     def interrupt(hook):
         def save_then_interrupt(payload):
             hook(payload)
+            if payload["phase"] == "recorded":
+                # Persisted rows are per invocation, whereas the budget and
+                # selection log are cumulative. Do not include the pending row.
+                ref = payload["last_case_ref"]
+                recorded_prefix.append(json.loads(
+                    (Path(ref["case_dir"]) / "row.json").read_text()))
+                assert payload["row_count"] == len(recorded_prefix)
             if payload["phase"] == "planned":
+                pending_sequence.append(payload["pending_selection"]["sequence"])
+                assert pending_sequence[-1] == len(recorded_prefix)
+                assert payload["row_count"] == len(recorded_prefix)
                 raise Interrupted()
         return save_then_interrupt
 
@@ -227,7 +265,24 @@ def test_policy_planning_interrupt_resume_matches_continuous_inputs(tmp_path, po
     state = load_checkpoint(tmp_path / "interrupted", profile=doc, cycle_id=CYCLE,
                             source_manifest=SOURCE, output_dir=tmp_path / "resumed")
     resumed = plan_cycle(tmp_path / "resumed", doc, state)
-    assert input_projection(whole) == input_projection(resumed)
+    combined = {"rows": recorded_prefix + resumed["rows"]}
+    assert input_projection(whole) == input_projection(combined)
+    assert len(combined["rows"]) == 5
+    assert input_projection({"rows": whole["rejected"]}) == input_projection({
+        "rows": [r for r in combined["rows"] if r.get("generation_status") == "rejected"]})
+    assert len(resumed["rows"]) == 5 - pending_sequence[0]
+    if authored_noop:
+        assert whole["rejected"]  # never silently turn the legacy recipe valid
+        if policy in (None, "feedback"):
+            assert recorded_prefix and all(r["reason_code"] == "no_effective_input"
+                                           for r in recorded_prefix)
+        for row in whole["rejected"]:
+            assert row["binding"]["status"] == "not_executed"
+            assert not row["actual_run"] and not row["feedback_eligible"]
+            assert "replay_path" not in row
+        for path in (tmp_path / "whole", tmp_path / "interrupted", tmp_path / "resumed"):
+            for row in list(recorded_prefix) + whole["rejected"] + resumed["rejected"]:
+                assert not (path / "cases" / row["cell_id"] / "capsule.json").exists()
     assert whole["selection_log"] == resumed["selection_log"]
     assert resumed["budget"]["selected"] == 5 and resumed["budget"]["actual"] == 0
     assert old == {str(p.relative_to(tmp_path / "interrupted")): p.read_bytes()

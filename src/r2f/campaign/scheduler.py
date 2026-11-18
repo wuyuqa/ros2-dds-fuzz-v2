@@ -6,7 +6,9 @@ surface x boundary classes, then rare observed edges.  Empty pools fall back in
 a fixed order.  Selection is a pure function of the feedback log, RNG seed and
 corpus snapshot; it never executes anything.  Explicit ``policy="fair"`` instead
 traverses declared input classes using only selection history, not runtime
-feedback.  Neither policy is a BFS/DFS state planner or execution evidence.
+feedback. Explicit ``policy="bfs"`` instead traverses a bounded, model-generated
+input worklist independently of novelty retention. None is a SUT state/action
+planner or execution evidence.
 """
 from fractions import Fraction
 from itertools import product
@@ -83,13 +85,13 @@ class ExploratoryScheduler:
 
     WEIGHTS = (("uniform", 20), ("uncovered", 40), ("rare_edge", 40))
     FALLBACK = ("uniform", "uncovered", "rare_edge")
-    POLICIES = ("feedback", "fair")
+    POLICIES = ("feedback", "fair", "bfs")
     FAIR_DIMENSIONS = ("target_id", "surface_id", "boundary_class", "variant_id",
                        "chain_depth", "sampling_kind")
     _surface_cache = None
 
     def __init__(self, corpus, feedback=None, *, rng_seed=0, warmup=10,
-                 sampling_kinds=None, sampling_weight=None, policy=None):
+                 sampling_kinds=None, sampling_weight=None, policy=None, search=None):
         if not isinstance(corpus, Corpus):
             raise ValueError("exploratory scheduler requires a Corpus")
         if type(rng_seed) is not int or rng_seed < 0:
@@ -118,8 +120,54 @@ class ExploratoryScheduler:
         self.selection_contexts = []
         self.sampling_kinds = None
         self.sampling_weight = None
+        self.frontier = None
         if sampling_kinds is not None or sampling_weight is not None:
             self.configure_sampling(sampling_kinds, sampling_weight)
+
+        if search is not None:
+            self.configure_search(search)
+
+    def configure_search(self, search):
+        from .search_frontier import InputSearchFrontier, search_settings
+        if self.policy != "bfs":
+            raise ValueError("search settings require explicit bfs policy")
+        settings = search_settings(search)
+        if self.frontier is not None:
+            if settings != self.frontier.settings:
+                raise ValueError("input search bounds cannot change after initialization")
+            if (self.sampling_kinds != self.frontier.sampling_kinds or
+                    self.sampling_weight != self.frontier.sampling_weight):
+                raise ValueError("input search sampling drift")
+            return
+        if self.selection_log:
+            raise ValueError("cannot initialize input search after selection")
+        self.frontier = InputSearchFrontier(self.corpus.selectable(), settings,
+            rng_seed=self.rng_seed, sampling_kinds=self.sampling_kinds,
+            sampling_weight=self.sampling_weight)
+
+    def _next_bfs(self):
+        if self.frontier is None:
+            raise ValueError("bfs requires explicit search bounds")
+        frontier_journal_count = len(self.frontier.journal)
+        task = self.frontier.select()
+        chosen = self.frontier.entry(task)
+        event = {key: deepcopy(value) for key, value in task.items()
+                 if key not in {"status", "execution", "actual"}}
+        event.update(sequence=len(self.selection_log), policy="bfs", mode="input_search_bfs",
+                     content_sha256=task["parent_content_sha256"], seed_id=chosen.get("seed_id"),
+                     phase="input_search", pool="declared_route_sample_slots",
+                     route_selection={"schema": chosen["mutation_routes_schema"],
+                                      "policy": "input_search_bfs", "selected": deepcopy(task["mutation_route"])})
+        event["selection_sha256"] = canonical_hash(event)
+        self.selection_log.append(event)
+        context = {"sequence": event["sequence"], "policy": "bfs",
+                   "feedback_epoch": len(self.feedback_epochs) - 1, **self._epoch(),
+                   "selection_sha256": event["selection_sha256"],
+                   "corpus": self.corpus.to_dict(), "frontier_journal_count": frontier_journal_count,
+                   "sampling": {"kinds": list(self.sampling_kinds), "weight": dict(self.sampling_weight)}}
+        context["context_sha256"] = canonical_hash(context)
+        self.selection_contexts.append(context)
+        return dict(deepcopy(event), entry=chosen)
 
     @property
     def policy(self):
@@ -191,7 +239,8 @@ class ExploratoryScheduler:
         self.sampling_kinds = list(sampling_kinds)
         self.sampling_weight = normalized
 
-    def _supported_sampling_kinds(self, entry):
+    @staticmethod
+    def _supported_sampling_kinds(entry):
         """Kinds the entry's catalog surface can actually generate.
 
         Uses the same declared-domain logic as ``mutate_wide``; it never probes
@@ -453,9 +502,11 @@ class ExploratoryScheduler:
         return chosen, event
 
     def next(self):
-        """Select using the legacy feedback cycle or explicit model-only fairness."""
+        """Select legacy feedback/fair inputs or the next bounded BFS task."""
         if self._epoch() != self.feedback_epochs[-1]:
             raise ValueError("accepted feedback epoch was modified")
+        if self.policy == "bfs":
+            return self._next_bfs()
         rows = self._rows()
         sequence = len(self.selection_log)
         if self.policy == "fair":
@@ -552,11 +603,15 @@ class ExploratoryScheduler:
             result["sampling"] = {"kinds": list(self.sampling_kinds), "weight": dict(self.sampling_weight)}
         if self._explicit_policy:
             result["policy"] = self.policy
+        if self.policy == "bfs":
+            if self.frontier is None:
+                raise ValueError("bfs requires initialized input search frontier")
+            result["frontier"] = self.frontier.to_dict()
         result["selection_identity"] = canonical_hash(result)
         return result
 
     @classmethod
-    def from_dict(cls, state, corpus, feedback):
+    def from_dict(cls, state, corpus, feedback, *, model_parents=None):
         """Replay each historical selection against its own corpus and epoch."""
         if not isinstance(state, dict) or state.get("schema") != "r2f.s1-selection-log/v2":
             raise ValueError("unsupported resumable selection log")
@@ -590,6 +645,17 @@ class ExploratoryScheduler:
         first = epochs[0]["feedback_event_count"]
         scheduler = cls(corpus, validated_feedback(full.events[:first]),
                         rng_seed=state["rng_seed"], warmup=state["warmup"], policy=policy)
+        final_frontier = None
+        if policy == "bfs":
+            from .search_frontier import InputSearchFrontier
+            final_frontier = InputSearchFrontier.from_dict(state.get("frontier"))
+            offsets = [i for i, item in enumerate(final_frontier.journal) if item["action"] == "select"]
+            if len(offsets) != len(events):
+                raise ValueError("input search selection/journal count mismatch")
+            historical_frontier = InputSearchFrontier.prefix(state["frontier"], 0)
+            historical_offset = 0
+        elif "frontier" in state:
+            raise ValueError("non-bfs selection cannot carry frontier")
         last_epoch = 0
         for sequence, (context, event) in enumerate(zip(contexts, events)):
             if not isinstance(context, dict) or not isinstance(event, dict):
@@ -606,11 +672,19 @@ class ExploratoryScheduler:
             while last_epoch < epoch_id:
                 last_epoch += 1
                 scheduler.advance_feedback(validated_feedback(full.events[:epochs[last_epoch]["feedback_event_count"]]))
-            scheduler.corpus = Corpus.from_dict(context["corpus"])
+            scheduler.corpus = Corpus.from_dict(context["corpus"], model_parents=model_parents)
             sampling = context.get("sampling")
             if sampling is not None:
                 scheduler.configure_sampling(sampling["kinds"], sampling["weight"])
+            if policy == "bfs":
+                if context.get("frontier_journal_count") != offsets[sequence]:
+                    raise ValueError("input search historical frontier prefix mismatch")
+                for item in final_frontier.journal[historical_offset:offsets[sequence]]:
+                    historical_frontier.apply_event(item)
+                scheduler.frontier = historical_frontier
             rebuilt = scheduler.next()
+            if policy == "bfs":
+                historical_offset = offsets[sequence] + 1
             rebuilt.pop("entry")
             if rebuilt != event or scheduler.selection_contexts[-1] != context:
                 raise ValueError("selection cannot be reproduced from historical corpus/prefix")
@@ -621,6 +695,12 @@ class ExploratoryScheduler:
         sampling = state.get("sampling")
         if sampling is not None:
             scheduler.configure_sampling(sampling["kinds"], sampling["weight"])
+        if policy == "bfs":
+            scheduler.frontier = final_frontier
+            if (final_frontier.rng_seed != scheduler.rng_seed or
+                    final_frontier.sampling_kinds != scheduler.sampling_kinds or
+                    final_frontier.sampling_weight != scheduler.sampling_weight):
+                raise ValueError("input search scheduler settings mismatch")
         if scheduler.to_dict() != state:
             raise ValueError("selection state cannot be reproduced")
         return scheduler

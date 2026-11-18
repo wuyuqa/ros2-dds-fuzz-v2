@@ -37,63 +37,200 @@ REJECTION_REASONS = frozenset({
     "bucket_representative_limit", "capacity_limit",
 })
 
-# Only deterministic input content contributes to corpus identity.  Observation
-# labels, retention metadata, random scheduling values and execution identity
-# are excluded by construction rather than by a growing blacklist.  A caller may
-# attach any of those labels without splitting an otherwise identical input.
+# Semantic corpus identity is distinct from the full effective replay input
+# identity.  In particular, a checked generation chain is not an execution
+# instruction.  All semantic hashes use an explicit new domain; old hashes
+# fail validation on load (no implicit migration of checkpoints/route anchors).
+CONTENT_IDENTITY_SCHEMA = "r2f.corpus-content/v2"
 INPUT_IDENTITY_KEYS = (
-    "target_id", "target_revision", "rmw", "contract_hash", "profile_id",
-    "mutation_kind", "carrier", "mutation_parameters", "operations",
-    "mutation_plan", "runtime_windows", "contract", "input_layer_receipts",
-    "final_config", "final_input",
+    "target_id", "target_revision", "rmw", "contract_hash",
+    "mutation_kind", "carrier", "mutation_parameters", "contract",
 )
 
 
-def _strip_transient(value):
-    """Drop execution metadata from whitelisted input subtrees recursively."""
-    if isinstance(value, dict):
-        return {key: _strip_transient(item) for key, item in value.items() if key not in _TRANSIENT}
-    if isinstance(value, list):
-        return [_strip_transient(item) for item in value]
+# These are generation-only fields emitted by the compile-time M01/M02/M03
+# implementations in core.mutators, NOT a recursive payload blacklist.  In
+# particular M06/M07 anchor/offset/window parameters are runtime-consumed and
+# are never filtered.  Unknown parameters remain in the hash.
+_CONTENT_SELECTION_PARAMETERS = {
+    "M01": frozenset({"boundary_class", "sampling_kind", "wide_sampling"}),
+    "M02": frozenset({"enum_size", "sampling_kind", "wide_sampling"}),
+    "M03": frozenset({"sampling", "step", "sampling_kind", "wide_sampling",
+                       "min", "max", "fraction", "parent", "parent_decade",
+                       "multiplier", "direction", "clamped", "decade",
+                       "declared_representatives", "selected"}),
+}
+
+
+def _content_fields(value, allowed, label):
+    if not isinstance(value, dict) or set(value) - set(allowed):
+        raise ValueError(f"unsupported corpus content {label} fields/schema")
     return deepcopy(value)
 
 
-_TRANSIENT = frozenset({
-    "run_id", "campaign_id", "domain", "domain_id", "origin_domain", "time",
-    "timestamp", "wallclock", "started_at", "finished_at", "duration_sec",
-    "guid", "pid", "endpoint_guid", "endpoint_generation", "repeat", "rng_seed",
-    "selection_id", "case_id", "cell_id", "output_dir", "raw_path",
-    "raw_sha256", "manifest_path", "history", "retained", "evicted",
-})
+def _content_operation_parameters(parameters):
+    """Preserve payload keys, projecting only declared generator envelopes.
+
+    A QoS/filter/action parameter named 'seed', 'time', 'duration_sec', 'path'
+    or 'history' is NOT globally transient.  The topology request schema alone
+    declares its seed fields as generator controls; its resulting program is
+    already bound by final_config.  Unknown parameter keys are retained.
+    """
+    if not isinstance(parameters, dict):
+        raise ValueError("corpus operation parameters must be a dict")
+    result = deepcopy(parameters)
+    if "input_layer_receipts" in result:
+        result["input_layer_receipts"] = _content_layers(result["input_layer_receipts"])
+    # Exact topology parameter envelope from topology_input._layer().
+    if set(parameters) == {"operator_id", "slot_id", "request", "seed", "input_layer_receipts"}:
+        result.pop("seed")
+        request = result["request"]
+        _content_fields(request, {"operator_id", "slot_id", "context"}, "topology request")
+        context = request.get("context", {})
+        if not isinstance(context, dict):
+            raise ValueError("corpus topology context must be a dict")
+        for mapping in (context, context.get("parameters", {})):
+            if not isinstance(mapping, dict):
+                raise ValueError("corpus topology context.parameters must be a dict")
+            for key in ("seed", "rng_seed", "rng_algorithm"):
+                mapping.pop(key, None)
+        if context.get("parameters") == {}:
+            context.pop("parameters")
+        if not context:
+            request.pop("context", None)
+    return result
+
+
+def _content_operations(operations):
+    from r2f.core.mutation_plan import MutationOperation
+    if not isinstance(operations, list):
+        raise ValueError("corpus operations must be a list")
+    checked = [MutationOperation.from_dict(op).to_dict() for op in operations]
+    ids = {op["op_id"]: i for i, op in enumerate(checked)}
+    if len(ids) != len(checked):
+        raise ValueError("duplicate corpus operation op_id")
+    result = []
+    for op in checked:
+        status = deepcopy(op["applicability_result"])
+        if "overridden_by" in status:
+            if status["overridden_by"] not in ids:
+                raise ValueError("unknown corpus overridden_by operation")
+            status["overridden_by"] = ids[status["overridden_by"]]
+        parameters = _content_operation_parameters(op["parameters"])
+        if op["application_phase"] == "compile_time":
+            for key in _CONTENT_SELECTION_PARAMETERS.get(op["mutator_id"], ()):
+                parameters.pop(key, None)
+        # Order is the list order, never the spelling of a generated op_id.
+        result.append({"schema": op["schema"], "surface_id": op["surface_id"],
+                       "mutator_id": op["mutator_id"],
+                       "parameters": parameters,
+                       "application_phase": op["application_phase"],
+                       "applicability_result": status})
+    return result
+
+
+def _content_layers(layers, operations=None):
+    """Project the actual provider/action-program receipt schemas.
+
+    Action-program before/after documents and v2_case are generation proof,
+    not extra submitted programs.  The execution program is final_config;
+    operator/slot/disposition and request parameters remain semantic inputs.
+    Unknown receipt shapes fail closed rather than lose future instructions.
+    """
+    from r2f.core.mutation_plan import ACTION_PROGRAM_LAYER_SCHEMA
+    if not isinstance(layers, list):
+        raise ValueError("corpus input_layer_receipts must be a list")
+    result = []
+    for layer in layers:
+        if not isinstance(layer, dict):
+            raise ValueError("corpus input layer must be a dict")
+        if layer.get("schema") == ACTION_PROGRAM_LAYER_SCHEMA:
+            fields = {"schema", "layer_index", "input_path", "program_schema", "seed",
+                      "input_before", "input_after", "input_before_sha256", "input_after_sha256",
+                      "operator_id", "slot_id", "expected_disposition", "case_hash_role",
+                      "v2_case", "execution_evidence", "candidate_eligible"}
+            _content_fields(layer, fields, "action-program layer")
+            required = {"schema", "input_path", "program_schema", "input_before", "input_after"}
+            if not required <= set(layer):
+                raise ValueError("corpus action-program layer missing fields")
+            result.append({key: deepcopy(layer[key]) for key in
+                           ("schema", "input_path", "program_schema", "operator_id",
+                            "slot_id", "expected_disposition") if key in layer})
+        elif "plan_hash" in layer:
+            fields = {"layer", "declared_mutation", "plan_hash", "content_sha256",
+                      "rng_algorithm", "rng_seed", "operation_status", "runtime_windows"}
+            _content_fields(layer, fields, "plan provider layer")
+            if operations is None:
+                raise ValueError("corpus plan provider layer requires operations")
+            statuses = layer.get("operation_status")
+            expected = {op["op_id"]: op["applicability_result"]["status"] for op in operations}
+            if statuses != expected:
+                raise ValueError("corpus provider operation_status mismatch")
+            result.append({key: deepcopy(layer[key]) for key in
+                           ("layer", "declared_mutation", "runtime_windows") if key in layer})
+        elif "layer" in layer:
+            fields = {"layer", "declared_mutation", "implementation", "parameters",
+                      "submitted_reader_delay_sec"}
+            result.append(_content_fields(layer, fields, "legacy provider layer"))
+        else:
+            raise ValueError("unsupported corpus input layer schema")
+    return result
 
 
 def content_identity(entry):
-    """Deterministic semantic identity of a corpus input.
+    """Hash final semantic input, not seed lineage or full replay provenance.
 
-    Only whitelisted input fields participate.  observed_edge, surface_id,
-    boundary_class, relation_class, contract_branch, oracle_verdict, seed_id,
-    pinned_seed, source, bucket_key, admission_reason, run/domain/time,
-    repeat/RNG seed, GUID/PID and paths are observation or retention metadata
-    and never split otherwise identical content.
+    Version policy: all new inputs use CONTENT_IDENTITY_SCHEMA, independently
+    of optional provenance labels.  Existing stored hashes are never auto-migrated.
+    Full effective_input_hash, MutationPlan hashes and historical artifacts are
+    intentionally untouched.  All payload dictionaries are copied losslessly.
     """
     if not isinstance(entry, dict):
         raise ValueError("corpus entry must be a dict")
-    identity = {key: _strip_transient(entry[key]) for key in INPUT_IDENTITY_KEYS if key in entry}
-    if "final_input" in identity and "final_config" not in identity:
-        identity["final_config"] = identity.pop("final_input")
-    elif "final_input" in identity:
-        # Keep one canonical spelling if both names are present.
-        identity.pop("final_input")
-    required = ("target_id", "target_revision", "rmw", "contract_hash", "final_config")
-    if any(key not in identity for key in required):
+    identity = {key: deepcopy(entry[key]) for key in INPUT_IDENTITY_KEYS if key in entry}
+    final = entry.get("final_config", entry.get("final_input"))
+    if "final_config" in entry and "final_input" in entry and entry["final_config"] != entry["final_input"]:
+        raise ValueError("corpus final_config/final_input mismatch")
+    identity["final_config"] = deepcopy(final)
+    required = ("target_id", "target_revision", "rmw", "contract_hash")
+    if any(key not in identity for key in required) or final is None:
         raise ValueError("corpus content identity requires target/revision/rmw/contract/final config")
-    if not isinstance(identity["final_config"], dict) or not identity["final_config"]:
+    if not isinstance(final, dict) or not final:
         raise ValueError("corpus final_config must be a nonempty dict")
-    return canonical_hash({"schema": SCHEMA, "identity": identity})
+
+    operations = entry.get("operations")
+    windows = entry.get("runtime_windows")
+    if "operations" in entry and not isinstance(operations, list):
+        raise ValueError("corpus operations must be a list")
+    if "runtime_windows" in entry and not isinstance(windows, list):
+        raise ValueError("corpus runtime_windows must be a list")
+    if "mutation_plan" in entry:
+        from r2f.core.mutation_plan import MutationPlan
+        # from_dict validates the raw lineage; do not hash that lineage.
+        plan = MutationPlan.from_dict(entry["mutation_plan"])
+        if plan.final_config != final or plan.contract_hash != identity["contract_hash"]:
+            raise ValueError("corpus mutation_plan final_config/contract mismatch")
+        plan_operations = [op.to_dict() for op in plan.operations]
+        if operations is not None and operations != plan_operations:
+            raise ValueError("corpus mutation_plan/operations mismatch")
+        if windows is not None and windows != plan.runtime_windows:
+            raise ValueError("corpus mutation_plan/runtime_windows mismatch")
+        operations, windows = plan_operations, plan.runtime_windows
+    if operations is not None:
+        identity["operations"] = _content_operations(operations)
+    if windows is not None:
+        from r2f.core.mutation_plan import _validate_runtime_windows
+        identity["runtime_windows"] = _validate_runtime_windows(windows)
+    if "input_layer_receipts" in entry:
+        identity["input_layer_receipts"] = _content_layers(entry["input_layer_receipts"], operations)
+    return canonical_hash({"schema": CONTENT_IDENTITY_SCHEMA, "identity": identity})
 
 
 def content_sha256(entry):
-    return entry.get("content_sha256") or content_identity(entry)
+    digest = content_identity(entry)
+    if entry.get("content_sha256") not in (None, digest):
+        raise ValueError("corpus content hash mismatch (semantic content identity; no implicit migration)")
+    return digest
 
 
 def bucket_key(entry):
@@ -320,11 +457,16 @@ class Corpus:
                       key=lambda r: (r.get("target_id", ""), r.get("seed_id", ""), r["content_sha256"]))
 
     @classmethod
-    def from_dict(cls, data):
+    def from_dict(cls, data, *, model_parents=None):
         """Restore an index, never re-admit observations as newly pinned seeds.
 
         Input identities are recomputed, but the original records/history are
         copied verbatim.  Evicted parents remain valid historical references.
+        A caller may supply hash->input_record model parents ONLY after its
+        frontier.validate_model(...) succeeds.  We independently check their
+        identities, ancestry and edge bindings; they are not novelty evidence
+        and are never inserted into entries/history or serialized on return.
+        The default (including load()) still rejects missing parent inputs.
         """
         if not isinstance(data, dict) or data.get("schema") != SCHEMA:
             raise ValueError("unsupported corpus schema")
@@ -369,17 +511,41 @@ class Corpus:
                     not isinstance(event.get("reason"), str)):
                 raise ValueError("invalid corpus history order/event")
         corpus.history = deepcopy(history)
-        known = set(corpus.entries) | {e["content_sha256"] for e in history}
-        for record in records:
+        external = {}
+        if model_parents is not None:
+            from collections.abc import Mapping
+            if not isinstance(model_parents, Mapping):
+                raise ValueError("corpus model_parents must be a mapping")
+            for digest, record in model_parents.items():
+                if (not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest)
+                        or not isinstance(record, dict) or content_sha256(record) != digest):
+                    raise ValueError("corpus model parent content hash mismatch")
+                parent = record.get("parent_content_sha256")
+                if parent is not None and (not isinstance(parent, str) or
+                        not re.fullmatch(r"[0-9a-f]{64}", parent) or parent == digest):
+                    raise ValueError("invalid corpus model parent reference")
+                external[digest] = deepcopy(record)
+        # Prefer the corpus's own retained lineage for shared semantic content;
+        # model generation metadata must not replace the original corpus audit.
+        ancestry = {**external, **corpus.entries}
+        known = set(ancestry) | {e["content_sha256"] for e in history}
+        binding = ("target_id", "target_revision", "rmw", "contract_hash")
+        for digest, record in [*corpus.entries.items(), *external.items()]:
             parent = record.get("parent_content_sha256")
             if parent is not None and parent not in known:
                 raise ValueError("corpus parent is missing from retained/historical inputs")
-            seen = {record["content_sha256"]}
-            while parent in corpus.entries:
+            child, child_digest = record, digest
+            seen = {digest}
+            while parent in ancestry:
                 if parent in seen:
                     raise ValueError("cyclic corpus parent lineage")
                 seen.add(parent)
-                parent = corpus.entries[parent].get("parent_content_sha256")
+                parent_record = ancestry[parent]
+                if external and (parent in external or child_digest in external):
+                    if any(parent_record[key] != child[key] for key in binding):
+                        raise ValueError("corpus model parent target/revision/RMW/contract mismatch")
+                child, child_digest = parent_record, parent
+                parent = parent_record.get("parent_content_sha256")
         corpus._rebuild_indexes()
         if len(corpus._evictable()) > corpus.capacity:
             raise ValueError("corpus exceeds capacity")

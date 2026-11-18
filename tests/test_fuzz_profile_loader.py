@@ -4,6 +4,7 @@ These tests build corpora and, for runner-supported cycles, generate planned
 cases through the shared runner (execute=False).  They never start ROS, a
 campaign, a network namespace or nft, and no built entry is execution evidence.
 """
+from copy import deepcopy
 import inspect
 import json
 from pathlib import Path
@@ -247,7 +248,7 @@ class PerCycleBuildContracts(unittest.TestCase):
 
 
 class RunnerConsumesEachCycle(unittest.TestCase):
-    """Every buildable cycle must yield planned cases, never a rejection row."""
+    """Buildable routing does not promise every authored mutation changes input."""
 
     def _run(self, profile, cycle, max_inputs=3):
         from r2f.campaign.feedback import FeedbackLog
@@ -261,6 +262,9 @@ class RunnerConsumesEachCycle(unittest.TestCase):
                 scheduler=ExploratoryScheduler(corpus, rng_seed=7, warmup=0),
                 profile=profile, execute=False, max_inputs=max_inputs,
                 run_id="profile-" + cycle["cycle_id"])
+            for row in result["rejected"]:
+                self.assertFalse((Path(temporary) / "cycle" / "cases" /
+                                  row["cell_id"] / "capsule.json").exists())
         return result, corpus
 
     def test_each_buildable_cycle_generates_planned_cases(self):
@@ -268,16 +272,57 @@ class RunnerConsumesEachCycle(unittest.TestCase):
         self.assertTrue(built)
         for name, profile, cycle in built:
             result, corpus = self._run(profile, cycle)
-            self.assertEqual(result["rejected"], [], cycle["cycle_id"])
-            self.assertGreaterEqual(len(result["rows"]), 1, cycle["cycle_id"])
+            self.assertEqual(result["budget"]["selected"], 3)
+            self.assertEqual(len(result["rows"]), 3, cycle["cycle_id"])
+            self.assertEqual(result["rejected"], [r for r in result["rows"]
+                             if r.get("generation_status") == "rejected"])
+            self.assertEqual(result["budget"]["generated"], 3 - len(result["rejected"]))
+            self.assertEqual(result["budget"]["actual"], 0)
+            self.assertEqual(result["budget"]["attempted"], 0)
+            self.assertEqual(result["budget"]["unique_inputs"], len({
+                row["content_sha256"] for row in result["rows"]
+                if row.get("generation_status") != "rejected"}))
             self.assertEqual(result["stop_reason"], "execute_false_planned_only")
             for row in result["rows"]:
                 self.assertEqual(row["execution_stage"], "planned", cycle["cycle_id"])
                 self.assertIs(row["actual_run"], False)
                 self.assertEqual(row["target_id"], cycle["target_id"])
-                self.assertIsNone(row.get("reason_code"), cycle["cycle_id"])
+                if row.get("generation_status") == "rejected":
+                    self.assertEqual(row["reason_code"], "no_effective_input")
+                    self.assertEqual(row["binding"]["status"], "not_executed")
+                    self.assertFalse(row["feedback_eligible"])
+                    self.assertFalse(row["candidate_eligible"])
+                    self.assertNotIn("replay_path", row)
+                    self.assertTrue(any(op["applicability_result"]["status"] == "no_op"
+                                        for op in row["mutation_plan"]["operations"]))
+                else:
+                    self.assertIsNone(row.get("reason_code"), cycle["cycle_id"])
+                    self.assertEqual(row["binding"]["status"], "preserved")
                 self.assertIsNotNone(row.get("mutation_plan"))
                 self.assertIn(row["target_id"], SUPPORTED_TARGETS)
+
+    def test_finite_endpoint_profile_with_explicit_change_generates_cases(self):
+        profile = deepcopy(load_profile("parameter"))
+        cycle_id = "late-endpoint-parameter"
+        cycle = next(c for c in profile["cycles"] if c["cycle_id"] == cycle_id)
+        # M01(finite) is a witness, M01(zero) changes these positive parents.
+        for spec in cycle["seed_specs"]:
+            self.assertEqual(spec["seed_id"], "P01")
+            self.assertIn(spec["boundary_class"], ("finite", "quantized_neighbor"))
+            spec["boundary_class"] = "zero"
+        result, corpus = self._run(profile, cycle)
+        self.assertEqual(result["rejected"], [])
+        self.assertEqual(len(result["rows"]), 3)
+        self.assertEqual(result["budget"]["generated"], 3)
+        for row in result["rows"]:
+            self.assertEqual(row["target_id"], cycle["target_id"])
+            self.assertEqual(row["execution_stage"], "planned")
+            self.assertFalse(row["actual_run"])
+            self.assertEqual(row["binding"]["status"], "preserved")
+            self.assertEqual(row["final_input"]["reader_delay_sec"], 0.0)
+            parent = corpus.entries[row["parent_content_sha256"]]
+            self.assertGreater(parent["final_config"]["reader_delay_sec"], 0)
+            self.assertNotEqual(row["final_input"], parent["final_config"])
 
     def test_projection_and_recovery_cycles_generate_planned_only(self):
         cases = (("parameter", "projection-parameter",

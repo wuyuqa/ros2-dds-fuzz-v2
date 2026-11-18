@@ -88,8 +88,57 @@ class GoldenRegression(unittest.TestCase):
                 self.assertEqual(proposal.changes, changes)
                 self.assertEqual(canonical_hash(proposal.to_dict()), proposal_hash)
                 plan = compose(parent, [proposal], self.contract, rng_seed=seed)
-                self.assertEqual(plan.plan_hash(), plan_hash)
-                # Legacy plans carry no chain key, so their bytes are unchanged.
+                if sid == "W02":
+                    # The old golden remains the generator-state reference:
+                    # proposal bytes/changes are unchanged, but admission now
+                    # labels this equal-input compile-time operation no_op.
+                    # Build the expected document independently, not by editing
+                    # the production plan's serialization or reusing its hash.
+                    expected = {
+                        "plan_version": "r2f.mutation-plan/v1",
+                        "rng_algorithm": "mt19937-v1", "rng_seed": 7,
+                        "parent_content_sha256":
+                            "ab7f63de6935856db1bc365d1a652e5b90b76811e1b4b444b41073847bd77fd4",
+                        "operations": [{
+                            "schema": "r2f.mutation-operation/v1",
+                            "op_id": "op-00-W02-M03", "surface_id": "W02", "mutator_id": "M03",
+                            "parameters": {"sampling": "local_bounded", "step": 0.001},
+                            "input_before_sha256":
+                                "ab7f63de6935856db1bc365d1a652e5b90b76811e1b4b444b41073847bd77fd4",
+                            "input_after_sha256":
+                                "ab7f63de6935856db1bc365d1a652e5b90b76811e1b4b444b41073847bd77fd4",
+                            "application_phase": "compile_time",
+                            "applicability_result": {
+                                "status": "no_op",
+                                "sut_guards": {"actual_send_interval_observed": "unknown"},
+                                "reason": "unwindowed_compile_time_input_unchanged",
+                            },
+                        }],
+                        "final_config": {"publish_interval_sec": 0.0}, "runtime_windows": [],
+                        "contract_hash":
+                            "e6b1572f55fceca51a3f0d2ec434a3f92f2930dcbb47892762346665a2344f9a",
+                    }
+
+                    def literal_plan_hash(document):
+                        # Reproduce the documented canonical envelope directly;
+                        # do not call MutationPlan.content_hash/plan_hash here.
+                        content = {key: value for key, value in document.items() if key != "rng_seed"}
+                        return canonical_hash({"plan": document, "content_hash": canonical_hash(content)})
+
+                    self.assertEqual(plan.to_dict(), expected)
+                    expected_hash = literal_plan_hash(expected)
+                    self.assertEqual(plan.plan_hash(), expected_hash)
+                    self.assertNotEqual(expected_hash, plan_hash)
+                    self.assertEqual(validate_plan(plan, contract=self.contract).status, "invalid")
+                    legacy = copy.deepcopy(expected)
+                    legacy["operations"][0]["applicability_result"] = {
+                        "status": "applicable",
+                        "sut_guards": {"actual_send_interval_observed": "unknown"},
+                    }
+                    self.assertEqual(literal_plan_hash(legacy), plan_hash)
+                else:
+                    self.assertEqual(plan.plan_hash(), plan_hash)
+                # The corrected status does not add a chain key or change schema.
                 self.assertNotIn("chain", plan.to_dict())
 
     def test_legacy_single_proposal_plan_dict_has_no_new_fields(self):
@@ -364,11 +413,15 @@ class ChainComposition(unittest.TestCase):
             applicability_result=proposal.applicability_result)
         plan = compose_chain([proposal, twin], self.contract, parent=parent)
         self.assertEqual(len(plan.operations), 2)
-        # Last-write-wins provenance: the earlier duplicate is marked
-        # overridden and excluded from hit aggregation; it is never counted
-        # twice.  The later layer remains the effective writer.
+        # Both operations remain in the audit description: the earlier one
+        # is overridden, while reapplying the same value makes the last one a
+        # no_op.  Neither may be counted as a new independent live mutation.
         self.assertEqual(plan.operations[0].applicability_status, "overridden")
-        self.assertEqual(plan.operations[1].applicability_status, "applicable")
+        self.assertEqual(plan.operations[1].applicability_status, "no_op")
+        result = validate_plan(plan, contract=self.contract)
+        self.assertEqual(result.status, "invalid")
+        self.assertFalse(result.executable)
+        self.assertIn("active no_op", "; ".join(result.reasons))
 
     def test_order_after_violation_is_rejected(self):
         # X01 declares order_after P04, so [X01, P04] is the wrong order.

@@ -417,4 +417,7 @@ def run_isolated_topology(config, output_dir, *, boundary_request):
 if __name__ == '__main__':
     if len(sys.argv) != 5 or sys.argv[1] != '_child':
         raise SystemExit('only fixed canonical child dispatch is supported')
-    raise SystemExit(_child(sys.argv[2], sys.argv[3], int(sys.argv[4])))
+    # -m executes a separate __main__ instance. Pair callbacks import MODULE,
+    # so install the collector in that canonical module, not in __main__.
+    from importlib import import_module
+    raise SystemExit(import_module(MODULE)._child(sys.argv[2], sys.argv[3], int(sys.argv[4])))

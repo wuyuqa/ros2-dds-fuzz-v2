@@ -322,18 +322,44 @@ def test_real_checkpoint_load_resume_matches_whole_planning(tmp_path, policy):
                         output_dir=tmp_path / "bad-resume")
 
 
-@pytest.mark.parametrize("policy,corpus_hash,state_hash,events_hash", [
-    (None, "8d2ac7ecaeb3533e25871de4d30838b02774960578758312247b1eb1cec7d449", "8472d2b3b8825a14a99d94dbf86fcf825adf6387b4feaf8c771720727b2c0043", "9085a8fe76876489aef015ef699e5fd8f2a25abfa012c4b0a794166db1555223"),
-    ("feedback", "8d2ac7ecaeb3533e25871de4d30838b02774960578758312247b1eb1cec7d449", "8371017173bbf0ca520be5972340d7b1fe4e5d3dc54094907c596d9be31bf2ed", "45243eb19f13726d7cfbd1cec6565f08ae246e8982cefd0f9ba23c37721bb4e0"),
-    ("fair", "8d2ac7ecaeb3533e25871de4d30838b02774960578758312247b1eb1cec7d449", "a39ff73ad8b5edec9109b999b7f82e4145f6fa2d6ef3a663379005dd8f722f34", "edeeaaa1f68ad98bee276ee34e90bc47a15f366a22c6bbcc4f37d9aea8262752"),
+# e35c913 reference used the old lineage-sensitive content identity. Its
+# frozen values remain here as explicit invalidated goldens, not new expected
+# values. r2f.corpus-content/v2 constants were independently computed using
+# hashlib/json + literal semantic keys (no production content_identity call):
+# results/main-review/s1-frontier-repair-20261118/identity-owner/
+# compute_v2_goldens.py and v2-golden-computation.json. The independent old
+# oracle also reproduces all nine old constants, isolating this version change
+# from scheduler policy changes. No historical artifact is migrated.
+@pytest.mark.parametrize("policy,old_hashes,v2_hashes", [
+    (None,
+     ("8d2ac7ecaeb3533e25871de4d30838b02774960578758312247b1eb1cec7d449",
+      "8472d2b3b8825a14a99d94dbf86fcf825adf6387b4feaf8c771720727b2c0043",
+      "9085a8fe76876489aef015ef699e5fd8f2a25abfa012c4b0a794166db1555223"),
+     ("5c35b9cd0c4a70b39aecbf3bad36bfc3507cac27615f944e3ada8bd1d670ac45",
+      "01035f498a58cac1e88d19902a95a23b3f74d50564559840df674390c9bc065f",
+      "f3cfa49cda1c24b2979c9e9abb7f5f73327351a39539bee962bd7ab988f26492")),
+    ("feedback",
+     ("8d2ac7ecaeb3533e25871de4d30838b02774960578758312247b1eb1cec7d449",
+      "8371017173bbf0ca520be5972340d7b1fe4e5d3dc54094907c596d9be31bf2ed",
+      "45243eb19f13726d7cfbd1cec6565f08ae246e8982cefd0f9ba23c37721bb4e0"),
+     ("5c35b9cd0c4a70b39aecbf3bad36bfc3507cac27615f944e3ada8bd1d670ac45",
+      "d0472b055ac8c6f3d95ea4fe363d782a1a77f75ea90cc1c64c7acfd42b85d081",
+      "a3c406db3a78dab7ce361e24a1ff9096217b2f37683da43faf2f9b121b91b405")),
+    ("fair",
+     ("8d2ac7ecaeb3533e25871de4d30838b02774960578758312247b1eb1cec7d449",
+      "a39ff73ad8b5edec9109b999b7f82e4145f6fa2d6ef3a663379005dd8f722f34",
+      "edeeaaa1f68ad98bee276ee34e90bc47a15f366a22c6bbcc4f37d9aea8262752"),
+     ("5c35b9cd0c4a70b39aecbf3bad36bfc3507cac27615f944e3ada8bd1d670ac45",
+      "f604b9d5d8884c550fcd3c63b7fdf21bc2cc74b72dbea19c0797147800da89ef",
+      "2ef667990f695cd47fa71a7b3f897f3ee2b1390ad7a1dacdb897332905ced8d6")),
 ])
-def test_legacy_corpus_hash_and_selection_bytes_unchanged(policy, corpus_hash, state_hash, events_hash):
+def test_v2_content_identity_corpus_and_selection_bytes(policy, old_hashes, v2_hashes):
     corpus = corpus_from_profile(ROOT / "config/s1_fuzz/profiles/composed.json", cycle_id="late-endpoint-composed")
     scheduler = ExploratoryScheduler(corpus, rng_seed=42, warmup=10, policy=policy)
     events = scheduler.plan(12)
-    assert canonical_hash(corpus.to_dict()) == corpus_hash
-    assert canonical_hash(scheduler.to_dict()) == state_hash
-    assert canonical_hash(events) == events_hash
+    actual = (canonical_hash(corpus.to_dict()), canonical_hash(scheduler.to_dict()), canonical_hash(events))
+    assert actual == v2_hashes
+    assert all(current != old for current, old in zip(actual, old_hashes))
 
 
 def test_multiref_template_only_legacy_requires_singleton():

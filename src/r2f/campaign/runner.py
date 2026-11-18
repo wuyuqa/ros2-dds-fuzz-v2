@@ -497,6 +497,14 @@ class ExploratoryCycleError(ValueError):
     """Raised when an exploratory cycle cannot be constructed honestly."""
 
 
+class _NoEffectiveInputRejection(ExploratoryCycleError):
+    """Core-classified ineffective proposal; retained audit, never prepared."""
+
+    def __init__(self, reason, plan):
+        super().__init__(reason)
+        self.plan = plan
+
+
 class _F2InputRejection(ExploratoryCycleError):
     """Pre-compose F2 guard failure; never an executed/runtime result."""
 
@@ -628,6 +636,15 @@ def _application_phase(surface):
 
 
 def _derive_rng_seed(scheduler, selection, entry):
+    if getattr(scheduler, "policy", None) == "bfs":
+        sequence = selection.get("sequence")
+        if type(sequence) is not int or not 0 <= sequence < len(scheduler.selection_log):
+            raise ExploratoryCycleError("input search task is not an accepted selection")
+        event = {key: value for key, value in selection.items() if key != "entry"}
+        accepted = scheduler.selection_log[sequence]
+        if (event != accepted or entry != scheduler.frontier.entry(accepted)):
+            raise ExploratoryCycleError("input search selection/parent binding mismatch")
+        return accepted["rng_seed"]
     if getattr(scheduler, "policy", None) == "fair":
         # Fair's audit selection hash deliberately retains feedback identity.
         # Only its scheduler-authenticated model decision may drive generation.
@@ -1354,6 +1371,12 @@ def run_exploratory_cycle(output_dir, *, corpus, feedback, scheduler, profile, r
         raise ExploratoryCycleError("checkpoint_hook must be callable")
     started = time.monotonic()
     _sync_sampling(scheduler, profile)
+    if profile.get("scheduler_policy", scheduler.policy) != scheduler.policy:
+        raise ExploratoryCycleError("scheduler policy differs from profile declaration")
+    if scheduler.policy == "bfs":
+        scheduler.configure_search(profile.get("search"))
+    elif "search" in profile:
+        raise ExploratoryCycleError("search profile requires bfs scheduler policy")
     sampling_kinds, sampling_weight, chain_length = _profile_wide_settings(profile)
 
     repo = Path(repo or Path(__file__).resolve().parents[3]).resolve()
@@ -1478,6 +1501,21 @@ def run_exploratory_cycle(output_dir, *, corpus, feedback, scheduler, profile, r
 
     def planned(row, selection):
         nonlocal pending, last_case_ref, submission_state
+        if scheduler.policy == "bfs":
+            from .search_frontier import derived_record
+            from r2f.core.mutation_plan import MutationPlan
+            record = derived_record(selection["entry"], MutationPlan.from_dict(row["mutation_plan"]))
+            if record["content_sha256"] != row["content_sha256"]:
+                raise ExploratoryCycleError("frontier/capsule content identity mismatch")
+            scheduler.frontier.planned(selection["task_id"], record)
+            row["input_search"] = {"mode": "input_search_bfs", "task_id": selection["task_id"],
+                "baseline_content_sha256": selection["baseline_content_sha256"],
+                "parent_content_sha256": selection["parent_content_sha256"],
+                "mutation_route": deepcopy(selection["mutation_route"]),
+                "sampling_kind": selection["sampling_kind"],
+                "derivation_depth": selection["derivation_depth"], "sample_slot": selection["sample_slot"],
+                "rng_seed": selection["rng_seed"], "status": "planned", "actual": False, "execution": None}
+            _atomic_json(output_dir / "cases" / row["cell_id"] / "row.json", row)
         pending = deepcopy(selection)
         case = output_dir / "cases" / row["cell_id"]
         last_case_ref = {"cell_id": row["cell_id"], "output_dir": str(output_dir),
@@ -1495,6 +1533,8 @@ def run_exploratory_cycle(output_dir, *, corpus, feedback, scheduler, profile, r
     def submitted(row, selection):
         nonlocal submission_state
         submission_state = "submitted"
+        if scheduler.policy == "bfs":
+            scheduler.frontier.submitted(selection["task_id"])
         _atomic_json(Path(last_case_ref["submission_marker_path"]), {
             "schema": "r2f.exploratory-submission/v1", "status": "submitted_or_uncertain",
             "cell_id": row["cell_id"], "sequence": selection["sequence"],
@@ -1549,7 +1589,7 @@ def run_exploratory_cycle(output_dir, *, corpus, feedback, scheduler, profile, r
         if update_elapsed():
             stop_reason = "cycle_deadline_reached"
             break
-        if not corpus.selectable():
+        if scheduler.policy != "bfs" and not corpus.selectable():
             stop_reason = "selection_exhausted"
             break
         try:
@@ -1563,7 +1603,8 @@ def run_exploratory_cycle(output_dir, *, corpus, feedback, scheduler, profile, r
                 selection = scheduler.next()
                 budget["selected"] += 1
         except ValueError as exc:
-            stop_reason = "selection_error:" + str(exc)
+            stop_reason = (scheduler.frontier.stop_reason if scheduler.policy == "bfs"
+                           and scheduler.frontier.stop_reason else "selection_error:" + str(exc))
             break
         sequence = selection["sequence"]
         entry = selection["entry"]
@@ -1676,9 +1717,46 @@ def run_exploratory_cycle(output_dir, *, corpus, feedback, scheduler, profile, r
                                            candidate_eligible=False, attribution="harness_input_generation")
                             except _F2InputRejection as exc:
                                 row = reject(sequence, entry, str(exc))
+                            except _NoEffectiveInputRejection as exc:
+                                # A generated proposal is auditable, but has no
+                                # prepared capsule, submission or execution.
+                                from .search_frontier import derived_record
+                                record = derived_record(entry, exc.plan)
+                                row = reject(sequence, entry, "no_effective_input")
+                                row.update(mutation_plan=exc.plan.to_dict(),
+                                           content_sha256=record["content_sha256"],
+                                           parent_content_sha256=entry["content_sha256"],
+                                           no_effective_input_reason=str(exc),
+                                           candidate_eligible=False, feedback_eligible=False)
+                                if scheduler.policy == "bfs":
+                                    scheduler.frontier.planned(selection["task_id"], record)
+                                case_dir = output_dir / "cases" / row["cell_id"]
+                                _atomic_json(case_dir / "mutation_plan.json", exc.plan.to_dict())
+                                _atomic_json(case_dir / "row.json", row)
         if row is None:
             stop_reason = "generation_failed"
             break
+        if scheduler.policy == "bfs":
+            actual = row.get("actual_run") is True
+            rejected_task = row.get("generation_status") == "rejected"
+            if rejected_task and row not in rejected:
+                rejected.append(row)
+            execution = ({"cell_id": row["cell_id"], "execution_stage": row["execution_stage"],
+                          "content_sha256": row["content_sha256"],
+                          "effective_input_sha256": row.get("effective_input_sha256"),
+                          "evidence_origin": row.get("evidence_origin"), "formal_runtime": bool(formal_runtime),
+                          "raw_path": row.get("raw_path"), "raw_sha256": row.get("raw_sha256")}
+                         if actual else None)
+            scheduler.frontier.finish(selection["task_id"], rejected=rejected_task,
+                reason=row.get("reason_code"), actual=actual, execution=execution)
+            row["input_search"] = {"mode": "input_search_bfs", "task_id": selection["task_id"],
+                "baseline_content_sha256": selection["baseline_content_sha256"],
+                "parent_content_sha256": selection["parent_content_sha256"],
+                "mutation_route": deepcopy(selection["mutation_route"]),
+                "sampling_kind": selection["sampling_kind"],
+                "derivation_depth": selection["derivation_depth"], "sample_slot": selection["sample_slot"],
+                "rng_seed": selection["rng_seed"], "status": "rejected" if rejected_task else "completed",
+                "actual": actual, "execution": execution}
         row_sequences.append({"cycle_row_index": len(rows), "selection_sequence": sequence,
                               "cell_id": row["cell_id"]})
         rows.append(row)
@@ -1761,6 +1839,35 @@ def run_exploratory_cycle(output_dir, *, corpus, feedback, scheduler, profile, r
         "runtime_boundary": runtime_boundary,
         "runtime_formal": bool(formal_runtime),
     }
+    if scheduler.policy == "bfs":
+        # Cumulative ledger counts survive resume. Completed input tasks are NOT
+        # execution evidence; the novelty corpus intentionally retains less.
+        frontier = scheduler.frontier
+        tasks = frontier.tasks
+        result["search_summary"] = {
+            "mode": "input_search_bfs",
+            "root_nodes": len(frontier.roots),
+            "derived_nodes": len(frontier.nodes) - len(frontier.roots),
+            "tasks_total": len(tasks),
+            "tasks_pending": sum(t["status"] == "pending" for t in tasks),
+            "tasks_in_flight": sum(t["status"] in {"selected", "planned", "submitted"} for t in tasks),
+            "proposal_generated": sum(t.get("generated_record") is not None for t in tasks),
+            "effective_unique_derived_nodes": len(frontier.nodes) - len(frontier.roots),
+            "submitted": sum(e["action"] == "submit" for e in frontier.journal),
+            "completed": sum(t["status"] == "completed" for t in tasks),
+            "rejected": sum(t["status"] == "rejected" for t in tasks),
+            "actual": sum(t.get("actual") is True for t in tasks),
+            "executed": sum(t.get("actual") is True and
+                            (t.get("execution") or {}).get("execution_stage") == "judged" for t in tasks),
+            "duplicate_content": sum(t.get("generation_outcome") == "duplicate_content" for t in tasks),
+            "stop_reason": stop_reason,
+            "frontier_stop_reason": frontier.stop_reason,
+            "retention_role": "novelty_evidence_only",
+            "frontier_ref": {"path": str(output_dir / "selection_log.json"), "json_pointer": "/frontier"},
+            "count_scope": "cumulative_task_ledger_including_resume",
+            "completed_meaning": "terminal_generated_or_planned_task_not_execution",
+            "coverage_scope": "declared_routes_and_finite_rng_sample_slots_not_all_continuous_values",
+        }
     if runtime_boundary == ISOLATED_RUNTIME:
         result["boundary_qualifications"] = {
             row["cell_id"]: row.get("boundary_qualification", execution_boundary_qualification(runtime_boundary))
@@ -1774,12 +1881,13 @@ def run_exploratory_cycle(output_dir, *, corpus, feedback, scheduler, profile, r
     return result
 
 
-def _generate_case(sequence, entry, target, contract, surface, parent, mutator_id,
-                  target_id, rmw, selection, scheduler, source, repo, run_id, profile,
-                  domain_id, registry, output_dir, budget, execute, runtime,
-                  corpus, feedback, *, planned_hook=None, submission_hook=None,
-                  deadline_reached=None, runtime_boundary=HOST_RUNTIME):
-    """Generate one planned case; optionally advance the execution gates."""
+def _build_case_plan(entry, target, contract, surface, parent, mutator_id,
+                     profile, rng_seed, selection):
+    """Pure shared generation; input planning is never execution evidence.
+
+    The frontier checkpoint verifier invokes this same generation path from its
+    retained parent, declared route and stable sample-slot RNG.
+    """
     target_id = target.target_id
     route = _route(target_id)
     if route is None:
@@ -1807,7 +1915,6 @@ def _generate_case(sequence, entry, target, contract, surface, parent, mutator_i
             "parent_after_controls_sha256": canonical_hash(adapted_parent),
             "normalized_before_compose": True,
         }
-    rng_seed = _derive_rng_seed(scheduler, selection, entry)
     sampling_kinds, sampling_weight, chain_length = _profile_wide_settings(profile)
     topology = target_id == TOPOLOGY_TARGET
     wide = _wide_generation_requested(profile) and not topology
@@ -1907,6 +2014,47 @@ def _generate_case(sequence, entry, target, contract, surface, parent, mutator_i
             compose_proposal = _replace(proposal, runtime_windows=[])
         plan = compose(adapted_parent, [compose_proposal], contract, rng_seed=rng_seed,
                        runtime_windows=windows)
+    from r2f.core.mutation_plan import mutation_plan_noop_reason
+    noop_reason = mutation_plan_noop_reason(plan)
+    if noop_reason is not None:
+        raise _NoEffectiveInputRejection(noop_reason, plan)
+    return {"plan": plan, "proposal": proposal, "route": route,
+            "mutation_kind": mutation_kind, "carrier": carrier,
+            "adaptation": adaptation, "runtime_windows": runtime_windows,
+            "topology": topology, "wide": wide, "sampling_kind": sampling_kind,
+            "sampling_kinds": sampling_kinds, "sampling_weight": sampling_weight,
+            "chain_length": chain_length, "sampling_filtered": sampling_filtered,
+            "adapted_parent": adapted_parent, "mutator_id": mutator_id,
+            "topology_generation": topology_generation if topology else None}
+
+
+def _generate_case(sequence, entry, target, contract, surface, parent, mutator_id,
+                  target_id, rmw, selection, scheduler, source, repo, run_id, profile,
+                  domain_id, registry, output_dir, budget, execute, runtime,
+                  corpus, feedback, *, planned_hook=None, submission_hook=None,
+                  deadline_reached=None, runtime_boundary=HOST_RUNTIME):
+    """Generate one planned case; optionally advance the execution gates."""
+    target_id = target.target_id
+    rng_seed = _derive_rng_seed(scheduler, selection, entry)
+    generated = _build_case_plan(entry, target, contract, surface, parent,
+                                 mutator_id, profile, rng_seed, selection)
+    plan = generated["plan"]
+    proposal = generated["proposal"]
+    route = generated["route"]
+    mutation_kind = generated["mutation_kind"]
+    carrier = generated["carrier"]
+    adaptation = generated["adaptation"]
+    runtime_windows = generated["runtime_windows"]
+    topology = generated["topology"]
+    wide = generated["wide"]
+    sampling_kind = generated["sampling_kind"]
+    sampling_kinds = generated["sampling_kinds"]
+    sampling_weight = generated["sampling_weight"]
+    chain_length = generated["chain_length"]
+    sampling_filtered = generated["sampling_filtered"]
+    adapted_parent = generated["adapted_parent"]
+    mutator_id = generated["mutator_id"]
+    topology_generation = generated["topology_generation"]
     scenario = Scenario(target, rmw, "mutated", 0, rng_seed,
                         {"mutation_kind": mutation_kind, "carrier": carrier,
                          "mutation_parameters": plan.final_config}, plan)
@@ -2125,6 +2273,14 @@ def _generate_case(sequence, entry, target, contract, surface, parent, mutator_i
     _atomic_json(row_path, row)
     if planned_hook is not None:
         planned_hook(row, selection)
+    if scheduler.policy == "bfs":
+        outcome = scheduler.frontier.task(selection["task_id"]).get("generation_outcome")
+        if outcome in {"compile_time_no_change", "duplicate_content"}:
+            reason = "model_" + outcome
+            row.update(generation_status="rejected", reason_code=reason,
+                       blocked_reason=reason, candidate_eligible=False)
+            _atomic_json(row_path, row)
+            return row
     if not execute:
         return row
     if route["execution_admitted"] is not True:

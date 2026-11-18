@@ -31,7 +31,7 @@ def main(argv=None):
     parser.add_argument("--exploratory-profile", type=Path,
                         help="explicit exploratory profile (including topology_v1 opt-in); uses the unified exploratory cycle")
     parser.add_argument("--cycle-id", help="cycle inside the exploratory profile")
-    parser.add_argument("--scheduler-policy", choices=("fair", "feedback"), default=None,
+    parser.add_argument("--scheduler-policy", choices=("fair", "feedback", "bfs"), default=None,
                         help="exploratory selection policy; omitted preserves legacy feedback or inherits the checkpoint policy")
     parser.add_argument("--max-inputs", type=int, default=None,
                         help="explicit cumulative exploratory selection cap (default: profile budget)")
@@ -60,9 +60,14 @@ def main(argv=None):
         if not cycle_id:
             parser.error("--exploratory-profile requires --cycle-id")
         profile = json.loads(profile_path.read_text())
+        if scheduler_policy is None:
+            scheduler_policy = profile.get("scheduler_policy", "bfs" if "search" in profile else None)
         source = source_manifest(Path(__file__).resolve().parents[1])
         continuation = None
         try:
+            declared_policy = profile.get("scheduler_policy", "bfs" if "search" in profile else None)
+            if declared_policy is not None and scheduler_policy != declared_policy:
+                raise ValueError("--scheduler-policy differs from profile scheduler_policy/search")
             warmup = profile.get("budget", {}).get("warmup_inputs", 10)
             if type(warmup) is not int or warmup < 0:
                 raise ValueError("profile budget.warmup_inputs must be a nonnegative integer")
@@ -81,6 +86,11 @@ def main(argv=None):
                 corpus = corpus_from_profile(profile, cycle_id=cycle_id)
                 feedback = FeedbackLog()
                 policy_options = {} if scheduler_policy is None else {"policy": scheduler_policy}
+                if scheduler_policy == "bfs":
+                    from r2f.campaign.search_frontier import search_settings
+                    policy_options.update(search=search_settings(profile.get("search")),
+                                          sampling_kinds=profile.get("sampling_kinds"),
+                                          sampling_weight=profile.get("sampling_weight"))
                 scheduler = ExploratoryScheduler(corpus, feedback,
                     rng_seed=args["seed"] if args["seed"] is not None else 0, warmup=warmup,
                     **policy_options)
@@ -95,10 +105,13 @@ def main(argv=None):
             runtime=runtime, continuation=continuation, checkpoint_hook=checkpoint_hook,
             run_id=args["run_id"], max_inputs=args["max_inputs"], domain_id=args["domain_id"],
             runtime_boundary=runtime_boundary)
-        print(json.dumps({"run_id": result["run_id"], "cycle_path": str(Path(args["output_dir"]).resolve() / "cycle.json"),
-                          "execution_stage": result["rows"][0].get("execution_stage") if result["rows"] else None,
-                          "runtime_boundary": result.get("runtime_boundary", runtime_boundary),
-                          "runtime_formal": result.get("runtime_formal", False)}, indent=2))
+        output = {"run_id": result["run_id"], "cycle_path": str(Path(args["output_dir"]).resolve() / "cycle.json"),
+                  "execution_stage": result["rows"][0].get("execution_stage") if result["rows"] else None,
+                  "runtime_boundary": result.get("runtime_boundary", runtime_boundary),
+                  "runtime_formal": result.get("runtime_formal", False)}
+        if "search_summary" in result:
+            output["search_summary"] = result["search_summary"]
+        print(json.dumps(output, indent=2))
         return 0 if not args["execute"] or any(r.get("actual_run") for r in result["rows"]) else 1
     args.pop("max_inputs")
     args["seed"] = args["seed"] if args["seed"] is not None else 0

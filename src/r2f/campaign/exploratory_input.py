@@ -39,11 +39,37 @@ PROFILE_METADATA_FIELDS = frozenset({
     'declared_seed_specs_union', 'pending_seed_ids', 'pending_surfaces',
     'sampling_kinds', 'sampling_weight', 'chain_length',
     'activation', 'cycle_id', 'runner_slice', 'mutator_whitelist',
+    'search', 'scheduler_policy',
 })
+
+
+def validate_search_profile(profile):
+    """Search declarations are input metadata, never runtime/evidence knobs.
+
+    Only declared-route F1 input BFS is currently implemented. Omitted search
+    and policy fields preserve the legacy path and add no profile defaults.
+    """
+    policy = profile.get('scheduler_policy')
+    if 'scheduler_policy' in profile and policy not in ('feedback', 'fair', 'bfs'):
+        raise ValueError('unsupported profile scheduler_policy')
+    if 'search' not in profile:
+        if policy == 'bfs':
+            raise ValueError('bfs profile requires explicit search settings')
+        return
+    if policy not in (None, 'bfs'):
+        raise ValueError('input_search_bfs search requires bfs scheduler policy')
+    from .search_frontier import search_settings
+    from .mutation_routes import routes_enabled
+    search_settings(profile['search'])
+    if not routes_enabled(profile):
+        raise ValueError('input_search_bfs currently requires declared F1 mutation routes')
+    if not isinstance(profile.get('sampling_kinds'), list) or not profile['sampling_kinds']:
+        raise ValueError('input_search_bfs requires explicit sampling_kinds')
 
 
 def validate_profile_fields(profile):
     """Reject misspellings/unsupported runtime knobs, rather than ignore them."""
+    validate_search_profile(profile)
     from r2f.modules.s1.topology_targets import TOPOLOGY_CAPABILITY, TOPOLOGY_TARGET
     if profile.get('runtime_capability') == TOPOLOGY_CAPABILITY or (
             isinstance(profile.get('target_ids'), list) and TOPOLOGY_TARGET in profile['target_ids']):
@@ -254,6 +280,7 @@ TOPOLOGY_SOURCE_SCHEMA = 'r2f.s1-seed-corpus/v2'
 
 def validate_topology_profile(profile):
     """Validate the dedicated topology declaration, not permission to execute."""
+    validate_search_profile(profile)
     from r2f.modules.s1.topology_targets import (
         TOPOLOGY_CAPABILITY, TOPOLOGY_TARGET, TOPOLOGY_SURFACE, TOPOLOGY_MUTATOR)
     from r2f.modules.s1 import fuzz_mutators_v2

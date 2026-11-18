@@ -6,10 +6,62 @@ All validation here is static: runtime guards, effect, source/lock qualification
 and candidate admission remain the existing runner's responsibility.
 """
 from copy import deepcopy
+from contextlib import contextmanager
+from contextvars import ContextVar
+from types import MappingProxyType
+from typing import NamedTuple
 import re
 
 ROUTES_SCHEMA = "r2f.mutation-routes/v1"
 ROUTE_KEYS = ("surface_id", "boundary_class", "mutator_id")
+
+
+class _RouteSurface(NamedTuple):
+    executable: bool
+    boundary_classes: frozenset
+    mutator_ids: frozenset
+
+
+class _RouteTarget(NamedTuple):
+    target_id: str
+    revision: int
+    contract_hash: str | None
+    surfaces: object
+
+
+# Only immutable projections live here, never caller-supplied models or hashes.
+_ROUTE_SCOPE_EMPTY = object()
+_ROUTE_VALIDATION_TARGETS = ContextVar("r2f_route_validation_targets", default=None)
+
+
+def _authoritative_route_targets():
+    from r2f.modules.s1.targets import exploratory_target_declarations
+    result = {}
+    for key, target in exploratory_target_declarations().items():
+        contract = target.exploration_contract
+        surfaces = {} if contract is None else {
+            key: _RouteSurface(surface.executable, frozenset(surface.boundary_classes),
+                               frozenset(surface.mutator_ids))
+            for key, surface in contract.surface_by_id.items()
+        }
+        result[key] = _RouteTarget(target.target_id, target.target_revision,
+                                  None if contract is None else contract.contract_hash(),
+                                  MappingProxyType(surfaces))
+    return MappingProxyType(result)
+
+
+@contextmanager
+def _route_validation_scope():
+    """At most one fresh lazy snapshot per validation, including nested calls.
+
+    Yield no writable model or directory. The token restores a parent scope on
+    success or failure; separate thread/task contexts cannot overwrite it.
+    """
+    token = _ROUTE_VALIDATION_TARGETS.set(_ROUTE_SCOPE_EMPTY)
+    try:
+        yield
+    finally:
+        _ROUTE_VALIDATION_TARGETS.reset(token)
 
 
 def routes_enabled(profile):
@@ -125,22 +177,26 @@ def validate_route_entry(entry, *, contract=None, profile=None):
         raise ValueError("unsupported or missing mutation_routes_schema")
     routes = normalize_routes(entry.get("mutation_routes"))
     origins = route_origins(entry, routes)
-    from r2f.modules.s1.targets import exploratory_target_declarations
     from r2f.core.mutators import MUTATORS
     from .runner import _F1_CYCLE_TARGETS
-    target = exploratory_target_declarations().get(entry.get("target_id"))
+    targets = _ROUTE_VALIDATION_TARGETS.get()
+    if targets is None or targets is _ROUTE_SCOPE_EMPTY:
+        scoped = targets is _ROUTE_SCOPE_EMPTY
+        targets = _authoritative_route_targets()
+        if scoped:
+            _ROUTE_VALIDATION_TARGETS.set(targets)
+    target = targets.get(entry.get("target_id"))
     if target is None or target.target_id not in _F1_CYCLE_TARGETS:
         raise ValueError("mutation route target has no F1 runtime capability")
-    current = target.exploration_contract
-    if (current is None or type(entry.get("target_revision")) is not int
-            or entry["target_revision"] != target.target_revision
-            or entry.get("contract_hash") != current.contract_hash()
-            or contract is not None and contract.contract_hash() != current.contract_hash()):
+    if (target.contract_hash is None or type(entry.get("target_revision")) is not int
+            or entry["target_revision"] != target.revision
+            or entry.get("contract_hash") != target.contract_hash
+            or contract is not None and contract.contract_hash() != target.contract_hash):
         raise ValueError("mutation route target revision/contract mismatch")
     if entry.get("runtime_capability") is not None:
         raise ValueError("mutation route runtime capability mismatch")
     for route in routes:
-        surface = current.surface_by_id.get(route["surface_id"])
+        surface = target.surfaces.get(route["surface_id"])
         if surface is None:
             raise ValueError("mutation route surface not in target contract: " + route["surface_id"])
         if not surface.executable:

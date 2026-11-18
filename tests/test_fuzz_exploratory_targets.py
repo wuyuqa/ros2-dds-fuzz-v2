@@ -55,12 +55,15 @@ def _profile(target_id, surfaces):
     }
 
 
-def _corpus(target_id, surface_id, *, boundary=None, mutator_id=None, seed_id=None):
+def _corpus(target_id, surface_id, *, boundary=None, mutator_id=None, seed_id=None,
+            config_overrides=None):
     """Corpus holding exactly one authored seed template for one surface."""
     seed_id = seed_id or surface_id
     seed = fuzz_catalog.load_seeds()["seeds"][seed_id]
     contract = _contract(target_id)
     surface = contract.surface_by_id[surface_id]
+    config = json.loads(json.dumps(seed["logical_config"]))
+    config.update(config_overrides or {})
     corpus = Corpus()
     corpus.add_seed({
         "target_id": target_id,
@@ -72,7 +75,7 @@ def _corpus(target_id, surface_id, *, boundary=None, mutator_id=None, seed_id=No
         "seed_id": seed_id,
         "executable": True,
         "mutator_id": mutator_id or surface.mutator_ids[0],
-        "final_config": json.loads(json.dumps(seed["logical_config"])),
+        "final_config": config,
     })
     return corpus
 
@@ -318,6 +321,9 @@ class RecoveryPlannedGeneration(unittest.TestCase):
             self.assertIn("surface_not_in_contract", result["rejected"][0]["reason_code"])
             self.assertIs(result["rejected"][0]["actual_run"], False)
             self.assertIsNone(result["rejected"][0]["mutation_plan"])
+        self.assertFalse(list(cycle.root.rglob("capsule.json")))
+        self.assertEqual(result["budget"]["generated"], 0)
+        self.assertEqual(result["budget"]["actual"], 0)
 
 
 class UnknownAndLatePaths(unittest.TestCase):
@@ -325,6 +331,9 @@ class UnknownAndLatePaths(unittest.TestCase):
         cycle = _Cycle(self, LATE, "P01")
         entry = dict(next(iter(cycle.corpus.entries.values())))
         entry["target_id"] = "discovery.not_a_target.fuzz_v1"
+        # Rebuild identity for the deliberately unknown target. A stale known-
+        # target digest is a separate corpus-integrity error, not a route test.
+        entry.pop("content_sha256")
         cycle.corpus.entries.clear()
         cycle.corpus.add_seed(entry)
         result = cycle.run(name="unknown")
@@ -335,6 +344,35 @@ class UnknownAndLatePaths(unittest.TestCase):
         self.assertEqual(result["rejected"][0]["reason_code"],
                          "target_not_in_exploratory_catalog")
         self.assertIsNone(result["rejected"][0]["mutation_plan"])
+        self.assertFalse(list(cycle.root.rglob("capsule.json")))
+        self.assertEqual(result["budget"]["generated"], 0)
+        self.assertEqual(result["budget"]["actual"], 0)
+
+    def test_unknown_target_with_stale_content_hash_fails_closed(self):
+        corpus = _corpus(LATE, "P01")
+        entry = dict(next(iter(corpus.entries.values())))
+        entry["target_id"] = "discovery.not_a_target.fuzz_v1"
+        with self.assertRaisesRegex(ValueError, "corpus content hash mismatch"):
+            Corpus().add_seed(entry)
+
+    def test_original_late_join_noop_never_executes_or_prepares_capsule(self):
+        # Keep the original default W02/M03+seed7 sample: local sampling may
+        # select the authored value, which is a rejection, not a valid route hit.
+        cycle = _Cycle(self, LATE_JOIN, "W02")
+        runtime = mock.Mock(side_effect=AssertionError("no-op cannot run"))
+        result = cycle.run(name="late-join-noop", execute=True, runtime=runtime)
+        runtime.assert_not_called()
+        self.assertEqual(result["rejected"], result["rows"])
+        self.assertEqual(len(result["rows"]), 1)
+        row = result["rows"][0]
+        self.assertEqual(row["reason_code"], "no_effective_input")
+        self.assertEqual(row["binding"]["status"], "not_executed")
+        self.assertFalse(row["actual_run"])
+        self.assertFalse(row["candidate_eligible"])
+        self.assertEqual(cycle.feedback.events, [])
+        self.assertFalse(list(cycle.root.rglob("capsule.json")))
+        for key in ("generated", "unique_inputs", "attempted", "actual", "unique_actual"):
+            self.assertEqual(result["budget"][key], 0, key)
 
     def test_match_compatibility_is_not_routed(self):
         entry_contract = _contract(COMPAT)
@@ -355,7 +393,8 @@ class UnknownAndLatePaths(unittest.TestCase):
         self.assertNotIn("environment_windows", config)
 
     def test_late_join_path_is_unchanged(self):
-        cycle = _Cycle(self, LATE_JOIN, "W02")
+        cycle = _Cycle(self, LATE_JOIN, "W02", boundary="finite", mutator_id="M03",
+                       config_overrides={"publish_interval_sec": 0.0305})
         result = cycle.run(name="late-join")
         self.assertEqual(result["rejected"], [])
         row = result["rows"][0]
@@ -364,6 +403,7 @@ class UnknownAndLatePaths(unittest.TestCase):
         config = cycle.config(row)
         self.assertEqual(config["runtime_route"]["backend"], "endpoint_pair")
         self.assertIn("publish_interval_sec", config["submitted_parameters"])
+        self.assertNotEqual(config["submitted_parameters"]["publish_interval_sec"], 0.0305)
 
 
 if __name__ == "__main__":

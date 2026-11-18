@@ -651,6 +651,7 @@ class MutationPlan:
         return chain
 
     def validate(self, contract=None):
+        _validate_runtime_windows(self.runtime_windows)
         op_ids = [op.op_id for op in self.operations]
         if len(op_ids) != len(set(op_ids)):
             raise ValueError("duplicate operation op_id")
@@ -783,6 +784,47 @@ def _validate_multiwindow_input(plan):
             raise ValueError(f"multi-window runtime_windows/environment_windows differ at window {index}")
 
 
+def is_unwindowed_compile_time_noop(operation, *, runtime_windows=()):
+    """Input-only classification, never a claim about a carrier's raw hit.
+
+    Equal config hashes cannot disprove a runtime action.  Only unwindowed
+    compile-time layers are inferred to be no-ops; explicit overrides remain
+    separate provenance rather than independently effective layers.
+    """
+    windows = _validate_runtime_windows(runtime_windows) if runtime_windows else []
+    return (not windows and operation.application_phase == "compile_time"
+            and operation.applicability_status != "overridden"
+            and (operation.applicability_status == "no_op"
+                 or operation.input_before_sha256 == operation.input_after_sha256))
+
+
+def mutation_plan_noop_reason(plan):
+    """Return an admission failure for provably ineffective input generation.
+
+    Call after structural validation.  Descriptive no-op plans remain valid
+    MutationPlan objects, but cannot be admitted as live mutated inputs.
+    Active no-op layers invalidate the whole live chain: a useful sibling
+    cannot make them independent mutations.  Overrides remain audit-only.
+    Runtime windows and non-compile-time actions still need their receipt gates;
+    their presence here is not proof of application, hit, or semantic effect.
+    """
+    windows = _validate_runtime_windows(plan.runtime_windows)
+    for op in plan.operations:
+        if (op.applicability_status == "no_op"
+                or is_unwindowed_compile_time_noop(op, runtime_windows=windows)):
+            return "active no_op layer has no effective input change: " + op.op_id
+    effective = [op for op in plan.operations
+                 if op.applicability_status not in {"no_op", "overridden"}
+                 and not is_unwindowed_compile_time_noop(op, runtime_windows=windows)]
+    if not effective and not windows:
+        return "mutation plan has no effective input change (no_op/overridden layers only)"
+    if (not windows
+            and all(op.application_phase == "compile_time" for op in plan.operations)
+            and canonical_hash(plan.final_config) == plan.parent_content_sha256):
+        return "unwindowed compile_time mutation plan has no net input change"
+    return None
+
+
 def validate_plan(plan, capabilities=None, contract=None):
     """Validate syntax, contract references, and declared runtime capabilities.
 
@@ -862,6 +904,10 @@ def validate_plan(plan, capabilities=None, contract=None):
             _validate_multiwindow_input(plan)
         except ValueError as exc:
             return ValidationResult("invalid", [str(exc)], plan.plan_hash(), plan.content_hash())
+
+    noop_reason = mutation_plan_noop_reason(plan)
+    if noop_reason is not None:
+        return ValidationResult("invalid", [noop_reason], plan.plan_hash(), plan.content_hash())
 
     if any(operation.applicability_status == "needs_observation" for operation in plan.operations):
         return ValidationResult("needs_observation", ["plan requires runtime observation"],
@@ -1149,6 +1195,12 @@ def compose(parent, proposals, contract, *, rng_seed=0, rng_algorithm=RNG_ALGORI
             input_after_sha256=canonical_hash(after), application_phase=proposal.application_phase,
             applicability_result=status,
         )
+        if (operation.applicability_status in {"applicable", "needs_observation"}
+                and is_unwindowed_compile_time_noop(
+                    operation, runtime_windows=windows)):
+            operation.applicability_result = dict(
+                operation.applicability_result, status="no_op",
+                reason="unwindowed_compile_time_input_unchanged")
         operations.append(operation)
         current = after
 

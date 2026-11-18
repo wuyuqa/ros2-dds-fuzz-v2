@@ -25,7 +25,7 @@ def profile(name="endpoint-chains"):
 
 
 class EndpointChainProfile(unittest.TestCase):
-    def planned_case(self, doc, cycle_id, rmw, rng_seed=3):
+    def planned_case(self, doc, cycle_id, rmw, rng_seed=3, *, rejected=False):
         doc = deepcopy(doc)
         doc["rmws"] = [rmw]
         corpus = corpus_from_profile(doc, cycle_id=cycle_id)
@@ -51,6 +51,25 @@ class EndpointChainProfile(unittest.TestCase):
                     max_inputs=1, execute=False, runtime=runtime)
             self.assertEqual(len(report["rows"]), 1)
             row = report["rows"][0]
+            if rejected:
+                self.assertEqual(report["rejected"], [row])
+                self.assertEqual(row["reason_code"], "no_effective_input")
+                self.assertEqual(row["binding"]["status"], "not_executed")
+                self.assertFalse(row["actual_run"])
+                self.assertFalse(row["candidate_eligible"])
+                self.assertFalse(row["feedback_eligible"])
+                for key in ("generated", "unique_inputs", "attempted", "actual", "unique_actual"):
+                    self.assertEqual(report["budget"][key], 0, key)
+                self.assertEqual(feedback.events, [])
+                case_dir = Path(tmp) / "out" / "cases" / row["cell_id"]
+                self.assertEqual(json.loads((case_dir / "mutation_plan.json").read_text()),
+                                 row["mutation_plan"])
+                self.assertFalse(list((Path(tmp) / "out").rglob("capsule.json")))
+                self.assertNotIn("replay_path", row)
+                self.assertNotIn("runtime_config_path", row)
+                runtime.assert_not_called()
+                return row, proposals
+            self.assertEqual(report["rejected"], [])
             saved_plan = json.loads((Path(row["replay_path"]).parent / "mutation_plan.json").read_text())
             config = json.loads(Path(row["runtime_config_path"]).read_text())
         runtime.assert_not_called()
@@ -110,15 +129,19 @@ class EndpointChainProfile(unittest.TestCase):
 
     def test_named_finite_layer_is_not_counted_as_a_real_content_change(self):
         # This deliberately reintroduces the old no-op recipe in memory.  The
-        # runner may represent it, but our two-real-layer evidence check must
-        # reject it instead of changing M01's legacy semantics to make it pass.
+        # runner must reject the entire chain before capsule preparation, not
+        # count its changing second layer as permission for a no-op first layer.
         doc = profile()
         for specs in (doc["seed_specs"], doc["declared_seed_specs_union"],
                       doc["cycles"][0]["seed_specs"]):
             specs[0]["boundary_class"] = "finite"
-        row, proposals = self.planned_case(doc, "late-endpoint-chain", doc["rmws"][0])
-        self.assertEqual(row["chain_depth"], 2)
+        row, proposals = self.planned_case(doc, "late-endpoint-chain", doc["rmws"][0],
+                                           rejected=True)
+        self.assertEqual(len(row["mutation_plan"]["operations"]), 2)
+        self.assertEqual(row["mutation_plan"]["operations"][0]["applicability_result"]["status"],
+                         "no_op")
         self.assertEqual(proposals[0]["input_before"], proposals[0]["input_after"])
+        self.assertNotEqual(proposals[1]["input_before"], proposals[1]["input_after"])
         with self.assertRaises(AssertionError):
             self.assert_real_two_layers(row, proposals, ["P01", "W02"])
 

@@ -209,6 +209,19 @@ def validate_execution(record, *, verify_raw_evidence=True):
     mutation = MutationReceipt.from_record(record)
     if record["arm"] in {"baseline", "transparent", "negative"} and (mutation.hit or mutation.applied):
         raise ValueError("baseline/transparent/negative cannot claim mutation applied/hit")
+    # A receipt cannot turn ineffective compile-time input generation into an
+    # applied mutation.  This is an admission rule, not a reinterpretation of
+    # historical carrier raw evidence.  Neutral/fault controls are unchanged.
+    if (record["arm"] == "mutated" and record.get("mutation_plan") is not None
+            and (mutation.applied or mutation.hit or mutation.effect_observed
+                 or stage in {ExecutionStage.MUTATION_APPLIED,
+                              ExecutionStage.EFFECT_OBSERVED, ExecutionStage.JUDGED})):
+        from .mutation_plan import MutationPlan, mutation_plan_noop_reason
+        plan = MutationPlan.from_dict(record["mutation_plan"])
+        plan.validate()
+        noop_reason = mutation_plan_noop_reason(plan)
+        if noop_reason is not None:
+            raise ValueError("mutated execution requires effective input generation: " + noop_reason)
     if stage == ExecutionStage.ABORTED:
         nonempty(record.get("abort_reason"), "abort_reason")
         return True

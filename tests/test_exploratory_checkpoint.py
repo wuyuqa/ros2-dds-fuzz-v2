@@ -20,9 +20,29 @@ SOURCE = {"source_repo": "/offline-fixture-only", "head": "fixture-head",
 CYCLE = "late-endpoint-parameter"
 
 
-def profile():
+def legacy_noop_profile():
     doc = json.loads((REPO / "config/s1_fuzz/profiles/parameter.json").read_text())
     doc["budget"] = {"max_inputs": 6, "warmup_inputs": 2}
+    return doc
+
+
+def profile():
+    """Finite parents plus an explicit range route, not M01's identity witness.
+
+    M01(finite) deliberately preserves a positive finite parent. Checkpoint
+    tests need a real input change before the planned/submission hooks exist.
+    M03 samples a bounded, quantized neighbourhood; seed 17 below is replayed
+    unchanged on resume, so the original deterministic assertions still apply.
+    """
+    doc = legacy_noop_profile()
+    cycle = next(c for c in doc["cycles"] if c["cycle_id"] == CYCLE)
+    doc["cycles"] = [cycle]
+    doc["target_ids"] = [cycle["target_id"]]
+    doc["surfaces"] = cycle["surfaces"]
+    doc["composition"] = {"mutation_routes_schema": "r2f.mutation-routes/v1"}
+    for spec in cycle["seed_specs"]:
+        spec["mutation_routes"] = [{"surface_id": "P01",
+                                    "boundary_class": "finite", "mutator_id": "M03"}]
     return doc
 
 
@@ -59,8 +79,37 @@ def rehash_checkpoint(data):
 
 
 def projection(result):
-    return [(r["parent_content_sha256"], r["content_sha256"], r["final_input"], r["mutation_plan"])
-            for r in result["rows"]]
+    """Compare every selected task, including terminal no-change audits."""
+    rows = []
+    for row in result["rows"]:
+        plan = row["mutation_plan"]
+        common = {"parent_content_sha256": row["parent_content_sha256"],
+                  "content_sha256": row["content_sha256"], "mutation_plan": plan,
+                  "final_config": plan["final_config"]}
+        if row.get("generation_status") == "rejected":
+            assert row["reason_code"] == "no_effective_input"
+            assert row["actual_run"] is False
+            assert row["candidate_eligible"] is row["feedback_eligible"] is False
+            assert row["execution_stage"] == "planned"
+            assert canonical_hash(plan["final_config"]) == plan["parent_content_sha256"]
+            assert row["no_effective_input_reason"]
+            case = Path(result["manifest_path"]).parent / "cases" / row["cell_id"]
+            assert not (case / "capsule.json").exists()
+            assert not (case / "runtime.json").exists()
+            assert not list(case.glob("submission*.json"))
+            for field in ("raw_path", "raw_sha256", "capsule_execution", "execution_metadata"):
+                assert row.get(field) is None
+            common.update(kind="rejected", generation_status=row["generation_status"],
+                          reason_code=row["reason_code"],
+                          no_effective_input_reason=row["no_effective_input_reason"],
+                          execution_stage=row["execution_stage"], actual_run=row["actual_run"])
+        else:
+            # Missing fields on a generated row are errors, not optional values.
+            common.update(kind="generated", final_input=row["final_input"],
+                          effective_input_sha256=row["effective_input_sha256"])
+            assert len(common["effective_input_sha256"]) == 64
+        rows.append(common)
+    return rows
 
 
 def test_corpus_restore_keeps_records_pins_lineage_and_history(tmp_path):
@@ -121,6 +170,10 @@ def test_split_resume_matches_continuous_input_plan_and_warmup(tmp_path):
     assert projection(whole) == projection(first) + projection(second)
     assert second["selection_log"] == whole["selection_log"]
     assert second["budget"]["selected"] == 6
+    assert whole["budget"]["generated"] == whole["budget"]["planned"] == 6
+    assert whole["rejected"] == []
+    assert all(canonical_hash(row["mutation_plan"]["final_config"]) !=
+               row["mutation_plan"]["parent_content_sha256"] for row in whole["rows"])
     assert second["budget"]["executed"] == 0
     assert second["feedback"]["events"] == []
     assert [s["phase"] for s in second["selection_log"]["selections"]] == ["warmup"] * 2 + ["exploratory"] * 4
@@ -286,6 +339,13 @@ def test_ingested_fixture_feedback_changes_next_pool_and_split_resume(tmp_path):
     from test_feedback_epoch_runner import adapter_runtime
     doc = profile()
     doc["budget"].update(max_inputs=5, warmup_inputs=0)
+    # One zero replacement covers its authored class; subsequent M03-derived
+    # children and the zero child's legitimate no-op revisits are BOTH audited.
+    for spec in doc["cycles"][0]["seed_specs"]:
+        if spec["variant_id"] == "P01-quantized-020":
+            spec["boundary_class"] = "zero"
+            spec["mutation_routes"] = [{"surface_id": "P01", "boundary_class": "zero",
+                                        "mutator_id": "M01"}]
 
     def runtime(config, output):
         return adapter_runtime(config, output)
@@ -295,11 +355,17 @@ def test_ingested_fixture_feedback_changes_next_pool_and_split_resume(tmp_path):
     restored = restore(tmp_path / "first", tmp_path / "second", doc)
     second = run_cycle(tmp_path / "second", doc, restored, runtime=runtime)
     assert projection(whole) == projection(first) + projection(second)
-    assert second["budget"]["actual"] == second["budget"]["attempted"] == 5
+    assert len(whole["rows"]) == second["budget"]["selected"] == 5
+    assert whole["budget"]["generated"] == second["budget"]["generated"] == 3
+    assert whole["budget"]["actual"] == whole["budget"]["attempted"] == 3
+    assert second["budget"]["actual"] == second["budget"]["attempted"] == 3
+    assert [r.get("generation_status") == "rejected" for r in whole["rows"]] == [False] * 3 + [True] * 2
+    executed = [r for r in whole["rows"] if r["actual_run"] is True]
+    assert len(executed) == len(whole["feedback"]["events"]) == 3
     assert all(e["coverage"] and e["edge_id"] and e["edge_provenance"] for e in whole["feedback"]["events"])
-    assert any(r["corpus_offer"]["admitted"] for r in whole["rows"])
+    assert any(r["corpus_offer"]["admitted"] for r in executed)
     assert whole["corpus"]["entry_count"] > len(fresh(doc)["corpus"].entries)
-    assert all(r["evidence_origin"] == "offline_fixture" for r in whole["rows"])
+    assert all(r["evidence_origin"] == "offline_fixture" for r in executed)
     assert all(r.get("candidate_status") in (None, "not_candidate") for r in whole["rows"])
     selections = whole["selection_log"]["selections"]
     # Coverage from an ingested raw fixture excludes at least one authored
@@ -307,9 +373,9 @@ def test_ingested_fixture_feedback_changes_next_pool_and_split_resume(tmp_path):
     assert selections[1]["used_pool"] == "uncovered"
     assert selections[1]["candidate_count"] < selections[0]["candidate_count"]
     contexts = whole["selection_log"]["selection_contexts"]
-    assert [c["feedback_event_count"] for c in contexts] == list(range(5))
+    assert [c["feedback_event_count"] for c in contexts] == [0, 1, 2, 3, 3]
     assert [c["feedback_events_sha256"] for c in contexts] == [
-        canonical_hash(whole["feedback"]["events"][:n]) for n in range(5)]
+        canonical_hash(whole["feedback"]["events"][:n]) for n in [0, 1, 2, 3, 3]]
     assert second.get("seal") is not True  # offline plumbing is not qualification
 
 
@@ -333,7 +399,11 @@ def test_checkpoint_rehashed_budget_cannot_invent_execution_or_unique_inputs(tmp
 
 def test_self_consistent_rehashed_seed_cannot_replace_profile_input(tmp_path):
     from r2f.campaign.corpus import corpus_identity
-    doc = profile()
+    doc = legacy_noop_profile()
+    # Use a changing non-route boundary case here: the attack is specifically
+    # against the fixed-seed gate, not the route-origin binding gate.
+    for spec in next(c for c in doc["cycles"] if c["cycle_id"] == CYCLE)["seed_specs"]:
+        spec["boundary_class"] = "zero"
     run_cycle(tmp_path / "old", doc, maximum=1)
     path = tmp_path / "old/checkpoint.json"
     data = json.loads(path.read_text())
@@ -378,3 +448,92 @@ def test_checkpoint_rehash_cannot_validate_invalid_feedback_edge(tmp_path, damag
     path.write_text(json.dumps(data))
     with pytest.raises(ValueError, match="feedback"):
         restore(path, tmp_path / "new", doc)
+
+
+@pytest.mark.parametrize("execute", [False, True])
+def test_legacy_finite_noop_stays_rejected_before_capsule_and_submission(tmp_path, execute):
+    doc = legacy_noop_profile()
+    calls, phases = [], []
+
+    def forbidden(config, output):
+        calls.append(config)
+        raise AssertionError("no-op must never submit the offline adapter")
+
+    def record(hook):
+        def wrapped(payload):
+            phases.append(payload["phase"])
+            hook(payload)
+        return wrapped
+
+    out = tmp_path / "noop"
+    result = run_cycle(out, doc, maximum=1, runtime=forbidden if execute else None,
+                       hook_wrapper=record)
+    assert calls == []
+    assert "planned" not in phases and "submitted" not in phases
+    assert result["budget"]["selected"] == len(result["rejected"]) == 1
+    for key in ("generated", "attempted", "actual", "executed", "unique_actual"):
+        assert result["budget"][key] == 0
+    assert result["feedback"]["events"] == []
+    assert len(result["rows"]) == 1
+    row = result["rows"][0]
+    assert row["reason_code"] == "no_effective_input"
+    assert row["candidate_eligible"] is row["feedback_eligible"] is False
+    assert row.get("actual_run") is not True
+    assert canonical_hash(row["mutation_plan"]["final_config"]) == row["mutation_plan"]["parent_content_sha256"]
+    assert not list(out.rglob("capsule.json"))
+    assert not list(out.rglob("runtime.json"))
+    assert not list(out.rglob("submission*.json"))
+    checkpoint = json.loads((out / "checkpoint.json").read_text())
+    assert checkpoint["state"]["continuation"]["pending_attempt"] is None
+
+
+def test_rejected_prefix_then_planned_interrupt_resumes_exactly(tmp_path):
+    """Do not hide rejected-selection checkpoint accounting behind all-valid seeds."""
+    doc = profile()
+    # The same finite parents/order as the old fixture. Only the last authored
+    # parent gets a changing route; the first selected finite witness is no-op.
+    for spec in doc["cycles"][0]["seed_specs"][:-1]:
+        spec["mutation_routes"][0]["mutator_id"] = "M01"
+    phases = []
+
+    class Interrupted(BaseException):
+        pass
+
+    def interrupt(hook):
+        def wrapped(payload):
+            hook(payload)
+            phases.append(payload["phase"])
+            if payload["phase"] == "planned":
+                raise Interrupted()
+        return wrapped
+
+    whole = run_cycle(tmp_path / "whole", doc)
+    with pytest.raises(Interrupted):
+        run_cycle(tmp_path / "old", doc, hook_wrapper=interrupt)
+    checkpoint = json.loads((tmp_path / "old/checkpoint.json").read_text())
+    pending = checkpoint["state"]["continuation"]
+    assert "recorded" in phases[:phases.index("planned")]
+    assert pending["pending_selection"]["sequence"] > 0
+    assert pending["budget"]["generated"] == 1
+    assert pending["budget"]["planned"] == pending["budget"]["selected"]
+    assert pending["budget"]["attempted"] == pending["budget"]["executed"] == 0
+    assert pending["pending_selection"]["sequence"] == pending["budget"]["selected"] - 1
+    assert pending["pending_attempt"] is not None
+    before = {str(p.relative_to(tmp_path / "old")): p.read_bytes()
+              for p in (tmp_path / "old").rglob("*") if p.is_file()}
+    state = restore(tmp_path / "old", tmp_path / "resumed", doc)
+    resumed = run_cycle(tmp_path / "resumed", doc, state)
+    prefix = whole["rows"][:pending["pending_selection"]["sequence"]]
+    assert prefix and all(r["reason_code"] == "no_effective_input" for r in prefix)
+
+    def identity(row):
+        return (row.get("reason_code"), row["content_sha256"],
+                row.get("effective_input_sha256"), row["mutation_plan"])
+
+    assert [identity(r) for r in prefix + resumed["rows"]] == [identity(r) for r in whole["rows"]]
+    assert resumed["selection_log"] == whole["selection_log"]
+    assert resumed["budget"]["selected"] == whole["budget"]["selected"] == 6
+    for key in ("generated", "planned", "attempted", "actual", "executed", "unique_inputs"):
+        assert resumed["budget"][key] == whole["budget"][key]
+    assert before == {str(p.relative_to(tmp_path / "old")): p.read_bytes()
+                      for p in (tmp_path / "old").rglob("*") if p.is_file()}

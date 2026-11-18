@@ -33,7 +33,7 @@ def entry(index, *, seed_id=None, boundary=None, relation=None, edge=None, targe
 class FuzzCorpusContracts(unittest.TestCase):
     def test_profiles_explicit_exploratory_disabled_and_not_required_catalog(self):
         expected = {"parameter", "environment", "composed", "f2-windows",
-                    "endpoint-chains", "topology-chains", "common-baseline-routes"}
+                    "endpoint-chains", "topology-chains", "common-baseline-routes", "model-bfs-routes"}
         f2_target = "discovery.interruption_recovery.fuzz_windows_v1"
         f2_mutators = {"E02": ["M07"], "E03": ["M06"]}
         seen = set()
@@ -256,3 +256,37 @@ class FuzzCorpusContracts(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ModelBfsProfileContracts(unittest.TestCase):
+    def test_bfs_profile_has_explicit_finite_input_search_configuration(self):
+        data = json.loads((REPO / "config/s1_fuzz/profiles/model-bfs-routes.json").read_text())
+        validate_profile_fields(data)
+        self.assertEqual(data["scheduler_policy"], "bfs")
+        self.assertEqual(data["search"]["mode"], "input_search_bfs")
+        for key in ("max_depth", "max_nodes", "max_tasks", "samples_per_class"):
+            self.assertIs(type(data["search"][key]), int)
+            self.assertGreater(data["search"][key], 0)
+        self.assertNotIn("runtime_capability", data)
+        self.assertEqual(data["target_ids"], ["discovery.late_endpoint.fuzz_v1"])
+
+    def test_bfs_profile_rejects_strategy_mismatch_unknown_schema_and_unbounded_search(self):
+        base = json.loads((REPO / "config/s1_fuzz/profiles/model-bfs-routes.json").read_text())
+        variants = []
+        for policy in ("fair", "feedback", "unknown"):
+            value = deepcopy(base)
+            value["scheduler_policy"] = policy
+            variants.append(value)
+        value = deepcopy(base)
+        value["search"]["schema"] = "future"
+        variants.append(value)
+        for key in ("max_depth", "max_nodes", "max_tasks", "samples_per_class"):
+            value = deepcopy(base)
+            value["search"][key] = None
+            variants.append(value)
+        value = deepcopy(base)
+        del value["search"]
+        variants.append(value)
+        for value in variants:
+            with self.assertRaises(ValueError):
+                validate_profile_fields(value)
