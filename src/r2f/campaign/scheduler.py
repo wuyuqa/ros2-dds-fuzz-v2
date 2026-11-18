@@ -17,6 +17,7 @@ from copy import deepcopy
 from r2f.core.evidence import canonical_hash
 from r2f.modules.s1.targets import RMWS, EXECUTION_ORDER
 from .corpus import Corpus, content_sha256
+from .mutation_routes import has_routes, route_view, validate_route_entry
 from .feedback import FeedbackLog, edge_id, feedback_identity, surface_class
 
 
@@ -212,7 +213,12 @@ class ExploratoryScheduler:
         if surface is None or not isinstance(parent, dict):
             return []
         try:
-            return _wide_kinds(surface, parent)
+            kinds = _wide_kinds(surface, parent)
+            if has_routes(entry):
+                allowed = {"M01": {"boundary"}, "M02": {"representative"},
+                           "M03": {"representative", "log_uniform", "linear_uniform", "neighbor", "jump"}}
+                kinds = [kind for kind in kinds if kind in allowed.get(entry.get("mutator_id"), set())]
+            return kinds
         except (TypeError, ValueError):
             return []
 
@@ -353,6 +359,29 @@ class ExploratoryScheduler:
                         "eligible": candidates, "used_counts": used,
                         "weights": {kind: self.sampling_weight[kind] for kind in positive}}
 
+    def _select_route(self, entry, sequence):
+        """Baseline first; equal route shares using selection history only.
+
+        No duplicate corpus rows, feedback-derived entropy, or execution claims.
+        A newly unioned route starts at zero without rewriting past contexts.
+        """
+        routes = validate_route_entry(entry)
+        if routes is None:
+            return entry, None
+        counts = [{"route": route, "count": sum(
+            event.get("content_sha256") == entry["content_sha256"] and
+            event.get("mutation_route") == route for event in self.selection_log)}
+            for route in routes]
+        floor = min(item["count"] for item in counts)
+        candidates = [item["route"] for item in counts if item["count"] == floor]
+        material = {"rng_seed": self.rng_seed, "sequence": sequence,
+                    "content_sha256": entry["content_sha256"], "route_counts": counts}
+        selected = self._fair_tie(candidates, material, "mutation_route")
+        return route_view(entry, selected), {
+            "schema": entry["mutation_routes_schema"], "policy": "least_used",
+            "route_counts": counts, "selected": deepcopy(selected),
+            "observation_guards_discharged": False}
+
     def _fair_event(self, rows, sequence):
         """Equal sibling shares down the input hierarchy, then content leaves.
 
@@ -369,6 +398,10 @@ class ExploratoryScheduler:
                     for key in ("sequence", "content_sha256", "input_classes")}
                    | {"sampling_kind": event.get("sampling_kind")}
                    for event in self.selection_log]
+        for item, event in zip(history, self.selection_log):
+            if "baseline_input_classes" in event:
+                item["input_classes"] = deepcopy(event["baseline_input_classes"])
+                item["mutation_route"] = deepcopy(event["mutation_route"])
         material = {"policy": "fair", "rng_seed": self.rng_seed,
                     "sequence": sequence, "eligible": eligible, "history": history}
         candidates, prior, prefix = eligible, history, {}
@@ -390,7 +423,10 @@ class ExploratoryScheduler:
         tied = [row for row in candidates if used[row["content_sha256"]] == floor]
         selected = self._fair_tie(tied, material, {"dimension": "content_sha256", "prefix": prefix})
         chosen = self._record(selected["content_sha256"])
+        chosen, route_selection = self._select_route(chosen, sequence)
         material["chosen"] = deepcopy(selected)
+        if route_selection is not None:
+            material["route_selection"] = deepcopy(route_selection)
         event = {"sequence": sequence,
                  "phase": "warmup" if sequence < self.warmup else "exploratory",
                  "pool": "fair", "used_pool": "fair", "requested_pool": "fair",
@@ -398,6 +434,11 @@ class ExploratoryScheduler:
                  "seed_id": chosen.get("seed_id"), "content_sha256": chosen["content_sha256"],
                  "input_classes": deepcopy(selected["input_classes"]),
                  "feedback_identity": self.feedback.identity()}
+        if route_selection is not None:
+            event.update(mutation_route=deepcopy(chosen["mutation_route"]),
+                         route_selection=route_selection,
+                         baseline_input_classes=deepcopy(selected["input_classes"]),
+                         input_classes=self._fair_classes(chosen))
         material["sampling"] = None
         if self.sampling_kinds is not None:
             kind, meta = self._fair_sampling(chosen, material)
@@ -461,6 +502,11 @@ class ExploratoryScheduler:
                      "weighted": True, "candidate_count": len(pool),
                      "seed_id": chosen.get("seed_id"), "content_sha256": chosen["content_sha256"],
                      "feedback_identity": self.feedback.identity()}
+        if self.policy != "fair":
+            chosen, route_selection = self._select_route(chosen, sequence)
+            if route_selection is not None:
+                event.update(mutation_route=deepcopy(chosen["mutation_route"]),
+                             route_selection=route_selection)
         if self.policy != "fair" and self.sampling_kinds is not None:
             sampling_kind, sampling_meta = self._choose_sampling_kind(
                 sequence, chosen, token=chosen["content_sha256"])
@@ -477,11 +523,14 @@ class ExploratoryScheduler:
                    "corpus": self.corpus.to_dict(),
                    "sampling": ({"kinds": list(self.sampling_kinds), "weight": dict(self.sampling_weight)}
                                 if self.sampling_kinds is not None else None)}
+        if "mutation_route" in event:
+            context["mutation_route"] = deepcopy(event["mutation_route"])
+            context["route_selection"] = deepcopy(event["route_selection"])
         if self._explicit_policy:
             context["policy"] = self.policy
         context["context_sha256"] = canonical_hash(context)
         self.selection_contexts.append(context)
-        return dict(deepcopy(event), entry=deepcopy(self._record(chosen["content_sha256"])))
+        return dict(deepcopy(event), entry=deepcopy(chosen))
 
     def _record(self, digest):
         return self.corpus.entries[digest]
@@ -592,7 +641,8 @@ def replay_selection(log, corpus, feedback_events):
         raise ValueError("unsupported selection log")
     # New policy/decision records are v2-only: the v1 hash-only replay must
     # not accidentally endorse unverified additive decision fields.
-    new_keys = {"policy", "decision_context", "decision_sha256"}
+    new_keys = {"policy", "decision_context", "decision_sha256",
+                "mutation_route", "route_selection", "baseline_input_classes"}
     if (new_keys.intersection(log) or
             any(new_keys.intersection(event) for event in log.get("selections", [])
                 if isinstance(event, dict))):

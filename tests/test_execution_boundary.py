@@ -368,12 +368,15 @@ class OfflineContracts(unittest.TestCase):
                 # No process was launched in this fake-worker offline test.
                 boundary._QUARANTINED_LEASES.pop().__exit__(None, None, None)
 
-    def test_small_control_messages_are_bounded(self):
+    def test_control_transport_total_size_is_bounded(self):
         left, right = boundary._pair()
         self.addCleanup(left.close)
         self.addCleanup(right.close)
+        self.assertEqual(boundary._CONTROL_INLINE_LIMIT, 60000)
+        self.assertEqual(boundary._CONTROL_MAX_JSON_BYTES, 16 * 1024 * 1024)
+        # The separate socket transport tests prove the inline/envelope boundary.
         with self.assertRaisesRegex(boundary.BoundaryError, 'too_large'):
-            boundary._send(left, {'large': 'x' * 60001})
+            boundary._send(left, {'large': 'x' * (16 * 1024 * 1024)})
 
 
 @unittest.skipUnless(os.environ.get('R2F_BOUNDARY_KERNEL_TESTS') == '1', 'opt-in non-DDS kernel namespace tests')

@@ -18,6 +18,8 @@ from r2f.core.evidence import canonical_hash
 from r2f.modules.s1.module import register_exploratory
 from r2f.modules.s1.fuzz_catalog import catalog_digest
 from .corpus import Corpus, corpus_from_profile, corpus_identity
+from .mutation_routes import (has_routes, route_view, routes_enabled,
+                              validate_route_entry, validate_route_selection)
 from .scheduler import ExploratoryScheduler, required_catalog_hash, validated_feedback
 from .exploratory_input import (F2_WINDOWS_TARGET, F2_SURFACE_MUTATORS,
                                 validate_f2_profile, runtime_input)
@@ -142,6 +144,8 @@ def _validate_corpus_binding(corpus, identity, seeds, registry):
             raise ValueError("checkpoint corpus target revision/contract mismatch")
         if record["rmw"] not in identity["profile"]["rmws"]:
             raise ValueError("checkpoint corpus RMW mismatch")
+        if has_routes(record) or routes_enabled(identity["profile"]):
+            validate_route_entry(record, contract=contract, profile=identity["profile"])
         f2_windows = record["target_id"] == F2_WINDOWS_TARGET
         if f2_windows:
             if not validate_f2_profile(identity["profile"]):
@@ -215,6 +219,9 @@ def _validate_state(state, identity, seeds, registry):
     continuation = deepcopy(state.get("continuation"))
     if not isinstance(continuation, dict):
         raise ValueError("checkpoint continuation must be a dict")
+    pending = continuation.get("pending_selection")
+    if isinstance(pending, dict) and has_routes(pending.get("entry", {})):
+        validate_route_selection(pending["entry"], pending, profile=identity["profile"])
     if continuation.get("cycle_id") != identity["cycle_id"]:
         raise ValueError("checkpoint continuation cycle mismatch")
     budget = continuation.get("budget")
@@ -263,6 +270,8 @@ def _validate_state(state, identity, seeds, registry):
         expected = deepcopy(scheduler.selection_log[-1])
         snapshot = scheduler.selection_contexts[-1]["corpus"]
         expected["entry"] = next(r for r in snapshot["entries"] if r["content_sha256"] == expected["content_sha256"])
+        if "mutation_route" in expected:
+            expected["entry"] = route_view(expected["entry"], expected["mutation_route"])
         if pending != expected:
             raise ValueError("checkpoint pending selection identity mismatch")
         if phase == "final" and continuation.get("stop_reason") not in {"resume_pending_execution_uncertain", "cycle_deadline_reached"}:

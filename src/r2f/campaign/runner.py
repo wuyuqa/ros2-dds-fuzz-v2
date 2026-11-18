@@ -398,6 +398,8 @@ from r2f.modules.s1.module import register_exploratory
 from r2f.modules.s1.targets import EXPLORATORY_TARGET_ORDER
 from r2f.modules.s1.fuzz_catalog import catalog_digest
 from .corpus import Corpus, content_identity
+from .mutation_routes import (has_routes, inherit_routes, routes_enabled,
+                              validate_route_entry, validate_route_selection)
 from .feedback import FeedbackLog, observation_complete, tool_error
 from .scheduler import ExploratoryScheduler, required_catalog_hash
 from .exploratory_input import (CONTROL_FIELDS, PROFILE_CONTROL_FIELDS,
@@ -540,6 +542,7 @@ def _load_profile(profile):
     _profile_wide_settings(profile)
     try:
         validate_profile_fields(profile)
+        routes_enabled(profile)
     except ValueError as exc:
         raise ExploratoryCycleError(str(exc)) from exc
     return json.loads(json.dumps(profile, allow_nan=False))
@@ -844,6 +847,18 @@ def _chain_surfaces(contract, surface, chain_length, allowed_surfaces=None):
                 f"{surface.surface_id}:{chain_length}")
         order.append(contract.surface_by_id[selected])
     return order
+
+
+def _declared_route_layers(entry, contract, chain_length):
+    routes = validate_route_entry(entry, contract=contract)
+    selected = entry.get("mutation_route")
+    if routes is None or selected not in routes:
+        raise ExploratoryCycleError("selected mutation route missing")
+    surfaces = _chain_surfaces(contract, contract.surface_by_id[selected["surface_id"]],
+                               chain_length, {route["surface_id"] for route in routes})
+    return [(surface, selected if index == 0 else next(
+        route for route in routes if route["surface_id"] == surface.surface_id))
+        for index, surface in enumerate(surfaces)]
 
 
 def _layer_mutator(surface, entry, layer_index, sampling_kind=None):
@@ -1310,6 +1325,12 @@ def run_exploratory_cycle(output_dir, *, corpus, feedback, scheduler, profile, r
         except ValueError as exc:
             raise ExploratoryCycleError(str(exc)) from exc
     profile = _load_profile(profile)
+    if routes_enabled(profile) or any(has_routes(entry) for entry in corpus.entries.values()):
+        try:
+            for entry in corpus.entries.values():
+                validate_route_entry(entry, profile=profile)
+        except ValueError as exc:
+            raise ExploratoryCycleError(str(exc)) from exc
     declared_budget = profile.get("budget", {})
     if not isinstance(declared_budget, dict):
         raise ExploratoryCycleError("profile budget must be an object")
@@ -1546,6 +1567,11 @@ def run_exploratory_cycle(output_dir, *, corpus, feedback, scheduler, profile, r
             break
         sequence = selection["sequence"]
         entry = selection["entry"]
+        if has_routes(entry):
+            try:
+                validate_route_selection(entry, selection, profile=profile)
+            except ValueError as exc:
+                raise ExploratoryCycleError(str(exc)) from exc
         target_id = entry.get("target_id")
         rmw = entry.get("rmw")
 
@@ -1599,12 +1625,20 @@ def run_exploratory_cycle(output_dir, *, corpus, feedback, scheduler, profile, r
                     else:
                         mutator_id = requested if requested in mutator_ids else (
                             preferred if preferred in mutator_ids else (mutator_ids[0] if mutator_ids else None))
+                    if has_routes(entry):
+                        # Explicit route mutators cannot be replaced by a catalog
+                        # default or a boundary/sampling preference.
+                        mutator_id = entry["mutation_route"]["mutator_id"]
                     row = None
                     wide_profile = _wide_generation_requested(profile) and target_id != TOPOLOGY_TARGET
                     declared_kinds, _, declared_depth = _profile_wide_settings(profile)
                     if wide_profile and declared_kinds is not None:
                         supported = set(_wide_kinds(surface, parent))
-                        if not [kind for kind in declared_kinds if kind in supported]:
+                        if has_routes(entry) and selection.get("sampling_error"):
+                            row = reject(
+                                sequence, entry,
+                                "unsupported_capability:no_declared_sampling_kind_for_mutation_route")
+                        elif not [kind for kind in declared_kinds if kind in supported]:
                             row = reject(
                                 sequence, entry,
                                 "unsupported_capability:no_declared_sampling_kind_for_surface")
@@ -1614,7 +1648,10 @@ def run_exploratory_cycle(output_dir, *, corpus, feedback, scheduler, profile, r
                                 "unsupported_capability:all_supported_sampling_kinds_zero_weight")
                     if row is None and wide_profile and declared_depth > 1:
                         try:
-                            _chain_surfaces(contract, surface, declared_depth, profile["surfaces"])
+                            if has_routes(entry):
+                                _declared_route_layers(entry, contract, declared_depth)
+                            else:
+                                _chain_surfaces(contract, surface, declared_depth, profile["surfaces"])
                         except ExploratoryCycleError as exc:
                             row = reject(sequence, entry, str(exc))
                     if row is None:
@@ -1799,17 +1836,23 @@ def _generate_case(sequence, entry, target, contract, surface, parent, mutator_i
             # a mismatch means the declaration and corpus disagree.
             raise ExploratoryCycleError(
                 "sampling kind was filtered but the scheduler declared one")
-        layer_surfaces = _chain_surfaces(contract, surface, profile.get("chain_length", 1),
-                                         profile["surfaces"])
+        if has_routes(entry):
+            layers = _declared_route_layers(entry, contract, chain_length)
+        else:
+            layers = [(item, None) for item in _chain_surfaces(
+                contract, surface, profile.get("chain_length", 1), profile["surfaces"])]
         proposals = []
         current = adapted_parent
-        for index, layer_surface in enumerate(layer_surfaces):
+        for index, (layer_surface, layer_route) in enumerate(layers):
             layer_kind = sampling_kind if index == 0 else None
-            layer_mutator = _layer_mutator(layer_surface, entry, index, layer_kind)
+            layer_mutator = (layer_route["mutator_id"] if layer_route is not None
+                             else _layer_mutator(layer_surface, entry, index, layer_kind))
+            context = _layer_context(entry, index, layer_kind)
+            if layer_route is not None:
+                context["boundary_class"] = layer_route["boundary_class"]
             proposal = mutate_wide(
                 current, layer_surface, _layer_rng(rng_seed, index, layer_surface.surface_id),
-                context=_layer_context(entry, index, layer_kind),
-                mutator_id=layer_mutator)
+                context=context, mutator_id=layer_mutator)
             proposals.append(proposal)
             current = proposal.input_after
         proposal = proposals[0]
@@ -1931,6 +1974,10 @@ def _generate_case(sequence, entry, target, contract, surface, parent, mutator_i
         "runtime_route": route,
         "parent_adaptation": adaptation,
     }
+    if has_routes(entry):
+        config["mutation_route"] = deepcopy(selection["mutation_route"])
+        config["mutation_route_selection_sha256"] = selection["selection_sha256"]
+        config["declared_mutation_routes"] = deepcopy(entry["mutation_routes"])
     if wide:
         # Additive provenance appears only when the profile opts into T-E, so
         # the undeclared (legacy) config/row keeps its historical bytes.
@@ -2045,6 +2092,11 @@ def _generate_case(sequence, entry, target, contract, surface, parent, mutator_i
             ("planned", "submitted", "carrier_admitted", "configured",
              "applied", "hit", "effect_observed"), False),
     }
+    if has_routes(entry):
+        row.update(mutation_route=deepcopy(selection["mutation_route"]),
+                   route_selection=deepcopy(selection["route_selection"]),
+                   selection_sha256=selection["selection_sha256"],
+                   declared_mutation_routes=deepcopy(entry["mutation_routes"]))
     if wide:
         # T-E coverage fields are additive opt-in: the legacy row stays byte
         # identical when neither sampling_kinds nor chain_length is declared.
@@ -2225,6 +2277,7 @@ def _generate_case(sequence, entry, target, contract, surface, parent, mutator_i
     if wide:
         offer_record.update({"sampling_kind": sampling_kind,
                              "chain_depth": len(plan.operations)})
+    inherit_routes(entry, offer_record)
     offer = corpus.offer(
         offer_record,
         executed=row.get("actual_run") is True, evidence_complete=complete,

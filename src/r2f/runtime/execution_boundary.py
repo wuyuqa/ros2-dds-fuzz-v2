@@ -25,6 +25,7 @@ from pathlib import Path
 import select
 import signal
 import socket
+import stat
 import struct
 import subprocess
 import sys
@@ -41,6 +42,21 @@ MODULE = 'r2f.runtime.execution_boundary'
 _RECEIPT_KEYS = ('planned', 'submitted', 'carrier_admitted', 'configured', 'applied', 'hit', 'effect_observed')
 # Only retained on cleanup uncertainty: never unlock resources still in use.
 _QUARANTINED_LEASES = []
+
+# Private socket transport only: artifact JSON, hashes and callers stay unchanged.
+_CONTROL_INLINE_LIMIT = 60000
+_CONTROL_MAX_JSON_BYTES = 16 * 1024 * 1024
+_CONTROL_MAX_APPLICATION_FDS = 16
+_TRANSPORT_KEY = '__r2f_boundary_transport__'
+_TRANSPORT_KEYS = frozenset((_TRANSPORT_KEY, 'version', 'size', 'sha256',
+                             'fd_index', 'application_fd_count'))
+_TRANSPORT_SEALS = (fcntl.F_SEAL_WRITE | fcntl.F_SEAL_GROW |
+                    fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_SEAL)
+_INT_SIZE = array.array('i').itemsize
+_CREDENTIAL_SIZE = struct.calcsize('3i')
+# One *additional* SCM_RIGHTS FD carries large JSON, even at the application cap.
+_CONTROL_ANCILLARY_BYTES = (socket.CMSG_SPACE(_INT_SIZE * (_CONTROL_MAX_APPLICATION_FDS + 1)) +
+                            socket.CMSG_SPACE(_CREDENTIAL_SIZE))
 
 
 class BoundaryError(RuntimeError):
@@ -134,40 +150,164 @@ def _pair():
 
 
 def _send(sock, value, fds=()):
-    ancillary = [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array('i', fds))] if fds else []
+    # The reserved top-level key cannot be application data on either path.
+    if isinstance(value, dict) and _TRANSPORT_KEY in value:
+        raise BoundaryError('reserved_transport_envelope')
+    fds = tuple(fds)
+    if len(fds) > _CONTROL_MAX_APPLICATION_FDS:
+        raise BoundaryError('control_application_fd_limit')
     data = _json(value)
-    if len(data) > 60000:
+    if len(data) > _CONTROL_MAX_JSON_BYTES:
         raise BoundaryError('control_message_too_large')
-    if sock.sendmsg([data], ancillary) != len(data):
-        raise BoundaryError('control_message_truncated')
+    transport_fd = None
+    try:
+        if len(data) > _CONTROL_INLINE_LIMIT:
+            transport_fd = os.memfd_create('r2f-boundary-json', os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING)
+            view, offset = memoryview(data), 0
+            while offset < len(data):
+                written = os.write(transport_fd, view[offset:])
+                if written <= 0:
+                    raise BoundaryError('transport_memfd_write_incomplete')
+                offset += written
+            fcntl.fcntl(transport_fd, fcntl.F_ADD_SEALS, _TRANSPORT_SEALS)
+            data = _json({_TRANSPORT_KEY: 'sealed_memfd', 'version': 1,
+                          'size': len(data), 'sha256': hashlib.sha256(data).hexdigest(),
+                          'fd_index': len(fds), 'application_fd_count': len(fds)})
+            fds = (*fds, transport_fd)  # Application order is never rewritten.
+        ancillary = [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array('i', fds))] if fds else []
+        if sock.sendmsg([data], ancillary) != len(data):
+            raise BoundaryError('control_message_truncated')
+    finally:
+        # Only the temporary transport FD is ours; caller FDs always stay open.
+        if transport_fd is not None:
+            os.close(transport_fd)
+
+
+def _transport_json(data):
+    def object_pairs(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise BoundaryError('transport_json_duplicate_key')
+            result[key] = value
+        return result
+
+    def constant(_):
+        raise BoundaryError('transport_json_nonfinite')
+
+    def finite_float(text):
+        value = float(text)
+        # parse_constant does not see exponent overflow such as 1e999.
+        if not math.isfinite(value):
+            raise BoundaryError('transport_json_nonfinite')
+        return value
+
+    try:
+        value = json.loads(data, object_pairs_hook=object_pairs,
+                           parse_constant=constant, parse_float=finite_float)
+    except (ValueError, UnicodeError, RecursionError) as exc:
+        raise BoundaryError('transport_json_invalid') from exc
+    if not isinstance(value, dict):
+        raise BoundaryError('control_message_not_object')
+    return value
+
+
+def _transport_envelope(data, fd_count):
+    envelope = _transport_json(data)
+    if (set(envelope) != _TRANSPORT_KEYS or envelope[_TRANSPORT_KEY] != 'sealed_memfd'
+            or type(envelope['version']) is not int or envelope['version'] != 1):
+        raise BoundaryError('transport_envelope_schema_invalid')
+    if (type(envelope['size']) is not int
+            or not _CONTROL_INLINE_LIMIT < envelope['size'] <= _CONTROL_MAX_JSON_BYTES):
+        raise BoundaryError('transport_size_invalid')
+    digest = envelope['sha256']
+    if (type(digest) is not str or len(digest) != 64
+            or any(c not in '0123456789abcdef' for c in digest)):
+        raise BoundaryError('transport_sha256_invalid')
+    count, index = envelope['application_fd_count'], envelope['fd_index']
+    if (type(count) is not int or not 0 <= count <= _CONTROL_MAX_APPLICATION_FDS
+            or type(index) is not int or index != count or fd_count != count + 1):
+        raise BoundaryError('transport_fd_count_or_index_invalid')
+    return envelope
+
+
+def _read_transport(fd, envelope):
+    # A regular file, pipe, pidfd or namespace FD must never act as this carrier.
+    if (not stat.S_ISREG(os.fstat(fd).st_mode)
+            or not os.readlink(f'/proc/self/fd/{fd}').startswith('/memfd:')):
+        raise BoundaryError('transport_fd_not_memfd')
+    try:
+        seals = fcntl.fcntl(fd, fcntl.F_GET_SEALS)
+    except OSError as exc:
+        raise BoundaryError('transport_fd_not_sealable') from exc
+    if seals & _TRANSPORT_SEALS != _TRANSPORT_SEALS:
+        raise BoundaryError('transport_seals_missing')
+    # Sample size *after* immutable seals: no pre-seal size/read TOCTOU.
+    size = envelope['size']
+    if os.fstat(fd).st_size != size:
+        raise BoundaryError('transport_size_mismatch')
+    chunks, offset = [], 0
+    digest = hashlib.sha256()
+    while offset < size:
+        chunk = os.pread(fd, min(65536, size - offset), offset)
+        if not chunk:
+            raise BoundaryError('transport_read_incomplete')
+        chunks.append(chunk)
+        digest.update(chunk)
+        offset += len(chunk)
+    if digest.hexdigest() != envelope['sha256']:
+        raise BoundaryError('transport_sha256_mismatch')
+    value = _transport_json(b''.join(chunks))
+    if _TRANSPORT_KEY in value:
+        raise BoundaryError('reserved_transport_envelope')
+    return value
 
 
 def _recv(sock, timeout=None):
     if timeout is not None and not select.select([sock], [], [], timeout)[0]:
         raise TimeoutError('boundary_control_timeout')
-    data, ancillary, flags, _ = sock.recvmsg(65536, socket.CMSG_SPACE(4 * 16) + socket.CMSG_SPACE(12), socket.MSG_CMSG_CLOEXEC)
+    data, ancillary, flags, _ = sock.recvmsg(65536, _CONTROL_ANCILLARY_BYTES, socket.MSG_CMSG_CLOEXEC)
     fds, credentials = [], []
     try:
+        malformed_rights = False
+        # Collect *all* received FDs before any fallible credential/JSON parsing,
+        # including on MSG_CTRUNC: every error path owns and closes this list.
         for level, kind, value in ancillary:
             if level == socket.SOL_SOCKET and kind == socket.SCM_RIGHTS:
                 received = array.array('i')
+                malformed_rights |= bool(len(value) % received.itemsize)
                 received.frombytes(value[:len(value) - len(value) % received.itemsize])
                 fds.extend(received)
             elif level == socket.SOL_SOCKET and kind == socket.SCM_CREDENTIALS:
-                credentials.append(struct.unpack('3i', value))
+                credentials.append(value)
         if flags & (socket.MSG_TRUNC | socket.MSG_CTRUNC):
             raise BoundaryError('truncated_kernel_credentials_or_message')
+        if malformed_rights:
+            raise BoundaryError('malformed_control_rights')
         if not data:
             raise EOFError('boundary_peer_closed')
-        if len(credentials) != 1:
+        if len(credentials) != 1 or len(credentials[0]) != _CREDENTIAL_SIZE:
             raise BoundaryError('missing_or_duplicate_kernel_credentials')
+        peer = struct.unpack('3i', credentials[0])
         value = json.loads(data)
         if not isinstance(value, dict):
             raise BoundaryError('control_message_not_object')
-        return value, credentials[0], fds
+        if len(data) > _CONTROL_INLINE_LIMIT:
+            raise BoundaryError('control_message_too_large')
+        if _TRANSPORT_KEY in value:
+            envelope = _transport_envelope(data, len(fds))
+            transport_fd = fds.pop(envelope['fd_index'])
+            try:
+                value = _read_transport(transport_fd, envelope)
+            finally:
+                os.close(transport_fd)
+        elif len(fds) > _CONTROL_MAX_APPLICATION_FDS:
+            raise BoundaryError('control_application_fd_limit')
+        return value, peer, fds
     except BaseException:
         for fd in fds:
-            os.close(fd)
+            with contextlib.suppress(OSError):
+                os.close(fd)
         raise
 
 

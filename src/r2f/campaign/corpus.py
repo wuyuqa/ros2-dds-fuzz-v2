@@ -17,6 +17,9 @@ from pathlib import Path
 import re
 
 from r2f.core.evidence import canonical_hash
+from .mutation_routes import (ROUTES_SCHEMA, canonical_route_record, has_routes,
+                              merge_routes, normalize_routes, routes_enabled,
+                              validate_route_entry)
 
 CAPACITY = 256
 BUCKET_LIMIT = 3
@@ -124,8 +127,10 @@ def _rank(entry):
 
 
 def _normal_record(entry, *, seed=False, candidate=False, source="observation"):
-    record = deepcopy(entry)
+    record = canonical_route_record(entry) if has_routes(entry) else deepcopy(entry)
     record["content_sha256"] = content_sha256(entry)
+    if has_routes(record) and record["content_sha256"] != content_identity(record):
+        raise ValueError("routed corpus content hash mismatch")
     record["pinned_seed"] = bool(seed or record.get("pinned_seed"))
     record["candidate_ids"] = sorted(set(record.get("candidate_ids") or []))
     record["source"] = source
@@ -196,6 +201,9 @@ class Corpus:
         record = _normal_record(entry, seed=True, source="initial_seed")
         digest = record["content_sha256"]
         if digest in self.entries:
+            merge_routes(self.entries[digest], record)
+            self.entries[digest]["bucket_key"] = list(bucket_key(self.entries[digest]))
+            self._rebuild_indexes()
             self.entries[digest]["pinned_seed"] = True
             self._log("retained", digest, "initial_seed", seed_id=record.get("seed_id"))
             return self.entries[digest]
@@ -219,6 +227,9 @@ class Corpus:
             record = _normal_record(content, candidate=True, source="candidate_reference")
             record["admission_reason"] = "candidate_reference"
             self.entries[digest] = record
+        if isinstance(content, dict) and has_routes(content):
+            merge_routes(record, _normal_record(content))
+            record["bucket_key"] = list(bucket_key(record))
         record.setdefault("candidate_ids", [])
         if candidate_id not in record["candidate_ids"]:
             record["candidate_ids"].append(candidate_id)
@@ -276,6 +287,9 @@ class Corpus:
             self._log("rejected", digest, "incomplete_observation")
             return {"admitted": False, "reason": "incomplete_observation", "content_sha256": digest}
         if digest in self.entries:
+            merge_routes(self.entries[digest], record)
+            self.entries[digest]["bucket_key"] = list(bucket_key(self.entries[digest]))
+            self._rebuild_indexes()
             if candidate_id:
                 self.pin_candidate(digest, candidate_id)
             self._log("deduplicated", digest, "duplicate_content")
@@ -324,6 +338,8 @@ class Corpus:
             digest = record.get("content_sha256")
             if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
                 raise ValueError("invalid corpus content hash")
+            if has_routes(record) and canonical_route_record(record) != record:
+                raise ValueError("noncanonical corpus mutation routes/labels")
             if digest != content_identity(record):
                 raise ValueError("corpus content hash mismatch")
             if digest in corpus.entries:
@@ -420,6 +436,13 @@ def corpus_identity(corpus):
                        ("content_sha256", "target_id", "seed_id", "pinned_seed", "candidate_ids")}
                       for row in corpus.get("entries", [])),
                      key=lambda r: r["content_sha256"])
+    by_content = {row["content_sha256"]: row for row in corpus.get("entries", [])}
+    for member in members:
+        record = by_content[member["content_sha256"]]
+        if has_routes(record):
+            member.update(mutation_routes_schema=record["mutation_routes_schema"],
+                          mutation_routes=deepcopy(record["mutation_routes"]),
+                          mutation_route_origins=deepcopy(record["mutation_route_origins"]))
     return canonical_hash({"schema": SCHEMA, "capacity": corpus.get("capacity"),
                            "bucket_limit": corpus.get("bucket_limit"), "members": members})
 
@@ -474,7 +497,7 @@ def _profile_strings(profile, key):
     return value
 
 
-def _profile_seed_specs(specs, *, context="profile"):
+def _profile_seed_specs(specs, *, context="profile", routed=False):
     if not isinstance(specs, list) or not specs:
         raise CorpusProfileError(f"{context} seed_specs must be a nonempty list")
     seen = set()
@@ -512,6 +535,15 @@ def _profile_seed_specs(specs, *, context="profile"):
                            "variant_id": variant,
                            "boundary_class": boundary, "executable": True,
                            "overrides": {"logical_config": deepcopy(logical)}})
+        if routed:
+            try:
+                normalized[-1]["mutation_routes"] = normalize_routes(spec.get("mutation_routes"))
+            except ValueError as exc:
+                raise CorpusProfileError(str(exc)) from exc
+        elif "mutation_routes" in spec or "mutation_routes_schema" in spec:
+            raise CorpusProfileError("mutation_routes require explicit profile opt-in")
+        if "mutation_routes_schema" in spec:
+            raise CorpusProfileError("route schema belongs to profile composition, not seed spec")
     return normalized
 
 
@@ -522,6 +554,10 @@ def _profile_cycles(profile):
     plus its own seed list.  Building a corpus requires choosing exactly one
     cycle, so a mixed corpus can never be handed to an endpoint-pair runner.
     """
+    try:
+        routed = routes_enabled(profile)
+    except ValueError as exc:
+        raise CorpusProfileError(str(exc)) from exc
     cycles = profile.get("cycles")
     if cycles is None:
         # Transitional shape: one target, seed specs directly on the profile.
@@ -559,7 +595,7 @@ def _profile_cycles(profile):
         if len(set(surfaces)) != len(surfaces):
             raise CorpusProfileError(f"profile cycle {cycle_id}.surfaces contains duplicates")
         specs = _profile_seed_specs(cycle.get("seed_specs"),
-                                   context=f"profile cycle {cycle_id}")
+                                   context=f"profile cycle {cycle_id}", routed=routed)
         if any(spec["target_id"] != target_id for spec in specs):
             raise CorpusProfileError(
                 f"profile cycle {cycle_id} contains a seed for a different target")
@@ -646,6 +682,7 @@ def corpus_from_profile(profile, seeds=None, *, cycle_id=None, target_id=None):
     all_surfaces = _profile_strings(profile, "surfaces")
     rmws = _profile_strings(profile, "rmws")
     cycles = _profile_cycles(profile)
+    routed = routes_enabled(profile)
 
     declared = exploratory_target_declarations(runtime_capability=profile.get("runtime_capability"))
     for target in all_targets:
@@ -661,6 +698,21 @@ def corpus_from_profile(profile, seeds=None, *, cycle_id=None, target_id=None):
                 raise CorpusProfileError(
                     f"profile cycle {cycle['cycle_id']} surface {surface_id} "
                     f"is not in profile surfaces")
+
+    if routed:
+        for item in cycles:
+            target = declared[item["target_id"]]
+            for spec in item["seed_specs"]:
+                for rmw in rmws:
+                    try:
+                        validate_route_entry({"target_id": target.target_id,
+                            "target_revision": target.target_revision,
+                            "contract_hash": target.exploration_contract.contract_hash(),
+                            "rmw": rmw, "cycle_id": item["cycle_id"], "seed_id": spec["seed_id"],
+                            "mutation_routes_schema": ROUTES_SCHEMA,
+                            "mutation_routes": spec["mutation_routes"]}, profile=profile)
+                    except ValueError as exc:
+                        raise CorpusProfileError(str(exc)) from exc
 
     for surface_id in all_surfaces:
         if surface_id not in fuzz_catalog.SURFACES:
@@ -801,9 +853,12 @@ def corpus_from_profile(profile, seeds=None, *, cycle_id=None, target_id=None):
             raise CorpusProfileError(
                 f"seed {seed_id} is capability pending and cannot enter the F1 live corpus")
         refs = seed.get("surface_refs")
-        if not isinstance(refs, list) or len(refs) != 1:
+        if not routed and (not isinstance(refs, list) or len(refs) != 1):
             raise CorpusProfileError(f"seed {seed_id} must reference exactly one surface in this slice")
-        surface_id = refs[0]
+        if routed and (not isinstance(refs, list) or not refs):
+            raise CorpusProfileError(f"seed {seed_id} must reference at least one valid template surface")
+        surface_id = spec["mutation_routes"][0]["surface_id"] if routed else refs[0]
+        boundary_class = spec["mutation_routes"][0]["boundary_class"] if routed else spec["boundary_class"]
         if not f2_windows and surface_id not in fuzz_catalog.F1_SURFACE_IDS:
             raise CorpusProfileError(f"seed {seed_id} references non-F1 surface {surface_id}")
         if surface_id not in surfaces:
@@ -813,7 +868,7 @@ def corpus_from_profile(profile, seeds=None, *, cycle_id=None, target_id=None):
                    else fuzz_catalog.SURFACES[surface_id])
         if not surface.executable:
             raise CorpusProfileError(f"seed {seed_id} surface {surface_id} is not executable")
-        if spec["boundary_class"] not in surface.boundary_classes:
+        if boundary_class not in surface.boundary_classes:
             raise CorpusProfileError(
                 f"seed {seed_id} boundary_class {spec['boundary_class']} is not declared by {surface_id}")
 
@@ -871,7 +926,7 @@ def corpus_from_profile(profile, seeds=None, *, cycle_id=None, target_id=None):
                 "rmw": rmw,
                 "contract_hash": contract_hash,
                 "surface_id": surface_id,
-                "boundary_class": spec["boundary_class"],
+                "boundary_class": boundary_class,
                 "seed_id": seed_id,
                 "variant_id": spec.get("variant_id", seed_id),
                 "seed_content_sha256": fuzz_catalog.seed_content_sha256(seed),
@@ -885,6 +940,10 @@ def corpus_from_profile(profile, seeds=None, *, cycle_id=None, target_id=None):
                                   **deepcopy(spec.get("overrides", {}).get("logical_config", {}))},
                 "executable": True,
             }
+            if routed:
+                entry.update(mutation_routes_schema=ROUTES_SCHEMA,
+                             mutation_routes=deepcopy(spec["mutation_routes"]))
+                entry.update(spec["mutation_routes"][0])
             if f2_windows:
                 # New contract-bound executable input, NOT promotion of the old
                 # pending template, nor evidence of runtime guard discharge.
@@ -899,6 +958,11 @@ def corpus_from_profile(profile, seeds=None, *, cycle_id=None, target_id=None):
                                  "target_id": target_id, "target_revision": target.target_revision,
                                  "contract_hash": contract_hash, "surface_id": surface_id,
                                  "mutator_id": implemented[0], "observation_guards_discharged": False})
+            if routed:
+                try:
+                    validate_route_entry(entry, profile=profile)
+                except ValueError as exc:
+                    raise CorpusProfileError(str(exc)) from exc
             corpus.add_seed(entry)
 
     if not corpus.entries:

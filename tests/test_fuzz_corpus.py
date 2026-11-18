@@ -33,7 +33,7 @@ def entry(index, *, seed_id=None, boundary=None, relation=None, edge=None, targe
 class FuzzCorpusContracts(unittest.TestCase):
     def test_profiles_explicit_exploratory_disabled_and_not_required_catalog(self):
         expected = {"parameter", "environment", "composed", "f2-windows",
-                    "endpoint-chains", "topology-chains"}
+                    "endpoint-chains", "topology-chains", "common-baseline-routes"}
         f2_target = "discovery.interruption_recovery.fuzz_windows_v1"
         f2_mutators = {"E02": ["M07"], "E03": ["M06"]}
         seen = set()
@@ -87,6 +87,17 @@ class FuzzCorpusContracts(unittest.TestCase):
             else:
                 self.assertNotIn("runtime_capability", data)
                 self.assertNotIn(f2_target, data["target_ids"])
+            if path.stem == "common-baseline-routes":
+                self.assertEqual(data["composition"]["mutation_routes_schema"],
+                                 "r2f.mutation-routes/v1")
+                self.assertEqual(data["target_ids"], ["discovery.late_endpoint.fuzz_v1"])
+                self.assertEqual(data["surfaces"], ["P01", "W02"])
+                self.assertEqual(data["chain_length"], 1)
+                self.assertEqual(data["seed_specs"], data["declared_seed_specs_union"])
+                self.assertEqual(data["cycles"][0]["seed_specs"], data["seed_specs"])
+                self.assertEqual([r["surface_id"] for r in data["seed_specs"][0]["mutation_routes"]],
+                                 ["P01", "W02"])
+                validate_profile_fields(data)
             if path.stem == "endpoint-chains":
                 # Explicit new offline profile, not blanket F2/runtime activation.
                 # The generic exploratory/disabled/not-required assertions above
