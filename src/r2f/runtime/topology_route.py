@@ -7,6 +7,8 @@ can prove this contract's plumbing but cannot acquire real-execution eligibility
 from copy import deepcopy
 import hashlib
 import json
+import os
+import tempfile
 from pathlib import Path
 
 from r2f.core.evidence import INPUT_SCHEMA_V2, IDENTITY_V2_KEYS, canonical_hash, effective_input_hash
@@ -158,6 +160,26 @@ def _blocked(reason):
             "sealed": False, "mature": False, "maturity_denominator": None}
 
 
+def _persist_runtime_result(result, output_dir):
+    """Publish only the final route result; serialization/I/O failure propagates."""
+    root = Path(output_dir).resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    data = json.dumps(result, sort_keys=True, indent=2, allow_nan=False) + "\n"
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=root,
+                                         prefix=".runtime_result-", suffix=".tmp", delete=False) as handle:
+            temporary = Path(handle.name)
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, root / "runtime_result.json")
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+    return result
+
+
 def run_topology_route(config, output_dir, *, backend=None):
     """Dispatch exactly the sealed program; normal real backend uses canonical gates."""
     try:
@@ -190,7 +212,11 @@ def run_topology_route(config, output_dir, *, backend=None):
     result["mutation_receipt"] = result["application_audit"]["mutation_receipt"]
     result["fixture"] = fixture
     result["candidate_eligible"] = result["sealed"] = result["mature"] = False
-    return result
+    # Pre-execution rejection (including missing live GO) has no raw execution
+    # artifact. Preserve that contract instead of manufacturing an output run.
+    if result.get("raw_path") is None:
+        return result
+    return _persist_runtime_result(result, output_dir)
 
 
 def _raw(runtime):

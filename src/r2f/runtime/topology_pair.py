@@ -904,6 +904,40 @@ def _execution_workers(events, raw_path):
     return workers
 
 
+def _cleanup_is_complete(receipt, backend, netem_ctx, *, netem_required=False):
+    """Conservative final cleanup observation, independent of execution eligibility."""
+    if (not isinstance(receipt, dict) or receipt.get("closed") is not True
+            or receipt.get("errors", []) != [] or receipt.get("survivors", []) != []
+            or receipt.get("error") is not None):
+        return False
+    returncodes = receipt.get("returncodes", [])
+    workers = receipt.get("workers", [])
+    if (not isinstance(returncodes, list) or not isinstance(workers, list)
+            or any(type(code) is not int or code != 0 for code in returncodes)
+            or any(not isinstance(worker, dict) or worker.get("closed") is not True
+                   or ("returncode" in worker and
+                       (type(worker["returncode"]) is not int or worker["returncode"] != 0))
+                   for worker in workers)):
+        return False
+    for worker in getattr(backend, "processes", []) or []:
+        process = worker.process
+        if process is not None:
+            code = process.poll()
+            if type(code) is not int or code != 0:
+                return False
+    if netem_required and netem_ctx is None:
+        # Setup/start failed before a restorable window receipt was returned.
+        return False
+    if netem_ctx is not None:
+        restore = netem_ctx.get("restore") or {}
+        if (netem_ctx.get("active") is not False or netem_ctx.get("restore_failure") is not None
+                or restore.get("restored") is not True
+                or restore.get("only_noqueue_root") is not True
+                or restore.get("residual_qdisc") != [] or restore.get("residual_filter") != []):
+            return False
+    return True
+
+
 def run_topology(program, config, output_dir, *, backend=None):
     """Execute one bounded topology program; return runtime facts, never a verdict."""
     output_dir = Path(output_dir).resolve()
@@ -1161,6 +1195,7 @@ def run_topology(program, config, output_dir, *, backend=None):
         return backend.snapshot(handles)
 
     netem_ctx = None
+    netem_cleanup_required = False
 
     def netem_counter_snapshot(step_id, window):
         """Counter snapshot bound to the live endpoint identities and raw bytes."""
@@ -1575,6 +1610,7 @@ def run_topology(program, config, output_dir, *, backend=None):
                 raise TopologyBackendBlocked("topology_netem_requires_isolated_netns")
             from .discovery_network import DiscoveryNetemController
             carrier = DiscoveryNetemController(cfg["domain_id"])
+            netem_cleanup_required = True
             setup = carrier.setup()
             emit("topology_netem_setup", receipt=setup)
             try:
@@ -2002,14 +2038,17 @@ def run_topology(program, config, output_dir, *, backend=None):
         cleanup_receipt = None
         try:
             cleanup_receipt = backend.close()
-        except (OSError, RuntimeError, ValueError) as exc:
+            if not isinstance(cleanup_receipt, dict):
+                raise TypeError("invalid_cleanup_receipt")
+        except Exception as exc:  # backend cleanup must leave a failed raw receipt
             cleanup_receipt = {"closed": False, "error": type(exc).__name__}
             result["status"] = "aborted"
             result["runtime_status"] = "aborted"
             result["reason"] = result["reason"] or "cleanup_failed:" + type(exc).__name__
         result["cleanup_receipt"] = cleanup_receipt
         emit("topology_cleanup", receipt=cleanup_receipt)
-        if cleanup_receipt.get("closed") is not True:
+        cleanup_complete = _cleanup_is_complete(cleanup_receipt, backend, netem_ctx=None)
+        if not cleanup_complete:
             result.update(status="aborted", runtime_status="aborted",
                           reason=result["reason"] or "cleanup_incomplete")
             emit("runtime_abort", reason=result["reason"], phase="cleanup")
@@ -2069,6 +2108,12 @@ def run_topology(program, config, output_dir, *, backend=None):
             failure_status = "aborted" if result["real_execution"] else "blocked"
             result.update(status=failure_status, runtime_status=failure_status, reason=str(exc))
             emit("runtime_abort", reason=str(exc))
+        cleanup_complete = _cleanup_is_complete(
+            cleanup_receipt, backend, netem_ctx, netem_required=netem_cleanup_required)
+        if not cleanup_complete and result["status"] != "aborted":
+            result.update(status="aborted", runtime_status="aborted",
+                          reason=result["reason"] or "cleanup_incomplete")
+            emit("runtime_abort", reason=result["reason"], phase="cleanup")
         if lease is not None:
             survivors = [p.process.pid for p in getattr(backend, "processes", [])
                          if p.process is not None and p.process.poll() is None]
@@ -2080,16 +2125,20 @@ def run_topology(program, config, output_dir, *, backend=None):
             else:
                 lease.__exit__(None, None, None)
                 emit("isolation_locks_released", after_full_cleanup=True)
+        # Final raw assertion is made only after restore and lease disposition.
+        # A release exception cannot fall through to a successful runtime_end.
+        cleanup_complete = _cleanup_is_complete(
+            cleanup_receipt, backend, netem_ctx, netem_required=netem_cleanup_required)
         if result["status"] == "aborted":
             state_boundary("aborted_cleanup")
         ended_ns = _now()
         result["precondition_receipts"].append({
             "step_id": "cleanup", "receipt_kind": "precondition",
             "requires": [{"id": "full_process_tree_closed", "kind": "cleanup",
-                          "status": "satisfied" if cleanup_receipt.get("closed") else "unknown"}],
+                          "status": "satisfied" if cleanup_complete else "unknown"}],
             "before": None, "after": cleanup_receipt,
-            "satisfied": bool(cleanup_receipt.get("closed")),
-            "disposition": "observed" if cleanup_receipt.get("closed") else "unknown",
+            "satisfied": cleanup_complete,
+            "disposition": "observed" if cleanup_complete else "unknown",
             "execution_evidence": bool(result["real_execution"]),
         })
         result["execution"] = {
@@ -2153,6 +2202,7 @@ def run_topology(program, config, output_dir, *, backend=None):
         (output_dir / "execution_metadata.json").write_text(
             json.dumps(result["execution_metadata"], sort_keys=True, indent=2) + "\n")
         emit("runtime_end", runtime_status=result["runtime_status"], status=result["status"],
+             cleanup_complete=cleanup_complete,
              reason=result["reason"], real_execution=result["real_execution"],
              mutation_receipt={key: bool(result["mutation_receipt"].get(key)) for key in
                                ("planned", "submitted", "carrier_admitted", "configured", "applied", "hit", "effect_observed")},
