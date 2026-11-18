@@ -442,11 +442,26 @@ def _delivery_window(audit, pair, deliveries):
     if len(openings) != 1 or len(closings) != 1:
         return {"delivery_window_identity_complete": False}
     opened, close = openings[0], closings[0]
-    # delivery() only returns these refs after proving current bidirectional
-    # match using per-peer API or named isolated inventory, never helper.status.
+    # delivery() validates fresh command-bound snapshots before returning
+    # these refs: match proof OR the independently checked no-obligation branch,
+    # never helper.status or a predicted edge.
     matches = [e for e in refs if e["event"] == "match_snapshot"]
     if len(matches) != 2 or any(m["event_index"] >= opened["event_index"] for m in matches):
         return {"delivery_window_identity_complete": False}
+    # This component is produced by project_topology_state from the audited
+    # persisted bytes, NOT runtime.facts or a caller's no-obligation flag. Its
+    # receipt branch independently checks actual endpoint identities/types,
+    # fresh snapshot/ACK chronology, the claim and its complete empty close.
+    # Writer sends after that claim belong to other pairs (or have no pair
+    # obligation); rebuilding expected from them would invent missing samples.
+    detail = component.get("detail", {})
+    claims = [e for e in refs if e["event"] == "topology_delivery_no_obligation"]
+    if (component.get("status") == "observed" and component.get("value") == "no_obligation"
+            and pair.get("delivery_closure") == "no_obligation" and len(claims) == 1
+            and detail.get("no_obligation_ref") == audit.ref(claims[0])
+            and all(detail.get(key) == [] for key in ("expected", "received", "missing"))):
+        detail.update(open_ref=audit.ref(opened), close_ref=audit.ref(close))
+        return {"delivery_window_identity_complete": True, "delivery_closure": "no_obligation"}
     w, r = pair["writer"], pair["reader"]
     wg, rg = pair["writer_generation"], pair["reader_generation"]
     inside = [e for e in audit.events if opened["event_index"] < e["event_index"] < close["event_index"]]
@@ -478,6 +493,49 @@ def _delivery_window(audit, pair, deliveries):
     component["detail"].update(detail)
     return {"delivery_window_identity_complete": True,
             "delivery_closure": ("closed_with_gap" if missing else "closed") if closed else "open"}
+
+
+def _no_obligation_send_covered(audit, pairs, send):
+    """Discharge only this raw send, not a writer's historical inventory.
+
+    All readers alive at this send must have the same generation in the
+    independently projected empty-obligation windows covering it. Older sends,
+    replaced readers, missing closes and overlapping unproved windows remain
+    unresolved; final nonmatch is never persistent historical nonmatch proof.
+    """
+    live_readers = {}
+    for event in audit.events[:send["event_index"]]:
+        eid = event.get("logical_id")
+        if event["event"] == "endpoint_created" and audit.specs[eid]["role"] == "reader":
+            live_readers[eid] = event["generation"]
+        elif event["event"] in {"endpoint_destroyed", "topology_endpoint_destroyed"}:
+            live_readers.pop(eid, None)
+    rows = [p for p in pairs if p["writer"] == send.get("logical_id")
+            and p.get("writer_generation") == send.get("generation")]
+    if not live_readers or {p["reader"]: p.get("reader_generation") for p in rows} != live_readers:
+        return False
+    covered = set()
+    for pair in rows:
+        if (pair.get("delivery_closure") != "no_obligation"
+                or pair.get("delivery_window_identity_complete") is not True):
+            return False
+        detail = pair["proofs"]["delivery_closure"]["detail"]
+        opened, close = (audit.resolve(detail[key]) for key in ("open_ref", "close_ref"))
+        if not (opened["event_index"] < send["event_index"] < close["event_index"]
+                and opened["monotonic_ns"] < send["monotonic_ns"] < close["monotonic_ns"]):
+            return False
+        covered.add(opened["event_index"])
+    for opened in audit.events[:send["event_index"]]:
+        if (opened["event"] != "topology_delivery_window_open"
+                or opened.get("writer") != send.get("logical_id")
+                or opened.get("writer_generation") != send.get("generation")):
+            continue
+        closes = [e for e in audit.events if e["event"] == "topology_delivery_window_closed"
+                  and e.get("open_ref") == opened["event_index"]]
+        if len(closes) != 1 or (closes[0]["event_index"] > send["event_index"]
+                                and opened["event_index"] not in covered):
+            return False
+    return True
 
 
 def facts_from_events(events, runtime, config):
@@ -524,7 +582,7 @@ def facts_from_events(events, runtime, config):
         facts["unresolved_historical_obligations"] = [a.ref(s) for s in sends if not any(
             p["writer"] == s.get("logical_id") and p.get("writer_generation") == s.get("generation")
             and p.get("delivery_closure") not in {"not_applicable", "no_obligation"}
-            for p in facts["pairs"])]
+            for p in facts["pairs"]) and not _no_obligation_send_covered(a, facts["pairs"], s)]
         facts["application_audit"] = _application(a)
         facts["source_provenance_qualified"] = _source_qualification(a)
         facts["execution_evidence"] = not a.fixture
