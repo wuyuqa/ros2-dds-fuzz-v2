@@ -52,11 +52,32 @@ def projection_input(**overrides):
 
 class BindingDeclarationTests(unittest.TestCase):
     def test_exploratory_targets_declare_backend_and_surfaces(self):
-        self.assertEqual(set(EXPLORATORY_TARGETS), {
+        from r2f.core import Registry
+        from r2f.modules.s1.module import register_exploratory
+        from r2f.modules.s1.targets import F2_WINDOWS_CAPABILITY, F2_WINDOWS_TARGET
+
+        legacy_targets = {
             'discovery.late_endpoint.fuzz_v1', 'discovery.late_join_delivery.fuzz_v1',
             'builtin.discovery_projection_reconciliation.fuzz_v1',
             'discovery.interruption_recovery.fuzz_v1',
-            'discovery.match_compatibility.fuzz_v1'})
+            'discovery.match_compatibility.fuzz_v1'}
+        default = Registry()
+        register_exploratory(default, include_required=False)
+        self.assertEqual(set(default.targets), legacy_targets)
+        with self.assertRaises(KeyError):
+            default.get_target(F2_WINDOWS_TARGET)
+        with self.assertRaises(KeyError):
+            default.get_services(F2_WINDOWS_TARGET)
+        # The runtime directory describes routes; it does not grant registry access.
+        self.assertEqual(set(EXPLORATORY_TARGETS), legacy_targets | {F2_WINDOWS_TARGET})
+        opted = Registry()
+        register_exploratory(opted, include_required=False,
+                             runtime_capability=F2_WINDOWS_CAPABILITY)
+        self.assertEqual(set(opted.targets), legacy_targets | {F2_WINDOWS_TARGET})
+        self.assertEqual({tid: opted.get_target(tid).to_dict() for tid in legacy_targets},
+                         {tid: default.get_target(tid).to_dict() for tid in legacy_targets})
+        self.assertEqual(EXPLORATORY_TARGETS[F2_WINDOWS_TARGET]['runtime_capability'],
+                         F2_WINDOWS_CAPABILITY)
         caps = exploratory_runtime_capabilities()
         self.assertFalse(caps['discovery.match_compatibility.fuzz_v1']['implemented'])
         self.assertFalse(caps['discovery.match_compatibility.fuzz_v1']['admitted'])
@@ -68,6 +89,26 @@ class BindingDeclarationTests(unittest.TestCase):
             self.assertTrue(caps[target]['implemented'])
             self.assertIsNone(caps[target]['available'])
             self.assertFalse(caps[target]['execution_evidence'])
+
+    def test_known_f2_route_does_not_supply_missing_input_authorization(self):
+        from r2f.modules.s1.targets import F2_WINDOWS_TARGET
+
+        for capability in (None, "", "f2_all"):
+            with self.subTest(capability=capability):
+                config = normalize_config(base(
+                    target_id=F2_WINDOWS_TARGET, carrier="wire_proxy",
+                    mutation_kind="discovery_drop", arm="mutated",
+                    runtime_capability=capability, fuzz_surfaces=["E03"],
+                    submitted_parameters={}))
+                with self.assertRaisesRegex(ValueError,
+                        "f2_windows_explicit_capability_and_timing_policy_required"):
+                    exploratory_bindings(config)
+        caps = exploratory_runtime_capabilities()[F2_WINDOWS_TARGET]
+        self.assertTrue(caps["implemented"])
+        self.assertFalse(caps["admitted"])
+        self.assertIsNone(caps["available"])
+        self.assertFalse(caps["execution_evidence"])
+        self.assertTrue(caps["admission_requires_live_preflight"])
 
     def test_unknown_target_remains_blocked(self):
         result = run_pair(base(target_id='discovery.not_a_target'), Path(tempfile.mkdtemp()) / 'state')

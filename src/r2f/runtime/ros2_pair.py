@@ -277,6 +277,11 @@ EXPLORATORY_TARGETS = {
         'backend': 'discovery_namespace',
         'surfaces': ('P01', 'E01', 'E02', 'E03', 'W01', 'W02'),
     },
+    'discovery.interruption_recovery.fuzz_windows_v1': {
+        'runtime_capability': 'f2_windows_v1',
+        'carrier': 'wire_proxy', 'mutation_kind': 'discovery_drop',
+        'backend': 'discovery_namespace', 'surfaces': ('E02', 'E03'),
+    },
     'discovery.match_compatibility.fuzz_v1': {
         'runtime_capability': 'pair_relation_guard',
         'carrier': 'ros2_endpoint',
@@ -318,6 +323,82 @@ RECOVERY_FUZZ_ADMITTED_SURFACES = frozenset({'E01', 'E02', 'E03'})
 MAX_RECOVERY_WINDOWS = 3
 
 
+F2_WINDOWS_TARGET = 'discovery.interruption_recovery.fuzz_windows_v1'
+F2_ANCHOR_POLICY = 'f2_anchor_not_before_v1'
+
+
+def f2_windows_operations(config):
+    """Input-only binding gate. Never supplies runtime observations or hits."""
+    from r2f.core.evidence import canonical_hash
+    if config.get('target_id') != F2_WINDOWS_TARGET:
+        return []
+    if (config.get('runtime_capability') != 'f2_windows_v1'
+            or type(config.get('target_revision')) is not int or config['target_revision'] != 0
+            or config.get('anchor_timing_policy') != F2_ANCHOR_POLICY
+            or type(config.get('anchor_lateness_tolerance_sec')) not in (int, float)
+            or config['anchor_lateness_tolerance_sec'] != 0.5):
+        raise ValueError('f2_windows_explicit_capability_and_timing_policy_required')
+    if config.get('arm') != 'mutated' or config.get('environment_mutation') is not None:
+        raise ValueError('f2_windows_requires_mutated_discovery_drop')
+    plan = config.get('mutation_plan')
+    if not isinstance(plan, dict) or canonical_hash(plan) != config.get('mutation_plan_sha256'):
+        raise ValueError('f2_windows_plan_hash_mismatch')
+    final = plan.get('final_config')
+    if not isinstance(final, dict) or config.get('final_input') != final:
+        raise ValueError('f2_windows_final_input_mismatch')
+    for field in ('environment_windows', 'runtime_capability', 'anchor_timing_policy', 'anchor_lateness_tolerance_sec'):
+        if field not in final or final[field] != config.get(field):
+            raise ValueError('f2_windows_final_input_mismatch:' + field)
+    from r2f.core.mutation_plan import MutationPlan
+    MutationPlan.from_dict(plan).validate()
+    operations = plan.get('operations')
+    # Initial activation is explicitly single-surface/single-operation.
+    if not isinstance(operations, list) or len(operations) != 1:
+        raise ValueError('f2_windows_requires_one_operation')
+    operation = operations[0]
+    if (not isinstance(operation, dict) or not isinstance(operation.get('op_id'), str)
+            or not operation['op_id'] or (operation.get('surface_id'), operation.get('mutator_id'))
+                not in (('E02', 'M07'), ('E03', 'M06'))
+            or config.get('fuzz_surfaces') != [operation['surface_id']]):
+        raise ValueError('f2_windows_operation_binding_mismatch')
+    windows = config.get('environment_windows')
+    from .discovery_network import validate_window_plan
+    validate_window_plan(windows)
+    parameters = operation.get('parameters', {})
+    if (operation.get('applicability_result', {}).get('status') != 'needs_observation'
+            or any(parameters.get(k, False) is not False for k in ('anchor_observed', 'post_match_observed'))):
+        raise ValueError('f2_windows_runtime_guard_not_pending')
+    if plan.get('runtime_windows') != [dict(schema='r2f.runtime-window/v1', **w) for w in windows]:
+        raise ValueError('f2_windows_plan_window_mismatch')
+    if any(config.get(k) for k in ('reader_recreate_in_window', 'writer_churn_in_window',
+                                   'publish_burst_in_window', 'discovery_probe')):
+        raise ValueError('f2_windows_additional_actions_not_enabled')
+    if operation['surface_id'] == 'E02':
+        submitted = config.get('submitted_parameters', {})
+        if (type(parameters.get('window_count')) is not int
+                or parameters.get('window_count') != len(windows)
+                or parameters.get('restore_interval_sec') != submitted.get('environment_windows.restore_interval_sec')
+                or submitted.get('environment_windows.count') != len(windows)
+                or any(w['restore_interval_sec'] != submitted.get('environment_windows.restore_interval_sec')
+                       for w in windows)):
+            raise ValueError('f2_windows_E02_count_or_interval_mismatch')
+        if (parameters.get('anchor') != windows[0]['trigger_anchor']
+                or parameters.get('anchor_offset_sec') != windows[0]['trigger_offset_sec']):
+            raise ValueError('f2_windows_E02_anchor_or_offset_mismatch')
+        affected = list(range(len(windows)))
+    else:
+        submitted = config.get('submitted_parameters', {})
+        anchor = parameters.get('anchor')
+        affected = [i for i, w in enumerate(windows) if w['trigger_anchor'] == anchor]
+        if (anchor not in ('fresh_match', 'previous_restore_confirmed') or not affected
+                or type(parameters.get('offset_sec')) not in (int, float)
+                or any(windows[i]['trigger_offset_sec'] != parameters['offset_sec'] for i in affected)
+                or submitted.get('environment_windows.anchor') != anchor
+                or submitted.get('environment_windows.anchor_offset_sec') != parameters['offset_sec']):
+            raise ValueError('f2_windows_E03_anchor_or_offset_mismatch')
+    return [dict(operation, affected_window_indices=affected)]
+
+
 def recovery_fuzz_admission_error(config):
     """Return an explicit non-admission reason, or None for the admitted slice.
 
@@ -327,6 +408,12 @@ def recovery_fuzz_admission_error(config):
     rewritten, so a config that mixes another target's surface (e.g. G01) is
     refused by the binding check or here.
     """
+    if config.get('target_id') == F2_WINDOWS_TARGET:
+        try:
+            f2_windows_operations(config)
+        except (ValueError, TypeError, KeyError) as exc:
+            return 'unsupported_capability:' + str(exc)
+        return None
     if config.get('target_id') != RECOVERY_FUZZ_TARGET:
         return None
     surfaces = set(config.get('fuzz_surfaces') or ())
@@ -385,6 +472,16 @@ def exploratory_bindings(config):
     expected = []
     for surface_id in surfaces:
         field, path, evidence_class = EXPLORATORY_BINDINGS[surface_id]
+        if surface_id == 'E03' and config.get('target_id') == F2_WINDOWS_TARGET:
+            operation = f2_windows_operations(config)[0]
+            for index in operation['affected_window_indices']:
+                for label, name in (('anchor', 'trigger_anchor'), ('anchor_offset_sec', 'trigger_offset_sec')):
+                    key = 'environment_windows.' + label
+                    expected.append({'surface_id': surface_id, 'field': key,
+                        'path': ['environment_windows', index, name], 'submitted': submitted[key],
+                        'configured': config['environment_windows'][index][name],
+                        'evidence_class': evidence_class, 'affected_window_indices': operation['affected_window_indices']})
+            continue
         if surface_id == 'G01':
             pair_fields = ('writer_qos.reliability', 'reader_qos.reliability')
             for pair_field, role in zip(pair_fields, ('writer', 'reader')):
@@ -457,6 +554,16 @@ def exploratory_runtime_capabilities():
                         'backend': spec['backend'],
                         'carrier': spec['carrier'],
                         'mutation_kind': spec['mutation_kind'],
+                        **({'runtime_capability': spec['runtime_capability']}
+                           if target_id == F2_WINDOWS_TARGET else {}),
+                        # Window execution is a route capability, not activation
+                        # of the generation-only E02/E03/G01 surfaces.
+                        'multi_window': (target_id in (RECOVERY_FUZZ_TARGET, F2_WINDOWS_TARGET)
+                                         and spec['backend'] == 'discovery_namespace'
+                                         and spec['carrier'] == 'wire_proxy'
+                                         and spec['mutation_kind'] == 'discovery_drop'),
+                        'max_runtime_windows': (MAX_RECOVERY_WINDOWS
+                                                if target_id in (RECOVERY_FUZZ_TARGET, F2_WINDOWS_TARGET) else 1),
                         'surfaces': list(spec['surfaces']),
                         'available': None if spec['backend'] != 'unsupported_relation_observation' else False,
                         'admitted': False,
@@ -591,7 +698,7 @@ def normalize_config(config):
         from .discovery_network import validate_window_plan
         windows = validate_window_plan(c['environment_windows'])
         if c['target_id'] not in ('discovery.interruption_recovery',
-                                  'discovery.interruption_recovery.fuzz_v1'):
+                                  'discovery.interruption_recovery.fuzz_v1', F2_WINDOWS_TARGET):
             raise ValueError('environment_windows_only_supported_for_discovery_target')
         c['environment_windows'] = windows
     return c
@@ -833,7 +940,73 @@ def query_acknowledged_graphs(pool, events, timeout, emit=None, capture_graph=No
     return proof
 
 
-def run_pair(config: dict, output_dir: Path) -> dict:
+def acquire_pair_environment(config, output_dir, emit, *, result=None):
+    """Canonical three-lease + process/RTPS/source/environment preflight.
+
+    Caller MUST keep the returned LeaseSet until every child has exited.
+    Failures release here because no worker may exist before this returns.
+    """
+    lock_root = Path(config.get('lock_root', f'/tmp/r2f-runtime-locks-{os.getuid()}'))
+    lease = LeaseSet(lock_root, output_dir, config['campaign_id'], config['domain_id'])
+    lease.__enter__()
+    try:
+        emit('isolation_locks_acquired', locks=lease.receipts)
+        environment = check_environment(config)
+        if result is not None:
+            result['environment'] = environment
+        (Path(output_dir) / 'environment.json').write_text(
+            json.dumps(environment, sort_keys=True, indent=2) + '\n')
+        emit('environment_preflight', ok=environment['ok'], reason=environment.get('reason'),
+             environment=environment)
+        if not environment['ok']:
+            raise IsolationError(environment.get('reason', 'environment_preflight_failed'))
+        require_rmws_available(environment, config)
+        _, child_environment = activated_environment(config)
+        return lease, environment, child_environment
+    except BaseException:
+        lease.__exit__(None, None, None)
+        raise
+
+
+def verify_pair_lease(lease, config, output_dir):
+    """Check actual open lease inodes/owners; config receipt strings cannot pass."""
+    if not isinstance(lease, LeaseSet) or len(lease.handles) != 3 or len(lease.receipts) != 3:
+        raise IsolationError('topology_requires_held_canonical_three_leases')
+    if (lease.state_dir != Path(output_dir).resolve()
+            or lease.campaign_id != config['campaign_id']
+            or lease.domain_id != config['domain_id']):
+        raise IsolationError('topology_lease_identity_mismatch')
+    for handle, receipt in zip(lease.handles, lease.receipts):
+        if handle.closed:
+            raise IsolationError('topology_lease_inode_not_held')
+        opened, named = os.fstat(handle.fileno()), Path(receipt['path']).stat()
+        if (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino):
+            raise IsolationError('topology_lease_inode_not_held')
+        # A nonempty receipt/open FD is not a held flock. An independently
+        # opened description MUST conflict while this process holds the lease.
+        import fcntl
+        with Path(receipt['path']).open('r') as probe:
+            try:
+                fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                pass
+            else:
+                fcntl.flock(probe, fcntl.LOCK_UN)
+                raise IsolationError('topology_lease_flock_not_held')
+        handle.seek(0)
+        owner = json.load(handle)
+        if (owner.get('pid') != os.getpid() or owner.get('campaign_id') != config['campaign_id']
+                or owner.get('domain_id') != config['domain_id']
+                or owner.get('state_dir') != str(Path(output_dir).resolve())):
+            raise IsolationError('topology_lease_owner_mismatch')
+    return lease.receipts
+
+
+def run_pair(config: dict, output_dir: Path, *, topology_backend=None) -> dict:
+    # Explicit opt-in extension, deliberately outside EXPLORATORY_TARGETS.
+    from .topology_route import topology_route_requested, run_topology_route
+    if topology_route_requested(config) or topology_backend is not None:
+        return run_topology_route(config, output_dir, backend=topology_backend)
     output_dir = Path(output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     result = {'real_execution': False, 'runtime_status': 'blocked', 'status': 'blocked', 'reason': None,
@@ -993,18 +1166,8 @@ def run_pair(config: dict, output_dir: Path) -> dict:
         pool.wait(lambda: has('command_done', 'writer', command_id=command_id), c['startup_timeout_sec'], 'publish_ack')
 
     try:
-        lock_root = Path(c.get('lock_root', f'/tmp/r2f-runtime-locks-{os.getuid()}'))
-        lease = LeaseSet(lock_root, output_dir, c['campaign_id'], c['domain_id'])
-        lease.__enter__()
-        emit('isolation_locks_acquired', locks=lease.receipts)
-        environment = check_environment(c)
+        lease, environment, child_environment = acquire_pair_environment(c, output_dir, emit, result=result)
         result['environment'] = environment
-        (output_dir / 'environment.json').write_text(json.dumps(environment, sort_keys=True, indent=2) + '\n')
-        emit('environment_preflight', ok=environment['ok'], reason=environment.get('reason'))
-        if not environment['ok']:
-            raise IsolationError(environment.get('reason', 'environment_preflight_failed'))
-        require_rmws_available(environment, c)
-        _, child_environment = activated_environment(c)
         # prepare must succeed before worker creation: never fall back to an
         # unsanitized environment after a blackbox preparation failure.
         if observation_uses_single_vendor_contract(c):

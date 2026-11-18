@@ -122,7 +122,9 @@ class StateSignatureV18V19V20(unittest.TestCase):
 
         record = {"execution_stage": "judged", "typed_facts": base_facts(observation_complete=False)}
         self.assertFalse(coverage_eligible(record))
-        record_complete = {"execution_stage": "judged", "typed_facts": base_facts()}
+        record_complete = {"execution_stage": "judged", "actual_run": True,
+                           "typed_facts": base_facts(environment_healthy=True, process_healthy=True,
+                                                     preconditions_reached=True, endpoint_identity_complete=True)}
         self.assertTrue(coverage_eligible(record_complete))
 
     def test_v20_state_schema_is_exact(self):

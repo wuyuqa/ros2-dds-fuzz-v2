@@ -22,6 +22,8 @@ from r2f.core.mutation_plan import validate_plan
 from r2f.modules.s1 import fuzz_catalog
 from r2f.modules.s1.module import register_exploratory
 from r2f.core import Registry
+from r2f.modules.s1.targets import F2_WINDOWS_CAPABILITY, F2_WINDOWS_TARGET
+from r2f.modules.s1.topology_targets import TOPOLOGY_CAPABILITY, TOPOLOGY_TARGET
 
 LATE = "discovery.late_endpoint.fuzz_v1"
 LATE_JOIN = "discovery.late_join_delivery.fuzz_v1"
@@ -109,13 +111,46 @@ class RouteTableContracts(unittest.TestCase):
         self.assertEqual(_EXPLORATORY_ROUTES[PROJECTION]["carrier"], "ros2_endpoint")
 
     def test_route_carrier_and_kind_match_the_declared_target_slots(self):
-        registry = Registry()
-        register_exploratory(registry, include_required=False)
-        for target_id, route in _EXPLORATORY_ROUTES.items():
-            with self.subTest(target=target_id):
-                slot = registry.get_target(target_id).mutation_slots[0]
-                self.assertEqual(slot.carrier, route["carrier"])
-                self.assertEqual(slot.mutation_kind, route["mutation_kind"])
+        capabilities = {None, F2_WINDOWS_CAPABILITY, TOPOLOGY_CAPABILITY}
+        legacy = {LATE, LATE_JOIN, RECOVERY, PROJECTION, COMPAT}
+        capability_targets = {None: set(), F2_WINDOWS_CAPABILITY: {F2_WINDOWS_TARGET},
+                              TOPOLOGY_CAPABILITY: {TOPOLOGY_TARGET}}
+        self.assertEqual({route.get("runtime_capability")
+                          for route in _EXPLORATORY_ROUTES.values()}, capabilities)
+        checked = set()
+        for capability in capabilities:
+            registry = Registry()
+            register_exploratory(registry, include_required=False,
+                                 runtime_capability=capability)
+            # A route is dispatch knowledge, not default or cross-capability permission.
+            self.assertEqual(set(registry.targets), legacy | capability_targets[capability])
+            if capability is None:
+                with self.assertRaises(KeyError):
+                    registry.get_target(F2_WINDOWS_TARGET)
+            for denied in {F2_WINDOWS_TARGET, TOPOLOGY_TARGET} - capability_targets[capability]:
+                with self.subTest(capability=capability, denied=denied):
+                    with self.assertRaises(KeyError):
+                        registry.get_target(denied)
+                    with self.assertRaises(KeyError):
+                        registry.get_services(denied)
+            for target_id, route in _EXPLORATORY_ROUTES.items():
+                if route.get("runtime_capability") != capability:
+                    continue
+                with self.subTest(target=target_id, capability=capability):
+                    slot = registry.get_target(target_id).mutation_slots[0]
+                    self.assertEqual(slot.carrier, route["carrier"])
+                    self.assertEqual(slot.mutation_kind, route["mutation_kind"])
+                    checked.add(target_id)
+        self.assertEqual(checked, set(_EXPLORATORY_ROUTES))
+
+    def test_route_names_do_not_grant_topology_capability(self):
+        self.assertEqual(_EXPLORATORY_ROUTES[TOPOLOGY_TARGET]["runtime_capability"],
+                         "topology_v1")
+        self.assertEqual(_EXPLORATORY_ROUTES[TOPOLOGY_TARGET]["backend"], "topology_pair")
+        for capability in (TOPOLOGY_TARGET, "topology", "topology_v1_extra"):
+            with self.subTest(capability=capability):
+                with self.assertRaisesRegex(ValueError, "unsupported exploratory runtime_capability"):
+                    register_exploratory(Registry(), runtime_capability=capability)
 
     def test_only_verified_routes_are_execution_admitted(self):
         # Live-admitted routes are evidence-based: late endpoint, projection

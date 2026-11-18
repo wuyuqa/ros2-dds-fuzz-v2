@@ -51,6 +51,108 @@ EXPLORATORY_SEAL = "not_applicable_exploratory"
 SUPPORTED_CAMPAIGN_KINDS = frozenset({"required", "exploratory"})
 
 
+BOUNDARY_AUDIT_PENDING = "isolated_boundary_qualification_pending"
+
+
+def execution_boundary_qualification(runtime_boundary=None, *, config=None, result=None,
+                                     row=None, formal_runtime=False, output_root=None):
+    """Combine caller selection and complete execution evidence after runtime.
+
+    The boundary helper only establishes artifact consistency. It does not
+    replace canonical selection, source freeze, nonfixture raw/env/worker or
+    successful outer-runtime gates. Planned rows remain explicitly pending.
+    """
+    for label, value in (("row", row), ("config", config), ("result", result)):
+        if value is not None and not isinstance(value, dict):
+            raise ValueError("boundary_" + label + "_not_object")
+    result_present = result is not None
+    row, config, result = row or {}, config or {}, result or {}
+    options = config.get("execution_boundary")
+    isolated = (runtime_boundary == "isolated_netns" or row.get("runtime_boundary") == "isolated_netns"
+                or isinstance(options, dict) and options.get("enabled") is True
+                or "execution_boundary" in result or isinstance(row.get("execution_boundary"), dict)
+                or any(isinstance(item, dict) and item.get("pid_interpretation") == "namespace_PID_not_host_PID"
+                       for item in (result.get("execution_metadata"), result.get("execution"),
+                                    row.get("runtime_execution_metadata"))))
+    if not isolated:
+        if runtime_boundary not in {None, "host"}:
+            return {"status": "invalid", "reason_code": "unsupported_runtime_boundary",
+                    "errors": ["unsupported_runtime_boundary"], "eligible": False}
+        return {"status": "not_applicable", "reason_code": "host_runtime", "errors": []}
+    if not result_present:
+        return {"status": "unknown", "reason_code": BOUNDARY_AUDIT_PENDING,
+                "errors": [], "eligible": False}
+    from r2f.campaign.replay import _qualification, ISOLATED_RUNTIME
+    origin = ISOLATED_RUNTIME if runtime_boundary == "isolated_netns" and formal_runtime is True else "injected_runtime"
+    try:
+        qualified = _qualification(origin, config, result, row, output_root=output_root)
+    except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
+        qualified = {"real_ros_execution": False, "real_runtime_attempt": False,
+                     "qualification_errors": ["invalid_boundary_runtime_evidence:" + type(exc).__name__ + ":" + str(exc)]}
+    errors = qualified["qualification_errors"]
+    source = config.get("source_manifest") or {}
+    if not isinstance(source, dict):
+        errors.append("boundary_source_manifest_not_object")
+    else:
+        try:
+            if not source.get("source_repo") or canonical_hash(source_manifest(Path(source["source_repo"]))) != canonical_hash(source):
+                errors.append("boundary_current_source_mismatch")
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            errors.append("boundary_current_source_unavailable:" + type(exc).__name__)
+    return {"status": "qualified" if not errors else "invalid",
+            "reason_code": "boundary_execution_qualified" if not errors else errors[0],
+            "errors": errors, "eligible": not errors,
+            "boundary_audit": qualified.get("boundary_audit"),
+            "real_runtime_attempt": qualified["real_runtime_attempt"],
+            "qualification_basis": "canonical_source_artifacts_completed_raw_environment_workers"}
+
+
+def boundary_qualification_for_row(root, row, report):
+    """Reopen evidence, pin the runner layout, and recompute; never trust labels.
+
+    For isolated artifacts the caller-owned campaign root and validated cell
+    identity fix the runtime directory. A sidecar or raw path cannot choose it.
+    Legacy host reports without additive artifact paths keep their contract.
+    """
+    root = Path(root).resolve()
+    config, result = None, None
+    if row.get("runtime_config_path"):
+        config = json.loads(_path(root, row["runtime_config_path"]).read_text())
+    result_path = None
+    if row.get("runtime_result_path"):
+        candidate = Path(row["runtime_result_path"])
+        candidate = candidate if candidate.is_absolute() else root / candidate
+        if candidate.exists() or row.get("actual_run") is True:
+            result_path = _path(root, row["runtime_result_path"])
+            result = json.loads(result_path.read_text())
+    # No artifact root is needed to describe a genuinely unexecuted plan.
+    if result is None:
+        return execution_boundary_qualification(report.get("runtime_boundary"), config=config, row=row)
+    cell = row.get("cell_id")
+    if not isinstance(cell, str) or cell in {"", ".", ".."} or Path(cell).name != cell or "\\" in cell:
+        raise ValueError("boundary_cell_identity_not_path_component")
+    directory = "cases" if row.get("campaign_kind") == "exploratory" else "cells"
+    output_root = root / directory / cell / "runtime"
+    qualification = execution_boundary_qualification(
+        report.get("runtime_boundary"), config=config, result=result, row=row,
+        formal_runtime=report.get("formal_runtime", report.get("runtime_formal")) is True,
+        output_root=output_root)
+    if qualification["status"] != "not_applicable":
+        expected_config = root / directory / cell / "runtime_config.json"
+        if (result_path != output_root.resolve() / "runtime_result.json"
+                or _path(root, row.get("runtime_config_path")) != expected_config.resolve()
+                or not output_root.resolve().is_relative_to(root)):
+            qualification.update(status="invalid", eligible=False, reason_code="boundary_runtime_artifact_layout_mismatch")
+            qualification["errors"].append("boundary_runtime_artifact_layout_mismatch")
+        expected_source = report.get("source_manifest")
+        if expected_source is None and report.get("manifest_path"):
+            expected_source = json.loads(_path(root, report["manifest_path"]).read_text()).get("source_manifest")
+        if expected_source is not None and canonical_hash((config or {}).get("source_manifest")) != canonical_hash(expected_source):
+            qualification.update(status="invalid", eligible=False, reason_code="boundary_report_source_binding_mismatch")
+            qualification["errors"].append("boundary_report_source_binding_mismatch")
+    return qualification
+
+
 def _coverage_hit(row):
     """A hit is only the plan-bearing mutation receipt's own boolean."""
     receipt = row.get("mutation_receipt")
@@ -71,7 +173,13 @@ def exploratory_coverage_fields(report):
     if not any(isinstance(row, dict) and ("sampling_kind" in row or "chain_depth" in row)
                for row in rows):
         return None
-    return exploratory_coverage_table(rows)
+    projected_rows = []
+    for row in rows:
+        qualification = row.get("boundary_qualification") or execution_boundary_qualification(report.get("runtime_boundary"), row=row)
+        if qualification["status"] not in {"not_applicable", "qualified"}:
+            row = dict(row, boundary_qualification=qualification)
+        projected_rows.append(row)
+    return exploratory_coverage_table(projected_rows)
 
 
 def exploratory_coverage_table(rows):
@@ -81,8 +189,12 @@ def exploratory_coverage_table(rows):
 
     * ``generated`` — a plan-bearing case was produced (not a rejected stub);
     * ``executed`` — the row recorded a real runtime run;
-    * ``judged`` — the row reached ``execution_stage=judged`` after a real run;
-    * ``hit`` — the row's own mutation receipt reports a real hit.
+    * ``judged`` — a boundary-eligible row reached ``judged`` after a real run;
+    * ``hit`` — a boundary-eligible row's own receipt reports a real hit.
+
+    Pending/invalid isolated evidence retains generated/actual execution counts,
+    but cannot contribute qualified judged/hit coverage. Original rows and raw
+    execution history are never rewritten to manufacture an unexecuted run.
 
     A planned-only case therefore contributes to ``generated`` but never to the
     other three.  Missing sampler/depth values are kept as ``None`` instead of
@@ -105,6 +217,13 @@ def exploratory_coverage_table(rows):
         entry["generated"] += 1
         if row.get("actual_run") is True:
             entry["executed"] += 1
+        qualification = row.get("boundary_qualification") or execution_boundary_qualification(row=row)
+        from r2f.modules.s1.topology_targets import TOPOLOGY_TARGET
+        if (row.get("target_id") == TOPOLOGY_TARGET
+                and (row.get("execution_qualification") or {}).get("real_ros_execution") is not True):
+            continue
+        if qualification["status"] not in {"not_applicable", "qualified"}:
+            continue
         if row.get("execution_stage") == "judged" and row.get("actual_run") is True:
             entry["judged"] += 1
         if _coverage_hit(row):
@@ -203,6 +322,11 @@ def _audit_required_report(report_path, report):
                     raise ValueError("integer identity required")
                 if row.get("identity") != identity or row.get("target_id") != target_id or row.get("target_revision") != revision or row.get("run_id") != report["run_id"]:
                     raise ValueError("cell_identity_mismatch")
+                qualification = boundary_qualification_for_row(root, row, report)
+                if qualification["status"] != "not_applicable":
+                    details.setdefault("boundary_qualifications", {})[cell_id] = qualification
+                if qualification["status"] not in {"not_applicable", "qualified"}:
+                    raise ValueError(qualification["reason_code"])
                 if row.get("execution_stage") != "judged" or row.get("actual_run") is not True:
                     raise ValueError("cell_not_actually_judged")
                 runtime = json.loads(_path(root, row["runtime_result_path"]).read_text())
@@ -292,13 +416,14 @@ def _audit_required_report(report_path, report):
         ledger = json.loads(_path(root, report["candidate_ledger_path"]).read_text())
         if canonical_hash(ledger) != report.get("candidate_ledger_sha256"):
             errors.append("candidate_ledger_hash_mismatch")
-        actual_anomalies = {r["cell_id"] for r in rows if r.get("oracle_verdict") == "fail" and r.get("arm") != "negative" and not r.get("control_kind")}
+        eligible_rows = [r for r in rows if boundary_qualification_for_row(root, r, report)["status"] in {"not_applicable", "qualified"}]
+        actual_anomalies = {r["cell_id"] for r in eligible_rows if r.get("oracle_verdict") == "fail" and r.get("arm") != "negative" and not r.get("control_kind")}
         if {c.get("cell_id") for c in ledger["candidates"] if c.get("observation_kind", "primary") == "primary"} != actual_anomalies:
             errors.append("candidate_ledger_dropped_or_invented_anomaly")
         if not ledger["candidates"] and not ledger.get("zero_candidate_explanation"):
             errors.append("zero_candidate_explanation_missing")
         from r2f.reports.candidate_report import candidate_ledger, audit_projection
-        reconstructed_ledger = candidate_ledger(rows)
+        reconstructed_ledger = candidate_ledger(eligible_rows)
         expected_candidates = {c["candidate_id"]: c for c in reconstructed_ledger["candidates"]}
         if Counter(c.get("candidate_id") for c in ledger["candidates"]) != Counter(expected_candidates.keys()):
             errors.append("candidate_ledger_dropped_or_invented_instrumentation")
@@ -350,6 +475,15 @@ def _validate_exploratory_profile(report, errors):
     if not isinstance(profile, dict):
         errors.append("exploratory_profile_missing")
         return None
+    from r2f.modules.s1.topology_targets import TOPOLOGY_TARGET
+    if (TOPOLOGY_TARGET in (profile.get("target_ids") or [])
+            or profile.get("runtime_capability") == "topology_v1"):
+        from r2f.campaign.exploratory_input import validate_topology_profile
+        try:
+            validate_topology_profile(profile)
+        except (ValueError, TypeError, KeyError) as exc:
+            errors.append("exploratory_topology_profile_invalid:" + str(exc))
+        return profile
     try:
         from r2f.modules.s1.fuzz_catalog import SURFACES
     except (ImportError, ValueError) as exc:  # pragma: no cover - catalog is required
@@ -414,6 +548,74 @@ def _validate_exploratory_identity(report, errors):
         errors.append("exploratory_report_cannot_claim_required_matrix")
 
 
+def _topology_artifact_qualification(root, row, report):
+    """Reopen the unified case layout; saved labels never grant qualification."""
+    from r2f.modules.s1.topology_targets import TOPOLOGY_TARGET, TOPOLOGY_CAPABILITY
+    from r2f.campaign.replay import _registered_target, _qualification, DEFAULT_RUNTIME, ISOLATED_RUNTIME
+    from r2f.runtime.topology_route import validate_topology_route
+    root = Path(root).resolve()
+    cell = row.get("cell_id")
+    if (not isinstance(cell, str) or cell in {"", ".", ".."}
+            or Path(cell).name != cell or "\\" in cell):
+        raise ValueError("topology_cell_identity_not_path_component")
+    case = root / "cases" / cell
+    paths = {"replay_path": case / "capsule.json", "runtime_config_path": case / "runtime_config.json",
+             "runtime_result_path": case / "runtime" / "runtime_result.json"}
+    for key, expected in paths.items():
+        if key != "runtime_result_path" or expected.exists() or row.get("actual_run") is True:
+            if _path(root, row.get(key)) != expected.resolve():
+                raise ValueError("topology_artifact_path_mismatch:" + key)
+    capsule = ReplayCapsule.from_dict(json.loads(paths["replay_path"].read_text()))
+    target, services, _ = _registered_target(capsule)
+    if (target.target_id != TOPOLOGY_TARGET
+            or target.observation_contract.get("runtime_capability") != TOPOLOGY_CAPABILITY):
+        raise ValueError("topology_registered_capability_mismatch")
+    config = json.loads(paths["runtime_config_path"].read_text())
+    plan = validate_topology_route(config)
+    if json.loads(_path(root, str(case / "mutation_plan.json")).read_text()) != plan.to_dict():
+        raise ValueError("topology_plan_artifact_mismatch")
+    identity = capsule.input
+    for key in ("scenario", "mutation_plan", "effective_input", "effective_input_sha256", "source_manifest"):
+        if canonical_hash(config.get(key)) != canonical_hash(identity.get(key)):
+            raise ValueError("topology_config_capsule_mismatch:" + key)
+    for key in ("run_id", "target_id", "target_revision", "rmw", "arm", "repeat", "seed",
+                "effective_input_sha256", "input_layer_receipts", "mutation_plan", "final_input"):
+        if canonical_hash(config.get(key)) != canonical_hash(row.get(key)):
+            raise ValueError("topology_config_row_mismatch:" + key)
+    if config.get("cell_id") != cell or config.get("profile_id") != report.get("profile", {}).get("profile_id"):
+        raise ValueError("topology_config_report_identity_mismatch")
+    if canonical_hash(config.get("source_manifest")) != canonical_hash(report.get("source_manifest")):
+        raise ValueError("topology_report_source_mismatch")
+    if not paths["runtime_result_path"].exists():
+        if row.get("actual_run") is True or row.get("execution_stage") not in {"planned", "aborted"}:
+            raise ValueError("topology_execution_result_missing")
+        qualified = {"real_ros_execution": False, "qualification_errors": ["topology_not_executed"]}
+    else:
+        result = json.loads(paths["runtime_result_path"].read_text())
+        original = Scenario.from_dict(identity["scenario"])
+        recalculated = ingest_execution(original, config, result, capsule, services=services)
+        for key in ("execution_stage", "actual_run", "abort_reason", "typed_facts", "oracle", "oracle_verdict",
+                    "rule_id", "mutation_receipt", "precondition_receipts", "observation_receipts",
+                    "raw_path", "raw_sha256", "runtime_status", "runtime_reason", "runtime_execution_metadata"):
+            if canonical_hash(row.get(key)) != canonical_hash(recalculated.get(key)):
+                raise ValueError("topology_recomputed_ingest_differs:" + key)
+        formal = report.get("formal_runtime", report.get("runtime_formal")) is True
+        boundary = report.get("runtime_boundary", "host")
+        origin = (ISOLATED_RUNTIME if boundary == "isolated_netns" else DEFAULT_RUNTIME) if formal else "injected_runtime"
+        qualified = _qualification(origin, config, result, recalculated, output_root=case / "runtime")
+        source = config.get("source_manifest") or {}
+        if (not source.get("source_repo")
+                or canonical_hash(source_manifest(Path(source["source_repo"]))) != canonical_hash(source)):
+            qualified["qualification_errors"].append("topology_current_source_mismatch")
+            qualified["real_ros_execution"] = False
+    if not qualified["real_ros_execution"]:
+        if any(row.get(key) is True for key in ("candidate_eligible", "feedback_eligible", "seal_eligible")):
+            raise ValueError("topology_unqualified_execution_claims_eligibility")
+        if row.get("execution_stage") == "judged" or row.get("actual_run") is True:
+            raise ValueError("topology_execution_not_qualified:" + ",".join(qualified["qualification_errors"]))
+    return qualified
+
+
 def _verify_exploratory_row(root, row, report, errors):
     cell = row.get("cell_id", "<missing>")
     try:
@@ -432,6 +634,19 @@ def _verify_exploratory_row(root, row, report, errors):
                 "modelled", "expressible", "planned", "precondition_executed", "reached",
                 "mutation_applied", "effect_observed", "judged", "aborted"}:
             raise ValueError("invalid execution_stage")
+        qualification = boundary_qualification_for_row(root, row, report)
+        if qualification["status"] not in {"not_applicable", "qualified"}:
+            raise ValueError(qualification["reason_code"])
+        from r2f.modules.s1.topology_targets import TOPOLOGY_TARGET
+        if row["target_id"] == TOPOLOGY_TARGET:
+            if row.get("generation_status") == "rejected":
+                if (row.get("actual_run") is not False or row.get("mutation_plan") is not None
+                        or row.get("execution_stage") != "planned"
+                        or row.get("attribution") != "harness_input_generation"
+                        or not row.get("reason_code", "").startswith("topology_input_rejected:")):
+                    raise ValueError("topology_generation_rejection_claim_invalid")
+                return True
+            _topology_artifact_qualification(root, row, report)
         plan = row.get("mutation_plan")
         if plan is not None:
             if not isinstance(plan, dict):
@@ -512,7 +727,9 @@ def _audit_exploratory_budget(report, rows, errors):
     if abort is not None:
         if not isinstance(abort, dict) or abort.get("reason_code") not in {
                 "source_repo_HEAD_or_behavior_tree_changed", "config_changed", "cli_contract_changed",
-                "observer_unhealthy", "budget_exhausted", "operator_interrupt"}:
+                "observer_unhealthy", "budget_exhausted", "operator_interrupt",
+                BOUNDARY_AUDIT_PENDING, "boundary_route_context_mismatch",
+                "execution_boundary_qualification_failed"}:
             errors.append("exploratory_abort_reason_unrecognized")
         else:
             index = abort.get("after_row_index")
@@ -574,7 +791,26 @@ def _audit_exploratory_ledger(root, report, rows, errors, details):
     ledger = json.loads(ledger_path.read_text())
     if canonical_hash(ledger) != report.get("candidate_ledger_sha256"):
         errors.append("candidate_ledger_hash_mismatch")
-    expected = exploratory_candidate_ledger(rows, reviews=report.get("review_records") or [])
+    eligible_rows, exclusions = [], []
+    from r2f.modules.s1.topology_targets import TOPOLOGY_TARGET
+    for row in rows:
+        if boundary_qualification_for_row(root, row, report)["status"] not in {"not_applicable", "qualified"}:
+            continue
+        if row.get("target_id") == TOPOLOGY_TARGET:
+            try:
+                qualified = _topology_artifact_qualification(root, row, report)
+            except (OSError, ValueError, KeyError, TypeError) as exc:
+                qualified = {"real_ros_execution": False, "qualification_errors": [str(exc)]}
+            if not qualified["real_ros_execution"]:
+                exclusions.append({"cell_id": row.get("cell_id"), "actual_run": row.get("actual_run"),
+                                   "execution_stage": row.get("execution_stage"), "raw_path": row.get("raw_path"),
+                                   "raw_sha256": row.get("raw_sha256"),
+                                   "qualification_errors": qualified["qualification_errors"]})
+                continue
+        eligible_rows.append(row)
+    expected = exploratory_candidate_ledger(eligible_rows, reviews=report.get("review_records") or [])
+    if exclusions and ledger.get("execution_exclusions") != exclusions:
+        errors.append("topology_ledger_execution_exclusions_mismatch")
     if Counter(c.get("candidate_id") for c in ledger.get("candidates", [])) != Counter(
             c.get("candidate_id") for c in expected["candidates"]):
         errors.append("candidate_ledger_dropped_or_invented_anomaly")
@@ -700,7 +936,22 @@ def audit_exploratory_report(report_path, *, report=None):
             coverage.append(row)
         details["coverage_entries"] = len(coverage)
         details["coverage_surfaces"] = sorted({s for row in coverage for s in (row.get("surface_ids") or [])})
-        coverage_table = exploratory_coverage_fields(report)
+        qualified_coverage_rows = []
+        for row in rows:
+            from r2f.modules.s1.topology_targets import TOPOLOGY_TARGET
+            if row.get("target_id") == TOPOLOGY_TARGET:
+                try:
+                    recomputed = _topology_artifact_qualification(root, row, report)
+                except (OSError, ValueError, TypeError, KeyError) as exc:
+                    recomputed = {"real_ros_execution": False, "qualification_errors": [str(exc)]}
+                details.setdefault("topology_qualifications", {})[row.get("cell_id", "<missing>")] = recomputed
+                row = dict(row, execution_qualification=recomputed)
+            qualification = boundary_qualification_for_row(root, row, report)
+            if qualification["status"] != "not_applicable":
+                details.setdefault("boundary_qualifications", {})[row.get("cell_id", "<missing>")] = qualification
+                row = dict(row, boundary_qualification=qualification)
+            qualified_coverage_rows.append(row)
+        coverage_table = exploratory_coverage_fields(dict(report, rows=qualified_coverage_rows))
         if coverage_table is not None:
             details["coverage"] = coverage_table
         observed = [r for r in valid if r.get("execution_stage") == "judged"]

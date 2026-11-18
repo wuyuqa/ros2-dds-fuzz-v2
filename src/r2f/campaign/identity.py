@@ -17,36 +17,101 @@ def reject_execution_identity(value, path="input"):
             reject_execution_identity(item, path)
 
 
+def _behavior_snapshot(repo, tracked, script_suffixes):
+    """Read content, never stat/mtime, including HEAD paths missing on disk."""
+    files = {path for folder in (repo / "src", repo / "config")
+             for path in folder.rglob("*") if path.is_file()}
+    files.update(path for path in (repo / "scripts").rglob("*")
+                 if path.is_file() and path.suffix in script_suffixes)
+    files.update(repo / relative for relative in tracked)
+    return {str(path.relative_to(repo)): path.read_bytes() if path.is_file() else None
+            for path in sorted(files)
+            if "__pycache__" not in path.parts and path.suffix != ".pyc"}
+
+
+def _head_behavior_blobs(repo, head, script_suffixes):
+    # NUL paths avoid git's core.quotePath quoting, including tabs/newlines.
+    listing = subprocess.run(
+        ["git", "-C", str(repo), "ls-tree", "-r", "-z", head, "--", "src", "config", "scripts"],
+        capture_output=True, timeout=10)
+    if listing.returncode:
+        raise ValueError("cannot enumerate tracked behavior sources at HEAD")
+    tracked = {}
+    try:
+        records = listing.stdout.split(b"\0")
+        if records.pop() != b"":
+            raise ValueError("unterminated ls-tree output")
+        for record in records:
+            metadata, raw_path = record.split(b"\t", 1)
+            _mode, kind, oid = metadata.split(b" ")
+            relative = raw_path.decode()
+            if not relative.startswith("scripts/") or Path(relative).suffix in script_suffixes:
+                tracked[relative] = (kind, oid)
+    except (ValueError, UnicodeError) as exc:
+        raise ValueError("cannot parse tracked behavior sources at HEAD") from exc
+    return tracked
+
+
+def _batch_behavior_blobs(repo, tracked, snapshot):
+    # Request only object IDs, not paths: --batch's line input is unambiguous
+    # even when a path contains newlines. HEAD is pinned by the ls-tree OIDs.
+    oids = list(dict.fromkeys(tracked[relative][1] for relative, content in snapshot.items()
+                             if content is not None and relative in tracked))
+    if not oids:
+        return {}
+    batch = subprocess.run(["git", "-C", str(repo), "cat-file", "--batch"],
+                           input=b"".join(oid + b"\n" for oid in oids),
+                           capture_output=True, timeout=10)
+    if batch.returncode:
+        raise ValueError("cannot read committed behavior source blobs")
+    blobs, offset = {}, 0
+    try:
+        for oid in oids:
+            end = batch.stdout.index(b"\n", offset)
+            actual_oid, kind, raw_size = batch.stdout[offset:end].split(b" ")
+            if actual_oid != oid or kind != b"blob" or not raw_size.isdigit():
+                raise ValueError("unexpected object header")
+            size = int(raw_size)
+            offset = end + 1
+            end = offset + size
+            if end >= len(batch.stdout) or batch.stdout[end:end + 1] != b"\n":
+                raise ValueError("truncated object body")
+            blobs[oid] = batch.stdout[offset:end]
+            offset = end + 1
+        if offset != len(batch.stdout):
+            raise ValueError("trailing batch data")
+    except ValueError as exc:
+        raise ValueError("cannot parse committed behavior source blobs") from exc
+    return blobs
+
+
 def source_manifest(repo):
     repo = Path(repo).resolve()
-    result = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"], capture_output=True, text=True, timeout=10)
+    command = ["git", "-C", str(repo), "rev-parse", "HEAD"]
+    result = subprocess.run(command, capture_output=True, text=True, timeout=10)
     head = result.stdout.strip() if result.returncode == 0 else None
-    files = sorted(path for folder in (repo / "src", repo / "config") for path in folder.rglob("*") if path.is_file() and "__pycache__" not in path.parts and path.suffix != ".pyc")
-    setup = repo / "scripts/setup_overlay.bash"
-    if setup.is_file():
-        files.append(setup)
+    script_suffixes = {".py", ".sh", ".bash"}
+    tracked = _head_behavior_blobs(repo, head, script_suffixes) if head else {}
+    snapshot = _behavior_snapshot(repo, tracked, script_suffixes)
+    blobs = _batch_behavior_blobs(repo, tracked, snapshot) if head else {}
     digest = hashlib.sha256()
-    dirty, tracked = [], []
-    if head:
-        listing = subprocess.run(["git", "-C", str(repo), "ls-tree", "-r", "--name-only", "HEAD", "--", "src", "config", "scripts/setup_overlay.bash"], capture_output=True, text=True, timeout=10)
-        tracked = listing.stdout.splitlines() if listing.returncode == 0 else []
-        files = sorted(set(files) | {repo / p for p in tracked})
-    for path in files:
-        relative = str(path.relative_to(repo))
-        if "__pycache__" in path.parts or path.suffix == ".pyc":
-            continue
-        if not path.is_file():
+    dirty = []
+    for relative, content in snapshot.items():
+        if content is None:
             dirty.append(relative)
             digest.update(relative.encode() + b"\0<missing>\0")
             continue
-        content = path.read_bytes()
         digest.update(relative.encode() + b"\0" + content + b"\0")
-        if not head or relative not in tracked:
+        if not head or relative not in tracked or blobs[tracked[relative][1]] != content:
             dirty.append(relative)
-            continue
-        committed = subprocess.run(["git", "-C", str(repo), "show", "HEAD:" + relative], capture_output=True, timeout=10)
-        if committed.returncode or committed.stdout != content:
-            dirty.append(relative)
+    # A bounded second content read catches persistent edits/additions/deletions
+    # during collection without trusting mtime, size, or an identity cache.
+    if _behavior_snapshot(repo, tracked, script_suffixes) != snapshot:
+        raise ValueError("behavior sources changed while collecting source manifest")
+    final = subprocess.run(command, capture_output=True, text=True, timeout=10)
+    final_head = final.stdout.strip() if final.returncode == 0 else None
+    if final_head != head:
+        raise ValueError("HEAD changed while collecting source manifest")
     return {"source_repo": str(repo), "head": head, "behavior_tree_sha256": digest.hexdigest(),
             "source_frozen": bool(head) and not dirty,
             "dirty_behavior_paths": sorted(set(dirty))}

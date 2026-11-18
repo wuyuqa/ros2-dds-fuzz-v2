@@ -1,7 +1,9 @@
 """Minimal, pure state abstraction for exploration feedback (plan section 7.1).
 
 This module computes *abstract* state and transition identities for one fixed
-writer/reader pair.  It never executes ROS, never reads raw files, and never
+writer/reader pair by default. Explicit schema dispatch delegates the versioned
+N-endpoint abstraction to topology_state; no shape-based detection occurs.
+It never executes ROS, never reads raw files, and never
 claims that a state was reached: reaching a state requires a separate,
 raw-backed execution observation.
 
@@ -18,6 +20,7 @@ Design constraints:
 
 from ._json import nonempty, snapshot
 from .evidence import canonical_hash
+from .observation_status import observation_complete
 
 STATE_ABSTRACTION_VERSION = "r2f.s1-state-abstraction/v1"
 EDGE_SCHEMA = "r2f.s1-state-edge/v1"
@@ -53,7 +56,7 @@ _IDENTITY_ONLY_KEYS = frozenset({
 })
 
 
-def abstract_state(facts, *, identity_consistent=True):
+def abstract_state(facts, *, identity_consistent=True, schema=STATE_ABSTRACTION_VERSION, program=None):
     """Return the eight-component abstraction for one observed pair state.
 
     ``facts`` may be a richer typed-facts mapping; only declared components are
@@ -62,6 +65,11 @@ def abstract_state(facts, *, identity_consistent=True):
     affirm completeness.  An identity mismatch raises instead of silently
     producing a different state id.
     """
+    if schema != STATE_ABSTRACTION_VERSION:
+        from .topology_state import SCHEMA, abstract_topology_state
+        if schema != SCHEMA:
+            raise ValueError("unsupported state schema: " + str(schema))
+        return abstract_topology_state(program, facts, identity_consistent=identity_consistent)
     if not isinstance(facts, dict):
         raise ValueError("state facts must be a dict")
     if identity_consistent is not True:
@@ -89,7 +97,12 @@ def abstract_state(facts, *, identity_consistent=True):
     return state
 
 
-def validate_state(state):
+def validate_state(state, *, schema=STATE_ABSTRACTION_VERSION):
+    if schema != STATE_ABSTRACTION_VERSION:
+        from .topology_state import SCHEMA, validate_topology_state
+        if schema != SCHEMA:
+            raise ValueError("unsupported state schema: " + str(schema))
+        return validate_topology_state(state)
     if not isinstance(state, dict):
         raise ValueError("state must be a dict")
     if set(state) != set(STATE_COMPONENTS):
@@ -100,8 +113,13 @@ def validate_state(state):
     return {component: state[component] for component in STATE_COMPONENTS}
 
 
-def state_id(state):
+def state_id(state, *, schema=STATE_ABSTRACTION_VERSION):
     """Stable abstract state id; excludes GUID/PID/time by construction."""
+    if schema != STATE_ABSTRACTION_VERSION:
+        from .topology_state import SCHEMA, topology_state_id
+        if schema != SCHEMA:
+            raise ValueError("unsupported state schema: " + str(schema))
+        return topology_state_id(state)
     state = snapshot(state)
     if not isinstance(state, dict) or set(state) != set(STATE_COMPONENTS):
         raise ValueError("state_id requires exactly the declared components")
@@ -111,8 +129,13 @@ def state_id(state):
     return canonical_hash({"abstraction_version": STATE_ABSTRACTION_VERSION, **state})
 
 
-def edge_id(before_state_id, operation_family, parameter_class, after_state_id):
+def edge_id(before_state_id, operation_family, parameter_class, after_state_id, *, schema=STATE_ABSTRACTION_VERSION):
     """Transition identity: before state, operation family, parameter class, after."""
+    if schema != STATE_ABSTRACTION_VERSION:
+        from .topology_state import SCHEMA, topology_edge_id
+        if schema != SCHEMA:
+            raise ValueError("unsupported state schema: " + str(schema))
+        return topology_edge_id(before_state_id, operation_family, parameter_class, after_state_id)
     nonempty(before_state_id, "edge.before_state_id")
     nonempty(operation_family, "edge.operation_family")
     nonempty(parameter_class, "edge.parameter_class")
@@ -127,47 +150,109 @@ def edge_id(before_state_id, operation_family, parameter_class, after_state_id):
 
 
 def coverage_eligible(record):
-    """Whether an execution observation may refresh coverage.
+    """The shared observation gate; state edges have an additional receipt gate."""
+    return observation_complete(record)
 
-    Plans, seeds, tool errors, non-judged stages and incomplete observations are
-    never coverage.  This function performs no additional execution claims: it
-    only filters records that already carry real observation fields.
-    """
-    if not isinstance(record, dict):
-        raise ValueError("coverage record must be a dict")
-    if record.get("execution_stage") != "judged":
-        return False
-    if record.get("tool_error") is True or record.get("reason_code") == "tool_error":
-        return False
-    facts = record.get("typed_facts")
-    if not isinstance(facts, dict) or not facts:
-        return False
-    if facts.get("observation_complete") is not True:
-        return False
-    if facts.get("window_complete") is False:
-        return False
-    if facts.get("endpoint_identity_consistent") is False:
-        return False
-    return True
+
+def _projection_states(record):
+    facts = record["typed_facts"]
+    receipt = facts.get("state_projection_receipt")
+    if not isinstance(receipt, dict):
+        return None
+    if (receipt.get("schema") != "r2f.s1-state-projection/v1"
+            or receipt.get("status") != "observed"
+            or receipt.get("scope") != "canonical_pair"
+            or receipt.get("reasons") != []):
+        return None
+    path, digest = receipt.get("raw_path"), receipt.get("raw_sha256")
+    if not isinstance(path, str) or not path:
+        return None
+    if (not isinstance(digest, str) or len(digest) != 64
+            or any(c not in "0123456789abcdef" for c in digest)):
+        return None
+    if path != record.get("raw_path") or digest != record.get("raw_sha256"):
+        return None
+    def valid_ref(ref, limit=None):
+        return (isinstance(ref, dict) and ref.get("path") == path
+                and ref.get("sha256") == digest
+                and type(ref.get("event_index")) is int and ref["event_index"] >= 0
+                and (limit is None or ref["event_index"] <= limit))
+
+    states = []
+    boundaries = []
+    for side in ("before", "after"):
+        binding = receipt.get(side)
+        if not isinstance(binding, dict) or not valid_ref(binding.get("boundary_ref")):
+            return None
+        boundary = binding["boundary_ref"]["event_index"]
+        boundaries.append(boundary)
+        refs = binding.get("component_refs")
+        if not isinstance(refs, dict) or set(refs) != set(STATE_COMPONENTS):
+            return None
+        for component in STATE_COMPONENTS:
+            evidence = refs[component]
+            if (not isinstance(evidence, dict)
+                    or evidence.get("status") not in ("observed", "not_applicable")
+                    or not isinstance(evidence.get("refs"), list) or not evidence["refs"]
+                    or any(not valid_ref(ref, boundary) for ref in evidence["refs"])):
+                return None
+            if evidence["status"] == "not_applicable" and not (
+                    isinstance(evidence.get("reason"), str) and evidence["reason"]):
+                return None
+        snapshot = facts.get("state_" + side)
+        if not isinstance(snapshot, dict) or not set(STATE_COMPONENTS) <= set(snapshot):
+            return None
+        for flag in ("observation_complete", "window_complete", "endpoint_identity_consistent",
+                     "identity_consistent"):
+            if flag in snapshot and snapshot[flag] is not True:
+                return None
+        try:
+            state = validate_state({key: snapshot[key] for key in STATE_COMPONENTS})
+        except (ValueError, TypeError):
+            return None
+        if state["observation_completeness"] != "complete":
+            return None
+        identity = binding.get("identity")
+        if not isinstance(identity, dict):
+            return None
+        live = state["live_roles"]
+        expected_roles = {"none": set(), "writer": {"writer"}, "reader": {"reader"},
+                          "both": {"writer", "reader"}}.get(live)
+        if expected_roles is not None and set(identity) != expected_roles:
+            return None
+        if set(identity) - {"writer", "reader"}:
+            return None
+        for token in identity.values():
+            if (not isinstance(token, dict)
+                    or not isinstance(token.get("endpoint_gid"), str) or not token["endpoint_gid"]
+                    or type(token.get("pid")) is not int or token["pid"] <= 0
+                    or not isinstance(token.get("endpoint_generation"), str) or not token["endpoint_generation"]
+                    or not valid_ref(token.get("endpoint_ref"), boundary)):
+                return None
+        states.append(state)
+    if boundaries[0] >= boundaries[1]:
+        return None
+    return states
 
 
 def observation_edge(record):
-    """Return ``(state_id, edge_id)`` for an eligible, complete observation.
+    """Derive an edge only from an explicitly versioned raw-bound projection.
 
-    Returns ``None`` when the record is not eligible (no coverage refresh).
-    ``facts.state_before``/``state_after`` may be either already abstracted
-    component dicts or typed facts with components; they are abstracted here.
+    The legacy pair receipt keeps its old contract; only the explicit topology
+    receipt schema delegates to the N-endpoint gate. No fallback to top-level facts or user supplied edge ids.  Explicit unknown
+    domain values are allowed, but missing components are never filled in.
+    The adapter verifies raw chronology; this pure function checks its binding.
     """
     if not coverage_eligible(record):
         return None
-    facts = record["typed_facts"]
-    before = facts.get("state_before") if isinstance(facts.get("state_before"), dict) else facts
-    after = facts.get("state_after") if isinstance(facts.get("state_after"), dict) else None
-    if after is None:
+    receipt = record["typed_facts"].get("state_projection_receipt")
+    if isinstance(receipt, dict) and receipt.get("schema") == "r2f.s1-topology-state-projection/v1":
+        from .topology_state import topology_observation_edge
+        return topology_observation_edge(record)
+    states = _projection_states(record)
+    if states is None:
         return None
-    before_state = abstract_state(before, identity_consistent=True)
-    after_state = abstract_state(after, identity_consistent=True)
-    after_id = state_id(after_state)
+    before, after = (state_id(state) for state in states)
     family = record.get("operation_family") or record.get("surface_id") or "unknown"
     parameter = record.get("parameter_class") or record.get("boundary_class") or "unknown"
-    return state_id(before_state), edge_id(state_id(before_state), family, parameter, after_id)
+    return before, edge_id(before, family, parameter, after)

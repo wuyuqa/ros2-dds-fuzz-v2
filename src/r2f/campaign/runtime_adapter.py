@@ -121,6 +121,9 @@ def fresh_match_proof(events, tokens, opening, *, anchor_ns=None):
 
 def facts_from_events(events, runtime, config):
     """Only raw tokens produce primary facts; summaries cannot substitute."""
+    if config.get("target_id") == "discovery.endpoint_topology.fuzz_v1":
+        from .topology_adapter import facts_from_events as topology_facts
+        return topology_facts(events, runtime, config)
     if str(config.get("target_id", "")).startswith("builtin.discovery_projection_reconciliation"):
         from .projection_adapter import projection_facts
         return projection_facts(events, runtime, config)
@@ -208,11 +211,15 @@ def facts_from_events(events, runtime, config):
         facts["evidence_error"] = str(exc)
         facts["endpoint_identity_complete"] = False
         facts["window"] = {"complete": False}
-    return facts
+    from .state_projection import attach_state_observations
+    return attach_state_observations(facts, events, runtime, config)
 
 
-def canonical_receipts(scenario, runtime, events):
+def canonical_receipts(scenario, runtime, events, *, config=None):
     """Exact 1:1 runtime step mapping; raw before/after events are mandatory."""
+    if scenario.target_id == "discovery.endpoint_topology.fuzz_v1":
+        from .topology_adapter import canonical_receipts as topology_receipts
+        return topology_receipts(scenario, runtime, events, config=config)
     if scenario.target_id.startswith("builtin.discovery_projection_reconciliation"):
         from .projection_adapter import projection_receipts
         return projection_receipts(scenario, runtime, events)
@@ -277,15 +284,25 @@ def _produce_facts(services, evidence):
                     "returned_result_type": type(result).__name__ if returned else None}
 
 
+def _primary_rule_id(scenario):
+    """Return only the declared rule identity; never infer one from a verdict."""
+    contract = scenario.target.rule_contract
+    rule_id = contract.get("primary_rule") if isinstance(contract, Mapping) else None
+    return rule_id if isinstance(rule_id, str) and rule_id.strip() else None
+
+
 def _evaluate_oracle(services, scenario, facts):
     """Contain an oracle tool failure without turning it into a SUT verdict."""
     returned = False
     result = None
+    primary_rule = _primary_rule_id(scenario)
     try:
+        if primary_rule is None:
+            raise ValueError("target_primary_rule_missing_or_invalid")
         result = services.oracle.evaluate(scenario, facts)
         returned = True
         if (not isinstance(result, dict)
-                or result.get("rule_id") != scenario.target.rule_contract["primary_rule"]
+                or result.get("rule_id") != primary_rule
                 or result.get("rule_role") != "primary"
                 or not isinstance(result.get("verdict"), str)
                 or result["verdict"] not in {"pass", "fail", "unknown", "not_applicable"}
@@ -307,7 +324,7 @@ def _evaluate_oracle(services, scenario, facts):
             except (TypeError, ValueError, OverflowError, RecursionError):
                 diagnostic["unserializable_result_type"] = type(result).__name__
         # This is an unavailable tool result, not another primary evaluation.
-        return {"rule_id": scenario.target.rule_contract["primary_rule"], "rule_role": "primary",
+        return {"rule_id": primary_rule or "unresolved_primary_rule", "rule_role": "primary",
                 "verdict": "unknown", "reason_codes": ["oracle_tool_failure"],
                 "forbidden_residuals": [], "closure": {}}, diagnostic
 
@@ -316,7 +333,11 @@ def ingest_execution(scenario, config, runtime, capsule, *, services=None):
     """Advance only through core gates; failures end as aborted with raw retained."""
     if services is None:
         from r2f.modules.s1.module import resolve_services
-        services = resolve_services(scenario.target_id)
+        if scenario.target_id == "discovery.endpoint_topology.fuzz_v1":
+            services = resolve_services(scenario.target_id, exploratory=True,
+                                        runtime_capability=config.get("runtime_capability"))
+        else:
+            services = resolve_services(scenario.target_id)
     record = ExecutionRecord(config["run_id"], scenario)
     audit = {"runtime_status": runtime.get("runtime_status"), "runtime_reason": runtime.get("reason"),
              "actual_run": runtime.get("real_execution") is True,
@@ -379,7 +400,7 @@ def ingest_execution(scenario, config, runtime, capsule, *, services=None):
             audit.update(tool_error=True, fact_producer_tool_failure=failure)
             # No primary evaluation is possible without valid producer output.
             # Cache a tool unknown so the existing abort path cannot evaluate it.
-            oracle = {"rule_id": scenario.target.rule_contract["primary_rule"], "rule_role": "primary",
+            oracle = {"rule_id": (_primary_rule_id(scenario) or "unresolved_primary_rule"), "rule_role": "primary",
                       "verdict": "unknown", "reason_codes": ["fact_producer_tool_failure"],
                       "forbidden_residuals": [], "closure": {}}
             raise ValueError("fact_producer_tool_failure:" + failure["reason"])
@@ -388,7 +409,7 @@ def ingest_execution(scenario, config, runtime, capsule, *, services=None):
             raise ValueError("oracle_tool_failure:" + audit["oracle_tool_failure"]["reason"])
         record.advance(ExecutionStage.EXPRESSIBLE, adapter_accepted=True)
         record.advance(ExecutionStage.PLANNED)
-        receipts = canonical_receipts(scenario, runtime, events)
+        receipts = canonical_receipts(scenario, runtime, events, config=config)
         record.advance(ExecutionStage.PRECONDITION_EXECUTED, precondition_receipts=receipts)
         record.advance(ExecutionStage.REACHED)
         neutral = None
@@ -435,12 +456,12 @@ def ingest_execution(scenario, config, runtime, capsule, *, services=None):
                         "mutation_ineffective_reason", "no_observable_effect")
                 row = record.to_dict()
                 row.update(audit, domain_id=config["domain_id"], typed_facts=facts,
-                           oracle={"rule_id": scenario.target.rule_contract["primary_rule"],
+                           oracle={"rule_id": (_primary_rule_id(scenario) or "unresolved_primary_rule"),
                                    "rule_role": "primary", "verdict": "not_applicable",
                                    "reason_codes": ["mutation_ineffective"],
                                    "forbidden_residuals": [], "closure": {}},
                            oracle_verdict="not_applicable",
-                           rule_id=scenario.target.rule_contract["primary_rule"],
+                           rule_id=(_primary_rule_id(scenario) or "unresolved_primary_rule"),
                            raw_path=runtime.get("raw_path"), raw_sha256=runtime.get("raw_sha256"),
                            runtime_execution_metadata=runtime.get("execution_metadata") or runtime.get("execution"),
                            observation_receipts=runtime.get("observation_receipts", []),

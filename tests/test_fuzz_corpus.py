@@ -1,10 +1,12 @@
 """V22: offline corpus capacity, fixed seeds and candidate pinning."""
+from copy import deepcopy
 import json
 from pathlib import Path
 import tempfile
 import unittest
 
 from r2f.campaign.corpus import CAPACITY, Corpus, content_identity
+from r2f.campaign.exploratory_input import validate_profile_fields
 
 REPO = Path(__file__).resolve().parents[1]
 
@@ -30,7 +32,10 @@ def entry(index, *, seed_id=None, boundary=None, relation=None, edge=None, targe
 
 class FuzzCorpusContracts(unittest.TestCase):
     def test_profiles_explicit_exploratory_disabled_and_not_required_catalog(self):
-        expected = {"parameter", "environment", "composed"}
+        expected = {"parameter", "environment", "composed", "f2-windows",
+                    "endpoint-chains", "topology-chains"}
+        f2_target = "discovery.interruption_recovery.fuzz_windows_v1"
+        f2_mutators = {"E02": ["M07"], "E03": ["M06"]}
         seen = set()
         for path in sorted((REPO / "config/s1_fuzz/profiles").glob("*.json")):
             data = json.loads(path.read_text())
@@ -41,7 +46,108 @@ class FuzzCorpusContracts(unittest.TestCase):
             self.assertIs(data["required_catalog_included"], False)
             self.assertTrue(data["seed_specs"])
             self.assertNotIn(path.stem, ("s1_scope",))
+            if path.stem == "f2-windows":
+                # A new explicit opt-in is not blanket F2/default activation.
+                self.assertEqual(data["runtime_capability"], "f2_windows_v1")
+                self.assertIs(type(data["chain_length"]), int)
+                self.assertEqual(data["chain_length"], 1)
+                self.assertEqual(data["target_ids"], [f2_target])
+                self.assertEqual(data["surfaces"], ["E02", "E03"])
+                self.assertEqual(data["mutator_whitelist"], f2_mutators)
+                self.assertEqual(data["anchor_timing_policy"], "f2_anchor_not_before_v1")
+                self.assertEqual(data["anchor_lateness_tolerance_sec"], 0.5)
+                self.assertEqual([cycle["surfaces"] for cycle in data["cycles"]],
+                                 [["E02"], ["E03"]])
+                for cycle in data["cycles"]:
+                    self.assertEqual(cycle["target_id"], f2_target)
+                    self.assertTrue(cycle["seed_specs"])
+                    for spec in cycle["seed_specs"]:
+                        self.assertEqual(spec["target_id"], f2_target)
+                        self.assertEqual(spec["seed_id"], cycle["surfaces"][0])
+                for spec in data["seed_specs"]:
+                    self.assertEqual(spec["target_id"], f2_target)
+                    self.assertIn(spec["seed_id"], f2_mutators)
+            elif path.stem == "topology-chains":
+                # This dedicated opt-in does not widen F2 multiwindow or defaults.
+                self.assertEqual(data["profile_id"], "s1-topology-chains")
+                self.assertEqual(data["runtime_capability"], "topology_v1")
+                self.assertIs(type(data["chain_length"]), int)
+                self.assertEqual(data["chain_length"], 2)
+                self.assertEqual(data["target_ids"], ["discovery.endpoint_topology.fuzz_v1"])
+                self.assertNotIn(f2_target, data["target_ids"])
+                self.assertEqual(data["surfaces"], ["S1.topology.program"])
+                self.assertEqual(data["mutator_whitelist"], ["I2.topology_program.v1"])
+                self.assertTrue(data["operator_whitelist"])
+                self.assertEqual(data["source_schema"], "r2f.s1-seed-corpus/v2")
+                self.assertEqual(data["seed_catalog_status"], "authored_v2")
+                self.assertEqual(data["seed_specs"], data["declared_seed_specs_union"])
+                self.assertEqual([spec for cycle in data["cycles"] for spec in cycle["seed_specs"]],
+                                 data["declared_seed_specs_union"])
+                validate_profile_fields(data)
+            else:
+                self.assertNotIn("runtime_capability", data)
+                self.assertNotIn(f2_target, data["target_ids"])
+            if path.stem == "endpoint-chains":
+                # Explicit new offline profile, not blanket F2/runtime activation.
+                # The generic exploratory/disabled/not-required assertions above
+                # apply unchanged to this profile and all four original ones.
+                self.assertEqual(data["profile_id"], "s1-fuzz-endpoint-chains")
+                self.assertIs(type(data["chain_length"]), int)
+                self.assertEqual(data["chain_length"], 2)
+                self.assertEqual(data["target_ids"], [
+                    "discovery.late_endpoint.fuzz_v1",
+                    "discovery.late_join_delivery.fuzz_v1",
+                ])
+                self.assertEqual(data["surfaces"], ["P01", "W02"])
+                self.assertEqual([cycle["cycle_id"] for cycle in data["cycles"]],
+                                 ["late-endpoint-chain", "late-join-chain"])
+                self.assertEqual(data["composition"]["environment_surfaces"], [])
+                self.assertEqual(data["composition"]["max_environment_windows"], 0)
         self.assertEqual(seen, expected)
+
+    def test_topology_chain_lengths_1_to_4_do_not_widen_f2_chain1(self):
+        profiles = REPO / "config/s1_fuzz/profiles"
+        topology = json.loads((profiles / "topology-chains.json").read_text())
+        self.assertEqual(topology["chain_length"], 2)
+        for length in (1, 2, 3, 4):
+            with self.subTest(topology_chain_length=length):
+                trial = deepcopy(topology)
+                trial["chain_length"] = length
+                validate_profile_fields(trial)
+        for length in (0, 5, -1, 2.0, True, "2", None):
+            with self.subTest(invalid_topology_chain_length=length):
+                trial = deepcopy(topology)
+                trial["chain_length"] = length
+                with self.assertRaisesRegex(ValueError, "topology_requires_chain_length_1_to_4"):
+                    validate_profile_fields(trial)
+        f2 = json.loads((profiles / "f2-windows.json").read_text())
+        self.assertEqual(f2["chain_length"], 1)
+        validate_profile_fields(f2)
+        for length in (0, 2, 3, 4):
+            with self.subTest(invalid_f2_chain_length=length):
+                trial = deepcopy(f2)
+                trial["chain_length"] = length
+                with self.assertRaisesRegex(ValueError, "f2_windows_requires_chain_length_1"):
+                    validate_profile_fields(trial)
+
+    def test_topology_profile_requires_exact_capability_and_offline_scope(self):
+        topology = json.loads((REPO / "config/s1_fuzz/profiles/topology-chains.json").read_text())
+        for capability in (None, "f2_windows_v1", "topology", "discovery.endpoint_topology.fuzz_v1"):
+            with self.subTest(capability=capability):
+                trial = deepcopy(topology)
+                if capability is None:
+                    trial.pop("runtime_capability")
+                else:
+                    trial["runtime_capability"] = capability
+                with self.assertRaisesRegex(ValueError, "topology_runtime_capability_required"):
+                    validate_profile_fields(trial)
+        for key, value in (("enabled", True), ("required_catalog_included", True),
+                           ("campaign_kind", "required")):
+            with self.subTest(field=key):
+                trial = deepcopy(topology)
+                trial[key] = value
+                with self.assertRaisesRegex(ValueError, "topology_profile_contract_mismatch:" + key):
+                    validate_profile_fields(trial)
 
     def test_capacity_256_fixed_seeds_and_candidate_inputs_survive(self):
         corpus = Corpus()

@@ -799,9 +799,9 @@ _RULE_RESPONSIBILITY = {
 
 
 #: Surface kinds used when projecting an F2 surface for *generation only*.
-#: These projections are never placed in an ``ExplorationContract`` because the
-#: core contract validator only knows the default (M01-M03) registry; putting
-#: them there would require widening a sealed contract schema.
+#: These projections are not placed in the default ``ExplorationContract``.
+#: Structural F2 knowledge alone is not execution activation; the separate
+#: live API below supplies only the explicitly reviewed E02/E03 bindings.
 _F2_GENERATION_KIND = {
     "W01": "relation",
     "E02": "environment",
@@ -1202,3 +1202,55 @@ def capability_matrix():
         "implemented_unregistered_mutator_ids": sorted(IMPLEMENTED_F2_MUTATOR_IDS),
         "f2_generation": f2_generation_capabilities(),
     }
+
+
+# Explicit live F2 projections.  These do not change the generation-only
+# templates or the default F1 projection/contract entry points above.
+F2_LIVE_SURFACE_BINDINGS = {
+    "E02": ("M07", "environment_windows.count"),
+    "E03": ("M06", "environment_windows.anchor_offset_sec"),
+}
+
+
+def f2_live_surface(surface_id):
+    """Return the explicitly opted-in E02/M07 or E03/M06 live projection.
+
+    A binding declares a route, not a reached precondition or mutation hit.
+    E03 retains its E02 ordering dependency; the live target contains both
+    capabilities even when selection mutates only the timing of existing windows.
+    """
+    from r2f.core.mutation_plan import MutationSurface
+
+    if surface_id not in F2_LIVE_SURFACE_BINDINGS:
+        raise UnsupportedCapabilityError(
+            f"{surface_id}: no f2_windows_v1 live surface (only E02,E03)")
+    data = f2_generation_surface(surface_id).to_dict()
+    mutator, binding = F2_LIVE_SURFACE_BINDINGS[surface_id]
+    data.update(mutator_ids=[mutator], runtime_binding=binding,
+                allowed_with=["E03" if surface_id == "E02" else "E02"],
+                order_after=["E02"] if surface_id == "E03" else [])
+    return MutationSurface.from_dict(data)
+
+
+def f2_live_contract():
+    """The closed E02/E03 contract for the new explicit runtime capability.
+
+    This is separate from ``exploration_contract`` so no F1 call can silently
+    acquire F2 mutators.  Core validates every transitive fact/rule/effect ref.
+    """
+    from r2f.core.mutation_plan import ExplorationContract
+
+    surfaces = [f2_live_surface(sid) for sid in ("E02", "E03")]
+    rule_ids = sorted({rid for surface in surfaces for rid in surface.rule_ids})
+    effect_ids = sorted({surface.effect_id for surface in surfaces}
+                        | {RULE_EFFECT_ID[rid] for rid in rule_ids})
+    fact_ids = sorted({fid for surface in surfaces for fid in surface.fact_ids}
+                      | {fid for rid in rule_ids for fid in RULES[rid].required_fact_ids})
+    contract = ExplorationContract(
+        surfaces=surfaces,
+        facts=[fact_to_core(FACT_SPECS[fid]) for fid in fact_ids],
+        rules=[rule_to_core(RULES[rid], RULE_EFFECT_ID[rid]) for rid in rule_ids],
+        effects=[effect_to_core(eid) for eid in effect_ids],
+    )
+    contract.validate()
+    return contract

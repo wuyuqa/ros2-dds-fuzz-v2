@@ -1,0 +1,1631 @@
+"""F3 topology worker: one fresh public-rclpy endpoint per logical generation.
+
+Two halves live here on purpose:
+
+* ``_worker_main`` is the child process.  It builds exactly one publisher or
+  subscription from explicit public QoS, reports its real GUID/PID/start ticks,
+  publishes bounded batches without per-sample controller ACKs, answers bounded
+  graph/match snapshots, and asserts writer liveliness through the public
+  ``Publisher.assert_liveliness`` API.
+* ``RosTopologyBackend`` / ``OfflineTopologyBackend`` are controller-side
+  adapters with the same small surface.  The offline half is a contract-test
+  double and is always ``not_ros`` / ``not candidate``.
+
+One process per endpoint generation is deliberate: ``recreate`` must allocate a
+fresh GUID *and* a fresh PID, and a retired generation can never be mistaken for
+its successor.  The existing ``WorkerPool`` remains untouched; this module only
+reuses its lifecycle ideas and the repository's public worker protocol shape.
+"""
+from __future__ import annotations
+
+from copy import deepcopy
+import json
+import math
+import os
+from pathlib import Path
+import re
+import selectors
+import signal
+import subprocess
+import sys
+import time
+import traceback
+import uuid
+
+from .environment import REPO, RMW_NAMES, activated_environment, check_environment
+
+INFINITE_NS = 9223372036854775807
+SUPPORTED_MESSAGE_TYPE = "std_msgs/msg/String"
+ROS_BACKEND = "ros2_public_api"
+OFFLINE_BACKEND = "offline_fake"
+MAX_INTERVAL_SEC = 30.0
+ROLE_RE = re.compile(r"(writer|reader)([1-9])?")
+
+_SUPPORTED_PUBLIC_FIELDS = frozenset({
+    "depth", "history", "reliability", "durability", "deadline_ns",
+    "liveliness", "liveliness_lease_duration_ns",
+})
+_VENDOR_ALIASES = {
+    "rmw_cyclonedds_cpp": "rmw_cyclonedds_cpp",
+    "cyclonedds": "rmw_cyclonedds_cpp",
+    "cyclone_dds": "rmw_cyclonedds_cpp",
+    "cyclonedds_cpp": "rmw_cyclonedds_cpp",
+    "rmw_fastrtps_cpp": "rmw_fastrtps_cpp",
+    "fastdds": "rmw_fastrtps_cpp",
+    "fast_dds": "rmw_fastrtps_cpp",
+    "fastrtps": "rmw_fastrtps_cpp",
+    "fast_rtps": "rmw_fastrtps_cpp",
+}
+
+
+NETEM_ISOLATION_ENV = "R2F_DISCOVERY_NETNS_PROOF"
+
+
+def normalize_topology_environment_mutation(value):
+    """Validate the opt-in topology environment mutation, or return None.
+
+    Only the existing ``DiscoveryNetemController`` capability is expressible:
+    network-layer delay/reorder/duplicate on derived default-RTPS UDP ports.
+    ``discovery_drop`` is refused by name because that carrier lives on the
+    nft/wire_proxy discovery target, not on this topology route, and the netem
+    controller fixes loss at 0% so it can never drop.  A neutral spec and a
+    zero ``restore_sec`` are refused: they cannot bound a real window, and a
+    no-op must not be reported as an applied environment mutation.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError("topology_environment_mutation_must_be_object")
+    unknown = set(value) - {"kind", "spec"}
+    if unknown:
+        raise ValueError("topology_environment_mutation_unknown_field:" + ",".join(sorted(unknown)))
+    kind = value.get("kind")
+    if kind == "discovery_drop":
+        raise ValueError("topology_netem_drop_not_supported:controller_loss_fixed_zero")
+    if kind != "discovery_netem":
+        raise ValueError("topology_environment_mutation_unsupported_kind:" + str(kind))
+    if "spec" not in value:
+        raise ValueError("topology_netem_spec_required")
+    from .discovery_network import DiscoveryNetworkError, normalize_netem_spec
+    try:
+        spec = normalize_netem_spec(value["spec"])
+    except DiscoveryNetworkError as exc:
+        raise ValueError("invalid_netem_spec:" + str(exc)) from exc
+    if spec["neutral"]:
+        raise ValueError("topology_netem_neutral_spec_not_a_mutation")
+    if not spec["restore_sec"]:
+        raise ValueError("topology_netem_restore_sec_required")
+    return {"kind": "discovery_netem", "spec": spec}
+
+
+def netem_isolation_receipt():
+    """Read-only check that this process really runs in the isolated netns.
+
+    Never calls tc/nft/ip and never creates a namespace.  Missing or mismatched
+    ``R2F_DISCOVERY_NETNS_PROOF`` is a hard fail-closed result: a topology route
+    that declared an environment mutation must not touch the host loopback.
+    """
+    from .discovery_network import NetworkIsolationError, assert_isolated_namespace
+    proof_present = bool(os.environ.get(NETEM_ISOLATION_ENV))
+    try:
+        isolation = assert_isolated_namespace()
+    except NetworkIsolationError as exc:
+        return {"schema": "r2f.topology-netem-isolation/v1", "isolated": False,
+                "proof_present": proof_present, "proof_env": NETEM_ISOLATION_ENV,
+                "error": str(exc), "tc_invoked": False,
+                "reason": "topology_netem_requires_isolated_netns"}
+    return {"schema": "r2f.topology-netem-isolation/v1", "isolated": True,
+            "proof_present": True, "proof_env": NETEM_ISOLATION_ENV,
+            "tc_invoked": False, "isolation": isolation,
+            "reason": None}
+
+
+class TopologyBackendError(RuntimeError):
+    """A backend/tool error, never a SUT verdict."""
+
+
+class TopologyBackendBlocked(TopologyBackendError):
+    """Preflight or capability admission blocked; no endpoint was launched."""
+
+
+class TopologyBackendTimeout(TopologyBackendError):
+    """Bounded command/barrier deadline expired."""
+
+    def __init__(self, message, *, command_id=None, endpoint_id=None, events=None):
+        super().__init__(message)
+        self.command_id = command_id
+        self.endpoint_id = endpoint_id
+        self.events = list(events or [])
+
+
+class TopologyUnsupported(TopologyBackendError):
+    """The model expresses something the public API cannot bind faithfully."""
+
+    def __init__(self, code, message=None, *, details=None):
+        self.code = code
+        self.details = dict(details or {})
+        super().__init__(message or code)
+
+
+def canonical_json(value):
+    return json.dumps(value, sort_keys=True, separators=(",", ":"),
+                      ensure_ascii=False, allow_nan=False)
+
+
+def sha256_json(value):
+    import hashlib
+    return hashlib.sha256(canonical_json(value).encode()).hexdigest()
+
+
+def _sha256_text(value):
+    import hashlib
+    return hashlib.sha256(value.encode()).hexdigest()
+
+
+def worker_role_for(role, index):
+    """Map a logical role/ordinal to a bounded worker role alias."""
+    if role not in ("writer", "reader"):
+        raise ValueError("role must be writer or reader")
+    if type(index) is not int or index < 0 or index > 3:
+        raise ValueError("at most four endpoints per role are supported")
+    return role if index == 0 else f"{role}{index + 1}"
+
+
+def worker_role_kind(role):
+    match = ROLE_RE.fullmatch(role) if isinstance(role, str) else None
+    return match.group(1) if match else None
+
+
+def _finite_ns(seconds, field):
+    if seconds == "infinite":
+        return INFINITE_NS
+    if isinstance(seconds, bool) or not isinstance(seconds, (int, float)):
+        raise TopologyUnsupported("qos_not_expressible", f"{field} must be seconds or infinite",
+                                  details={"field": field, "value": seconds})
+    if not math.isfinite(seconds) or seconds < 0:
+        raise TopologyUnsupported("qos_not_expressible", f"{field} must be finite nonnegative",
+                                  details={"field": field, "value": seconds})
+    ns = int(seconds * 1_000_000_000)
+    if ns < 0 or ns > INFINITE_NS:
+        raise TopologyUnsupported("qos_not_expressible", f"{field} exceeds Duration range",
+                                  details={"field": field, "value": seconds})
+    return ns
+
+
+def _required_qos(qos, field, allowed=None):
+    value = qos.get(field)
+    if value is None:
+        raise TopologyUnsupported("qos_unknown_field", f"qos.{field} is unknown",
+                                  details={"field": field})
+    if allowed is not None and value not in allowed:
+        raise TopologyUnsupported("qos_not_expressible", f"qos.{field}={value!r} unsupported",
+                                  details={"field": field, "value": value,
+                                           "allowed": list(allowed)})
+    return value
+
+
+def _vendor_rmw(declared, configured):
+    if declared is None:
+        return None
+    key = str(declared).strip().lower()
+    target = _VENDOR_ALIASES.get(key)
+    if target is None:
+        raise TopologyUnsupported("vendor_declaration_not_expressible",
+                                  "vendor declaration is not a known RMW alias",
+                                  details={"vendor": declared})
+    if target != configured:
+        raise TopologyUnsupported("vendor_declaration_mismatch",
+                                  "declared vendor does not match configured RMW",
+                                  details={"vendor": declared, "declared_rmw": target,
+                                           "configured_rmw": configured})
+    return target
+
+
+
+def initial_content_filter_capability():
+    """Initial reader configuration is conditional, not full CFT coverage."""
+    return {
+        "status": "conditional", "scope": "initial_only", "roles": ["reader"],
+        "message_type": SUPPORTED_MESSAGE_TYPE, "field_types": {"data": "string"},
+        "requirements": ["public_creation_api", "rmw_acceptance",
+                         "get_content_filter", "is_cft_enabled"],
+        "sample_filter_effect": False, "dynamic_update": False, "lease": False,
+    }
+
+
+def _initial_content_filter(value, role):
+    """Bind a bounded String.data filter, without evaluating any samples."""
+    from .filter_backend import validate_filter
+    if role != "reader":
+        raise TopologyUnsupported("content_filter_role_not_supported",
+                                  "initial content filtering belongs to a reader")
+    if (not isinstance(value, dict)
+            or set(value) - {"expression", "parameters", "evaluation"}
+            or not {"expression", "parameters"} <= set(value)):
+        raise TopologyUnsupported("content_filter_invalid", "invalid initial filter object",
+                                  details={"layer": "filter_specification"})
+    expression, parameters = value["expression"], value["parameters"]
+    if not isinstance(expression, str) or len(expression) > 1024:
+        raise TopologyUnsupported("content_filter_invalid", "filter expression must be text <=1024",
+                                  details={"layer": "expression_type"})
+    if (not isinstance(parameters, list) or len(parameters) > 16
+            or any(not isinstance(item, str) or len(item) > 256 for item in parameters)):
+        raise TopologyUnsupported("content_filter_invalid",
+                                  "filter parameters must be <=16 strings of length <=256",
+                                  details={"layer": "parameter_type"})
+    if value.get("evaluation") is not None and type(value["evaluation"]) is not bool:
+        raise TopologyUnsupported("content_filter_invalid", "evaluation must be bool or null",
+                                  details={"layer": "filter_specification"})
+    try:
+        validation = validate_filter(expression, parameters, field_types={"data": "string"})
+    except RecursionError as exc:
+        raise TopologyUnsupported("content_filter_invalid", "filter nesting exceeds harness limit",
+                                  details={"layer": "unsupported_feature"}) from exc
+    if not validation["ok"]:
+        code = ("content_filter_invalid_field" if validation["layer"] == "unsupported_field"
+                else "content_filter_invalid")
+        raise TopologyUnsupported(code, validation["reason"],
+                                  details={"layer": validation["layer"],
+                                           "reason": validation["reason"],
+                                           "validation_scope": "harness_subset"})
+    # Whitespace and parameter spelling belong to the exact submitted input.
+    # In particular, evaluation is never a runtime fact or an API argument.
+    return {"expression": expression, "parameters": list(parameters)}
+
+
+def _create_reader_with_initial_filter(node, message_type, topic, callback, qos,
+                                       initial_filter=None, *, emit=None,
+                                       options_factory=None, fixture=False):
+    """The worker owns creation; the existing adapter observes the returned API.
+
+    No setter, sample admission, match inference or unfiltered fallback exists
+    on this path. A missing readback does not destroy an otherwise created
+    subscription: it leaves configuration unverified and independently visible.
+    """
+    from .filter_backend import (
+        ContentFilterAdapter, content_filter_options, filter_api_failure, receipt,
+    )
+    if initial_filter is None:
+        return node.create_subscription(message_type, topic, callback, qos), None
+    requested = _initial_content_filter(initial_filter, "reader")
+    requested["enabled"] = bool(requested["expression"].strip())
+    common = {"scope": "initial_only", "fixture": fixture,
+              "execution_evidence": False, "filter_effect_observed": None,
+              "filter_false_implies_unmatch": False,
+              "dynamic_update_covered": False, "lease_covered": False}
+
+    def record(event, value):
+        if emit is not None:
+            emit(event, filter_receipt=value)
+        return value
+
+    record("content_filter_initial_begin", receipt(
+        "filter_initial_begin", requested=deepcopy(requested), submitted=False,
+        configured=None, configuration_status="unverified", **common))
+    try:
+        options = content_filter_options(requested["expression"], requested["parameters"],
+                                         options_factory=options_factory)
+        create = getattr(node, "create_subscription", None)
+        if not callable(create):
+            raise AttributeError("Node.create_subscription unavailable")
+        kwargs = {}
+        if options is not None:
+            # An old public Node signature is an API limitation, not an RMW
+            # rejection. If introspection is unavailable, let the real call
+            # report its exception rather than declaring the API absent.
+            import inspect
+            try:
+                signature = inspect.signature(create)
+            except (TypeError, ValueError):
+                signature = None
+            if signature is not None and not (
+                    "content_filter_options" in signature.parameters
+                    or any(p.kind == inspect.Parameter.VAR_KEYWORD
+                           for p in signature.parameters.values())):
+                raise AttributeError("Node.create_subscription lacks content_filter_options")
+            kwargs["content_filter_options"] = options
+    except Exception as exc:
+        failure = filter_api_failure(exc)
+        # No subscription submission has happened at this point: constructor/
+        # import/signature failures cannot establish an RMW rejection.
+        failure["layer"] = "submission_api"
+        value = record("content_filter_initial_guard", receipt(
+            "filter_initial_guard", requested=deepcopy(requested), submitted=False,
+            configured=None, configuration_status="unverified",
+            reason=("content_filter_creation_api_unavailable"
+                    if isinstance(exc, (ImportError, AttributeError))
+                    else "content_filter_options_or_api_probe_failed"), **failure, **common))
+        raise TopologyUnsupported("content_filter_submission_api", value["reason"],
+                                  details=value) from exc
+    try:
+        endpoint = create(message_type, topic, callback, qos, **kwargs)
+        created_ns = time.monotonic_ns()
+    except Exception as exc:
+        failure = filter_api_failure(exc)
+        value = record("content_filter_initial_guard", receipt(
+            "filter_initial_guard", requested=deepcopy(requested), submitted=True,
+            accepted=False, configured=None, configuration_status="unverified",
+            reason="create_subscription_failed", **failure, **common))
+        raise TopologyUnsupported("content_filter_" + failure["layer"], value["reason"],
+                                  details=value) from exc
+    record("content_filter_initial_submitted", receipt(
+        "filter_initial_submitted", requested=deepcopy(requested), submitted=True,
+        accepted=True, configured=None, configuration_status="unverified",
+        creation_returned_monotonic_ns=created_ns, **common))
+    adapter = ContentFilterAdapter()
+    adapter.attach(endpoint, created_with=requested)
+    observed = adapter.initial_readback(fixture=fixture)
+    observed["creation_returned_monotonic_ns"] = created_ns
+    record("content_filter_initial_configuration", observed)
+    return endpoint, observed
+
+
+def endpoint_expressibility(spec, config):
+    """Translate model endpoint fields into the exact public-rclpy input.
+
+    The returned receipt is an input binding, never an observed identity.
+    Unsupported model fields are rejected instead of silently dropped.
+    """
+    if not isinstance(spec, dict):
+        raise TopologyUnsupported("invalid_endpoint", "endpoint spec must be an object")
+    role = spec.get("role")
+    if role not in ("writer", "reader"):
+        raise TopologyUnsupported("invalid_role", "role must be writer or reader")
+    topic = spec.get("topic")
+    if not isinstance(topic, str) or not topic or len(topic) > 256:
+        raise TopologyUnsupported("invalid_topic", "nonempty bounded topic required")
+    type_name = spec.get("type_name")
+    if type_name != SUPPORTED_MESSAGE_TYPE:
+        raise TopologyUnsupported(
+            "message_type_not_expressible",
+            "this worker constructs only std_msgs/msg/String",
+            details={"type_name": type_name, "supported": SUPPORTED_MESSAGE_TYPE})
+    initial_filter = (_initial_content_filter(spec["filter"], role)
+                      if "filter" in spec else None)
+    qos = spec.get("qos")
+    if not isinstance(qos, dict):
+        raise TopologyUnsupported("invalid_qos", "qos object required")
+    reliability = _required_qos(qos, "reliability", ("best_effort", "reliable"))
+    durability = _required_qos(qos, "durability", ("volatile", "transient_local"))
+    history = _required_qos(qos, "history", ("keep_last",))
+    depth = _required_qos(qos, "depth")
+    if isinstance(depth, bool) or not isinstance(depth, int) or not 1 <= depth <= 65536:
+        raise TopologyUnsupported("qos_not_expressible", "depth must be 1..65536")
+    liveliness = _required_qos(qos, "liveliness",
+                               ("automatic", "manual_by_topic"))
+    deadline_ns = _finite_ns(_required_qos(qos, "deadline_sec"), "deadline_sec")
+    lease_ns = _finite_ns(_required_qos(qos, "lease_duration_sec"), "lease_duration_sec")
+    ownership = _required_qos(qos, "ownership", ("shared",))
+    partitions = _required_qos(qos, "partitions")
+    if partitions != []:
+        raise TopologyUnsupported(
+            "partitions_not_expressible",
+            "rclpy QoSProfile has no public partition selector",
+            details={"partitions": deepcopy(partitions)})
+    configured_rmw = config.get("rmw", "rmw_cyclonedds_cpp")
+    declared_vendor = spec.get("vendor")
+    bound_vendor = _vendor_rmw(declared_vendor, configured_rmw)
+    public_qos = {
+        "depth": depth,
+        "history": history,
+        "reliability": reliability,
+        "durability": durability,
+        "deadline_ns": deadline_ns,
+        "liveliness": liveliness,
+        "liveliness_lease_duration_ns": lease_ns,
+    }
+    assert not (set(public_qos) - _SUPPORTED_PUBLIC_FIELDS)
+    binding = {
+        "schema": "r2f.topology-endpoint-binding/v1",
+        "logical_id": spec.get("logical_id"),
+        "role": role,
+        "topic": topic,
+        "type_name": type_name,
+        "requested_qos": deepcopy(qos),
+        "public_api_qos": dict(public_qos),
+        "api_fields": sorted(public_qos),
+        "default_equivalent_fields": [
+            {"field": "ownership", "requested": ownership, "runtime_default": "shared"},
+            {"field": "partitions", "requested": deepcopy(partitions), "runtime_default": []},
+        ],
+        "unknown_fields": [],
+        "unsupported_fields": [],
+        "binding_status": "exact_with_default_equivalent_fields",
+        "vendor_declared": declared_vendor,
+        "vendor_bound_rmw": bound_vendor,
+        "participant_id_declared": spec.get("participant_id"),
+        "participant_id_status": "declaration_only",
+        "source": "topology_worker_public_rclpy_input",
+        "execution_evidence": False,
+        "candidate_eligible": False,
+    }
+    if initial_filter is not None:
+        binding["initial_content_filter"] = {
+            **deepcopy(initial_filter), "scope": "initial_only",
+            "rmw_support": "unverified", "observation_status": "input_only",
+        }
+    return {"public_qos": public_qos, "binding": binding,
+            "initial_content_filter": initial_filter}
+
+
+def _public_qos_kwargs(qos):
+    from rclpy.qos import (
+        DurabilityPolicy, HistoryPolicy, LivelinessPolicy, ReliabilityPolicy,
+    )
+    from rclpy.duration import Duration
+    kwargs = {
+        "depth": qos["depth"],
+        "history": HistoryPolicy.KEEP_LAST,
+        "reliability": {
+            "best_effort": ReliabilityPolicy.BEST_EFFORT,
+            "reliable": ReliabilityPolicy.RELIABLE,
+        }[qos["reliability"]],
+        "durability": {
+            "volatile": DurabilityPolicy.VOLATILE,
+            "transient_local": DurabilityPolicy.TRANSIENT_LOCAL,
+        }[qos["durability"]],
+        "deadline": Duration(nanoseconds=qos["deadline_ns"]),
+        "liveliness": {
+            "automatic": LivelinessPolicy.AUTOMATIC,
+            "manual_by_topic": LivelinessPolicy.MANUAL_BY_TOPIC,
+        }[qos["liveliness"]],
+        "liveliness_lease_duration": Duration(nanoseconds=qos["liveliness_lease_duration_ns"]),
+    }
+    return kwargs
+
+
+def _worker_main(argv):
+    """Child entry point: one endpoint generation, strict JSONL on stdout."""
+    if len(argv) != 3:
+        print(json.dumps({"event": "worker_error", "error": "usage: config_json role"}))
+        return 2
+    config = json.loads(argv[1])
+    role = argv[2]
+    kind = worker_role_kind(role)
+    if kind is None:
+        print(json.dumps({"event": "worker_error", "error": "unsupported_role"}))
+        return 2
+    import rclpy
+    from rclpy.context import Context
+    from rclpy.executors import SingleThreadedExecutor
+    from rclpy.node import Node
+    from rclpy.qos import QoSProfile
+    from std_msgs.msg import String
+
+    context = Context()
+    rclpy.init(context=context)
+    rmw_identifier = rclpy.get_rmw_implementation_identifier()
+    try:
+        observed_domain_id = context.get_domain_id()
+    except (AttributeError, RuntimeError, TypeError):
+        observed_domain_id = None
+    start_ticks = int(Path("/proc/self/stat").read_text().rsplit(")", 1)[1].split()[19])
+    node_token = uuid.uuid4().hex
+    node_name = f"r2f_topo_{config['logical_id']}_g{config['generation']}_{node_token[:8]}"
+    node = Node(node_name, context=context, enable_rosout=False, start_parameter_services=False)
+    executor = SingleThreadedExecutor(context=context)
+    executor.add_node(node)
+    local_gid = None
+    receive_sequence = 0
+    endpoint_generation = node_token
+
+    def emit(event, **fields):
+        value = {
+            "event": event, "time_ns": time.time_ns(), "monotonic_ns": time.monotonic_ns(),
+            "role": role, "logical_id": config["logical_id"], "generation": config["generation"],
+            "pid": os.getpid(), "pgid": os.getpgrp(), "process_start_ticks": start_ticks,
+            "run_id": config["run_id"], "domain_id": config["domain_id"],
+            "observed_domain_id": observed_domain_id,
+            "domain_observation_source": "rclpy.context.get_domain_id" if observed_domain_id is not None else "unavailable_api",
+            "rmw_identifier": rmw_identifier, "node_name": node_name,
+            "endpoint_generation": endpoint_generation,
+        }
+        value.update(fields)
+        print(json.dumps(value, sort_keys=True), flush=True)
+        return value
+
+    def gid_bytes(value):
+        return bytes(value).hex() if value is not None else None
+
+    def receive(message, info):
+        nonlocal receive_sequence
+        receive_sequence += 1
+        body = None
+        try:
+            body = json.loads(message.data)
+        except (ValueError, TypeError):
+            body = None
+        get = info.get if isinstance(info, dict) else lambda key: getattr(info, key, None)
+        publisher_gid = gid_bytes(get("publisher_gid"))
+        emit(
+            "receive", send_sequence=body.get("send_sequence") if isinstance(body, dict) else None,
+            phase=body.get("phase") if isinstance(body, dict) else None,
+            receive_sequence=receive_sequence, reader_gid=local_gid,
+            publisher_gid=publisher_gid,
+            publisher_gid_status="available" if publisher_gid is not None else "unavailable_api",
+            identity_basis="message_info_gid" if publisher_gid is not None else "endpoint_correlated",
+            payload_sha256=__import__("hashlib").sha256(message.data.encode()).hexdigest(),
+            payload_run_id=body.get("run_id") if isinstance(body, dict) else None,
+            payload_writer_id=body.get("writer_id") if isinstance(body, dict) else None,
+            payload_writer_generation=body.get("writer_generation") if isinstance(body, dict) else None,
+            payload_endpoint_gid=body.get("endpoint_gid") if isinstance(body, dict) else None,
+            declared_payload_sha256=body.get("declared_payload_sha256") if isinstance(body, dict) else None,
+            message_info_type=type(info).__name__,
+        )
+
+    qos = QoSProfile(**_public_qos_kwargs(config["qos"]))
+    try:
+        create_begin = emit("endpoint_create_begin", topic=config["topic"],
+                            qos=config["qos"], message_type=config["type_name"])
+        filter_configuration = None
+        if kind == "writer":
+            endpoint = node.create_publisher(String, config["topic"], qos)
+        else:
+            endpoint, filter_configuration = _create_reader_with_initial_filter(
+                node, String, config["topic"], receive, qos,
+                config.get("initial_content_filter"), emit=emit)
+        created_ns = (filter_configuration["creation_returned_monotonic_ns"]
+                      if filter_configuration is not None else time.monotonic_ns())
+
+        def graph():
+            def entry(info):
+                profile = info.qos_profile
+                return {
+                    "node_name": info.node_name, "node_namespace": info.node_namespace,
+                    "topic_type": info.topic_type, "endpoint_gid": gid_bytes(info.endpoint_gid),
+                    "qos": {
+                        "reliability": profile.reliability.name.lower(),
+                        "durability": profile.durability.name.lower(),
+                        "depth": profile.depth,
+                        "history": profile.history.name.lower(),
+                        "deadline_ns": profile.deadline.nanoseconds,
+                        "liveliness": profile.liveliness.name.lower(),
+                        "liveliness_lease_duration_ns": profile.liveliness_lease_duration.nanoseconds,
+                    },
+                }
+            publishers = [entry(x) for x in node.get_publishers_info_by_topic(config["topic"])]
+            subscriptions = [entry(x) for x in node.get_subscriptions_info_by_topic(config["topic"])]
+            nonlocal local_gid
+            rows = publishers if kind == "writer" else subscriptions
+            for item in rows:
+                if item["node_name"] == node_name:
+                    local_gid = item["endpoint_gid"]
+            return {"publishers": publishers, "subscriptions": subscriptions}
+
+        initial_graph = graph()
+        deadline = time.monotonic() + float(config.get("startup_timeout_sec", 10.0))
+        while local_gid is None and time.monotonic() < deadline:
+            executor.spin_once(timeout_sec=0.02)
+            initial_graph = graph()
+        if local_gid is None:
+            emit("worker_error", error="endpoint_gid_not_observed_within_startup_timeout")
+            return 1
+        # Endpoint-info QoS/type are observed graph reflection. Requested
+        # creation arguments stay separate and never backfill missing fields.
+        own_rows = initial_graph["publishers" if kind == "writer" else "subscriptions"]
+        own = next((row for row in own_rows if row["endpoint_gid"] == local_gid), {})
+        emit("endpoint_created", endpoint_gid=local_gid, created_monotonic_ns=created_ns,
+             create_begin_monotonic_ns=create_begin["monotonic_ns"],
+             topic=endpoint.topic_name, qos=own.get("qos"), message_type=own.get("topic_type"),
+             requested_qos=config["qos"], configuration_source="public_graph_endpoint_reflection",
+             identity_source="get_publishers_info_by_topic" if kind == "writer"
+             else "get_subscriptions_info_by_topic",
+             **({"initial_content_filter": filter_configuration}
+                if filter_configuration is not None else {}))
+        emit("graph_snapshot", **initial_graph)
+
+        stdin_buffer = b""
+        queue = []
+        last_count = None
+        last_graph_ns = 0
+        while True:
+            executor.spin_once(timeout_sec=0.01)
+            now = time.monotonic_ns()
+            count = (endpoint.get_subscription_count() if kind == "writer"
+                     else endpoint.get_publisher_count())
+            if count != last_count:
+                emit("match", matched_count=count, endpoint_gid=local_gid)
+                emit("graph_snapshot", **graph())
+                last_count = count
+            if now - last_graph_ns > 500_000_000:
+                emit("graph_snapshot", **graph())
+                last_graph_ns = now
+            if sys.stdin is not None and selectors_for_stdin():
+                chunk = os.read(sys.stdin.fileno(), 65536)
+                if not chunk:
+                    break
+                stdin_buffer += chunk
+                while b"\n" in stdin_buffer:
+                    line, stdin_buffer = stdin_buffer.split(b"\n", 1)
+                    queue.append(line)
+            if not queue:
+                continue
+            command = json.loads(queue.pop(0))
+            command_id = command.get("command_id")
+            if command["command"] in ("stop", "destroy"):
+                emit("worker_stopping", command_id=command_id)
+                break
+            if command["command"] == "snapshot":
+                emit("match_snapshot", command_id=command_id,
+                     matched_count=(endpoint.get_subscription_count() if kind == "writer"
+                                    else endpoint.get_publisher_count()),
+                     endpoint_gid=local_gid, sampled_monotonic_ns=time.monotonic_ns(),
+                     count_api="get_subscription_count" if kind == "writer"
+                     else "get_publisher_count")
+                emit("graph_snapshot", command_id=command_id, **graph())
+                emit("command_done", command_id=command_id)
+            elif command["command"] == "publish_batch" and kind == "writer":
+                sequences = command.get("sequences")
+                interval = command.get("interval_sec", 0.0)
+                payload = command.get("payload")
+                phase = command.get("phase") or "publish"
+                if (not isinstance(sequences, list) or not sequences
+                        or any(type(x) is not int or x < 0 for x in sequences)):
+                    emit("worker_command_error", command_id=command_id,
+                         error="invalid_sequences")
+                    continue
+                if (isinstance(interval, bool) or not isinstance(interval, (int, float))
+                        or not math.isfinite(interval) or interval < 0 or interval > MAX_INTERVAL_SEC):
+                    emit("worker_command_error", command_id=command_id,
+                         error="invalid_interval")
+                    continue
+                if payload is not None and (not isinstance(payload, str) or len(payload) > 1024):
+                    emit("worker_command_error", command_id=command_id,
+                         error="invalid_payload")
+                    continue
+                for index, sequence in enumerate(sequences):
+                    body = {
+                        "run_id": config["run_id"], "send_sequence": sequence,
+                        "phase": phase, "writer_id": config["logical_id"],
+                        "writer_generation": config["generation"],
+                        "endpoint_gid": local_gid,
+                    }
+                    if payload is not None:
+                        body["declared_payload"] = payload
+                        body["declared_payload_sha256"] = _sha256_text(payload)
+                    message = String()
+                    message.data = json.dumps(body, sort_keys=True)
+                    endpoint.publish(message)
+                    emit("send", send_sequence=sequence, phase=phase,
+                         writer_gid=local_gid, publish_returned=True,
+                         payload_sha256=_sha256_text(message.data),
+                         declared_payload_sha256=body.get("declared_payload_sha256"),
+                         command_id=command_id, burst=True)
+                    if interval and index + 1 < len(sequences):
+                        end = time.monotonic() + float(interval)
+                        while time.monotonic() < end:
+                            executor.spin_once(timeout_sec=min(0.01, max(0.0, end - time.monotonic())))
+                emit("command_done", command_id=command_id, burst_count=len(sequences))
+            elif command["command"] == "assert_liveliness" and kind == "writer":
+                endpoint.assert_liveliness()
+                emit("liveliness_asserted", command_id=command_id,
+                     endpoint_gid=local_gid, api="rclpy.publisher.Publisher.assert_liveliness")
+                emit("command_done", command_id=command_id)
+            else:
+                emit("worker_command_error", command_id=command_id,
+                     error="unsupported_command:" + str(command.get("command")))
+    finally:
+        try:
+            executor.shutdown()
+        except Exception:
+            pass
+        try:
+            node.destroy_node()
+        except Exception:
+            pass
+        try:
+            context.shutdown()
+        except Exception:
+            pass
+        emit("worker_shutdown")
+    return 0
+
+
+def selectors_for_stdin():
+    import select
+    return select.select([sys.stdin], [], [], 0)[0]
+
+
+def worker_main():  # console/module entry used by RosTopologyBackend
+    try:
+        return _worker_main(sys.argv)
+    except BaseException as exc:  # noqa: BLE001 - must report a real child failure
+        print(json.dumps({
+            "event": "worker_error", "pid": os.getpid(), "pgid": os.getpgrp(),
+            "time_ns": time.time_ns(), "monotonic_ns": time.monotonic_ns(),
+            "error": type(exc).__name__ + ":" + str(exc),
+            "traceback": traceback.format_exc(),
+        }), flush=True)
+        return 1
+
+
+class _EndpointProcess:
+    """Own exactly one fresh worker process group; never signal a foreign PID."""
+
+    def __init__(self, config, environment, output_dir, role, emit):
+        self.config = dict(config)
+        self.environment = dict(environment)
+        self.output_dir = Path(output_dir)
+        self.role = role
+        self.emit = emit
+        self.process = None
+        self.stderr = None
+        self.selector = None
+        self.buffer = b""
+        self.events = []
+        self.command_serial = 0
+        self.stop_command_id = None
+        self.stop_requested_ns = None
+        self.metadata = None
+
+    def start(self):
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        env = dict(self.environment)
+        env.update({
+            "ROS_DOMAIN_ID": str(self.config["domain_id"]),
+            "RMW_IMPLEMENTATION": self.config["rmw"],
+            "ROS_LOCALHOST_ONLY": "1",
+            "ROS_LOG_DIR": str(self.output_dir / "ros_logs"),
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "PYTHONUNBUFFERED": "1",
+        })
+        attempt = 1
+        stderr_path = self.output_dir / f"{self.role}.stderr.log"
+        while True:
+            try:
+                self.stderr = stderr_path.open("xb")
+                break
+            except FileExistsError:
+                attempt += 1
+                stderr_path = self.output_dir / f"{self.role}.{attempt}.stderr.log"
+        self.process = subprocess.Popen(
+            ["/usr/bin/python3", "-B", "-m", "r2f.runtime.topology_worker",
+             json.dumps(self.config, sort_keys=True), self.role],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self.stderr,
+            env=env, start_new_session=True, cwd=self.config["source_repo"])
+        os.set_blocking(self.process.stdout.fileno(), False)
+        self.selector = selectors.DefaultSelector()
+        self.selector.register(self.process.stdout, selectors.EVENT_READ)
+        self.metadata = {
+            "role": self.role, "pid": self.process.pid, "pgid": self.process.pid,
+            "fresh_process": True, "separate_context": True,
+            "logical_id": self.config["logical_id"], "generation": self.config["generation"],
+            "worker_role": self.role, "worker_generation": self.config["generation"],
+            "stderr_path": str(stderr_path),
+        }
+        self.emit("process_started", **self.metadata)
+        return self.metadata
+
+    def _dispatch(self, line):
+        try:
+            event = json.loads(line)
+            if not isinstance(event, dict) or "event" not in event:
+                raise ValueError("bad event")
+            kind = event.pop("event")
+            if event.get("pid") not in (None, self.process.pid):
+                raise ValueError("pid mismatch")
+            event["pid"] = self.process.pid
+            event["pgid"] = self.process.pid
+            event["worker_role"] = self.role
+            event["worker_generation"] = self.config["generation"]
+            if kind == "endpoint_created":
+                self.metadata.update({k: deepcopy(event.get(k)) for k in
+                    ("logical_id", "generation", "endpoint_gid", "endpoint_generation", "process_start_ticks",
+                     "rmw_identifier", "domain_id", "observed_domain_id", "domain_observation_source")})
+            self.events.append({"event": kind, **event})
+            self.emit(kind, **event)
+        except (ValueError, TypeError):
+            self.emit("worker_stdout_diagnostic", role=self.role,
+                      text=line.decode(errors="replace")[:512])
+
+    def pump(self, timeout=0.05):
+        if self.selector is None:
+            return
+        for _, _ in self.selector.select(timeout):
+            try:
+                chunk = self.process.stdout.read()
+            except (OSError, ValueError):
+                chunk = b""
+            if not chunk:
+                continue
+            self.buffer += chunk
+            while b"\n" in self.buffer:
+                line, self.buffer = self.buffer.split(b"\n", 1)
+                if line.strip():
+                    self._dispatch(line)
+
+    def command(self, command, **fields):
+        if self.process is None or self.process.poll() is not None:
+            raise TopologyBackendError("worker_not_running:" + self.role)
+        self.command_serial += 1
+        command_id = self.command_serial
+        payload = {"command": command, "command_id": command_id, **fields}
+        if command == "snapshot":
+            created = next((e for e in reversed(self.events) if e.get("event") == "endpoint_created"), {})
+            self.emit("topology_snapshot_requested", command="snapshot", command_id=command_id,
+                      **{k: created.get(k) for k in ("logical_id", "generation", "endpoint_gid", "pid", "process_start_ticks", "endpoint_generation")})
+        try:
+            self.process.stdin.write((json.dumps(payload) + "\n").encode())
+            self.process.stdin.flush()
+        except (BrokenPipeError, OSError) as exc:
+            raise TopologyBackendError("worker_pipe_closed:" + self.role) from exc
+        if command in ("stop", "destroy"):
+            self.stop_command_id = command_id
+            self.stop_requested_ns = time.monotonic_ns()
+        return command_id
+
+    def has(self, event, **fields):
+        return any(row.get("event") == event and all(row.get(k) == v for k, v in fields.items())
+                   for row in self.events)
+
+    def wait(self, predicate, timeout, label):
+        deadline = time.monotonic() + float(timeout)
+        while True:
+            if predicate():
+                return
+            if self.process.poll() is not None:
+                self.pump(0)
+                if predicate():
+                    return
+                raise TopologyBackendError(
+                    "worker_exited:" + label + ":" + str(self.process.returncode))
+            if time.monotonic() >= deadline:
+                raise TopologyBackendTimeout("timeout:" + label)
+            self.pump(min(0.05, max(0.0, deadline - time.monotonic())))
+
+    def close(self, timeout=3.0):
+        if self.process is None:
+            return {"closed": True, "returncode": None, "already": True}
+        if self.metadata is not None and "returncode" in self.metadata:
+            return {"closed": self.process.poll() is not None, "returncode": self.metadata["returncode"],
+                    "pid": self.process.pid, "pgid": self.process.pid, "already": True}
+        if self.process.poll() is None:
+            try:
+                self.command("stop")
+            except TopologyBackendError:
+                pass
+            deadline = time.monotonic() + float(timeout)
+            while self.process.poll() is None and time.monotonic() < deadline:
+                self.pump(0.05)
+        if self.process.poll() is None:
+            try:
+                os.killpg(self.process.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            try:
+                self.process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(self.process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                self.process.wait(timeout=2)
+        self.pump(0)
+        if self.selector is not None:
+            try:
+                self.selector.unregister(self.process.stdout)
+            except (KeyError, ValueError):
+                pass
+            self.selector.close()
+        for handle in (self.process.stdin, self.process.stdout, self.stderr):
+            try:
+                handle.close()
+            except (AttributeError, OSError):
+                pass
+        self.metadata["returncode"] = self.process.returncode
+        self.emit("process_exit", **self.metadata)
+        return {"closed": True, "returncode": self.process.returncode,
+                "pid": self.process.pid, "pgid": self.process.pid}
+
+
+class OfflineTopologyBackend:
+    """Contract-test double.  Never ROS, never SUT evidence, never a candidate."""
+
+    backend_name = OFFLINE_BACKEND
+    real_ros = False
+    supports_assert_liveliness = True
+
+    def __init__(self, event_sink=None, *, auto_match=True, auto_delivery=True,
+                 match_policy="all", graph_visibility="matched",
+                 publisher_gid_available=True):
+        # Legacy default contract: all same-topic opposite-role edges match
+        # automatically, graph inventory is filtered by that match relation, and
+        # simulated MessageInfo carries a publisher GID. The ambiguous N-graph
+        # and no-MessageInfo-GID shapes exist only when a caller explicitly asks
+        # for them; defaults never change under test convenience.
+        if match_policy not in {"one_to_one", "all"}:
+            raise ValueError("offline_match_policy_must_be_one_to_one_or_all")
+        if graph_visibility not in {"matched", "all_live_topic"}:
+            raise ValueError("offline_graph_visibility_must_be_matched_or_all_live_topic")
+        if type(publisher_gid_available) is not bool:
+            raise ValueError("offline_publisher_gid_available_must_be_bool")
+        self.match_policy = match_policy
+        self.graph_visibility = graph_visibility
+        self.publisher_gid_available = publisher_gid_available
+        self.visibility = {}
+        self.count_overrides = {}
+        self.event_sink = event_sink
+        self.serial = 0
+        self.command_serial = 0
+        self.handles = {}
+        self.closed = False
+        self.graph = {}
+        self.writer_sees = {}
+        self.reader_sees = {}
+        self.prepared = None
+        self.auto_match = auto_match
+        self.auto_delivery = auto_delivery
+
+    def set_event_sink(self, sink):
+        self.event_sink = sink
+
+    def _emit(self, event, **fields):
+        value = {"event": event, "time_ns": time.time_ns(),
+                 "monotonic_ns": time.monotonic_ns(),
+                 "role": "offline_backend", "pid": os.getpid(), "pgid": os.getpgrp(),
+                 "backend": self.backend_name, "real_ros": False}
+        value.update(fields)
+        if self.event_sink is not None:
+            self.event_sink(event, **{key: item for key, item in value.items() if key != "event"})
+        return value
+
+    def prepare(self, program, config):
+        if config.get("environment_mutation") is not None:
+            # The offline fixture can never own a real namespace or tc window.
+            self.prepared = {
+                "ok": False, "backend": self.backend_name, "ros_execution": False,
+                "reason": "blocked:offline_fixture_cannot_claim_environment_mutation",
+                "execution_evidence": False, "candidate_eligible": False,
+                "declared_environment_mutation": deepcopy(config.get("environment_mutation")),
+            }
+            self._emit("topology_backend_blocked", **self.prepared)
+            return self.prepared
+        self.prepared = {
+            "ok": True, "backend": self.backend_name, "ros_execution": False,
+            "run_id": config.get("run_id"),
+            "execution_evidence": False, "candidate_eligible": False,
+            "declared_environment": deepcopy(program.get("environment", {})),
+            "observed_environment": {"backend": self.backend_name, "ros": False,
+                                     "note": "offline fake backend; not ROS/DDS execution"},
+            "limitations": ["offline_fake_backend_is_not_ros"],
+            "fixture_observation_controls": {
+                "match_policy": self.match_policy,
+                "graph_visibility": self.graph_visibility,
+                "publisher_gid_available": self.publisher_gid_available,
+                "auto_match": self.auto_match,
+                "auto_delivery": self.auto_delivery,
+                "scope": "explicit_offline_fixture_control_not_live_semantics",
+            },
+        }
+        self._emit("topology_backend_prepared", **self.prepared)
+        return self.prepared
+
+    def _fake_gid(self):
+        return f"{0xFA000000000000000000000000000000 + self.serial:032x}"
+
+    def _refresh_matches(self, topic):
+        writers = sorted(h["logical_id"] for h in self.handles.values()
+                         if h.get("alive") and h["topic"] == topic and h["role"] == "writer")
+        readers = sorted(h["logical_id"] for h in self.handles.values()
+                         if h.get("alive") and h["topic"] == topic and h["role"] == "reader")
+        edges = set(zip(writers, readers)) if self.match_policy == "one_to_one" else {
+            (writer, reader) for writer in writers for reader in readers}
+        for writer in writers:
+            for reader in readers:
+                self.writer_sees[(writer, reader)] = (writer, reader) in edges
+                self.reader_sees[(writer, reader)] = (writer, reader) in edges
+
+    def set_match_edge(self, writer_id, reader_id, *, writer_sees=True, reader_sees=True):
+        """Simulated match relation, independent of graph visibility."""
+        self.writer_sees[(writer_id, reader_id)] = bool(writer_sees)
+        self.reader_sees[(writer_id, reader_id)] = bool(reader_sees)
+
+    def _graph_visible(self, observer_id, peer_id, peer_role):
+        """Explicit per-observer override, else the selected fixture policy.
+
+        ``matched`` reproduces the legacy filtered inventory. ``all_live_topic``
+        is an explicit synthetic "full discovery inventory" control. Neither is
+        a per-peer match receipt; only ``match_snapshot`` counts/edges claim a
+        simulated match relation.
+        """
+        override = self.visibility.get((observer_id, peer_id))
+        if override is not None:
+            return override
+        if self.graph_visibility == "all_live_topic":
+            return True
+        observer = self.handles.get(observer_id) or {}
+        observer_role = observer.get("role")
+        if observer_role == peer_role or peer_id == observer_id:
+            # Same-role inventory has no match relation to filter by; the fake
+            # backend lists every alive same-topic endpoint of that role.
+            return True
+        if peer_role == "reader":
+            return bool(self.writer_sees.get((observer_id, peer_id), False))
+        return bool(self.reader_sees.get((peer_id, observer_id), False))
+
+    def set_graph_visibility(self, observer_id, peer_id, *, visible=True):
+        """Simulated discovery inventory, never a per-peer match receipt."""
+        self.visibility[(observer_id, peer_id)] = bool(visible)
+
+    def set_matched_count(self, logical_id, count):
+        """Explicit aggregate observation override for inconsistent fixtures."""
+        if count is not None and (type(count) is not int or count < 0):
+            raise ValueError("offline_matched_count_must_be_nonnegative_integer_or_none")
+        if count is None:
+            self.count_overrides.pop(logical_id, None)
+        else:
+            self.count_overrides[logical_id] = count
+
+    def create_endpoint(self, spec, generation, worker_role):
+        if self.closed:
+            raise TopologyBackendError("backend_closed")
+        initial_filter = (_initial_content_filter(spec["filter"], spec["role"])
+                          if "filter" in spec else None)
+        filter_configuration = None
+        if initial_filter is not None:
+            from .filter_backend import receipt
+            filter_configuration = receipt(
+                "filter_initial_configuration", scope="initial_only", fixture=True,
+                backend=OFFLINE_BACKEND, real_ros=False, execution_evidence=False,
+                requested=initial_filter, submitted=False, observed=None,
+                is_cft_enabled=None, configured=None, configuration_status="unverified",
+                readback_status="unavailable", reason="offline_fixture_no_cft_api",
+                filter_effect_observed=None, filter_false_implies_unmatch=False,
+                dynamic_update_covered=False, lease_covered=False)
+            self._emit("content_filter_initial_configuration", logical_id=spec["logical_id"],
+                       generation=generation, fixture=True, candidate_eligible=False,
+                       execution_evidence=False, filter_receipt=filter_configuration)
+        self.serial += 1
+        gid = self._fake_gid()
+        handle = {
+            "logical_id": spec["logical_id"], "role": spec["role"],
+            "generation": generation, "worker_role": worker_role,
+            "topic": spec["topic"], "type_name": spec["type_name"],
+            "qos": deepcopy(spec["qos"]), "endpoint_gid": gid,
+            "pid": 200000 + self.serial, "pgid": 200000 + self.serial,
+            "process_start_ticks": self.serial, "worker_generation": self.serial,
+            "endpoint_generation": f"offline-generation-{self.serial}",
+            "rmw_identifier": "offline_fake_no_ros",
+            "identity_source": "offline_fake", "real_ros": False, "alive": True,
+            "created_monotonic_ns": time.monotonic_ns(),
+        }
+        if filter_configuration is not None:
+            handle["initial_content_filter"] = filter_configuration
+        self.handles[spec["logical_id"]] = handle
+        self.graph.setdefault(spec["topic"], {"writer": set(), "reader": set()})
+        self.graph[spec["topic"]][spec["role"]].add(spec["logical_id"])
+        if self.auto_match:
+            self._refresh_matches(spec["topic"])
+        self._emit("endpoint_created", logical_id=spec["logical_id"],
+                   role=spec["role"], worker_role=worker_role,
+                   generation=generation, endpoint_gid=gid, pid=handle["pid"],
+                   pgid=handle["pgid"], process_start_ticks=handle["process_start_ticks"],
+                   endpoint_generation=handle["endpoint_generation"],
+                   topic=spec["topic"], qos=deepcopy(spec["qos"]),
+                   message_type=spec["type_name"], identity_source="offline_fake",
+                   configuration_source="offline_fixture",
+                   **({"initial_content_filter": filter_configuration}
+                      if filter_configuration is not None else {}))
+        return handle
+
+    def destroy_endpoint(self, handle):
+        if self.closed:
+            raise TopologyBackendError("backend_closed")
+        handle = self.handles.get(handle["logical_id"], handle)
+        if handle.get("alive") is not True:
+            raise TopologyBackendError("endpoint_generation_not_alive")
+        handle["alive"] = False
+        self.graph.get(handle["topic"], {}).get(handle["role"], set()).discard(
+            handle["logical_id"])
+        for key in list(self.writer_sees):
+            if handle["logical_id"] in key:
+                self.writer_sees.pop(key, None)
+                self.reader_sees.pop(key, None)
+        identity = {k: handle[k] for k in ("logical_id", "generation", "endpoint_gid", "pid", "pgid",
+                                           "process_start_ticks", "endpoint_generation")}
+        # 'closed' describes the simulated handle's actual removal above.
+        # Backend/real_ros/fixture identity explicitly prevent real qualification.
+        self._emit("endpoint_destroyed", role=handle["role"], **identity,
+                   returncode=0, cleanup_status="closed", fixture=True,
+                   backend=self.backend_name, real_ros=False,
+                   cleanup_scope="offline_simulated_endpoint")
+        self._emit("topology_worker_exit", **identity, returncode=0, fixture=True,
+                   cleanup_scope="offline_simulated_endpoint")
+        return {"cleanup_status": "closed", "returncode": 0, **identity,
+                "fixture": True, "real_ros": False, "cleanup_scope": "offline_simulated_endpoint"}
+
+    def publish_batch(self, handle, sequences, interval_sec, phase, payload=None):
+        if self.closed:
+            raise TopologyBackendError("backend_closed")
+        if interval_sec < 0 or interval_sec > MAX_INTERVAL_SEC:
+            raise TopologyUnsupported("burst_interval_not_expressible",
+                                      "interval exceeds bounded worker input")
+        self.command_serial += 1
+        command_id = self.command_serial
+        start_ns = time.monotonic_ns()
+        for sequence in sequences:
+            body = {"run_id": self.prepared_run_id(), "send_sequence": sequence,
+                    "phase": phase, "writer_id": handle["logical_id"],
+                    "writer_generation": handle["generation"],
+                    "endpoint_gid": handle["endpoint_gid"]}
+            if payload is not None:
+                body.update(declared_payload=payload, declared_payload_sha256=_sha256_text(payload))
+            payload_sha256 = _sha256_text(json.dumps(body, sort_keys=True))
+            self._emit("send", logical_id=handle["logical_id"],
+                       role=handle["role"], generation=handle["generation"],
+                       worker_role=handle["worker_role"], endpoint_gid=handle["endpoint_gid"],
+                       writer_gid=handle["endpoint_gid"], send_sequence=sequence,
+                       phase=phase, publish_returned=True, command_id=command_id,
+                       burst=True, payload_sha256=payload_sha256,
+                       pid=handle["pid"], pgid=handle["pgid"],
+                       process_start_ticks=handle["process_start_ticks"],
+                       endpoint_generation=handle["endpoint_generation"],
+                       declared_payload_sha256=_sha256_text(payload) if payload is not None else None)
+            if self.auto_delivery:
+                for reader in self.handles.values():
+                    if (reader["role"] == "reader" and reader.get("alive")
+                            and reader["topic"] == handle["topic"]
+                            and self.reader_sees.get((handle["logical_id"], reader["logical_id"]))):
+                        self._emit(
+                            "receive", logical_id=reader["logical_id"],
+                            role=reader["role"], generation=reader["generation"],
+                            endpoint_gid=reader["endpoint_gid"],
+                            reader_gid=reader["endpoint_gid"],
+                            publisher_gid=handle["endpoint_gid"] if self.publisher_gid_available else None,
+                            publisher_gid_status="available" if self.publisher_gid_available else "unavailable_api",
+                            identity_basis="message_info_gid" if self.publisher_gid_available else "endpoint_correlated_payload",
+                            send_sequence=sequence, phase=phase,
+                            payload_run_id=self.prepared_run_id(),
+                            pid=reader["pid"], pgid=reader["pgid"],
+                            process_start_ticks=reader["process_start_ticks"],
+                            endpoint_generation=reader["endpoint_generation"],
+                            payload_sha256=payload_sha256,
+                            payload_writer_id=body["writer_id"],
+                            payload_writer_generation=body["writer_generation"],
+                            payload_endpoint_gid=body["endpoint_gid"],
+                            backend=self.backend_name)
+        end_ns = time.monotonic_ns()
+        self._emit("command_done", command_id=command_id, burst_count=len(sequences),
+                   logical_id=handle["logical_id"], role=handle["role"],
+                   endpoint_gid=handle["endpoint_gid"], generation=handle["generation"],
+                   pid=handle["pid"], pgid=handle["pgid"],
+                   process_start_ticks=handle["process_start_ticks"],
+                   endpoint_generation=handle["endpoint_generation"])
+        return {"command_id": command_id, "sent_sequences": list(sequences),
+                "start_ns": start_ns, "end_ns": end_ns,
+                "controller_ack_count": 1, "per_sample_ack": False,
+                "payload_binding": "declared_payload_embedded" if payload is not None
+                else "canonical_metadata_only",
+                "backend": self.backend_name}
+
+    def snapshot(self, handles):
+        if self.closed:
+            raise TopologyBackendError("backend_closed")
+        self.command_serial += 1
+        command_id = self.command_serial
+        snapshots = {}
+        for handle in (handles.values() if isinstance(handles, dict) else handles):
+            identity = {k: handle[k] for k in ("logical_id", "generation", "pid", "process_start_ticks", "endpoint_generation")}
+            self._emit("topology_snapshot_requested", command="snapshot", command_id=command_id, **identity)
+            topic = handle["topic"]
+            rows = self.graph.get(topic, {"writer": set(), "reader": set()})
+            publishers = [self.handles[eid]["endpoint_gid"] for eid in sorted(rows["writer"])
+                          if self._graph_visible(handle["logical_id"], eid, "writer")]
+            subscriptions = [self.handles[eid]["endpoint_gid"] for eid in sorted(rows["reader"])
+                             if self._graph_visible(handle["logical_id"], eid, "reader")]
+            if handle["role"] == "writer":
+                matched_count = sum(self.writer_sees.get((handle["logical_id"], eid), False)
+                                    for eid in rows["reader"])
+            else:
+                matched_count = sum(self.reader_sees.get((eid, handle["logical_id"]), False)
+                                    for eid in rows["writer"])
+            matched_count = self.count_overrides.get(handle["logical_id"], matched_count)
+            graph = {
+                "publishers": [{"endpoint_gid": gid, "node_name": "offline_fake",
+                                "node_namespace": "/", "topic_type": handle["type_name"],
+                                "qos": {}} for gid in publishers],
+                "subscriptions": [{"endpoint_gid": gid, "node_name": "offline_fake",
+                                   "node_namespace": "/", "topic_type": handle["type_name"],
+                                   "qos": {}} for gid in subscriptions],
+            }
+            match = {"command_id": command_id, "matched_count": matched_count,
+                     "endpoint_gid": handle["endpoint_gid"],
+                     "sampled_monotonic_ns": time.monotonic_ns(),
+                     "count_api": "get_subscription_count" if handle["role"] == "writer"
+                     else "get_publisher_count"}
+            snapshots[handle["logical_id"]] = {
+                "match_snapshot": match, "graph_snapshot": graph,
+                "command_id": command_id, "complete": True,
+            }
+            self._emit("match_snapshot", role=handle["role"], **identity, **match)
+            self._emit("graph_snapshot", role=handle["role"], **identity,
+                       endpoint_gid=handle["endpoint_gid"], command_id=command_id, **graph)
+            self._emit("command_done", command_id=command_id, **identity)
+        return {"snapshots": snapshots, "command_id": command_id,
+                "complete": all(v["complete"] for v in snapshots.values())}
+
+    def assert_liveliness(self, handle):
+        if self.closed:
+            raise TopologyBackendError("backend_closed")
+        self._emit("liveliness_asserted", logical_id=handle["logical_id"],
+                   generation=handle["generation"], endpoint_gid=handle["endpoint_gid"],
+                   api="offline_fake_assert_liveliness", real_ros=False)
+        return {"api": "offline_fake_assert_liveliness", "real_ros": False}
+
+    def prepared_run_id(self):
+        return (self.prepared or {}).get("run_id")
+
+    def set_graph_edge(self, writer_id, reader_id, *, writer_sees=True, reader_sees=True):
+        # Legacy convenience keeps its historical combined control. New tests
+        # use independent set_match_edge / set_graph_visibility instead.
+        self.set_match_edge(writer_id, reader_id, writer_sees=writer_sees, reader_sees=reader_sees)
+        self.set_graph_visibility(writer_id, reader_id, visible=writer_sees)
+        self.set_graph_visibility(reader_id, writer_id, visible=reader_sees)
+
+    def deliver(self, writer_id, reader_id, sequence, *, publisher_gid=True, payload_run_id=None):
+        writer = self.handles[writer_id]
+        reader = self.handles[reader_id]
+        self._emit("receive", logical_id=reader_id, role=reader["role"],
+                   generation=reader["generation"], endpoint_gid=reader["endpoint_gid"],
+                   reader_gid=reader["endpoint_gid"], send_sequence=sequence,
+                   publisher_gid=writer["endpoint_gid"] if publisher_gid else None,
+                   publisher_gid_status="available" if publisher_gid else "unavailable_api",
+                   identity_basis="message_info_gid" if publisher_gid else "endpoint_correlated",
+                   payload_run_id=payload_run_id, backend=self.backend_name)
+
+    def pump(self, timeout=0.0):
+        return 0
+
+    def close(self):
+        if self.closed:
+            return {"already_closed": True, "closed": True}
+        for handle in self.handles.values():
+            if handle.get("alive"):
+                identity = {k: handle[k] for k in ("logical_id", "generation", "endpoint_gid", "pid", "pgid",
+                                                   "process_start_ticks", "endpoint_generation")}
+                handle["alive"] = False
+                self._emit("topology_worker_exit", **identity, returncode=0, fixture=True,
+                           cleanup_scope="offline_simulated_endpoint")
+        self.closed = True
+        self._emit("topology_backend_closed", backend=self.backend_name, real_ros=False)
+        return {"closed": True, "backend": self.backend_name}
+
+
+class RosTopologyBackend:
+    """Controller for one fresh worker process per endpoint generation."""
+
+    backend_name = ROS_BACKEND
+    real_ros = True
+    supports_assert_liveliness = True
+
+    def __init__(self, config, output_dir, event_sink=None):
+        self.config = dict(config or {})
+        self.output_dir = Path(output_dir).resolve()
+        self.event_sink = event_sink
+        self.preflight = None
+        self.environment = None
+        self.execution_lease = None
+        self.execution_preflight = None
+        self.execution_environment = None
+        self.processes = []
+        self.handles = {}
+        self.closed = False
+        self.netem_isolation = None
+
+    def set_event_sink(self, sink):
+        self.event_sink = sink
+
+    def _emit(self, event, **fields):
+        value = {"event": event, "time_ns": time.time_ns(),
+                 "monotonic_ns": time.monotonic_ns(),
+                 "role": "topology_backend", "pid": os.getpid(), "pgid": os.getpgrp(),
+                 "backend": self.backend_name, "real_ros": True}
+        value.update(fields)
+        if self.event_sink is not None:
+            self.event_sink(event, **{key: item for key, item in value.items() if key != "event"})
+        return value
+
+    def prepare(self, program, config=None):
+        cfg = dict(self.config)
+        cfg.update(config or {})
+        cfg.setdefault("source_repo", str(REPO))
+        # Hard gate: this backend must refuse to touch a live domain unless an
+        # explicit owner GO was supplied.  Direct API use cannot bypass it.
+        if cfg.get("live_execution_go") is not True:
+            receipt = {"ok": False, "backend": self.backend_name, "ros_execution": False,
+                       "reason": "blocked:no_live_ros_go",
+                       "requires": ["explicit owner GO for real ROS/DDS execution"],
+                       "execution_evidence": False, "candidate_eligible": False}
+            self.preflight = receipt
+            self._emit("topology_backend_blocked", **receipt)
+            return receipt
+        # Environment mutation is only meaningful inside a verified isolated
+        # namespace.  Direct backend use must fail exactly like the route gate.
+        try:
+            netem = normalize_topology_environment_mutation(cfg.get("environment_mutation"))
+        except ValueError as exc:
+            raise TopologyBackendBlocked(str(exc)) from exc
+        if netem is not None:
+            isolation = netem_isolation_receipt()
+            if not isolation["isolated"]:
+                raise TopologyBackendBlocked("topology_netem_requires_isolated_netns")
+            self.netem_isolation = isolation
+        # These are actual runtime-owned lease handles/environment measurements,
+        # never cfg.live_execution_go / cfg.lease_receipts assertions.
+        from .ros2_pair import verify_pair_lease
+        try:
+            locks = verify_pair_lease(self.execution_lease, cfg, self.output_dir)
+        except (RuntimeError, OSError, ValueError) as exc:
+            raise TopologyBackendBlocked(str(exc)) from exc
+        env = self.execution_preflight
+        if not isinstance(env, dict) or env.get("ok") is not True or not self.execution_environment:
+            raise TopologyBackendBlocked("canonical_environment_preflight_missing")
+        self.preflight = env
+        self.environment = dict(self.execution_environment)
+        activated = env
+        receipt = {
+            "ok": True, "backend": self.backend_name, "ros_execution": True,
+            "declared_environment": deepcopy(program.get("environment", {})),
+            "observed_environment": {
+                "ros_distro": activated.get("ros_distro"),
+                "rmw_availability": activated.get("rmw"),
+                "rmw": None, "domain_id": None,
+                "requested_rmw": cfg.get("rmw"), "requested_domain_id": cfg.get("domain_id"),
+                "source": env.get("source"), "process_scan": env.get("process_scan"),
+                "rtps_probe": env.get("rtps_probe"),
+                "environment_mode": env.get("environment_mode"),
+            },
+            "lease_context": {"status": "held_canonical_three_leases", "locks": locks},
+            "limitations": [],
+            "execution_evidence": False,
+            "candidate_eligible": False,
+        }
+        self._emit("topology_backend_prepared", **receipt)
+        return receipt
+
+    def _start_ticks(self, pid):
+        try:
+            text = Path(f"/proc/{int(pid)}/stat").read_text()
+            return int(text.rsplit(")", 1)[1].split()[19])
+        except (OSError, ValueError, IndexError) as exc:
+            raise TopologyBackendError("cannot_verify_process_start_ticks") from exc
+
+    def create_endpoint(self, spec, generation, worker_role):
+        if self.closed:
+            raise TopologyBackendError("backend_closed")
+        if self.environment is None:
+            raise TopologyBackendError("backend_not_prepared")
+        prepared = endpoint_expressibility(spec, self.config)
+        endpoint_dir = (self.output_dir / "endpoints"
+                        / re.sub(r"[^A-Za-z0-9_.-]", "_", spec["logical_id"])
+                        / f"g{generation}")
+        endpoint_dir.mkdir(parents=True, exist_ok=True)
+        worker_config = {
+            "run_id": self.config["run_id"], "domain_id": self.config["domain_id"],
+            "rmw": self.config["rmw"], "source_repo": str(self.config.get("source_repo", REPO)),
+            "logical_id": spec["logical_id"], "generation": generation,
+            "topic": spec["topic"], "type_name": spec["type_name"],
+            "qos": prepared["public_qos"],
+            "startup_timeout_sec": float(self.config.get("startup_timeout_sec", 10.0)),
+        }
+
+        if prepared["initial_content_filter"] is not None:
+            worker_config["initial_content_filter"] = deepcopy(prepared["initial_content_filter"])
+
+        def sink(event, **fields):
+            value = dict(fields)
+            value.setdefault("topology_logical_id", spec["logical_id"])
+            value.setdefault("topology_generation", generation)
+            value.setdefault("topology_worker_role", worker_role)
+            value.setdefault("backend", self.backend_name)
+            value.setdefault("real_ros", True)
+            if self.event_sink is not None:
+                self.event_sink(event, **value)
+
+        process = _EndpointProcess(worker_config, self.environment, endpoint_dir,
+                                   worker_role, sink)
+        self.processes.append(process)
+        try:
+            process.start()
+            pid = process.process.pid
+            process.wait(lambda: process.has("endpoint_created", pid=pid),
+                         worker_config["startup_timeout_sec"],
+                         "topology_endpoint_created:" + spec["logical_id"])
+            row = [e for e in process.events
+                   if e.get("event") == "endpoint_created" and e.get("pid") == pid][-1]
+            gid = row.get("endpoint_gid")
+            if not isinstance(gid, str) or not re.fullmatch(r"[0-9a-fA-F]{2,}", gid):
+                raise TopologyBackendError("endpoint_created_without_real_guid")
+            if not isinstance(row.get("endpoint_generation"), str) or not row["endpoint_generation"]:
+                raise TopologyBackendError("endpoint_created_without_worker_generation")
+            if row.get("pgid") != pid:
+                raise TopologyBackendError("endpoint_process_group_identity_mismatch")
+            ticks = self._start_ticks(pid)
+            if row.get("process_start_ticks") != ticks:
+                raise TopologyBackendError("endpoint_process_start_ticks_mismatch")
+            handle = {
+                "logical_id": spec["logical_id"], "role": spec["role"],
+                "generation": generation, "worker_role": worker_role,
+                "topic": spec["topic"], "type_name": spec["type_name"],
+                "qos": deepcopy(spec["qos"]), "public_qos": prepared["public_qos"],
+                "endpoint_gid": gid, "endpoint_generation": row["endpoint_generation"],
+                "pid": pid, "pgid": row.get("pgid"), "process_start_ticks": ticks,
+                "rmw_identifier": row.get("rmw_identifier"),
+                "observed_domain_id": row.get("observed_domain_id"),
+                "node_name": row.get("node_name"),
+                "identity_source": row.get("identity_source"),
+                "binding": prepared["binding"],
+                "process": process, "alive": True, "real_ros": True,
+                "created_monotonic_ns": row.get("created_monotonic_ns"),
+            }
+            if prepared["initial_content_filter"] is not None:
+                # Only child API results can populate this observation.
+                handle["initial_content_filter"] = deepcopy(row.get("initial_content_filter"))
+            self.handles[spec["logical_id"]] = handle
+            self._emit("topology_endpoint_bound", logical_id=spec["logical_id"],
+                       role=spec["role"], generation=generation, worker_role=worker_role,
+                       endpoint_gid=gid, pid=pid,
+                       endpoint_generation=handle["endpoint_generation"],
+                       binding=prepared["binding"],
+                       identity_source=handle["identity_source"])
+            return handle
+        except Exception:
+            process.close()
+            raise
+
+    def destroy_endpoint(self, handle):
+        process = handle.get("process")
+        receipt = process.close() if process is not None else {"closed": False}
+        handle["alive"] = False
+        if receipt.get("closed"):
+            self._emit("topology_worker_exit", returncode=receipt.get("returncode"),
+                       **{k: handle.get(k) for k in ("logical_id", "generation", "endpoint_gid", "pid", "pgid", "process_start_ticks", "endpoint_generation")})
+            self._emit("worker_exit", returncode=receipt.get("returncode"),
+                       **{k: handle.get(k) for k in ("logical_id", "generation", "endpoint_gid", "pid", "process_start_ticks", "endpoint_generation")})
+        identity = {k: handle.get(k) for k in ("logical_id", "generation", "endpoint_gid", "pid", "pgid",
+                                               "process_start_ticks", "endpoint_generation")}
+        self._emit("topology_endpoint_destroyed", role=handle["role"], **identity,
+                   returncode=receipt.get("returncode"),
+                   cleanup_status="closed" if receipt.get("closed") else "unknown")
+        return {"cleanup_status": "closed" if receipt.get("closed") else "unknown",
+                "returncode": receipt.get("returncode"), **identity}
+
+    def _batch(self, handle, command, **fields):
+        process = handle["process"]
+        command_id = process.command(command, **fields)
+        try:
+            process.wait(lambda: process.has("command_done", command_id=command_id),
+                         float(self.config.get("publish_timeout_sec", 10.0)),
+                         "topology_" + command + ":" + handle["logical_id"])
+        except TopologyBackendError as exc:
+            if isinstance(exc, TopologyBackendTimeout):
+                raise TopologyBackendTimeout(
+                    str(exc), command_id=command_id, endpoint_id=handle["logical_id"]) from exc
+            raise
+        errors = [e for e in process.events
+                  if e.get("event") == "worker_command_error" and e.get("command_id") == command_id]
+        if errors:
+            raise TopologyBackendError("worker_command_error:" + str(errors[-1].get("error")))
+        return command_id
+
+    def publish_batch(self, handle, sequences, interval_sec, phase, payload=None):
+        if self.closed:
+            raise TopologyBackendError("backend_closed")
+        if interval_sec < 0 or interval_sec > MAX_INTERVAL_SEC:
+            raise TopologyUnsupported("burst_interval_not_expressible",
+                                      "interval outside bounded worker input")
+        command_id = self._batch(handle, "publish_batch", sequences=list(sequences),
+                                 interval_sec=float(interval_sec), phase=phase,
+                                 payload=payload)
+        sends = [e for e in handle["process"].events if e.get("event") == "send"
+                 and e.get("command_id") == command_id]
+        sent = [e.get("send_sequence") for e in sends]
+        if sent != list(sequences):
+            raise TopologyBackendError("publish_batch_send_set_mismatch")
+        return {
+            "command_id": command_id, "sent_sequences": sent,
+            "start_ns": min(e["monotonic_ns"] for e in sends),
+            "end_ns": max(e["monotonic_ns"] for e in sends),
+            "controller_ack_count": 1, "per_sample_ack": False,
+            "payload_binding": "declared_payload_embedded" if payload is not None
+            else "canonical_metadata_only",
+            "backend": self.backend_name,
+        }
+
+    def snapshot(self, handles):
+        if self.closed:
+            raise TopologyBackendError("backend_closed")
+        snapshots = {}
+        for logical_id, handle in (handles.items() if isinstance(handles, dict) else handles):
+            process = handle["process"]
+            command_id = process.command("snapshot")
+            try:
+                process.wait(lambda: process.has("command_done", command_id=command_id),
+                             float(self.config.get("snapshot_timeout_sec", 5.0)),
+                             "topology_snapshot:" + logical_id)
+            except TopologyBackendError as exc:
+                if isinstance(exc, TopologyBackendTimeout):
+                    raise TopologyBackendTimeout(str(exc), command_id=command_id,
+                                                 endpoint_id=logical_id) from exc
+                raise
+            matches = [e for e in process.events if e.get("event") == "match_snapshot"
+                       and e.get("command_id") == command_id]
+            graphs = [e for e in process.events if e.get("event") == "graph_snapshot"
+                      and e.get("command_id") == command_id]
+            snapshots[logical_id] = {
+                "match_snapshot": dict(matches[-1]) if matches else None,
+                "graph_snapshot": dict(graphs[-1]) if graphs else None,
+                "command_id": command_id,
+                "complete": bool(matches and graphs),
+            }
+        return {"snapshots": snapshots, "command_id": None,
+                "complete": all(v["complete"] for v in snapshots.values())}
+
+    def assert_liveliness(self, handle):
+        command_id = self._batch(handle, "assert_liveliness")
+        rows = [e for e in handle["process"].events
+                if e.get("event") == "liveliness_asserted" and e.get("command_id") == command_id]
+        return {"api": rows[-1].get("api") if rows else None, "command_id": command_id,
+                "real_ros": True}
+
+    def pump(self, timeout=0.0):
+        for process in self.processes:
+            process.pump(timeout)
+
+    def close(self):
+        if self.closed:
+            return {"already_closed": True, "closed": True}
+        workers, errors = [], []
+        for process in self.processes:
+            try:
+                receipt = process.close()
+                workers.append(receipt)
+                handle = next((h for h in self.handles.values() if h.get("process") is process and h.get("alive")), None)
+                if handle is not None and receipt.get("closed"):
+                    handle["alive"] = False
+                    self._emit("topology_worker_exit", returncode=receipt.get("returncode"),
+                               **{k: handle.get(k) for k in ("logical_id", "generation", "endpoint_gid", "pid", "pgid", "process_start_ticks", "endpoint_generation")})
+                    self._emit("worker_exit", returncode=receipt.get("returncode"),
+                               **{k: handle.get(k) for k in ("logical_id", "generation", "endpoint_gid", "pid", "process_start_ticks", "endpoint_generation")})
+            except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+                errors.append({"error": type(exc).__name__, "detail": str(exc)})
+        alive = [p.process.pid for p in self.processes
+                 if p.process is not None and p.process.poll() is None]
+        self.closed = not alive and not errors and all(w.get("closed") for w in workers)
+        self._emit("topology_backend_closed", backend=self.backend_name,
+                   workers=len(workers), closed=self.closed, survivors=alive, errors=errors,
+                   returncodes=[w.get("returncode") for w in workers])
+        return {"closed": self.closed, "backend": self.backend_name, "workers": workers,
+                "survivors": alive, "errors": errors,
+                "returncodes": [w.get("returncode") for w in workers]}
+
+
+def normalize_topology_config(config):
+    """Minimal config normalization for the topology backend; no ROS created."""
+    if not isinstance(config, dict):
+        raise ValueError("topology config must be an object")
+    c = dict(config)
+    c.setdefault("run_id", uuid.uuid4().hex)
+    c.setdefault("campaign_id", c["run_id"])
+    c.setdefault("domain_id", 173)
+    if (isinstance(c["domain_id"], bool) or not isinstance(c["domain_id"], int)
+            or not 0 <= c["domain_id"] <= 231):
+        raise ValueError("domain_id must be an integer in 0..231")
+    c.setdefault("rmw", "rmw_cyclonedds_cpp")
+    if c["rmw"] not in RMW_NAMES:
+        raise ValueError("unsupported_rmw:" + str(c["rmw"]))
+    c.setdefault("source_repo", str(REPO))
+    c.setdefault("startup_timeout_sec", 10.0)
+    c.setdefault("publish_timeout_sec", 30.0)
+    c.setdefault("snapshot_timeout_sec", 10.0)
+    for key in ("startup_timeout_sec", "publish_timeout_sec", "snapshot_timeout_sec"):
+        value = c[key]
+        if (isinstance(value, bool) or not isinstance(value, (int, float))
+                or not math.isfinite(value) or value <= 0):
+            raise ValueError("invalid_timeout:" + key)
+        c[key] = float(value)
+    return c
+
+
+if __name__ == "__main__":
+    raise SystemExit(worker_main())

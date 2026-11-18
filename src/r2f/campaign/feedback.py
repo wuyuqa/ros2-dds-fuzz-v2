@@ -11,26 +11,10 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 
 from r2f.core.evidence import canonical_hash
+from r2f.core.observation_status import observation_complete, tool_error
+from r2f.core.state_signature import observation_edge
 
 SCHEMA = "r2f.s1-feedback/v1"
-
-
-def tool_error(record):
-    return bool(record.get("tool_error") or record.get("reason_code") == "tool_error"
-                or record.get("runtime_status") == "tool_error"
-                or record.get("oracle_tool_failure"))
-
-
-def observation_complete(record):
-    facts = record.get("typed_facts") or {}
-    if record.get("execution_stage") != "judged":
-        return False
-    if facts.get("environment_healthy") is not True or facts.get("process_healthy") is not True:
-        return False
-    if facts.get("preconditions_reached") is not True or facts.get("endpoint_identity_complete") is not True:
-        return False
-    window = facts.get("window") or {}
-    return window.get("complete") is True
 
 
 def surface_class(record):
@@ -51,27 +35,15 @@ def surface_class(record):
 
 
 def edge_id(record):
-    explicit = record.get("edge_id") or record.get("observed_edge")
-    if isinstance(explicit, str) and explicit:
-        return explicit
-    facts = record.get("typed_facts") or {}
-    edge = facts.get("observed_edge") or facts.get("transition_id")
-    if isinstance(edge, str) and edge:
-        return edge
-    before, after = facts.get("state_before"), facts.get("state_after")
-    if isinstance(before, str) and isinstance(after, str) and before and after:
-        family = record.get("operation_family") or record.get("surface_id") or "unknown"
-        parameter_class = record.get("parameter_class") or record.get("boundary_class") or "unknown"
-        return canonical_hash({"before": before, "operation_family": family,
-                               "parameter_class": parameter_class, "after": after})
-    return None
+    observed = observation_edge(record)
+    return observed[1] if observed else None
 
 
 def feedback_identity(events):
     """Feedback order is an identity input; duplicate events remain ordered."""
     members = [{"content_sha256": e.get("content_sha256"),
                 "surface_class": list(surface_class(e)) if surface_class(e) else None,
-                "edge_id": edge_id(e),
+                "edge_id": e.get("edge_id"),
                 "complete": bool(e.get("coverage")),
                 "tool_error": bool(e.get("tool_error"))} for e in events]
     return canonical_hash({"schema": SCHEMA, "ordered_events": members})
@@ -89,7 +61,7 @@ class FeedbackLog:
         complete = observation_complete(record) and not tool_error(record)
         event = {
             "content_sha256": content,
-            "executed": record.get("workspace_executed", record.get("actual_run")) is True,
+            "executed": (record.get("workspace_executed") is True or record.get("actual_run") is True),
             "coverage": bool(complete and record.get("execution_stage") == "judged"),
             "complete": bool(complete),
             "tool_error": tool_error(record),
@@ -97,6 +69,19 @@ class FeedbackLog:
             "edge_id": edge_id(record) if complete else None,
             "oracle_verdict": record.get("oracle_verdict"),
         }
+        if event["edge_id"] is not None:
+            fields = ("execution_stage", "actual_run", "workspace_executed", "surface_id",
+                      "operation_family", "parameter_class", "boundary_class", "raw_path", "raw_sha256")
+            observation = {key: deepcopy(record[key]) for key in fields if key in record}
+            fact_fields = ("environment_healthy", "process_healthy", "preconditions_reached",
+                           "endpoint_identity_complete", "observation_complete", "identity_consistent",
+                           "endpoint_identity_consistent", "window", "window_complete", "window_completion",
+                           "evidence_error", "evidence_errors", "state_before", "state_after",
+                           "state_projection_receipt")
+            observation["typed_facts"] = {key: deepcopy(record["typed_facts"][key])
+                                         for key in fact_fields if key in record["typed_facts"]}
+            event["edge_provenance"] = {"schema": "r2f.s1-feedback-edge-provenance/v1",
+                                        "observation": observation}
         event["event_sha256"] = canonical_hash(event)
         self.events.append(event)
         return deepcopy(event)

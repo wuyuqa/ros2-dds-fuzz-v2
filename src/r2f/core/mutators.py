@@ -23,6 +23,7 @@ from .mutation_plan import (
 MUTATOR_SCHEMA = "r2f.mutator-spec/v1"
 SURFACE_KINDS = frozenset({
     "parameter_numeric", "parameter_enum", "parameter_timing", "relation", "environment", "compatibility",
+    "action_program",
 })
 
 
@@ -85,6 +86,31 @@ F2_MUTATOR_SPECS = {
 }
 ALL_MUTATOR_SPECS = dict(MUTATOR_SPECS)
 ALL_MUTATOR_SPECS.update(F2_MUTATOR_SPECS)
+
+
+# Separately opted-in input extension.  Do NOT merge into either historical
+# registry: M01-M03 signatures and F2-only defaults are compatibility contracts.
+TOPOLOGY_MUTATOR_ID = "I2.topology_program.v1"
+TOPOLOGY_MUTATOR_SPECS = {
+    TOPOLOGY_MUTATOR_ID: MutatorSpec(
+        TOPOLOGY_MUTATOR_ID, 1, ("action_program",), "topology_program_v2_delegate",
+        "bounded compile-time topology content mutation delegated to S1 v2; input only"),
+}
+
+# Description-only opt-in table, not a live/default registry or validator hook.
+ACTION_PROGRAM_MUTATOR_SPECS = TOPOLOGY_MUTATOR_SPECS
+
+
+def mutator_extension_digest(mutator_ids):
+    """Versioned digest, present ONLY in contracts referencing this extension."""
+    from .evidence import canonical_hash
+    selected = sorted(set(mutator_ids) & set(ACTION_PROGRAM_MUTATOR_SPECS))
+    if not selected:
+        return None
+    return canonical_hash({
+        "schema": "r2f.mutator-registry-extension/v1",
+        "mutators": [ACTION_PROGRAM_MUTATOR_SPECS[key].to_dict() for key in selected],
+    })
 
 
 def mutator_registry_signature():

@@ -24,20 +24,11 @@ def seed(index, *, surface="late_joiner.reader_delay", boundary="baseline", edge
 
 
 def observed(content_sha256, *, surface, boundary, edge):
-    return {
-        "content_sha256": content_sha256,
-        "run_id": "run-1",
-        "target_id": "discovery.late_endpoint",
-        "execution_stage": "judged",
-        "actual_run": True,
-        "oracle_verdict": "pass",
-        "surface_id": surface,
-        "boundary_class": boundary,
-        "observed_edge": edge,
-        "typed_facts": {"environment_healthy": True, "process_healthy": True,
-                        "preconditions_reached": True, "endpoint_identity_complete": True,
-                        "window": {"complete": True}},
-    }
+    from test_observation_status import projected_record
+    record = projected_record()  # explicit unit projection fixture, not real ROS
+    record.update(content_sha256=content_sha256, surface_id=surface,
+                  boundary_class=boundary, parameter_class=boundary)
+    return record
 
 
 class FuzzSchedulerContracts(unittest.TestCase):

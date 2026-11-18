@@ -10,11 +10,12 @@ from pathlib import Path
 import struct
 
 from r2f.core.evidence import verify_raw
+from r2f.runtime.discovery_network import DiscoveryNetworkError
 from r2f.core.state_machine import StepReceipt
 from r2f.modules.s1.facts import integer
 from .runtime_adapter import _one, _iso, fresh_match_proof
 
-from r2f.runtime.ros2_pair import role_rmw
+from r2f.runtime.ros2_pair import role_rmw, F2_WINDOWS_TARGET, f2_windows_operations
 
 IMPLEMENTATION = 'isolated_netns_nft_discovery_udp_drop'
 NETEM_IMPLEMENTATION = 'isolated_netns_tc_netem_discovery_udp'
@@ -386,6 +387,8 @@ def _multi_window_chain(events, config):
     Its facts must stay byte-identical, so only the explicit chain (including
     a one-window explicit plan) enters the per-window collector.
     """
+    if config.get('target_id') == F2_WINDOWS_TARGET:
+        return True
     if any(e.get('event') == 'discovery_window_begin' for e in events):
         return True
     windows = config.get('environment_windows')
@@ -399,6 +402,165 @@ def _window_one(events, name, index, **fields):
     if len(found) != 1:
         raise ValueError(f'window[{index}]: {name} evidence absent or ambiguous')
     return found[0]
+
+
+def _f2_window_timing(events, index, plan, tokens, isolation, config, expected_anchor):
+    """Independently recompute eligibility from raw, not runtime/config echoes."""
+    anchor = _resolve(events, expected_anchor)
+    begin = _window_one(events, 'discovery_window_begin', index)
+    drop = _window_one(events, 'discovery_drop_begin', index)
+    timing = _window_one(events, 'discovery_window_timing', index)
+    if (anchor.get('event') != ('discovery_precondition_snapshot' if index == 0 else 'discovery_recovery_confirmed')
+            or anchor.get('role') != 'controller'
+            or any(anchor.get(k) != config[k] for k in ('run_id', 'domain_id'))
+            or not anchor['event_index'] < begin['event_index'] < drop['event_index'] < timing['event_index']
+            or not anchor['monotonic_ns'] <= begin['monotonic_ns'] <= drop['monotonic_ns'] <= timing['monotonic_ns']
+            or timing.get('window_id') != plan['window_id']
+            or timing.get('anchor_ref') != expected_anchor or timing.get('trigger_anchor') != plan['trigger_anchor']):
+        raise ValueError('f2_anchor_identity_or_chronology_invalid')
+    snapshot = _one(events, 'discovery_precondition_snapshot')
+    if index == 0:
+        if anchor.get('satisfied') is not True:
+            raise ValueError('f2_anchor_precondition_not_satisfied')
+        matched = anchor['matched']
+        proof_anchor = tokens['reader']['created_monotonic_ns']
+    else:
+        prior_plan = config['environment_windows'][index - 1]
+        if (anchor.get('window_index') != index - 1 or anchor.get('window_id') != prior_plan['window_id']
+                or anchor.get('receipt', {}).get('recovery_verified') is not True):
+            raise ValueError('f2_anchor_previous_recovery_not_confirmed')
+        matched = anchor['receipt']['activity_receipt']['fresh_graph_count']
+        proof_anchor = _window_one(events, 'discovery_restore_boundary', index - 1)['post_restore_monotonic_ns']
+    _, match_proof = fresh_match_proof(events, tokens, anchor, anchor_ns=proof_anchor)
+    graphs = _graph(events, match_proof, tokens, after_ns=proof_anchor)
+    proof_refs = []
+    for role, proof in match_proof.items():
+        if (matched['matches'][role] != _ref(events[proof['snapshot_index']])
+                or matched['graphs'][role] != _ref(events[graphs[role]])):
+            raise ValueError('f2_anchor_fresh_match_ref_mismatch')
+        proof_refs.extend(_ref(events[j]) for j in (proof['request_index'], proof['snapshot_index'],
+                                                   graphs[role], proof['ack_index']))
+    if timing.get('matched_event_refs') != proof_refs:
+        raise ValueError('f2_anchor_matched_event_refs_mismatch')
+    dr = drop['receipt']
+    _bindings(dr['pair_bindings'], tokens, isolation, config['domain_id'])
+    if dr['pair_bindings'].get('worker_start_ticks') != snapshot['bindings'].get('worker_start_ticks'):
+        raise ValueError('f2_anchor_process_generation_mismatch')
+    anchor_ns = integer(anchor.get('monotonic_ns'), 'f2 anchor time')
+    due_offset = anchor_ns + round(plan['trigger_offset_sec'] * 1e9)
+    due_interval = (anchor_ns + round(config['environment_windows'][index - 1]['restore_interval_sec'] * 1e9)
+                    if index else anchor_ns)
+    due = max(due_offset, due_interval)
+    start = integer(timing.get('actual_start_monotonic_ns'), 'f2 actual start')
+    install = integer(dr.get('drop_applied_monotonic_ns'), 'f2 actual install')
+    command = dr['install_command']
+    if not (begin['monotonic_ns'] <= start <= dr['drop_begin_monotonic_ns']
+            <= command['started_monotonic_ns'] <= command['ended_monotonic_ns']
+            <= install <= drop['monotonic_ns'] <= timing['monotonic_ns']):
+        raise ValueError('f2_install_command_chronology_invalid')
+    calculated = {'anchor_monotonic_ns': anchor_ns, 'offset_due_monotonic_ns': due_offset,
+                  'prior_interval_due_monotonic_ns': due_interval, 'earliest_due_monotonic_ns': due,
+                  'actual_install_monotonic_ns': install, 'overshoot_ns': install - due}
+    if any(timing.get(k) != v for k, v in calculated.items()):
+        raise ValueError('f2_timing_receipt_mismatch')
+    if (start < due or install < due or install - due > round(config['anchor_lateness_tolerance_sec'] * 1e9)
+            or timing.get('status') != 'observed' or timing.get('reason') is not None):
+        raise ValueError('harness_anchor_timing_miss')
+    return {**calculated, 'actual_start_monotonic_ns': start,
+            'actual_anchor_offset_sec': (install - anchor_ns) / 1e9,
+            'actual_prior_restore_interval_sec': ((install - anchor_ns) / 1e9 if index else None),
+            'anchor_ref': expected_anchor, 'matched_event_refs': proof_refs,
+            'raw_event_ref': _ref(timing), 'complete': True}
+
+
+def _f2_operation_facts(events, runtime, config, facts):
+    from r2f.runtime.ros2_pair import f2_windows_operations
+    operations = f2_windows_operations(config)
+    if runtime.get('real_execution') is not True or runtime.get('runtime_status') != 'completed':
+        raise ValueError('f2_operation_not_completed_execution')
+    verify_raw(runtime['raw_path'], runtime['raw_sha256'])
+    if ([json.loads(line) for line in Path(runtime['raw_path']).read_text().splitlines()] != events
+            or any(e.get('event_index') != i for i, e in enumerate(events))):
+        raise ValueError('f2_raw_index_or_content_mismatch')
+    raw_ops = [e for e in events if e.get('event') == 'f2_operation_receipt']
+    claimed = runtime.get('operation_receipts')
+    if len(raw_ops) != len(operations) or not isinstance(claimed, list) or len(claimed) != len(operations):
+        raise ValueError('f2_operation_receipts_missing_or_duplicate')
+    result = []
+    for operation, event, returned in zip(operations, raw_ops, claimed):
+        if (event.get('role') != 'controller'
+                or any(event.get(k) != config[k] for k in ('run_id', 'domain_id'))
+                or any(e.get('event') in ('worker_stopping', 'worker_shutdown')
+                       and e.get('role') in ('writer', 'reader')
+                       for e in events[:event['event_index']])):
+            raise ValueError('f2_operation_controller_identity_or_cleanup_chronology_invalid')
+        receipt = event['receipt']
+        for key in ('op_id', 'surface_id', 'mutator_id'):
+            if receipt.get(key) != operation[key]:
+                raise ValueError('f2_operation_identity_mismatch:' + key)
+        if receipt.get('schema') != 'r2f.f2-window-operation/v1' or receipt.get('plan_hash') != config['mutation_plan_sha256']:
+            raise ValueError('f2_operation_plan_hash_mismatch')
+        observed = facts['windows']
+        if receipt.get('window_count') != len(observed) or len(receipt.get('windows', [])) != len(observed):
+            raise ValueError('f2_operation_window_count_mismatch')
+        refs, all_hit = [], True
+        transitions = []
+        for index, (actual, declared) in enumerate(zip(observed, receipt['windows'])):
+            plan = config['environment_windows'][index]
+            names = ('discovery_window_timing', 'discovery_drop_begin', 'discovery_drop_end',
+                     'discovery_recovery_confirmed', 'discovery_window_restore_verified')
+            expected = {name: _ref(_window_one(events, name, index)) for name in names}
+            counter = _resolve(events, actual['counter_event_ref'])
+            hit = actual['complete'] and actual['drop']['hit']
+            if (declared.get('window_id') != plan['window_id'] or declared.get('window_index') != index
+                    or declared.get('raw_refs') != expected or declared.get('counter_ref') != _ref(counter)
+                    or declared.get('complete') is not True or declared.get('hit') is not hit
+                    or declared.get('packets_delta') != actual['drop']['packets_delta']):
+                raise ValueError('f2_operation_window_receipt_mismatch')
+            refs.extend(list(expected.values()) + [_ref(counter)])
+            all_hit = all_hit and hit
+            if index:
+                transitions.append({'from_window_index': index - 1, 'to_window_index': index,
+                                    'actual_interval_sec': actual['timing']['actual_prior_restore_interval_sec'],
+                                    'required_interval_sec': config['environment_windows'][index - 1]['restore_interval_sec'],
+                                    'anchor_ref': actual['timing']['anchor_ref'],
+                                    'timing_ref': actual['timing']['raw_event_ref']})
+        affected = operation['affected_window_indices']
+        if operation['surface_id'] == 'E03':
+            observed_parameters = {'anchor': operation['parameters']['anchor'],
+                'requested_offset_sec': operation['parameters']['offset_sec'],
+                'actual_offsets': [{'window_index': i, 'anchor_ref': observed[i]['timing']['anchor_ref'],
+                                    'actual_offset_sec': observed[i]['timing']['actual_anchor_offset_sec']}
+                                   for i in affected]}
+        else:
+            observed_parameters = {'actual_window_count': len(observed),
+                'actual_restore_intervals_sec': [w['timing']['actual_prior_restore_interval_sec'] for w in observed[1:]],
+                'trailing_interval_status': 'not_applicable_no_next_window'}
+        if (receipt.get('affected_window_indices') != affected
+                or receipt.get('observed_parameters') != observed_parameters):
+            raise ValueError('f2_operation_affected_windows_or_observed_parameters_mismatch')
+        closing = _one(events, 'window_close', window='post_restore_delivery')
+        final = _one(events, 'state_step_after', step_id='observe_final_graph')
+        if (final.get('satisfied') is not True or not closing['event_index'] < final['event_index'] < event['event_index']
+                or not closing['monotonic_ns'] <= final['monotonic_ns'] <= event['monotonic_ns']):
+            raise ValueError('f2_operation_closure_chronology_invalid')
+        refs.extend((_ref(closing), _ref(final)))
+        if (receipt.get('evidence_refs') != refs or receipt.get('status') != 'executed'
+                or receipt.get('applied') is not True or receipt.get('hit') is not all_hit
+                or receipt.get('effect_observed') is not all_hit
+                or any(returned.get(k) != v for k, v in receipt.items())
+                or returned.get('raw_event_ref') != _ref(event)):
+            raise ValueError('f2_operation_result_or_hit_mismatch')
+        audited_refs = [{'path': runtime['raw_path'], 'sha256': runtime['raw_sha256'],
+                         'event_index': _resolve(events, ref)['event_index']}
+                        for ref in refs + [_ref(event)]]
+        if returned.get('raw_refs') != audited_refs:
+            raise ValueError('f2_operation_raw_ref_mismatch')
+        result.append({**deepcopy(receipt), 'verified': True, 'raw_refs': audited_refs,
+                       'actual_window_count': len(observed), 'actual_restore_intervals': transitions,
+                       'trailing_interval': {'status': 'not_applicable', 'reason': 'no_next_window'},
+                       'raw_event_ref': _ref(event)})
+    return result
 
 
 def _window_fact(events, index, plan, tokens, isolation, config, previous_ref,
@@ -423,6 +585,9 @@ def _window_fact(events, index, plan, tokens, isolation, config, previous_ref,
             or dr.get('configured') is not True or dr.get('applied') is not True):
         raise ValueError('window drop was not actually applied to this pair')
     _bindings(dr['pair_bindings'], tokens, isolation, config['domain_id'])
+    if (config.get('target_id') == F2_WINDOWS_TARGET
+            and dr['pair_bindings'].get('worker_start_ticks') != snapshot['bindings'].get('worker_start_ticks')):
+        raise ValueError('f2_window_process_generation_mismatch')
     if dr.get('precondition', {}).get('evidence_ref') != expected_anchor:
         raise ValueError('window drop precondition is not bound to the required anchor')
     _command(dr['install_command'], ['nft', '-f', '-'], isolation)
@@ -447,6 +612,11 @@ def _window_fact(events, index, plan, tokens, isolation, config, previous_ref,
 
     from r2f.runtime.discovery_network import window_counter_delta
     delta = window_counter_delta(dr, rr)
+    timing = None
+    if config.get('target_id') == F2_WINDOWS_TARGET:
+        _counter(dr['counter_snapshot'], dr['table'], ports, isolation)
+        _counter(rr['counter_snapshot'], rr['table'], ports, isolation)
+        timing = _f2_window_timing(events, index, plan, tokens, isolation, config, expected_anchor)
     # The runtime emits one delta immediately after this window's verified
     # restore.  The receipt itself carries no window_index, so bind it by the
     # window's own raw event interval instead of by global position.
@@ -542,6 +712,7 @@ def _window_fact(events, index, plan, tokens, isolation, config, previous_ref,
         'recovery_confirmed': True,
         'recovery_event_ref': _ref(confirmed),
         'drop_event_ref': _ref(dropped), 'restore_event_ref': _ref(restored),
+        **({'timing': timing, 'counter_event_ref': _ref(emitted)} if timing is not None else {}),
     }
 
 
@@ -552,6 +723,8 @@ def _multi_window_recovery_facts(events, runtime, config):
              'endpoint_identity_complete': False, 'observed_effects': [],
              'sent': [], 'received': [], 'windows': []}
     try:
+        if config.get('target_id') == F2_WINDOWS_TARGET:
+            f2_windows_operations(config)
         plans = config.get('environment_windows')
         if not isinstance(plans, list) or not 1 <= len(plans) <= 3:
             raise ValueError('window plan must contain 1..3 windows')
@@ -736,17 +909,25 @@ def _multi_window_recovery_facts(events, runtime, config):
             window_complete=True,
             window_completion={'complete': True, 'window_count': len(facts['windows'])},
         )
-    except (KeyError, ValueError, TypeError, IndexError, OSError, struct.error) as exc:
+        if config.get('target_id') == F2_WINDOWS_TARGET:
+            facts['operation_receipts'] = _f2_operation_facts(events, runtime, config, facts)
+    except (KeyError, ValueError, TypeError, IndexError, OSError, struct.error, DiscoveryNetworkError) as exc:
         message = str(exc)
         if not message.startswith('window['):
             message = 'window[%d]: %s' % (len(facts.get('windows', [])), message)
         facts['evidence_error'] = message
+        if config.get('target_id') == F2_WINDOWS_TARGET:
+            facts['operation_receipts'] = []
+            facts['observation_complete'] = False
+            facts['responsibility_layer'] = 'harness'
+            facts['candidate_eligible'] = False
         facts['endpoint_identity_complete'] = False
         facts['window'] = {'complete': False}
         facts['window_complete'] = False
         facts['window_completion'] = {'complete': False, 'reason': message,
                                       'completed_windows': len(facts.get('windows', []))}
-    return facts
+    from .state_projection import attach_state_observations
+    return attach_state_observations(facts, events, runtime, config)
 
 
 def recovery_facts(events, runtime, config):
@@ -1166,8 +1347,9 @@ def recovery_facts(events, runtime, config):
                                'activity_unix_ns': activity_wall, 'clock_guard_ns': guard,
                                'activity_event_ref': _ref(observed)},
                      observed_effects=['discovery_temporarily_unavailable', 'discovery_restored'] if active else ['discovery_restored'])
-    except (KeyError, ValueError, TypeError, IndexError, OSError, struct.error) as exc:
+    except (KeyError, ValueError, TypeError, IndexError, OSError, struct.error, DiscoveryNetworkError) as exc:
         facts['evidence_error'] = str(exc)
         facts['endpoint_identity_complete'] = False
         facts['window'] = {'complete': False}
-    return facts
+    from .state_projection import attach_state_observations
+    return attach_state_observations(facts, events, runtime, config)

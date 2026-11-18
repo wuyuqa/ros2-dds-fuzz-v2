@@ -1,0 +1,202 @@
+{
+  "schema_version": "r2f.s1-fuzz-profile/v1",
+  "profile_id": "s1-f2-windows-v1",
+  "campaign_kind": "exploratory",
+  "enabled": false,
+  "seed_catalog_status": "authored_t02",
+  "required_catalog_included": false,
+  "runtime_capability": "f2_windows_v1",
+  "anchor_timing_policy": "f2_anchor_not_before_v1",
+  "anchor_lateness_tolerance_sec": 0.5,
+  "description": "Explicit F2 E02/M07 and E03/M06 new-target inputs; 1..3 windows, exact runtime guards unresolved until raw execution. Original E02/E03 templates stay capability_pending, never promoted as live seed evidence; composed chains live in the separate composed profile.",
+  "target_ids": [
+    "discovery.interruption_recovery.fuzz_windows_v1"
+  ],
+  "surfaces": [
+    "E02",
+    "E03"
+  ],
+  "mutator_whitelist": {
+    "E02": [
+      "M07"
+    ],
+    "E03": [
+      "M06"
+    ]
+  },
+  "chain_length": 1,
+  "cycles": [
+    {
+      "cycle_id": "f2-e02-windows",
+      "target_id": "discovery.interruption_recovery.fuzz_windows_v1",
+      "surfaces": [
+        "E02"
+      ],
+      "runner_slice": "endpoint_pair_slice",
+      "seed_specs": [
+        {
+          "seed_id": "E02",
+          "target_id": "discovery.interruption_recovery.fuzz_windows_v1",
+          "variant_id": "E02-f2-template",
+          "boundary_class": "count_boundary",
+          "executable": true,
+          "overrides": {
+            "logical_config": {
+              "environment_windows": {
+                "count": 2,
+                "restore_interval_sec": 0.2
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "cycle_id": "f2-e03-anchor",
+      "target_id": "discovery.interruption_recovery.fuzz_windows_v1",
+      "surfaces": [
+        "E03"
+      ],
+      "runner_slice": "endpoint_pair_slice",
+      "seed_specs": [
+        {
+          "seed_id": "E03",
+          "target_id": "discovery.interruption_recovery.fuzz_windows_v1",
+          "variant_id": "E03-f2-1-window",
+          "boundary_class": "phase_offset",
+          "executable": true,
+          "overrides": {
+            "logical_config": {
+              "environment_windows": {
+                "count": 1,
+                "restore_interval_sec": 0.2,
+                "anchor": "fresh_match",
+                "anchor_offset_sec": 0.1
+              }
+            }
+          }
+        },
+        {
+          "seed_id": "E03",
+          "target_id": "discovery.interruption_recovery.fuzz_windows_v1",
+          "variant_id": "E03-f2-2-window",
+          "boundary_class": "phase_offset",
+          "executable": true,
+          "overrides": {
+            "logical_config": {
+              "environment_windows": {
+                "count": 2,
+                "restore_interval_sec": 0.2,
+                "anchor": "fresh_match",
+                "anchor_offset_sec": 0.1
+              }
+            }
+          }
+        },
+        {
+          "seed_id": "E03",
+          "target_id": "discovery.interruption_recovery.fuzz_windows_v1",
+          "variant_id": "E03-f2-3-window",
+          "boundary_class": "phase_offset",
+          "executable": true,
+          "overrides": {
+            "logical_config": {
+              "environment_windows": {
+                "count": 3,
+                "restore_interval_sec": 0.2,
+                "anchor": "fresh_match",
+                "anchor_offset_sec": 0.1
+              }
+            }
+          }
+        }
+      ]
+    }
+  ],
+  "seed_specs": [
+    {
+      "seed_id": "E02",
+      "target_id": "discovery.interruption_recovery.fuzz_windows_v1",
+      "variant_id": "E02-f2-template",
+      "boundary_class": "count_boundary",
+      "executable": true,
+      "overrides": {
+        "logical_config": {
+          "environment_windows": {
+            "count": 2,
+            "restore_interval_sec": 0.2
+          }
+        }
+      }
+    },
+    {
+      "seed_id": "E03",
+      "target_id": "discovery.interruption_recovery.fuzz_windows_v1",
+      "variant_id": "E03-f2-1-window",
+      "boundary_class": "phase_offset",
+      "executable": true,
+      "overrides": {
+        "logical_config": {
+          "environment_windows": {
+            "count": 1,
+            "restore_interval_sec": 0.2,
+            "anchor": "fresh_match",
+            "anchor_offset_sec": 0.1
+          }
+        }
+      }
+    },
+    {
+      "seed_id": "E03",
+      "target_id": "discovery.interruption_recovery.fuzz_windows_v1",
+      "variant_id": "E03-f2-2-window",
+      "boundary_class": "phase_offset",
+      "executable": true,
+      "overrides": {
+        "logical_config": {
+          "environment_windows": {
+            "count": 2,
+            "restore_interval_sec": 0.2,
+            "anchor": "fresh_match",
+            "anchor_offset_sec": 0.1
+          }
+        }
+      }
+    },
+    {
+      "seed_id": "E03",
+      "target_id": "discovery.interruption_recovery.fuzz_windows_v1",
+      "variant_id": "E03-f2-3-window",
+      "boundary_class": "phase_offset",
+      "executable": true,
+      "overrides": {
+        "logical_config": {
+          "environment_windows": {
+            "count": 3,
+            "restore_interval_sec": 0.2,
+            "anchor": "fresh_match",
+            "anchor_offset_sec": 0.1
+          }
+        }
+      }
+    }
+  ],
+  "rmws": [
+    "rmw_cyclonedds_cpp",
+    "rmw_fastrtps_cpp"
+  ],
+  "execution_boundary": "Disabled by default. Explicit new target/capability only; plan()/fixture do not discharge needs_observation, prove runtime/ROS qualification or old seed activation. Real execution requires main GO, source_frozen and unchanged environment/lock/domain gates.",
+  "budget": {
+    "max_inputs": 12,
+    "warmup_inputs": 2,
+    "max_seconds": 900
+  },
+  "corpus": {
+    "capacity": 256,
+    "bucket_limit": 3
+  },
+  "controls": {
+    "required": true,
+    "policy": "per source+rmw+target contract+recipe"
+  }
+}

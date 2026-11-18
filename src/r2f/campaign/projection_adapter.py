@@ -542,4 +542,5 @@ def projection_facts(events, runtime, config):
             facts['mutation_ineffective_reason'] = 'qos_equals_baseline'
     except (KeyError,ValueError,TypeError,OSError,IndexError) as exc:
         facts['evidence_error']=str(exc)
-    return facts
+    from .state_projection import attach_state_observations
+    return attach_state_observations(facts, events, runtime, config)

@@ -21,6 +21,10 @@ MUTATION_PLAN_SCHEMA = "r2f.mutation-plan/v1"
 MUTATION_CHAIN_SCHEMA = "r2f.mutation-chain/v1"
 MUTATION_CHAIN_MAX_LENGTH = 4
 RUNTIME_WINDOW_SCHEMA = "r2f.runtime-window/v1"
+MAX_RUNTIME_WINDOWS = 3
+ACTION_PROGRAM_LAYER_SCHEMA = "r2f.action-program-input-layer/v1"
+MAX_ACTION_PROGRAM_BYTES = 1024 * 1024
+MAX_ACTION_PROGRAM_DEPTH = 32
 
 RNG_ALGORITHM = "mt19937-v1"
 APPLICATION_PHASES = frozenset({
@@ -35,7 +39,7 @@ MISSING_POLICIES = frozenset({"unknown", "reject", "not_applicable", "needs_obse
 UNSUPPORTED_POLICIES = frozenset({"reject", "unsupported", "not_applicable", "unknown"})
 VALUE_TYPES = frozenset({
     "int", "float", "bool", "str", "enum", "duration_ns", "duration_sec",
-    "relation", "window_plan", "pair_relation",
+    "relation", "window_plan", "pair_relation", "action_program",
 })
 FACT_SCOPES = frozenset({"run", "endpoint", "pair", "window", "sample"})
 RESPONSIBILITY_LAYERS = frozenset({"s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "cross_module"})
@@ -257,7 +261,7 @@ class MutationSurface:
         nonempty(self.surface_kind, "surface.surface_kind")
         if self.surface_kind not in {
                 "parameter_numeric", "parameter_enum", "parameter_timing",
-                "relation", "environment", "compatibility"}:
+                "relation", "environment", "compatibility", "action_program"}:
             raise ValueError(f"unsupported surface_kind: {self.surface_kind}")
         self.source_refs = _string_list(self.source_refs, "surface.source_refs", allow_empty=False)
         self.input_paths = _string_list(
@@ -269,6 +273,15 @@ class MutationSurface:
             raise ValueError(f"unsupported surface value_type: {self.value_type}")
         nonempty(self.unit, "surface.unit")
         self.domain = _mapping(self.domain, "surface.domain")
+        if self.value_type == "action_program" or self.surface_kind == "action_program":
+            if self.value_type != "action_program" or self.surface_kind != "action_program":
+                raise ValueError("action_program requires matching kind and value_type")
+            nonempty(self.domain.get("program_schema"), "surface.domain.program_schema")
+            bound = self.domain.get("max_program_bytes")
+            if type(bound) is not int or not 1 <= bound <= MAX_ACTION_PROGRAM_BYTES:
+                raise ValueError("action_program must declare a bounded max_program_bytes")
+            if len(self.input_paths) != 1:
+                raise ValueError("action_program requires exactly one whole-program input path")
         if not self.domain:
             raise ValueError("surface.domain must not be empty")
         self.special_values = snapshot(self.special_values)
@@ -450,11 +463,17 @@ class ExplorationContract:
 
     def contract_hash(self):
         from .mutators import mutator_registry_signature
-        return canonical_hash({
+        from .mutators import mutator_extension_digest
+        identity = {
             "hash_schema": "r2f.exploration-contract-hash/v1",
             "contract": self.to_dict(),
             "mutator_registry_sha256": mutator_registry_signature(),
-        })
+        }
+        extension = mutator_extension_digest(
+            mid for surface in self.surfaces for mid in surface.mutator_ids)
+        if extension is not None:
+            identity["mutator_extension_sha256"] = extension
+        return canonical_hash(identity)
 
     def to_dict(self):
         return snapshot({
@@ -499,8 +518,12 @@ def _cycle_check(surfaces):
 def validate_contract(contract, mutators=None):
     if not isinstance(contract, ExplorationContract):
         contract = ExplorationContract.from_dict(contract)
-    if mutators is None:
-        from .mutators import MUTATOR_SPECS
+    # Structural knowledge is not runtime activation.  Only an explicitly F2
+    # surface may reference implemented, unregistered F2 specs by default.
+    # An explicit caller registry remains authoritative, including an empty one.
+    default_specs = mutators is None
+    if default_specs:
+        from .mutators import MUTATOR_SPECS, ALL_MUTATOR_SPECS
         mutators = MUTATOR_SPECS
     if not isinstance(mutators, dict):
         mutators = {spec.mutator_id: spec for spec in mutators}
@@ -521,10 +544,15 @@ def validate_contract(contract, mutators=None):
     effects = contract.effect_by_id
 
     for surface in contract.surfaces:
+        specs = (ALL_MUTATOR_SPECS if default_specs and surface.activation == "F2"
+                 else mutators)
+        if default_specs and surface.activation == "F2" and surface.value_type == "action_program":
+            from .mutators import ACTION_PROGRAM_MUTATOR_SPECS
+            specs = {**specs, **ACTION_PROGRAM_MUTATOR_SPECS}
         for mutator_id in surface.mutator_ids:
-            if mutator_id not in mutators:
+            if mutator_id not in specs:
                 raise ValueError(f"unknown mutator reference: {mutator_id}")
-            spec = mutators[mutator_id]
+            spec = specs[mutator_id]
             if surface.surface_kind not in spec.accepted_surface_kinds:
                 raise ValueError(
                     f"mutator {mutator_id} does not accept surface kind {surface.surface_kind}")
@@ -633,19 +661,27 @@ class MutationPlan:
             previous = operation.input_after_sha256
         if canonical_hash(self.final_config) != previous:
             raise ValueError("final_config does not match the final operation input_after_sha256")
+        # Description-only extension metadata selects generic JSON checks;
+        # module-specific validators are explicitly invoked by their provider.
+        if any(_is_action_program_operation(op) for op in self.operations):
+            _validate_action_program_plan(self)
         if contract is not None:
             if not isinstance(contract, ExplorationContract):
                 contract = ExplorationContract.from_dict(contract)
             if self.contract_hash != contract.contract_hash():
                 raise ValueError("mutation plan contract_hash mismatch")
             surfaces = contract.surface_by_id
-            for operation in self.operations:
+            for index, operation in enumerate(self.operations):
                 if operation.surface_id not in surfaces:
                     raise ValueError(f"plan references unknown surface: {operation.surface_id}")
                 surface = surfaces[operation.surface_id]
                 if operation.mutator_id not in surface.mutator_ids:
                     raise ValueError(
                         f"plan mutator {operation.mutator_id} is not declared by surface {surface.surface_id}")
+                if surface.value_type == "action_program":
+                    _action_program_layer(operation.parameters,
+                                          index, self.rng_seed,
+                                          surface=surface)
         return True
 
     def content_hash(self):
@@ -715,6 +751,38 @@ class ValidationResult:
         return snapshot(vars(self))
 
 
+def _validate_multiwindow_input(plan):
+    """Require the executable chain and final input to describe identical windows.
+
+    Only multi-window inputs use this stricter execution contract.  Historical
+    single-window plans may omit environment_windows and keep their old hashes.
+    No defaults or reindexing are allowed at this identity boundary.
+    """
+    windows = _validate_runtime_windows(plan.runtime_windows)
+    environment = plan.final_config.get("environment_windows")
+    if not isinstance(environment, list) or len(environment) != len(windows):
+        raise ValueError("multi-window runtime_windows/environment_windows count mismatch")
+    fields = set(windows[0]) - {"schema"} if windows else set()
+    for index, (window, submitted) in enumerate(zip(windows, environment)):
+        _exact(submitted, fields, f"environment_windows[{index}]")
+        if type(window["window_index"]) is not int or window["window_index"] != index:
+            raise ValueError("multi-window window_index must be sequential from zero")
+        anchor = "fresh_match" if index == 0 else "previous_restore_confirmed"
+        if window["trigger_anchor"] != anchor:
+            raise ValueError(f"multi-window window {index} must anchor on {anchor}")
+        for key in ("trigger_offset_sec", "drop_duration_sec", "restore_interval_sec"):
+            value = window[key]
+            if not 0 <= value <= 30 or (key == "drop_duration_sec" and value <= 0):
+                raise ValueError(f"multi-window {key} outside namespace window bounds")
+        if type(submitted["window_index"]) is not int:
+            raise ValueError("environment_windows.window_index must be an integer")
+        for key in ("trigger_offset_sec", "drop_duration_sec", "restore_interval_sec"):
+            if type(submitted[key]) not in (int, float):
+                raise ValueError(f"environment_windows.{key} must be a number")
+        if submitted != {key: value for key, value in window.items() if key != "schema"}:
+            raise ValueError(f"multi-window runtime_windows/environment_windows differ at window {index}")
+
+
 def validate_plan(plan, capabilities=None, contract=None):
     """Validate syntax, contract references, and declared runtime capabilities.
 
@@ -738,8 +806,21 @@ def validate_plan(plan, capabilities=None, contract=None):
             contract = ExplorationContract.from_dict(contract)
         surfaces = contract.surface_by_id
 
+    caps = {} if capabilities is None else _mapping(capabilities, "capabilities")
+    environment_windows = plan.final_config.get("environment_windows")
+    window_count = max(len(plan.runtime_windows),
+                       len(environment_windows) if isinstance(environment_windows, list) else 0)
+    if window_count > 1:
+        if caps.get("multi_window") is not True:
+            reasons.append("multi-window execution is not enabled")
+        else:
+            maximum = caps.get("max_runtime_windows", MAX_RUNTIME_WINDOWS)
+            if type(maximum) is not int or not 1 <= maximum <= MAX_RUNTIME_WINDOWS:
+                reasons.append("multi-window runtime window limit is not enabled")
+            elif window_count > maximum:
+                reasons.append(f"multi-window count exceeds runtime limit {maximum}")
+
     if capabilities is not None:
-        caps = _mapping(capabilities, "capabilities")
         if "mutators" in caps:
             allowed = set(caps["mutators"])
             for operation in plan.operations:
@@ -765,8 +846,6 @@ def validate_plan(plan, capabilities=None, contract=None):
                 surface = surfaces.get(operation.surface_id)
                 if surface is not None and surface.activation not in allowed:
                     reasons.append(f"surface activation not enabled: {surface.activation}")
-        if len(plan.runtime_windows) > 1 and not caps.get("multi_window", False):
-            reasons.append("multi-window execution is not enabled")
 
     for operation in plan.operations:
         if operation.applicability_status == "unsupported":
@@ -778,9 +857,11 @@ def validate_plan(plan, capabilities=None, contract=None):
     if reasons:
         return ValidationResult("unsupported_capability", reasons, plan.plan_hash(), plan.content_hash())
 
-    if len(plan.runtime_windows) > 1:
-        return ValidationResult("unsupported_capability", ["multi-window execution is not implemented"],
-                                plan.plan_hash(), plan.content_hash())
+    if window_count > 1:
+        try:
+            _validate_multiwindow_input(plan)
+        except ValueError as exc:
+            return ValidationResult("invalid", [str(exc)], plan.plan_hash(), plan.content_hash())
 
     if any(operation.applicability_status == "needs_observation" for operation in plan.operations):
         return ValidationResult("needs_observation", ["plan requires runtime observation"],
@@ -823,6 +904,128 @@ def _apply_changes(data, changes):
     return result
 
 
+def _is_action_program_operation(operation):
+    from .mutators import ACTION_PROGRAM_MUTATOR_SPECS
+    receipts = operation.parameters.get("input_layer_receipts", [])
+    return operation.mutator_id in ACTION_PROGRAM_MUTATOR_SPECS or (
+        isinstance(receipts, list) and any(isinstance(r, dict) and
+        r.get("schema") == ACTION_PROGRAM_LAYER_SCHEMA for r in receipts))
+
+
+def _bounded_action_program(document, schema, maximum):
+    """Generic bounded JSON only: no module imports, predictions or execution."""
+    nonempty(schema, "action_program.program_schema")
+    if not isinstance(document, dict) or document.get("schema") != schema:
+        raise ValueError("action_program declared schema mismatch")
+    stack = [(document, 0)]
+    nodes = 0
+    while stack:
+        value, depth = stack.pop()
+        nodes += 1
+        if depth > MAX_ACTION_PROGRAM_DEPTH or nodes > MAX_ACTION_PROGRAM_BYTES:
+            raise ValueError("action_program JSON depth/node budget exceeded")
+        if isinstance(value, dict):
+            stack.extend((child, depth + 1) for child in value.values())
+        elif isinstance(value, list):
+            stack.extend((child, depth + 1) for child in value)
+    import json
+    if len(json.dumps(snapshot(document), sort_keys=True, separators=(",", ":"),
+                      ensure_ascii=False, allow_nan=False).encode()) > maximum:
+        raise ValueError("action_program JSON byte budget exceeded")
+
+
+def _action_program_layer(parameters, index, rng_seed, *, surface=None):
+    receipts = parameters.get("input_layer_receipts")
+    if not isinstance(receipts, list) or len(receipts) != 1 or not isinstance(receipts[0], dict):
+        raise ValueError("action_program needs exactly one deterministic input layer receipt")
+    receipt = receipts[0]
+    required = {"schema", "layer_index", "seed", "input_path", "program_schema", "input_before",
+                "input_after", "input_before_sha256", "input_after_sha256"}
+    if not required <= set(receipt) or receipt["schema"] != ACTION_PROGRAM_LAYER_SCHEMA:
+        raise ValueError("action_program input layer receipt schema/fields mismatch")
+    if type(receipt["layer_index"]) is not int or receipt["layer_index"] != index:
+        raise ValueError("action_program receipt order mismatch")
+    if type(receipt["seed"]) is not int or receipt["seed"] != rng_seed + index:
+        raise ValueError("action_program receipt seed mismatch")
+    path = nonempty(receipt["input_path"], "action_program.input_path")
+    if path.startswith(".") or path.endswith(".") or ".." in path:
+        raise ValueError("action_program input_path must be a dotted path")
+    maximum = MAX_ACTION_PROGRAM_BYTES
+    if surface is not None:
+        if surface.value_type != "action_program" or surface.surface_kind != "action_program" \
+                or surface.input_paths != [path] \
+                or surface.domain.get("program_schema") != receipt["program_schema"]:
+            raise ValueError("action_program receipt disagrees with declared surface/schema")
+        maximum = surface.domain["max_program_bytes"]
+    for name in ("input_before", "input_after"):
+        _bounded_action_program(receipt[name], receipt["program_schema"], maximum)
+        if canonical_hash(receipt[name]) != receipt[name + "_sha256"]:
+            raise ValueError("action_program raw-document canonical hash mismatch")
+    if receipt["input_before"] == receipt["input_after"]:
+        raise ValueError("action_program layer must change actual content")
+    from .evidence import _deterministic_receipt
+    _deterministic_receipt(receipt)
+    return receipt
+
+
+def _validate_action_program_proposals(parent, proposals, contract, rng_seed,
+                                       rng_algorithm, chain_length):
+    """Only proven sequential whole-program replacements bypass conflicts."""
+    if rng_algorithm != RNG_ALGORITHM or chain_length != len(proposals) \
+            or not 1 <= len(proposals) <= MUTATION_CHAIN_MAX_LENGTH:
+        raise CompositionRejection("action_program requires an explicit bounded chain and RNG")
+    current = snapshot(parent)
+    expected_path = None
+    for index, proposal in enumerate(proposals):
+        surface = contract.surface_by_id[proposal.surface_id]
+        receipt = _action_program_layer(proposal.parameters, index, rng_seed, surface=surface)
+        path = receipt["input_path"]
+        expected_path = path if expected_path is None else expected_path
+        if path != expected_path or proposal.override or proposal.runtime_windows \
+                or proposal.application_phase != "compile_time":
+            raise CompositionRejection("action_program sequential path/phase/override mismatch")
+        changes = {path: receipt["input_after"]}
+        try:
+            actual_before = _get_path(current, path)
+        except (KeyError, TypeError) as exc:
+            raise CompositionRejection("action_program input path missing from parent") from exc
+        after = _apply_changes(current, changes)
+        if proposal.input_before != current or actual_before != receipt["input_before"] \
+                or proposal.changes != changes or proposal.input_after != after:
+            raise CompositionRejection("action_program proposal actual before/after/changes mismatch")
+        current = after
+
+
+def _validate_action_program_plan(plan):
+    """Reconstruct config hashes from serialized raw content, without mutation."""
+    integer(plan.rng_seed, "action_program.rng_seed")
+    if plan.rng_algorithm != RNG_ALGORITHM:
+        raise ValueError("action_program RNG algorithm mismatch")
+    if not 1 <= len(plan.operations) <= MUTATION_CHAIN_MAX_LENGTH or plan.chain is None:
+        raise ValueError("action_program requires an explicit 1..4 layer chain")
+    plan._validate_chain(plan.chain)
+    current, expected_path = snapshot(plan.final_config), None
+    for index in reversed(range(len(plan.operations))):
+        operation = plan.operations[index]
+        receipt = _action_program_layer(operation.parameters, index, plan.rng_seed)
+        path = receipt["input_path"]
+        expected_path = path if expected_path is None else expected_path
+        if path != expected_path or operation.application_phase != "compile_time" or plan.runtime_windows:
+            raise ValueError("action_program plan sequential path/phase/window mismatch")
+        try:
+            actual_after = _get_path(current, path)
+        except (KeyError, TypeError) as exc:
+            raise ValueError("action_program final input path missing") from exc
+        if actual_after != receipt["input_after"] \
+                or operation.input_after_sha256 != canonical_hash(current):
+            raise ValueError("action_program actual after/config hash mismatch")
+        current = _apply_changes(current, {path: receipt["input_before"]})
+        if operation.input_before_sha256 != canonical_hash(current):
+            raise ValueError("action_program actual before/config hash mismatch")
+    if plan.parent_content_sha256 != canonical_hash(current):
+        raise ValueError("action_program parent config hash mismatch")
+
+
 def compose(parent, proposals, contract, *, rng_seed=0, rng_algorithm=RNG_ALGORITHM,
             runtime_windows=None, allow_override=False, chain_length=None):
     """Compose pure proposals into one versioned plan.
@@ -862,6 +1065,12 @@ def compose(parent, proposals, contract, *, rng_seed=0, rng_algorithm=RNG_ALGORI
         if proposal.mutator_id not in surface.mutator_ids:
             raise CompositionRejection(
                 f"mutator {proposal.mutator_id} is not declared by surface {surface.surface_id}")
+
+    sequential_program = any(
+        surfaces[p.surface_id].value_type == "action_program" for p in proposals)
+    if sequential_program:
+        _validate_action_program_proposals(parent, proposals, contract, rng_seed,
+                                          rng_algorithm, chain_length)
 
     op_ids = [p.proposal_id or f"op-{index:02d}-{p.surface_id}-{p.mutator_id}"
               for index, p in enumerate(proposals)]
@@ -908,7 +1117,11 @@ def compose(parent, proposals, contract, *, rng_seed=0, rng_algorithm=RNG_ALGORI
                 continue
             constraints["field_conflicts"].append(
                 {"fields": sorted(common), "left": op_ids[i], "right": op_ids[j]})
-            if allow_override or right.override:
+            if sequential_program:
+                # Every proposal was checked against its actual predecessor;
+                # these are dependent content transformations, not overrides.
+                constraints["field_conflicts"][-1]["decision"] = "sequential_action_program"
+            elif allow_override or right.override:
                 override_map[i] = op_ids[j]
             else:
                 raise CompositionRejection(

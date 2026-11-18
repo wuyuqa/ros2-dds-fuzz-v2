@@ -1,0 +1,726 @@
+"""Raw-backed N-endpoint projection. Pure artifact processing; never runs DDS.
+
+Public API: project_topology_state(program, raw_path, *, before_ref, after_ref,
+                                  expected_sha256=None).
+Returns {state_before, state_after, receipt, eligible}. ``eligible`` is only a
+state-coverage gate, NOT an oracle, candidate, execution-stage or seal decision.
+Input program/fixture declarations and helper pair.status are never proof.
+
+Raw protocol (additive to topology_pair JSONL; missing additions fail closed):
+* input_binding.receipt.program_sha256 binds the program. Endpoint lifecycle is
+  endpoint_created / endpoint_destroyed or topology_endpoint_destroyed, carrying
+  logical_id, generation, endpoint_gid, pid (creation also process_start_ticks,
+  endpoint_generation, topic, message_type). Logical generations must be declared
+  by create/recreate actions; history stays in receipt, not state identity.
+* Each endpoint snapshot chain is worker_command_requested(command='snapshot')
+  or topology_snapshot_requested, then match_snapshot, graph_snapshot, command_done.
+  Same logical_id/generation/pid/endpoint_generation/command_id, current GID,
+  strictly request < match < graph < ACK. These are command ACKs, not DDS ACKs.
+* Per-peer match proof is match_snapshot.matched_peer_gids (complete list),
+  peer_gids_complete=True and peer_proof_source='dds_matched_endpoint_api'.
+  Alternatively topology_controlled_isolation with nonempty isolation_id,
+  writer/reader generations, inventory_complete=True, graph_refs to the two
+  current graphs. Both inventories must contain ONLY that exact writer/reader.
+  Positive topic counts + graph membership NEVER suffice in multi-peer graphs.
+* Delivery uses topology_delivery_window_open / topology_delivery_window_closed
+  with writer/reader generations; close.open_ref binds open; close may name
+  sentinel_sequence. Actual sends/receives inside the window establish samples.
+  Missing publisher_gid requires unique actual send/body/hash/run/identity
+  correlation (endpoint_correlated_payload), or named controlled isolation,
+  never multiwriter totals. Delivery does not backfill per-peer match proof.
+  Closure requires a received later same-writer-generation sentinel;
+  finite trailing loss stays open. No cross-writer ordering is required.
+* topology_network_phase is measured carrier evidence, not program intent:
+  network_phase, recovery_cycle, observed=True, implementation. normal requires
+  audit_neutral=True; drop_active requires applied=True, discovery_packets>0;
+  restore_pending requires rules_removed=True. topology_network_observation links
+  carrier_ref to it with same phase/cycle and source='carrier_audit'. Restored
+  verification additionally requires discovery_refs to identity-bound
+  topology_discovery_activity plus fresh pair proof and closed postrestore data.
+* A boundary (topology_state_boundary, state_step_before/after or
+  topology_pair_observation) explicitly records lifecycle_complete,
+  observation_complete and window_complete. Unknowns cannot be upgraded by flags.
+
+Embedded raw refs are integer line indexes (avoiding self-referential file
+hashes), or externally supplied {path,sha256,event_index} into the SAME verified
+raw file. All returned receipt refs are fully path/hash bound. Raw provenance
+must be ros2_public_api with prepared real_ros=True and no fixture markers to be
+coverage eligible. This audits artifact consistency, not cryptographic runtime
+attestation/source freeze. Synthetic fixtures always remain ineligible.
+"""
+from copy import deepcopy
+import hashlib
+import json
+import math
+from pathlib import Path
+
+from r2f.core.evidence import canonical_hash
+from r2f.core.topology_state import (
+    PAIR_DOMAINS, abstract_topology_state, logical_endpoints, topology_state_id,
+)
+from r2f.instrumentation.sedp import check_offered_requested
+
+SCHEMA = "r2f.s1-topology-state-projection/v1"
+_BOUNDARIES = {"topology_state_boundary", "state_step_before", "state_step_after", "topology_pair_observation"}
+
+
+def _text(value):
+    return isinstance(value, str) and bool(value)
+
+
+def _integer(value, minimum=0):
+    return type(value) is int and value >= minimum
+
+
+def _gid(value):
+    if not _text(value):
+        return None
+    return value[:32].lower() if len(value) == 48 and value[32:] == "0" * 16 else value.lower()
+
+
+def _pointer(value):
+    return value.replace("~", "~0").replace("/", "~1")
+
+
+def _json_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate_raw_json_key:" + key)
+        result[key] = value
+    return result
+
+
+def _reject_constant(value):
+    raise ValueError("nonfinite_raw_json:" + value)
+
+
+def _finite_float(value):
+    parsed = float(value)
+    if not math.isfinite(parsed):
+        raise ValueError("nonfinite_raw_json:" + value)
+    return parsed
+
+
+class _Projection:
+    def __init__(self, program, path, digest, events, receipt):
+        self.program, self.path, self.digest = program, path, digest
+        self.events, self.receipt = events, receipt
+        self.roles = logical_endpoints(program)
+        self.declared = {eid: set() for eid in self.roles}
+        for a in program["actions"]:
+            if isinstance(a, dict) and a.get("op") in ("create", "recreate"):
+                eid, gen = a.get("endpoint_id"), a.get("generation")
+                if _text(eid) and eid in self.declared and _integer(gen, 1):
+                    self.declared[eid].add(gen)
+
+    def ref(self, event):
+        return {"path": self.path, "sha256": self.digest, "event_index": event["event_index"]}
+
+    def resolve(self, ref, *, boundary=None, integer=True):
+        if integer and _integer(ref):
+            index = ref
+        else:
+            if (not isinstance(ref, dict) or set(ref) != {"path", "sha256", "event_index"}
+                    or ref["path"] != self.path or ref["sha256"] != self.digest
+                    or not _integer(ref["event_index"])):
+                raise ValueError("malformed_or_unbound_raw_ref")
+            index = ref["event_index"]
+        if index >= len(self.events):
+            raise ValueError("raw_ref_out_of_range")
+        event = self.events[index]
+        if boundary is not None:
+            if (index > boundary["event_index"]
+                    or event["monotonic_ns"] > boundary["monotonic_ns"]):
+                raise ValueError("raw_ref_after_boundary_chronology")
+        return event
+
+    def chain_order(self, rows):
+        indexes = [e["event_index"] for e in rows]
+        times = [e["monotonic_ns"] for e in rows]
+        if (indexes != sorted(set(indexes)) or times != sorted(times)):
+            raise ValueError("evidence_chain_chronology_invalid")
+
+    def component(self, side, path, value, rows=(), *, status="observed", reason=None, **detail):
+        boundary = self.receipt[side]["boundary_ref"]["event_index"]
+        end = self.events[boundary]
+        refs = [self.ref(e) for e in sorted({e["event_index"]: e for e in rows}.values(),
+                                          key=lambda e: e["event_index"])]
+        for ref in refs:
+            self.resolve(ref, boundary=end)
+        if status in ("observed", "not_applicable") and not refs:
+            raise ValueError("observed_component_without_raw_refs")
+        self.receipt[side]["component_refs"][path] = {
+            "status": status, "value": deepcopy(value), "refs": refs, "reason": reason, "detail": detail,
+        }
+        if reason:
+            self.receipt["reasons"].append(side + ":" + path + ":" + reason)
+        return value
+
+    def unknown(self, side, path, reason, rows=(), *, contradiction=False, **detail):
+        return self.component(side, path, "unknown", rows,
+                              status="contradiction" if contradiction else "unknown",
+                              reason=reason, **detail)
+
+    def prefix(self, boundary):
+        return self.events[:boundary["event_index"] + 1]
+
+    def bound(self, event, token, *, gid_field=None):
+        run_id = self.events[self.receipt["input_ref"]["event_index"]].get("run_id")
+        if not _text(run_id) or event.get("run_id") != run_id or token.get("run_id") != run_id:
+            raise ValueError("endpoint_worker_run_binding_mismatch")
+        if (not _integer(event.get("generation"), 1) or not _integer(event.get("pid"), 1)
+                or not _text(event.get("logical_id")) or not _text(event.get("endpoint_generation"))):
+            raise ValueError("endpoint_worker_identity_fields_malformed")
+        for k in ("logical_id", "generation", "pid", "endpoint_generation"):
+            if event.get(k) != token.get(k):
+                raise ValueError("endpoint_identity_or_old_generation_mismatch:" + k)
+        if ("process_start_ticks" in event and
+                (not _integer(event["process_start_ticks"], 1)
+                 or event["process_start_ticks"] != token["process_start_ticks"])):
+            raise ValueError("endpoint_process_start_ticks_mismatch")
+        if gid_field and _gid(event.get(gid_field)) != _gid(token["endpoint_gid"]):
+            raise ValueError("endpoint_gid_mismatch:" + gid_field)
+        if event["event_index"] < token["event_index"] or event["monotonic_ns"] < token["monotonic_ns"]:
+            raise ValueError("observation_before_current_generation")
+
+    def endpoints(self, side, boundary, lifecycle):
+        facts, tokens = {}, {}
+        prefix = self.prefix(boundary)
+        for eid in self.roles:
+            path = "/endpoints/" + _pointer(eid)
+            history = [e for e in prefix if e.get("logical_id") == eid
+                       and e["event"] in ("endpoint_created", "endpoint_destroyed", "topology_endpoint_destroyed")]
+            self.receipt[side]["history"][eid] = [self.ref(e) for e in history]
+            try:
+                if history:
+                    self.chain_order(history)
+                current, generation, alive = None, 0, False
+                old_gids, old_workers = set(), set()
+                for event in history:
+                    if event["event"] == "endpoint_created":
+                        gen = event.get("generation")
+                        if (not _integer(gen, 1) or gen not in self.declared[eid]
+                                or gen != generation + 1 or alive):
+                            raise ValueError("undeclared_duplicate_or_old_logical_generation")
+                        input_run = self.events[self.receipt["input_ref"]["event_index"]].get("run_id")
+                        if not _text(input_run) or event.get("run_id") != input_run:
+                            raise ValueError("endpoint_creation_run_binding_missing_or_mismatch")
+                        if (not _gid(event.get("endpoint_gid")) or not _integer(event.get("pid"), 1)
+                                or not _integer(event.get("process_start_ticks"), 1)
+                                or not _text(event.get("endpoint_generation"))
+                                or not _text(event.get("topic")) or not _text(event.get("message_type"))):
+                            raise ValueError("endpoint_creation_identity_incomplete")
+                        gid, worker = _gid(event["endpoint_gid"]), (event["pid"], event["process_start_ticks"], event["endpoint_generation"])
+                        if gid in old_gids or worker in old_workers:
+                            raise ValueError("generation_reused_raw_identity")
+                        old_gids.add(gid)
+                        old_workers.add(worker)
+                        current, generation, alive = event, gen, True
+                    else:
+                        if current is None or not alive:
+                            raise ValueError("retirement_without_current_generation")
+                        # Controller retirement events omit endpoint_generation;
+                        # PID/GID/logical ordinal must still agree with creation.
+                        if (not _integer(event.get("generation"), 1) or not _integer(event.get("pid"), 1)
+                                or event.get("run_id") != current.get("run_id")
+                                or any(event.get(k) != current[k] for k in ("generation", "pid"))
+                                or _gid(event.get("endpoint_gid")) != _gid(current["endpoint_gid"])
+                                or event.get("cleanup_status") != "closed"):
+                            raise ValueError("retirement_identity_or_cleanup_mismatch")
+                        self.chain_order([current, event])
+                        alive = False
+                if not lifecycle:
+                    raise ValueError("lifecycle_capture_incomplete")
+                if current is not None and current["monotonic_ns"] > boundary["monotonic_ns"]:
+                    raise ValueError("endpoint_creation_after_boundary_chronology")
+                if alive:
+                    tokens[eid] = current
+                life = "alive" if alive else "retired" if generation else "absent"
+                facts[eid] = {"generation": generation, "liveness": life}
+                rows = history + [boundary]
+                self.component(side, path + "/generation", generation, rows)
+                self.component(side, path + "/liveness", life, rows)
+                if current is not None:
+                    self.receipt[side]["identity"][eid] = {
+                        k: current[k] for k in ("generation", "endpoint_gid", "pid", "process_start_ticks", "endpoint_generation")
+                    }
+                    self.receipt[side]["identity"][eid]["creation_ref"] = self.ref(current)
+            except ValueError as exc:
+                facts[eid] = {"generation": None, "liveness": "unknown"}
+                self.unknown(side, path + "/generation", str(exc), history, contradiction="incomplete" not in str(exc))
+                self.unknown(side, path + "/liveness", str(exc), history, contradiction="incomplete" not in str(exc))
+        # Raw IDs must be one-to-one across live logical endpoints.
+        gids = [_gid(t["endpoint_gid"]) for t in tokens.values()]
+        if len(gids) != len(set(gids)):
+            for eid in list(tokens):
+                facts[eid] = {"generation": None, "liveness": "unknown"}
+                path = "/endpoints/" + _pointer(eid)
+                for name in ("generation", "liveness"):
+                    self.unknown(side, path + "/" + name, "live_logical_ids_share_raw_gid", [tokens[eid]], contradiction=True)
+            tokens.clear()
+        return facts, tokens
+
+    def snapshot_chain(self, token, boundary):
+        candidates = [e for e in self.prefix(boundary) if e["event"] == "match_snapshot"
+                      and e.get("logical_id") == token["logical_id"]
+                      and e.get("generation") == token["generation"]]
+        if not candidates:
+            raise ValueError("fresh_current_generation_snapshot_missing")
+        match = candidates[-1]
+        self.bound(match, token, gid_field="endpoint_gid")
+        cid = match.get("command_id")
+        if not (_text(cid) or _integer(cid)):
+            raise ValueError("snapshot_command_id_missing")
+        related = [e for e in self.prefix(boundary)
+                   if e.get("logical_id") == token["logical_id"]
+                   and e.get("generation") == token["generation"] and e.get("command_id") == cid]
+        def one(kinds):
+            rows = [e for e in related if e["event"] in kinds]
+            if len(rows) != 1:
+                raise ValueError("snapshot_request_graph_ack_missing_or_duplicate")
+            self.bound(rows[0], token)
+            return rows[0]
+        if len([e for e in related if e["event"] == "match_snapshot"]) != 1:
+            raise ValueError("snapshot_match_duplicate")
+        request = one({"worker_command_requested", "topology_snapshot_requested"})
+        if request.get("command", "snapshot" if request["event"] == "topology_snapshot_requested" else None) != "snapshot":
+            raise ValueError("snapshot_request_wrong_command")
+        graph, ack = one({"graph_snapshot"}), one({"command_done"})
+        self.chain_order([request, match, graph, ack])
+        if (not _integer(match.get("matched_count"))
+                or not isinstance(graph.get("publishers"), list)
+                or not isinstance(graph.get("subscriptions"), list)):
+            raise ValueError("snapshot_graph_or_count_malformed")
+        for key in ("publishers", "subscriptions"):
+            gids = [_gid(row.get("endpoint_gid")) if isinstance(row, dict) else None for row in graph[key]]
+            if None in gids or len(gids) != len(set(gids)):
+                raise ValueError("snapshot_graph_identity_malformed_or_duplicate")
+        return request, match, graph, ack
+
+    def isolation(self, w, r, wc, rc, boundary):
+        proofs = [e for e in self.prefix(boundary) if e["event"] == "topology_controlled_isolation"
+                  and e.get("writer") == w["logical_id"] and e.get("reader") == r["logical_id"]
+                  and e.get("writer_generation") == w["generation"]
+                  and e.get("reader_generation") == r["generation"]]
+        if not proofs:
+            raise ValueError("no_per_peer_match_proof_or_named_controlled_isolation")
+        proof = proofs[-1]
+        if (not _integer(proof.get("writer_generation"), 1) or not _integer(proof.get("reader_generation"), 1)
+                or not _text(proof.get("isolation_id")) or not _text(proof.get("mechanism"))
+                or proof.get("inventory_complete") is not True
+                or not isinstance(proof.get("graph_refs"), list) or len(proof["graph_refs"]) != 2):
+            raise ValueError("controlled_isolation_proof_incomplete")
+        graphs = [self.resolve(ref, boundary=proof) for ref in proof["graph_refs"]]
+        if {g["event_index"] for g in graphs} != {wc[2]["event_index"], rc[2]["event_index"]}:
+            raise ValueError("controlled_isolation_graph_refs_stale")
+        for graph in graphs:
+            if ([_gid(row["endpoint_gid"]) for row in graph["publishers"]] != [_gid(w["endpoint_gid"])]
+                    or [_gid(row["endpoint_gid"]) for row in graph["subscriptions"]] != [_gid(r["endpoint_gid"])]):
+                raise ValueError("controlled_isolation_inventory_has_other_peers")
+        return proof
+
+    def match(self, w, r, wc, rc, boundary):
+        direct = []
+        for token, peer, chain in ((w, r, wc), (r, w, rc)):
+            row = chain[1]
+            if (row.get("peer_proof_source") == "dds_matched_endpoint_api"
+                    and row.get("peer_gids_complete") is True
+                    and isinstance(row.get("matched_peer_gids"), list)):
+                gids = [_gid(gid) for gid in row["matched_peer_gids"]]
+                if None in gids or len(gids) != len(set(gids)) or row["matched_count"] != len(gids):
+                    raise ValueError("per_peer_list_count_contradiction")
+                direct.append(_gid(peer["endpoint_gid"]) in gids)
+            else:
+                direct.append(None)
+        proof = None
+        if None in direct:
+            proof = self.isolation(w, r, wc, rc, boundary)
+            counts = [c[1]["matched_count"] for c in (wc, rc)]
+            if any(count not in (0, 1) for count in counts):
+                raise ValueError("isolated_pair_count_out_of_range")
+            measured = [count == 1 for count in counts]
+            if any(a is not None and a != b for a, b in zip(direct, measured)):
+                raise ValueError("isolation_and_direct_peer_proof_contradict")
+            direct = measured
+        value = ("bidirectional" if all(direct) else "writer_only" if direct[0]
+                 else "reader_only" if direct[1] else "none")
+        return value, [w, r, *wc, *rc] + ([proof] if proof else []), proof
+
+    def compatibility(self, w, r, wc, rc):
+        if w["topic"] != r["topic"]:
+            return "incompatible", {"reason": "observed_topic_mismatch", "actual_match": "not_evaluated"}
+        contracts = {}
+        for token, list_key in ((w, "publishers"), (r, "subscriptions")):
+            rows = []
+            for chain in (wc, rc):
+                members = [row for row in chain[2][list_key]
+                           if _gid(row["endpoint_gid"]) == _gid(token["endpoint_gid"])]
+                if len(members) != 1:
+                    raise ValueError("observed_endpoint_contract_missing_from_graph")
+                rows.append(members[0])
+            if rows[0] != rows[1]:
+                raise ValueError("observed_contract_sources_contradict")
+            row = rows[0]
+            if not _text(row.get("topic_type")) or not isinstance(row.get("qos"), dict):
+                raise ValueError("observed_contract_fields_missing")
+            fields = {}
+            for policy, key in (("reliability", "reliability"), ("durability", "durability"),
+                                ("liveliness.kind", "liveliness"), ("deadline", "deadline_ns"),
+                                ("liveliness.lease_duration", "liveliness_lease_duration_ns")):
+                value = row["qos"].get(key)
+                if key.endswith("_ns"):
+                    value = ({"infinite": True} if value == 9223372036854775807 else
+                             {"nanoseconds": value} if _integer(value) else None)
+                if value is not None:
+                    fields[policy] = {"status": "observed", "value": value}
+            contracts[token["logical_id"]] = fields, row["topic_type"]
+        wf, wt = contracts[w["logical_id"]]
+        rf, rt = contracts[r["logical_id"]]
+        check = check_offered_requested(wf, rf)
+        if w["topic"] != r["topic"] or wt != rt:
+            return "incompatible", check
+        return ("compatible" if check["compatible"] is True else "incompatible"
+                if check["compatible"] is False else "unknown"), check
+
+    def pair_bound(self, event, w, r):
+        if any(event.get(role) != t["logical_id"] or not _integer(event.get(role + "_generation"), 1)
+               or event.get(role + "_generation") != t["generation"]
+               for role, t in (("writer", w), ("reader", r))):
+            raise ValueError("delivery_window_old_generation_or_pair_mismatch")
+
+    def delivery(self, w, r, tokens, boundary):
+        prefix = self.prefix(boundary)
+        closes = [e for e in prefix if e["event"] == "topology_delivery_window_closed"
+                  and e.get("writer") == w["logical_id"] and e.get("reader") == r["logical_id"]]
+        if not closes:
+            raise ValueError("delivery_window_raw_missing")
+        close = closes[-1]
+        self.pair_bound(close, w, r)
+        opened = self.resolve(close.get("open_ref"), boundary=close)
+        if opened["event"] != "topology_delivery_window_open":
+            raise ValueError("delivery_window_open_ref_wrong_kind")
+        self.pair_bound(opened, w, r)
+        self.chain_order([opened, close])
+        wc, rc = self.snapshot_chain(w, opened), self.snapshot_chain(r, opened)
+        try:
+            matched, match_rows, isolation = self.match(w, r, wc, rc, opened)
+        except ValueError:
+            # Identity-bound communication may be observed independently of the
+            # SDK's unavailable per-peer matching API. Never upgrade match from it.
+            matched, match_rows, isolation = "unknown", [*wc, *rc], None
+        if close.get("window_complete") is not True:
+            raise ValueError("delivery_window_capture_incomplete")
+        rows = [e for e in prefix if opened["event_index"] < e["event_index"] < close["event_index"]]
+        sends = [e for e in rows if e["event"] == "send" and e.get("logical_id") == w["logical_id"]]
+        expected = {}
+        for event in sends:
+            self.bound(event, w, gid_field="writer_gid")
+            seq = event.get("send_sequence")
+            if not _integer(seq) or seq in expected:
+                raise ValueError("send_sequence_invalid_or_duplicate_in_writer_generation")
+            prior = [e for e in self.prefix(close) if e["event"] == "send"
+                     and e.get("logical_id") == w["logical_id"] and e.get("generation") == w["generation"]
+                     and e.get("send_sequence") == seq]
+            if len(prior) != 1:
+                raise ValueError("ambiguous_reused_sequence_in_writer_generation")
+            expected[seq] = event
+        if sends:
+            self.chain_order(sends)
+        received, ambiguous = {}, []
+        def possible_writers_at(sample):
+            active = {}
+            for event in self.prefix(sample):
+                eid = event.get("logical_id")
+                if not _text(eid) or self.roles.get(eid) != "writer":
+                    continue
+                if event["event"] == "endpoint_created":
+                    active[eid] = event
+                elif event["event"] in ("endpoint_destroyed", "topology_endpoint_destroyed"):
+                    active.pop(eid, None)
+            return [t for t in active.values() if t.get("topic") == w["topic"]]
+        samples, attributions = [], []
+        def payload_send(sample):
+            digest = sample.get("payload_sha256")
+            run_id = sample.get("payload_run_id")
+            if (not isinstance(digest, str) or len(digest) != 64
+                    or any(c not in "0123456789abcdef" for c in digest)
+                    or not _text(run_id) or sample.get("run_id") != run_id
+                    or not _text(sample.get("payload_writer_id"))
+                    or not _integer(sample.get("payload_writer_generation"), 1)):
+                return None
+            candidates = [e for e in self.prefix(close) if e["event"] == "send"
+                          and e.get("run_id") == run_id and e.get("payload_sha256") == digest]
+            if len(candidates) != 1:
+                return None
+            send = candidates[0]
+            if (send.get("logical_id") != sample["payload_writer_id"]
+                    or send.get("generation") != sample["payload_writer_generation"]
+                    or send.get("send_sequence") != sample.get("send_sequence")
+                    or send.get("publish_returned") is not True
+                    or send.get("run_id") != self.events[self.receipt["input_ref"]["event_index"]].get("run_id")):
+                return None
+            return send
+        for event in rows:
+            if event["event"] != "receive" or event.get("logical_id") != r["logical_id"]:
+                continue
+            self.bound(event, r, gid_field="reader_gid")
+            publisher = _gid(event.get("publisher_gid"))
+            if publisher is not None and publisher != _gid(w["endpoint_gid"]):
+                continue
+            basis, linked = "direct_publisher_gid", None
+            if publisher is None:
+                linked = payload_send(event)
+                if linked is not None:
+                    if linked.get("logical_id") != w["logical_id"]:
+                        continue
+                    self.bound(linked, w, gid_field="writer_gid")
+                    basis = "endpoint_correlated_payload"
+                elif len(possible_writers_at(event)) == 1 and isolation is not None:
+                    basis = "controlled_isolation_endpoint_correlated"
+                else:
+                    ambiguous.append(event)
+                    continue
+            seq = event.get("send_sequence")
+            if not _integer(seq):
+                raise ValueError("received_sequence_missing")
+            if seq not in expected:
+                raise ValueError("received_sequence_has_no_current_writer_send")
+            if linked is not None and linked["event_index"] != expected[seq]["event_index"]:
+                raise ValueError("payload_send_outside_current_delivery_window")
+            # Worker stdout drain order is not a cross-process causal clock:
+            # publish() may deliver before the sending worker logs its return.
+            # Both raw events must be inside this actual capture window, but no
+            # global send-log-before-receive-log order is invented.
+            received.setdefault(seq, []).append(event)
+            samples.append(event)
+            attributions.append(basis)
+        refs = [w, r, opened, close, *match_rows, *sends, *samples, *ambiguous]
+        for event in [*sends, *samples, *ambiguous]:
+            if not opened["monotonic_ns"] <= event["monotonic_ns"] <= close["monotonic_ns"]:
+                raise ValueError("delivery_sample_outside_window_clock")
+        if ambiguous:
+            return "unknown", refs, {"reason": "multiwriter_or_unproven_publisher_attribution", "missing": sorted(set(expected) - set(received))}
+        missing = sorted(set(expected) - set(received))
+        detail = {"expected": sorted(expected), "received": sorted(received), "missing": missing,
+                  "attribution": attributions[0] if attributions and len(set(attributions)) == 1 else "mixed" if attributions else "none",
+                  "directed_pair_communication": bool(samples), "observed_match_used": matched,
+                  "cross_writer_order_required": False, "cross_worker_log_order": "not_assumed",
+                  "payload_uniqueness_scope": "raw_prefix_through_window_close",
+                  "open_ref": self.ref(opened), "close_ref": self.ref(close)}
+        if not expected:
+            return "no_obligation", refs, detail
+        sentinel = close.get("sentinel_sequence")
+        closed = (_integer(sentinel) and sentinel in received and sentinel in expected
+                  and sentinel == max(expected)
+                  and all(seq < sentinel and expected[seq]["event_index"] < expected[sentinel]["event_index"] for seq in missing))
+        if not closed:
+            return "open", refs, {**detail, "reason": "finite_window_without_later_sentinel_closure"}
+        return "closed_with_gap" if missing else "closed", refs, detail
+
+    def globals(self, side, boundary, tokens, pairs):
+        prefix = self.prefix(boundary)
+        refs = [e for e in prefix if e["event"] == "topology_network_observation"]
+        values = {"network_phase": "unknown", "recovery_cycle_bucket": "unknown"}
+        try:
+            if not refs:
+                raise ValueError("observed_network_recovery_evidence_missing")
+            row = refs[-1]
+            carrier = self.resolve(row.get("carrier_ref"), boundary=row)
+            carriers = [e for e in prefix if e["event"] == "topology_network_phase"]
+            if not carriers or carriers[-1]["event_index"] != carrier["event_index"]:
+                raise ValueError("stale_network_phase_observation")
+            phase, cycle = row.get("network_phase"), row.get("recovery_cycle")
+            if (row.get("source") != "carrier_audit" or not _integer(cycle)
+                    or carrier["event"] != "topology_network_phase"
+                    or carrier.get("observed") is not True or not _text(carrier.get("implementation"))
+                    or carrier.get("recovery_cycle") != cycle):
+                raise ValueError("network_carrier_evidence_incomplete_or_contradictory")
+            expected_phase = "restore_pending" if phase == "restored_verified" else phase
+            if carrier.get("network_phase") != expected_phase:
+                raise ValueError("network_phase_evidence_contradiction")
+            evidence = [carrier, row]
+            self.chain_order(evidence)
+            if phase == "normal":
+                valid = carrier.get("audit_neutral") is True
+            elif phase == "drop_active":
+                valid = carrier.get("applied") is True and _integer(carrier.get("discovery_packets"), 1)
+            elif phase in ("restore_pending", "restored_verified"):
+                valid = carrier.get("rules_removed") is True
+            else:
+                valid = False
+            if not valid:
+                raise ValueError("network_phase_effect_not_observed")
+            if phase == "restored_verified":
+                drefs = row.get("discovery_refs")
+                if not isinstance(drefs, list) or not drefs or not tokens:
+                    raise ValueError("restoration_identity_discovery_missing")
+                seen = set()
+                for ref in drefs:
+                    discovery = self.resolve(ref, boundary=row)
+                    eid = discovery.get("logical_id")
+                    if (eid not in tokens or discovery["event"] != "topology_discovery_activity"
+                            or discovery.get("source") != "endpoint_discovery_capture"
+                            or not _integer(discovery.get("packet_count"), 1)):
+                        raise ValueError("restoration_discovery_not_identity_bound")
+                    self.bound(discovery, tokens[eid], gid_field="endpoint_gid")
+                    self.chain_order([carrier, discovery, row])
+                    evidence.append(discovery)
+                    seen.add(eid)
+                if seen != set(tokens):
+                    raise ValueError("restoration_discovery_identity_inventory_incomplete")
+                for pair in pairs:
+                    if pair["compatibility"] == "not_applicable":
+                        continue
+                    if pair["compatibility"] == "unknown":
+                        raise ValueError("restoration_pair_contract_unknown")
+                    if pair["compatibility"] == "incompatible":
+                        continue
+                    path = "/pairs/" + _pointer(pair["writer"]) + "/" + _pointer(pair["reader"])
+                    component = self.receipt[side]["component_refs"][path + "/delivery_closure"]
+                    match_component = self.receipt[side]["component_refs"][path + "/observed_match"]
+                    snapshots = [self.resolve(ref, boundary=boundary) for ref in match_component["refs"]]
+                    if any(event["event_index"] <= carrier["event_index"] for event in snapshots
+                           if event["event"] in ("worker_command_requested", "topology_snapshot_requested", "match_snapshot", "graph_snapshot", "command_done")):
+                        raise ValueError("restoration_pair_snapshot_not_fresh_after_restore")
+                    if (pair["observed_match"] != "bidirectional" or pair["delivery_closure"] != "closed"
+                            or component["detail"].get("open_ref", {}).get("event_index", -1) <= carrier["event_index"]):
+                        raise ValueError("restoration_fresh_pair_and_postrestore_delivery_missing")
+                    evidence.extend(self.resolve(ref, boundary=boundary) for ref in component["refs"])
+            values = {"network_phase": phase, "recovery_cycle_bucket": "0" if cycle == 0 else "1" if cycle == 1 else "2plus"}
+            for name, value in values.items():
+                self.component(side, "/" + name, value, evidence, actual_cycle=cycle)
+        except ValueError as exc:
+            for name in values:
+                self.unknown(side, "/" + name, str(exc), refs)
+        return values
+
+    def boundary(self, side, boundary):
+        binding = self.receipt[side]
+        binding["boundary_ref"] = self.ref(boundary)
+        if boundary["event"] not in _BOUNDARIES:
+            raise ValueError("unsupported_boundary_event")
+        flags = all(boundary.get(k) is True for k in ("lifecycle_complete", "observation_complete", "window_complete"))
+        endpoints, tokens = self.endpoints(side, boundary, boundary.get("lifecycle_complete") is True)
+        pairs = []
+        for w in (eid for eid in self.roles if self.roles[eid] == "writer"):
+            for r in (eid for eid in self.roles if self.roles[eid] == "reader"):
+                path = "/pairs/" + _pointer(w) + "/" + _pointer(r)
+                pair = {"writer": w, "reader": r}
+                nonlive = any(endpoints[eid]["liveness"] in ("absent", "retired") for eid in (w, r))
+                if nonlive:
+                    for name in PAIR_DOMAINS:
+                        pair[name] = self.component(side, path + "/" + name, "not_applicable", [boundary],
+                                                    status="not_applicable", reason=None,
+                                                    basis="raw_backed_endpoint_not_alive")
+                elif w not in tokens or r not in tokens:
+                    for name in PAIR_DOMAINS:
+                        pair[name] = self.unknown(side, path + "/" + name, "endpoint_lifecycle_unknown")
+                else:
+                    wc = rc = None
+                    try:
+                        wc, rc = self.snapshot_chain(tokens[w], boundary), self.snapshot_chain(tokens[r], boundary)
+                        value, policy = self.compatibility(tokens[w], tokens[r], wc, rc)
+                        pair["compatibility"] = self.component(side, path + "/compatibility", value, [tokens[w], tokens[r], *wc, *rc],
+                            status="unknown" if value == "unknown" else "observed",
+                            reason="observed_matching_policy_fields_missing" if value == "unknown" else None,
+                            policy_scope=policy, limitation="Observed topic/type and listed offered/requested policies, not proof of match.")
+                    except (ValueError, KeyError, TypeError) as exc:
+                        pair["compatibility"] = self.unknown(side, path + "/compatibility", str(exc),
+                            [*(wc or ()), *(rc or ())])
+                    try:
+                        if wc is None or rc is None:
+                            raise ValueError("current_snapshot_chain_missing")
+                        value, rows, proof = self.match(tokens[w], tokens[r], wc, rc, boundary)
+                        pair["observed_match"] = self.component(side, path + "/observed_match", value, rows,
+                            proof_kind="controlled_isolation" if proof else "direct_per_peer_api",
+                            isolation_id=proof.get("isolation_id") if proof else None)
+                    except ValueError as exc:
+                        diagnostics = [e for e in self.prefix(boundary) if e["event"] == "topology_pair_observation"]
+                        pair["observed_match"] = self.unknown(side, path + "/observed_match", str(exc),
+                            [*(wc or ()), *(rc or ()), *diagnostics], helper_status_accepted=False)
+                    try:
+                        value, rows, detail = self.delivery(tokens[w], tokens[r], tokens, boundary)
+                        pair["delivery_closure"] = self.component(side, path + "/delivery_closure", value, rows,
+                            status="unknown" if value == "unknown" else "observed", **detail)
+                    except (ValueError, KeyError, TypeError) as exc:
+                        pair["delivery_closure"] = self.unknown(side, path + "/delivery_closure", str(exc))
+                pairs.append(pair)
+        globals_ = self.globals(side, boundary, tokens, pairs)
+        errors = [e for e in self.prefix(boundary) if e["event"] in
+                  ("worker_error", "worker_command_error", "topology_backend_blocked")]
+        complete = (flags and not errors and all(e["liveness"] != "unknown" for e in endpoints.values())
+                    and all(p[c] != "unknown" for p in pairs for c in PAIR_DOMAINS)
+                    and all(v != "unknown" for v in globals_.values()))
+        self.component(side, "/observation_completeness", "complete" if complete else "incomplete", [boundary, *errors],
+                       status="observed" if complete else "unknown",
+                       reason="raw_worker_or_backend_error" if errors else None if complete else "boundary_flags_or_component_evidence_incomplete")
+        state = abstract_topology_state(self.program, {"endpoints": endpoints, "pairs": pairs,
+            **globals_, "observation_complete": complete})
+        binding["state_id"] = topology_state_id(state)
+        return state
+
+
+def project_topology_state(program, raw_path, *, before_ref, after_ref, expected_sha256=None):
+    """Project two explicit boundaries from immutable JSONL bytes; fail closed.
+
+    Invalid program identity raises ValueError. Missing/malformed raw evidence is
+    returned as an invalid/incomplete receipt with ineligible unknown states.
+    File I/O is read-only. The actual hash is calculated once from the same bytes
+    parsed; no receipt accepts a caller-supplied helper or predicted graph.
+    """
+    logical_endpoints(program)
+    empty = abstract_topology_state(program, {})
+    path = str(raw_path)
+    receipt = {"schema": SCHEMA, "status": "incomplete", "raw_path": path, "raw_sha256": None,
+               "program_sha256": canonical_hash(program), "reasons": [], "execution_evidence": False,
+               "fixture": True, "chronology": {"status": "unverified"},
+               "before": {"boundary_ref": None, "component_refs": {}, "identity": {}, "history": {}},
+               "after": {"boundary_ref": None, "component_refs": {}, "identity": {}, "history": {}}}
+    result = {"state_before": deepcopy(empty), "state_after": deepcopy(empty), "receipt": receipt, "eligible": False}
+    try:
+        content = Path(path).read_bytes()
+        digest = hashlib.sha256(content).hexdigest()
+        receipt["raw_sha256"] = digest
+        if expected_sha256 is not None and expected_sha256 != digest:
+            raise ValueError("raw_sha256_mismatch")
+        lines = content.decode("utf-8").splitlines()
+        events = [json.loads(line, object_pairs_hook=_json_object, parse_constant=_reject_constant, parse_float=_finite_float) for line in lines]
+        if not events:
+            raise ValueError("raw_events_empty")
+        for index, event in enumerate(events):
+            if (not isinstance(event, dict) or type(event.get("event_index")) is not int
+                    or event["event_index"] != index or not _text(event.get("event"))
+                    or not _integer(event.get("monotonic_ns"), 1)):
+                raise ValueError("raw_event_index_or_clock_malformed")
+        projection = _Projection(program, path, digest, events, receipt)
+        before = projection.resolve(before_ref, integer=True)
+        after = projection.resolve(after_ref, integer=True)
+        projection.chain_order([before, after])
+        bindings = [e for e in projection.prefix(before) if e["event"] == "input_binding"]
+        if (len(bindings) != 1 or not isinstance(bindings[0].get("receipt"), dict)
+                or bindings[0]["receipt"].get("program_sha256") != receipt["program_sha256"]):
+            raise ValueError("raw_program_input_binding_missing_or_mismatch")
+        receipt["input_ref"] = projection.ref(bindings[0])
+        prepared = [e for e in projection.prefix(before) if e["event"] == "topology_backend_prepared"]
+        real = (bindings[0].get("backend") == "ros2_public_api"
+                and len(prepared) == 1 and prepared[0].get("real_ros") is True
+                and all(e.get("backend") == "ros2_public_api" and e.get("fixture") is not True
+                        and e.get("offline_fake") is not True and e.get("real_ros") is not False for e in events))
+        receipt["execution_evidence"], receipt["fixture"] = real, not real
+        for side, boundary in (("before", before), ("after", after)):
+            result["state_" + side] = projection.boundary(side, boundary)
+        receipt["chronology"] = {"status": "verified", "before_ref": projection.ref(before),
+                                 "after_ref": projection.ref(after), "component_refs_bounded": True,
+                                 "snapshot_ack_kind": "command_completion_not_dds_delivery_ack"}
+        complete = all(result["state_" + side]["observation_completeness"] == "complete" for side in ("before", "after"))
+        receipt["status"] = "observed" if complete else "incomplete"
+        result["eligible"] = complete and real
+        if not real:
+            receipt["eligibility_reason"] = "fixture_or_unverified_execution_provenance"
+    except (OSError, ValueError, TypeError, KeyError, UnicodeError, IndexError, RecursionError) as exc:
+        receipt["status"] = "invalid"
+        receipt["reasons"].append(str(exc))
+        receipt["chronology"]["status"] = "invalid"
+        result["eligible"] = False
+    return result

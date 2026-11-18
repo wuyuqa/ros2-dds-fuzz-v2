@@ -12,6 +12,9 @@ from __future__ import annotations
 from collections import defaultdict
 from copy import deepcopy
 from dataclasses import dataclass, field
+import json
+from pathlib import Path
+import re
 
 from r2f.core.evidence import canonical_hash
 
@@ -139,6 +142,7 @@ class Corpus:
     semantics: dict = field(default_factory=lambda: defaultdict(set))
     candidates: dict = field(default_factory=lambda: defaultdict(set))
     history: list = field(default_factory=list)
+    source_ingestion_receipt: dict | None = None  # optional topology provenance; not input identity
 
     def __post_init__(self):
         if type(self.capacity) is not int or self.capacity < 1:
@@ -165,7 +169,8 @@ class Corpus:
 
     def _evict(self, digest, reason, *, bucket=None):
         record = self.entries.pop(digest)
-        if bucket is not None:
+        bucket = bucket if bucket is not None else bucket_key(record)
+        if bucket in self.buckets:
             self.buckets[bucket].discard(digest)
             if not self.buckets[bucket]:
                 self.buckets.pop(bucket, None)
@@ -256,6 +261,7 @@ class Corpus:
         record = _normal_record(entry, source="observation")
         if observed_edge:
             record["observed_edge"] = observed_edge
+            record["bucket_key"] = list(bucket_key(record))
         digest = record["content_sha256"]
         if not executed:
             self._log("rejected", digest, "not_executed")
@@ -299,15 +305,111 @@ class Corpus:
                        if record.get("executable", True) is not False),
                       key=lambda r: (r.get("target_id", ""), r.get("seed_id", ""), r["content_sha256"]))
 
+    @classmethod
+    def from_dict(cls, data):
+        """Restore an index, never re-admit observations as newly pinned seeds.
+
+        Input identities are recomputed, but the original records/history are
+        copied verbatim.  Evicted parents remain valid historical references.
+        """
+        if not isinstance(data, dict) or data.get("schema") != SCHEMA:
+            raise ValueError("unsupported corpus schema")
+        corpus = cls(capacity=data["capacity"], bucket_limit=data["bucket_limit"])
+        records, history = data.get("entries"), data.get("history")
+        if not isinstance(records, list) or not isinstance(history, list):
+            raise ValueError("corpus entries/history must be lists")
+        for record in records:
+            if not isinstance(record, dict):
+                raise ValueError("corpus record must be a dict")
+            digest = record.get("content_sha256")
+            if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+                raise ValueError("invalid corpus content hash")
+            if digest != content_identity(record):
+                raise ValueError("corpus content hash mismatch")
+            if digest in corpus.entries:
+                raise ValueError("duplicate corpus content")
+            if type(record.get("pinned_seed")) is not bool:
+                raise ValueError("invalid corpus pinned flag")
+            candidates = record.get("candidate_ids")
+            if (not isinstance(candidates, list) or
+                    any(not isinstance(c, str) or not c.strip() for c in candidates) or
+                    candidates != sorted(set(candidates))):
+                raise ValueError("invalid corpus candidate references")
+            if record.get("bucket_key") != list(bucket_key(record)):
+                raise ValueError("corpus bucket index mismatch")
+            parent = record.get("parent_content_sha256")
+            if parent is not None and (not isinstance(parent, str) or
+                    not re.fullmatch(r"[0-9a-f]{64}", parent) or parent == digest):
+                raise ValueError("invalid corpus parent reference")
+            corpus.entries[digest] = deepcopy(record)
+            for candidate in candidates:
+                corpus.candidates[candidate].add(digest)
+        for sequence, event in enumerate(history):
+            if (not isinstance(event, dict) or type(event.get("sequence")) is not int or
+                    event["sequence"] != sequence or
+                    event.get("action") not in {"admitted", "retained", "pinned", "rejected", "evicted", "deduplicated"} or
+                    not isinstance(event.get("content_sha256"), str) or
+                    not re.fullmatch(r"[0-9a-f]{64}", event["content_sha256"]) or
+                    not isinstance(event.get("reason"), str)):
+                raise ValueError("invalid corpus history order/event")
+        corpus.history = deepcopy(history)
+        known = set(corpus.entries) | {e["content_sha256"] for e in history}
+        for record in records:
+            parent = record.get("parent_content_sha256")
+            if parent is not None and parent not in known:
+                raise ValueError("corpus parent is missing from retained/historical inputs")
+            seen = {record["content_sha256"]}
+            while parent in corpus.entries:
+                if parent in seen:
+                    raise ValueError("cyclic corpus parent lineage")
+                seen.add(parent)
+                parent = corpus.entries[parent].get("parent_content_sha256")
+        corpus._rebuild_indexes()
+        if len(corpus._evictable()) > corpus.capacity:
+            raise ValueError("corpus exceeds capacity")
+        if any(sum(not corpus._is_pinned(corpus.entries[d]) for d in members) > corpus.bucket_limit
+               for members in corpus.buckets.values()):
+            raise ValueError("corpus exceeds bucket limit")
+        if any(r.get('source_schema') == 'r2f.s1-seed-corpus/v2' for r in records) and \
+                'source_ingestion_receipt' not in data:
+            raise ValueError('topology_source_ingestion_receipt_missing')
+        if 'source_ingestion_receipt' in data:
+            corpus.source_ingestion_receipt = deepcopy(data['source_ingestion_receipt'])
+            _validate_topology_ingestion(corpus.source_ingestion_receipt, corpus.entries.values())
+        # Includes all serialized counts and explicit indexes.  Never repair a
+        # damaged checkpoint by dropping records or silently rebuilding claims.
+        rebuilt = corpus.to_dict()
+        if data != rebuilt:
+            raise ValueError("corpus indexes/counts or fields do not match records")
+        return corpus
+
+    @classmethod
+    def load(cls, path):
+        return cls.from_dict(json.loads(Path(path).read_text()))
+
+    def _index_dict(self):
+        def index(records, key):
+            result = defaultdict(list)
+            for digest, record in records.items():
+                result[key(record)].append(digest)
+            return [{"key": list(k), "members": sorted(v)}
+                    for k, v in sorted(result.items(), key=lambda item: canonical_hash(list(item[0])))]
+        return {"buckets": index(self.entries, bucket_key),
+                "semantics": index(self.entries, semantic_key),
+                "candidates": {k: sorted(v) for k, v in sorted(self.candidates.items())}}
+
     def to_dict(self):
-        return {"schema": SCHEMA, "capacity": self.capacity, "bucket_limit": self.bucket_limit,
+        result = {"schema": SCHEMA, "capacity": self.capacity, "bucket_limit": self.bucket_limit,
                 "entry_count": len(self.entries), "evictable_count": len(self._evictable()),
                 "pinned_seed_count": sum(r.get("pinned_seed") is True for r in self.entries.values()),
                 "candidate_reference_count": len(self.candidates),
                 "capacity_controlled": len(self._evictable()) <= self.capacity,
                 "entries": sorted((deepcopy(r) for r in self.entries.values()),
                                   key=lambda r: r["content_sha256"]),
-                "history": deepcopy(self.history)}
+                "history": deepcopy(self.history), "indexes": self._index_dict()}
+        if self.source_ingestion_receipt is not None:
+            result['source_ingestion_receipt'] = deepcopy(self.source_ingestion_receipt)
+        return result
 
 
 def corpus_identity(corpus):
@@ -338,15 +440,17 @@ _PROFILE_SCHEMA = "r2f.s1-fuzz-profile/v1"
 _RUNNER_SLICE_CURRENT = "endpoint_pair_slice"
 
 
-def _runner_cycle_targets():
+def _runner_cycle_targets(profile=None):
     """Targets the shared exploratory runner can currently turn into cases.
 
     Imported lazily to avoid an import cycle (the runner imports this module).
     The set is the runner's own gate; this module never widens it, it only
     refuses to build a corpus the runner would reject case by case.
     """
-    from r2f.campaign.runner import _F1_CYCLE_TARGETS
-    return frozenset(_F1_CYCLE_TARGETS)
+    from r2f.campaign.runner import _F1_CYCLE_TARGETS, _F2_CYCLE_TARGETS
+    from r2f.campaign.exploratory_input import validate_f2_profile
+    enabled = validate_f2_profile(profile or {})
+    return frozenset(_F1_CYCLE_TARGETS) | (_F2_CYCLE_TARGETS if enabled else frozenset())
 
 
 def _load_profile_document(profile):
@@ -471,7 +575,7 @@ def _profile_cycles(profile):
 def available_cycles(profile):
     """Offline view of a profile's cycles and their runner availability."""
     profile = _load_profile_document(profile)
-    supported = _runner_cycle_targets()
+    supported = _runner_cycle_targets(profile)
     return [{"cycle_id": cycle["cycle_id"], "target_id": cycle["target_id"],
              "surfaces": list(cycle["surfaces"]),
              "seed_specs": [dict(spec) for spec in cycle["seed_specs"]],
@@ -498,18 +602,33 @@ def corpus_from_profile(profile, seeds=None, *, cycle_id=None, target_id=None):
     current endpoint-pair slice is refused with an explicit capability reason
     instead of producing a corpus that the runner would reject case by case.
 
-    F1-routable templates only enter the corpus.  Capability-pending F2
-    surfaces/seeds (E02, E03, G01) are rejected if they appear as live
-    surfaces or seed specs; they may only be listed as pending metadata.
+    F1 remains the default. Only the explicit f2_windows_v1 profile/new
+    target may authorize new E02/M07 or E03/M06 entries from pending templates;
+    it never edits their authored provenance or admits G01/other F2 surfaces.
     """
     from r2f.modules.s1 import fuzz_catalog
     from r2f.modules.s1.targets import (
-        EXPLORATORY_RUNTIME_TARGET, EXPLORATORY_TARGET_ORDER,
+        EXPLORATORY_RUNTIME_TARGET, F2_WINDOWS_RUNTIME_TARGET,
         exploratory_target_declarations,
     )
     from r2f.core.mutators import MUTATORS
+    from r2f.campaign.exploratory_input import (
+        F2_SURFACE_MUTATORS, F2_WINDOWS_CAPABILITY, apply_profile_controls,
+        validate_profile_fields, validate_f2_profile,
+    )
 
     profile = _load_profile_document(profile)
+    from r2f.modules.s1.topology_targets import TOPOLOGY_CAPABILITY, TOPOLOGY_TARGET
+    if profile.get('runtime_capability') == TOPOLOGY_CAPABILITY or (
+            isinstance(profile.get('target_ids'), list) and TOPOLOGY_TARGET in profile['target_ids']):
+        if target_id not in (None, TOPOLOGY_TARGET):
+            raise CorpusProfileError('topology_selected_target_mismatch')
+        return topology_corpus_from_profile(profile, seeds, cycle_id=cycle_id)
+    try:
+        validate_profile_fields(profile)
+        f2_windows = validate_f2_profile(profile)
+    except ValueError as exc:
+        raise CorpusProfileError(str(exc)) from exc
     if profile.get("schema_version") != _PROFILE_SCHEMA:
         raise CorpusProfileError("unsupported profile schema_version")
     if profile.get("campaign_kind") != "exploratory":
@@ -528,8 +647,9 @@ def corpus_from_profile(profile, seeds=None, *, cycle_id=None, target_id=None):
     rmws = _profile_strings(profile, "rmws")
     cycles = _profile_cycles(profile)
 
+    declared = exploratory_target_declarations(runtime_capability=profile.get("runtime_capability"))
     for target in all_targets:
-        if target not in EXPLORATORY_TARGET_ORDER:
+        if target not in declared:
             raise CorpusProfileError(f"profile target_ids contains unknown target {target}")
     for cycle in cycles:
         if cycle["target_id"] not in all_targets:
@@ -545,6 +665,10 @@ def corpus_from_profile(profile, seeds=None, *, cycle_id=None, target_id=None):
     for surface_id in all_surfaces:
         if surface_id not in fuzz_catalog.SURFACES:
             raise CorpusProfileError(f"profile surfaces contains unknown surface {surface_id}")
+        if f2_windows:
+            if surface_id not in F2_SURFACE_MUTATORS or not fuzz_catalog.f2_live_surface(surface_id).executable:
+                raise CorpusProfileError(f"profile surface {surface_id} has no explicit F2 live binding")
+            continue
         if surface_id in fuzz_catalog.F2_SURFACE_IDS:
             raise CorpusProfileError(
                 f"profile surface {surface_id} is capability pending and cannot enter the F1 live corpus")
@@ -576,7 +700,7 @@ def corpus_from_profile(profile, seeds=None, *, cycle_id=None, target_id=None):
         raise CorpusProfileError(
             f"cycle {cycle_id} belongs to {cycle['target_id']}, not {target_id}")
 
-    supported = _runner_cycle_targets()
+    supported = _runner_cycle_targets(profile)
     if cycle["runner_slice"] != _RUNNER_SLICE_CURRENT:
         raise CorpusProfileError(
             f"cycle {cycle['cycle_id']} ({cycle['target_id']}) is "
@@ -590,7 +714,7 @@ def corpus_from_profile(profile, seeds=None, *, cycle_id=None, target_id=None):
     surfaces = list(cycle["surfaces"])
     specs = cycle["seed_specs"]
 
-    declared_target = exploratory_target_declarations().get(cycle["target_id"])
+    declared_target = declared.get(cycle["target_id"])
     if declared_target is None:
         raise CorpusProfileError(f"cycle target {cycle['target_id']} is not declared")
     cycle_contract = declared_target.exploration_contract
@@ -653,7 +777,6 @@ def corpus_from_profile(profile, seeds=None, *, cycle_id=None, target_id=None):
     except ValueError as exc:
         raise CorpusProfileError("invalid corpus limits: " + str(exc)) from exc
 
-    declared = exploratory_target_declarations()
     live_seed_variants = set()
     for spec in specs:
         seed_id = spec["seed_id"]
@@ -671,19 +794,23 @@ def corpus_from_profile(profile, seeds=None, *, cycle_id=None, target_id=None):
         seed = seed_map[seed_id]
         fuzz_catalog.validate_seed(seed)
         capability = seed.get("capability", {})
-        if capability.get("status") != "authored" or capability.get("f1_routable") is not True:
+        if f2_windows:
+            if capability.get("status") != "capability_pending" or capability.get("f1_routable") is not False:
+                raise CorpusProfileError(f"seed {seed_id}: F2 template provenance must remain pending")
+        elif capability.get("status") != "authored" or capability.get("f1_routable") is not True:
             raise CorpusProfileError(
                 f"seed {seed_id} is capability pending and cannot enter the F1 live corpus")
         refs = seed.get("surface_refs")
         if not isinstance(refs, list) or len(refs) != 1:
             raise CorpusProfileError(f"seed {seed_id} must reference exactly one surface in this slice")
         surface_id = refs[0]
-        if surface_id not in fuzz_catalog.F1_SURFACE_IDS:
+        if not f2_windows and surface_id not in fuzz_catalog.F1_SURFACE_IDS:
             raise CorpusProfileError(f"seed {seed_id} references non-F1 surface {surface_id}")
         if surface_id not in surfaces:
             raise CorpusProfileError(
                 f"seed {seed_id} surface {surface_id} is not declared in the selected cycle")
-        surface = fuzz_catalog.SURFACES[surface_id]
+        surface = (fuzz_catalog.f2_live_surface(surface_id) if f2_windows
+                   else fuzz_catalog.SURFACES[surface_id])
         if not surface.executable:
             raise CorpusProfileError(f"seed {seed_id} surface {surface_id} is not executable")
         if spec["boundary_class"] not in surface.boundary_classes:
@@ -691,8 +818,8 @@ def corpus_from_profile(profile, seeds=None, *, cycle_id=None, target_id=None):
                 f"seed {seed_id} boundary_class {spec['boundary_class']} is not declared by {surface_id}")
 
         target_id = spec["target_id"]
-        if target_id not in EXPLORATORY_TARGET_ORDER:
-            raise CorpusProfileError(f"seed {seed_id} target {target_id} is not exploratory")
+        if target_id not in declared:
+            raise CorpusProfileError(f"seed {seed_id} target {target_id} is not explicitly exploratory")
         target = declared.get(target_id)
         if target is None:
             raise CorpusProfileError(f"seed {seed_id} target {target_id} is not declared")
@@ -702,7 +829,8 @@ def corpus_from_profile(profile, seeds=None, *, cycle_id=None, target_id=None):
         if surface_id not in contract.surface_by_id:
             raise CorpusProfileError(
                 f"target {target_id} does not declare surface {surface_id}")
-        runtime_target = EXPLORATORY_RUNTIME_TARGET.get(target_id)
+        runtime_target = (F2_WINDOWS_RUNTIME_TARGET if f2_windows
+                          else EXPLORATORY_RUNTIME_TARGET.get(target_id))
         if runtime_target is None:
             raise CorpusProfileError(
                 f"target {target_id} has no required runtime family; capability pending")
@@ -710,15 +838,20 @@ def corpus_from_profile(profile, seeds=None, *, cycle_id=None, target_id=None):
             raise CorpusProfileError(
                 f"seed {seed_id} target_family {seed.get('target_family')} "
                 f"does not match {target_id} runtime family {runtime_target}")
-        if target.observation_contract.get("activation") != "F1":
-            raise CorpusProfileError(f"target {target_id} is not an F1 activation target")
+        if target.observation_contract.get("activation") != ("F2" if f2_windows else "F1"):
+            raise CorpusProfileError(f"target {target_id} activation differs from explicit profile")
 
         # Select from the target's *projected* contract surface, not the raw
         # catalog list: projection prunes mutators per target (for example W02
         # keeps only M03 in the late-join contract).  Picking the catalog's
         # first mutator would hand the runner an undeclared mutator id.
         projected = contract.surface_by_id[surface_id]
-        implemented = [mid for mid in projected.mutator_ids if mid in MUTATORS]
+        implemented = ([F2_SURFACE_MUTATORS[surface_id]] if f2_windows
+                       and F2_SURFACE_MUTATORS[surface_id] in projected.mutator_ids else
+                       [mid for mid in projected.mutator_ids if mid in MUTATORS])
+        if f2_windows and (projected.to_dict() != surface.to_dict()
+                           or implemented != [F2_SURFACE_MUTATORS[surface_id]]):
+            raise CorpusProfileError(f"target {target_id} F2 surface/mutator contract mismatch")
         if not implemented:
             raise CorpusProfileError(
                 f"surface {surface_id} has no implemented mutator for the live corpus")
@@ -752,6 +885,20 @@ def corpus_from_profile(profile, seeds=None, *, cycle_id=None, target_id=None):
                                   **deepcopy(spec.get("overrides", {}).get("logical_config", {}))},
                 "executable": True,
             }
+            if f2_windows:
+                # New contract-bound executable input, NOT promotion of the old
+                # pending template, nor evidence of runtime guard discharge.
+                entry["final_config"] = apply_profile_controls(
+                    entry["final_config"], profile, backend="discovery_namespace")
+                from r2f.campaign.runner import _materialize_recovery_windows
+                _materialize_recovery_windows(entry["final_config"])
+                entry.update(activation="F2", runtime_capability=F2_WINDOWS_CAPABILITY,
+                             seed_template_capability=deepcopy(capability),
+                             seed_template_status=seed.get("status"),
+                             runtime_authorization={"runtime_capability": F2_WINDOWS_CAPABILITY,
+                                 "target_id": target_id, "target_revision": target.target_revision,
+                                 "contract_hash": contract_hash, "surface_id": surface_id,
+                                 "mutator_id": implemented[0], "observation_guards_discharged": False})
             corpus.add_seed(entry)
 
     if not corpus.entries:
@@ -948,6 +1095,7 @@ def f2_generation_corpus_from_profile(profile, seeds=None, *, cycle_id=None):
         if target_id != cycle["target_id"]:
             raise CorpusProfileError(
                 f"seed {seed_id} target {target_id} does not match cycle target {cycle['target_id']}")
+        # Generation never opts in to the distinct F2 windows runtime target.
         runtime_target = EXPLORATORY_RUNTIME_TARGET.get(target_id)
         # A target with no required runtime family (G01) is still generatable:
         # generation is not execution.  When a family is declared, the seed must
@@ -994,4 +1142,201 @@ def f2_generation_corpus_from_profile(profile, seeds=None, *, cycle_id=None):
             corpus.add_seed(entry)
     if not corpus.entries:
         raise CorpusProfileError("F2 profile produced an empty generation corpus")
+    return corpus
+
+
+TOPOLOGY_NORMALIZATION_SCHEMA = "r2f.topology-seed-normalization/v1"
+TOPOLOGY_INGESTION_SCHEMA = "r2f.topology-seed-ingestion/v1"
+
+
+def normalize_topology_seed_corpus(source_corpus):
+    """Return authored topology entries and a disposition for EVERY source entry.
+
+    Hashes are checked in their original domains. No defaults, RNG or observed
+    data are injected. Unsupported surfaces remain named in the ingestion audit.
+    """
+    from r2f.modules.s1 import input_model, topology_model
+    from .exploratory_input import TOPOLOGY_SOURCE_SCHEMA
+    if not isinstance(source_corpus, dict) or source_corpus.get('schema') != TOPOLOGY_SOURCE_SCHEMA:
+        raise CorpusProfileError('topology_source_schema_mismatch')
+    entries = source_corpus.get('entries')
+    if not isinstance(entries, list) or len(entries) > 256:
+        raise CorpusProfileError('topology_source_entries_budget_or_shape')
+    normalized, rows, seen = {}, [], set()
+    for entry in entries:
+        if not isinstance(entry, dict) or entry.get('schema') != 'r2f.s1-seed-entry/v1':
+            raise CorpusProfileError('topology_source_entry_schema_mismatch')
+        seed_id, surface = entry.get('seed_id'), entry.get('surface_id')
+        if not isinstance(seed_id, str) or not seed_id or seed_id in seen:
+            raise CorpusProfileError('topology_source_seed_id_missing_or_duplicate:' + str(seed_id))
+        seen.add(seed_id)
+        if 'document' not in entry or entry.get('content_sha256') != input_model.content_hash(entry['document']):
+            raise CorpusProfileError('topology_source_document_hash_mismatch:' + seed_id)
+        row = {'seed_id': seed_id, 'surface_id': surface,
+               'source_content_sha256': entry['content_sha256'],
+               'disposition': 'not_connected_non_topology_surface'}
+        if surface != 'S1.topology':
+            rows.append(row)
+            continue
+        provenance = entry.get('provenance', {})
+        if not isinstance(provenance, dict) or entry.get('status') != 'authored' or provenance.get('authored') is not True or \
+                provenance.get('derived_from_execution') is not False or \
+                entry.get('execution_evidence') is not False or entry.get('candidate_eligible') is not False:
+            raise CorpusProfileError('topology_source_not_authored_input:' + seed_id)
+        program = entry['document']
+        if not isinstance(program, dict) or program.get('schema') != topology_model.SCHEMA or \
+                len(json.dumps(program, ensure_ascii=False, allow_nan=False).encode()) > 1024 * 1024:
+            raise CorpusProfileError('topology_source_program_shape_or_byte_budget:' + seed_id)
+        expected = entry.get('expected_disposition')
+        validation = topology_model.validate_program(program)
+        negative = expected == 'expect_guard_reject'
+        if expected not in ('expect_pass', 'expect_guard_reject') or (
+                not negative and (validation['status'] != 'valid' or
+                                  validation['guard_disposition'] == 'guard_violation')) or (
+                negative and validation['status'] == 'valid' and
+                validation['guard_disposition'] != 'guard_violation') or (
+                validation['status'] != 'valid' and (not negative or any(
+                    error['code'] != 'duplicate' for error in validation['errors']))):
+            raise CorpusProfileError('topology_seed_validation_or_guard_expectation_mismatch:' + seed_id)
+        row['disposition'] = 'retained_guard_negative' if negative else 'normalized_authored_topology'
+        normalized[seed_id] = {**deepcopy(entry), 'validation': validation}
+        rows.append(row)
+    body = {'schema': TOPOLOGY_INGESTION_SCHEMA, 'source_schema': TOPOLOGY_SOURCE_SCHEMA,
+            'source_entry_count': len(entries), 'entries': rows,
+            'execution_evidence': False, 'candidate_eligible': False}
+    return normalized, {**body, 'receipt_sha256': canonical_hash(body)}
+
+
+def _validate_topology_ingestion(receipt, records):
+    """Check detached normalization provenance on checkpoint restore."""
+    from r2f.modules.s1 import input_model
+    if not isinstance(receipt, dict) or receipt.get('schema') != TOPOLOGY_INGESTION_SCHEMA:
+        raise ValueError('topology_ingestion_receipt_schema_mismatch')
+    body = {key: value for key, value in receipt.items() if key != 'receipt_sha256'}
+    if canonical_hash(body) != receipt.get('receipt_sha256'):
+        raise ValueError('topology_ingestion_receipt_hash_mismatch')
+    if receipt.get('source_schema') != 'r2f.s1-seed-corpus/v2' or \
+            receipt.get('execution_evidence') is not False or receipt.get('candidate_eligible') is not False:
+        raise ValueError('topology_ingestion_contract_mismatch')
+    rows = receipt.get('entries')
+    if not isinstance(rows, list) or receipt.get('source_entry_count') != len(rows):
+        raise ValueError('topology_ingestion_entry_count_mismatch')
+    for row in rows:
+        if not isinstance(row, dict) or set(row) != {
+                'seed_id', 'surface_id', 'source_content_sha256', 'disposition'} or \
+                not isinstance(row['seed_id'], str) or not row['seed_id'] or \
+                not isinstance(row['source_content_sha256'], str) or \
+                re.fullmatch(r'[0-9a-f]{64}', row['source_content_sha256']) is None or \
+                row['disposition'] not in {'not_connected_non_topology_surface',
+                                          'normalized_authored_topology', 'retained_guard_negative'} or \
+                (row['surface_id'] == 'S1.topology') != (
+                    row['disposition'] != 'not_connected_non_topology_surface'):
+            raise ValueError('topology_ingestion_entry_contract_mismatch')
+    by_id = {row['seed_id']: row for row in rows}
+    if len(by_id) != len(rows):
+        raise ValueError('topology_ingestion_duplicate_seed_id')
+    for record in records:
+        normalization = record.get('normalization_receipt')
+        # Derived corpus observations have their own receipts; only source
+        # templates participate in the authored normalization contract.
+        if normalization is None:
+            if record.get('seed_template') is True or record.get('source_seed_id') is not None:
+                raise ValueError('topology_source_normalization_receipt_missing')
+            continue
+        if not isinstance(normalization, dict) or normalization.get('schema') != TOPOLOGY_NORMALIZATION_SCHEMA:
+            raise ValueError('topology_normalization_receipt_schema_mismatch')
+        if normalization.get('source_surface_id') != 'S1.topology' or \
+                normalization.get('core_surface_id') != 'S1.topology.program' or \
+                normalization.get('normalization') != 'wrap_document_without_defaults_or_mutation' or \
+                normalization.get('execution_evidence') is not False or \
+                normalization.get('candidate_eligible') is not False:
+            raise ValueError('topology_normalization_contract_mismatch')
+        row = by_id.get(record.get('source_seed_id'))
+        final = record.get('final_config', {})
+        if row is None or row['disposition'] == 'not_connected_non_topology_surface' or \
+                record.get('source_schema') != receipt.get('source_schema') or \
+                record.get('source_content_sha256') != row['source_content_sha256'] or \
+                normalization.get('source_ingestion_sha256') != receipt['receipt_sha256'] or \
+                normalization.get('source_content_sha256') != row['source_content_sha256'] or \
+                set(final) != {'topology_program'} or \
+                input_model.content_hash(final['topology_program']) != row['source_content_sha256'] or \
+                normalization.get('core_envelope_sha256') != canonical_hash(final):
+            raise ValueError('topology_source_normalization_binding_mismatch')
+        provenance = record.get('source_provenance')
+        if record.get('source_entry_schema') != 'r2f.s1-seed-entry/v1' or \
+                not isinstance(provenance, dict) or provenance.get('authored') is not True or \
+                provenance.get('derived_from_execution') is not False or \
+                record.get('planned_only') is not True or record.get('derived_from_execution') is not False:
+            raise ValueError('topology_authored_source_provenance_mismatch')
+        negative = row['disposition'] == 'retained_guard_negative'
+        if record.get('expected_disposition') != ('expect_guard_reject' if negative else 'expect_pass'):
+            raise ValueError('topology_source_expected_disposition_mismatch')
+        if record.get('case_kind') != ('guard_negative' if negative else 'authored_topology') or \
+                record.get('executable') is not (not negative) or \
+                record.get('candidate_eligible') is not False or record.get('execution_admitted') is not False:
+            raise ValueError('topology_guard_or_candidate_classification_mismatch')
+
+
+def topology_corpus_from_profile(profile, source_corpus=None, *, cycle_id=None):
+    """Bridge authored v2 programs into the existing Corpus; no execution."""
+    from r2f.modules.s1 import fuzz_mutators_v2
+    from r2f.modules.s1.topology_targets import (
+        TOPOLOGY_TARGET, TOPOLOGY_SURFACE, TOPOLOGY_MUTATOR, TOPOLOGY_MUTATION_KIND,
+        TOPOLOGY_CARRIER, topology_target_declaration)
+    from .exploratory_input import validate_topology_profile, TOPOLOGY_SOURCE_SCHEMA
+    profile = _load_profile_document(profile)
+    try:
+        validate_topology_profile(profile)
+    except ValueError as exc:
+        raise CorpusProfileError(str(exc)) from exc
+    if cycle_id is None:
+        if len(profile['cycles']) != 1:
+            raise CorpusProfileError('topology_explicit_cycle_id_required')
+        cycle = profile['cycles'][0]
+    else:
+        matches = [c for c in profile['cycles'] if c['cycle_id'] == cycle_id]
+        if len(matches) != 1:
+            raise CorpusProfileError('topology_cycle_not_found:' + str(cycle_id))
+        cycle = matches[0]
+    source = fuzz_mutators_v2.corpus_v2() if source_corpus is None else source_corpus
+    normalized, ingestion = normalize_topology_seed_corpus(source)
+    dispositions = {row['seed_id']: row for row in ingestion['entries']}
+    target = topology_target_declaration()
+    corpus = Corpus(**profile.get('corpus', {}))
+    corpus.source_ingestion_receipt = ingestion
+    for spec in cycle['seed_specs']:
+        seed_id = spec['seed_id']
+        if seed_id not in normalized:
+            reason = dispositions.get(seed_id, {}).get('disposition', 'missing_seed')
+            raise CorpusProfileError('topology_seed_not_connected:' + seed_id + ':' + reason)
+        seed = normalized[seed_id]
+        if spec['expected_disposition'] != seed['expected_disposition']:
+            raise CorpusProfileError('topology_seed_spec_expectation_mismatch:' + seed_id)
+        final = {'topology_program': deepcopy(seed['document'])}
+        normalization = {'schema': TOPOLOGY_NORMALIZATION_SCHEMA,
+                         'source_surface_id': 'S1.topology', 'core_surface_id': TOPOLOGY_SURFACE,
+                         'source_content_sha256': seed['content_sha256'],
+                         'core_envelope_sha256': canonical_hash(final),
+                         'source_ingestion_sha256': ingestion['receipt_sha256'],
+                         'normalization': 'wrap_document_without_defaults_or_mutation',
+                         'execution_evidence': False, 'candidate_eligible': False}
+        for rmw in profile['rmws']:
+            corpus.add_seed({
+                'target_id': TOPOLOGY_TARGET, 'target_revision': target.target_revision, 'rmw': rmw,
+                'contract_hash': target.exploration_contract.contract_hash(),
+                'profile_id': profile['profile_id'], 'cycle_id': cycle['cycle_id'],
+                'surface_id': TOPOLOGY_SURFACE, 'boundary_class': spec['boundary_class'],
+                'mutator_id': TOPOLOGY_MUTATOR, 'mutation_kind': TOPOLOGY_MUTATION_KIND,
+                'carrier': TOPOLOGY_CARRIER, 'seed_id': seed_id, 'seed_template': True,
+                'source_schema': TOPOLOGY_SOURCE_SCHEMA, 'source_entry_schema': seed['schema'],
+                'source_seed_id': seed_id, 'source_content_sha256': seed['content_sha256'],
+                'source_provenance': deepcopy(seed['provenance']),
+                'normalization_receipt': deepcopy(normalization), 'final_config': deepcopy(final),
+                'expected_disposition': seed['expected_disposition'],
+                'case_kind': 'guard_negative' if not spec['executable'] else 'authored_topology',
+                'executable': spec['executable'], 'execution_admitted': False,
+                'candidate_eligible': False, 'derived_from_execution': False,
+                'planned_only': True, 'runner_slice': 'topology_v1',
+            })
+    _validate_topology_ingestion(ingestion, corpus.entries.values())
     return corpus

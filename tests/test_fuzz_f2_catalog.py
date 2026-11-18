@@ -187,6 +187,178 @@ class F2CorpusIsNotF1LiveCorpus(unittest.TestCase):
         self.assertIn("no F2 generation path", str(caught.exception))
 
 
+class F2GenerationBranchContracts(unittest.TestCase):
+    """Generation projections stay offline for every supported surface/mutator."""
+
+    @staticmethod
+    def profile():
+        return f2_profile("discovery.interruption_recovery.fuzz_v1",
+                          "E02", "E02", "M07", "count_boundary")
+
+    def test_every_generation_surface_mutator_boundary_and_rmw_is_nonselectable(self):
+        from copy import deepcopy
+        from r2f.campaign.corpus import F2_GENERATION_SLICE, f2_generation_corpus_from_profile
+
+        targets = {
+            "P01": "discovery.late_endpoint.fuzz_v1",
+            "P04": "builtin.discovery_projection_reconciliation.fuzz_v1",
+            "P06": "builtin.discovery_projection_reconciliation.fuzz_v1",
+            "W01": "discovery.late_join_delivery.fuzz_v1",
+            "E02": "discovery.interruption_recovery.fuzz_v1",
+            "E03": "discovery.interruption_recovery.fuzz_v1",
+            "G01": "discovery.match_compatibility.fuzz_v1",
+        }
+        self.assertEqual(set(targets), set(catalog.F2_GENERATION_MUTATORS))
+        seeds = catalog.load_seeds()["seeds"]
+        original_seeds = deepcopy(seeds)
+        for sid, target in targets.items():
+            for mid in catalog.F2_GENERATION_MUTATORS[sid]:
+                for boundary in catalog.SURFACES[sid].boundary_classes:
+                    with self.subTest(surface=sid, mutator=mid, boundary=boundary):
+                        profile = f2_profile(target, sid, sid, mid, boundary)
+                        profile["rmws"] = ["rmw_cyclonedds_cpp", "rmw_fastrtps_cpp"]
+                        spec = profile["cycles"][0]["seed_specs"][0]
+                        spec["overrides"] = {"logical_config": {"offline_marker": sid}}
+                        original_profile = deepcopy(profile)
+                        corpus = f2_generation_corpus_from_profile(
+                            profile, seeds, cycle_id="cycle-" + sid.lower())
+                        self.assertEqual(len(corpus.entries), 2)
+                        self.assertEqual(corpus.selectable(), [])
+                        self.assertEqual({row["rmw"] for row in corpus.entries.values()},
+                                         set(profile["rmws"]))
+                        for row in corpus.entries.values():
+                            self.assertFalse(row["executable"])
+                            self.assertFalse(row["execution_admitted"])
+                            self.assertTrue(row["planned_only"])
+                            self.assertFalse(row["derived_from_execution"])
+                            self.assertEqual(row["capability_status"], "generatable_pending_execution")
+                            self.assertEqual(row["runner_slice"], F2_GENERATION_SLICE)
+                            self.assertEqual((row["target_id"], row["surface_id"], row["mutator_id"],
+                                              row["boundary_class"]), (target, sid, mid, boundary))
+                            self.assertEqual(row["final_config"],
+                                             {**seeds[sid]["logical_config"], "offline_marker": sid})
+                            for field in ("runtime_capability", "runtime_authorization", "raw_path",
+                                          "execution_metadata", "oracle_verdict", "mutation_receipt"):
+                                self.assertNotIn(field, row)
+                        self.assertEqual(profile, original_profile)
+        self.assertEqual(seeds, original_seeds)
+
+    def test_generation_profile_authorization_and_shape_gates(self):
+        from r2f.campaign.corpus import CorpusProfileError, f2_generation_corpus_from_profile
+        cases = (
+            ("schema_version", "bad", "schema_version"),
+            ("campaign_kind", "required", "campaign_kind"),
+            ("activation", "F1", "activation"),
+            ("required_catalog_included", True, "required catalog"),
+            ("enabled", True, "enabled=false"),
+            ("profile_id", "", "profile_id"),
+            ("seed_catalog_status", "executed", "authored_t02"),
+            ("rmws", [], "rmws"),
+            ("target_ids", [], "target_ids"),
+            ("surfaces", [], "surfaces"),
+            ("cycles", [], "explicit cycles"),
+            ("cycles", [None], "must be an object"),
+        )
+        for field, value, reason in cases:
+            with self.subTest(field=field, value=value):
+                profile = self.profile()
+                profile[field] = value
+                with self.assertRaisesRegex(CorpusProfileError, reason):
+                    f2_generation_corpus_from_profile(profile, cycle_id="cycle-e02")
+
+    def test_generation_cycle_and_spec_validation_gates(self):
+        from copy import deepcopy
+        from r2f.campaign.corpus import CorpusProfileError, f2_generation_corpus_from_profile
+        cases = (
+            ("cycle_id", "", "cycle_id is required"),
+            ("target_id", "", "target_id is required"),
+            ("surfaces", [], "surfaces must be nonempty"),
+            ("surfaces", ["E02", "E02"], "surfaces contains duplicates"),
+            ("seed_specs", [], "nonempty list"),
+            ("seed_specs", [None], "must be an object"),
+        )
+        for field, value, reason in cases:
+            with self.subTest(field=field, value=value):
+                profile = self.profile()
+                profile["cycles"][0][field] = value
+                with self.assertRaisesRegex(CorpusProfileError, reason):
+                    f2_generation_corpus_from_profile(profile, cycle_id="cycle-e02")
+        for field, value, reason in (
+                ("seed_id", "", "requires seed_id"),
+                ("target_id", "foreign", "different target"),
+                ("executable", True, "executable=false"),
+                ("overrides", [], "overrides must be an object"),
+                ("overrides", {"logical_config": []}, "logical_config must be an object")):
+            with self.subTest(spec_field=field, value=value):
+                profile = self.profile()
+                profile["cycles"][0]["seed_specs"][0][field] = value
+                with self.assertRaisesRegex(CorpusProfileError, reason):
+                    f2_generation_corpus_from_profile(profile, cycle_id="cycle-e02")
+        for duplicate, reason in (("cycles", "duplicates cycle_id"),
+                                  ("seed_specs", "seed_specs duplicates")):
+            profile = self.profile()
+            items = (profile["cycles"] if duplicate == "cycles"
+                     else profile["cycles"][0]["seed_specs"])
+            items.append(deepcopy(items[0]))
+            with self.subTest(duplicate=duplicate), self.assertRaisesRegex(CorpusProfileError, reason):
+                f2_generation_corpus_from_profile(profile, cycle_id="cycle-e02")
+
+    def test_generation_target_surface_seed_and_family_gates(self):
+        from copy import deepcopy
+        from r2f.campaign.corpus import CorpusProfileError, f2_generation_corpus_from_profile
+        cases = (
+            ("cycle", "not-present", "no unique cycle"),
+            ("targets", ["foreign"], "not in profile target_ids"),
+            ("surfaces", ["E99"], "unknown surface"),
+            ("surfaces", ["E01"], "no F2 generation path"),
+            ("surfaces", ["E03"], "not declared in the selected cycle"),
+            ("seeds", {}, "missing from the provided seed mapping"),
+            ("seed_id", "E01", "has no F2 generation path"),
+            ("mutator_id", "M01", "not declared for E02"),
+            ("boundary_class", "bogus", "not declared by E02"),
+            ("target_id", "discovery.late_join_delivery", "is not exploratory"),
+            ("target_id", "discovery.late_join_delivery.fuzz_v1", "runtime family"),
+        )
+        for field, value, reason in cases:
+            with self.subTest(field=field, value=value):
+                profile, seeds, cycle_id = self.profile(), deepcopy(catalog.load_seeds()["seeds"]), "cycle-e02"
+                spec = profile["cycles"][0]["seed_specs"][0]
+                if field == "cycle":
+                    cycle_id = value
+                elif field == "targets":
+                    profile["target_ids"] = value
+                elif field == "surfaces":
+                    profile["surfaces"] = value
+                elif field == "seeds":
+                    seeds = value
+                else:
+                    spec[field] = value
+                    if field == "target_id":
+                        profile["target_ids"] = [value]
+                        profile["cycles"][0]["target_id"] = value
+                with self.assertRaisesRegex(CorpusProfileError, reason):
+                    f2_generation_corpus_from_profile(profile, seeds, cycle_id=cycle_id)
+
+    def test_live_capability_field_cannot_promote_a_generation_profile(self):
+        from r2f.campaign.corpus import CorpusProfileError, f2_generation_corpus_from_profile
+        from r2f.modules.s1.targets import F2_WINDOWS_CAPABILITY, F2_WINDOWS_TARGET
+        for capability in (None, F2_WINDOWS_CAPABILITY, "f2_all"):
+            with self.subTest(capability=capability):
+                profile = self.profile()
+                profile["runtime_capability"] = capability
+                corpus = f2_generation_corpus_from_profile(profile, cycle_id="cycle-e02")
+                self.assertEqual(corpus.selectable(), [])
+                for row in corpus.entries.values():
+                    self.assertFalse(row["executable"])
+                    self.assertFalse(row["execution_admitted"])
+                    self.assertNotIn("runtime_capability", row)
+                profile["target_ids"] = [F2_WINDOWS_TARGET]
+                profile["cycles"][0]["target_id"] = F2_WINDOWS_TARGET
+                profile["cycles"][0]["seed_specs"][0]["target_id"] = F2_WINDOWS_TARGET
+                with self.assertRaisesRegex(CorpusProfileError, "is not exploratory"):
+                    f2_generation_corpus_from_profile(profile, cycle_id="cycle-e02")
+
+
 class PlannedOnlyToRuntime(unittest.TestCase):
     def test_multi_window_plan_is_unsupported_without_multi_window_capability(self):
         from r2f.core.mutation_plan import ExplorationContract

@@ -116,22 +116,12 @@ def make_corpus():
 
 def synthetic_observation(content, *, boundary, edge):
     """Labelled synthetic feedback for scheduler tests only. Never evidence."""
-    return {
-        "content_sha256": content,
-        "run_id": "synthetic-feedback-fixture",
-        "target_id": TARGET,
-        "execution_stage": "judged",
-        "actual_run": True,
-        "evidence_origin": "synthetic_feedback_fixture",
-        "surface_id": "P01",
-        "boundary_class": boundary,
-        "observed_edge": edge,
-        "oracle_verdict": "pass",
-        "typed_facts": {"environment_healthy": True, "process_healthy": True,
-                        "preconditions_reached": True,
-                        "endpoint_identity_complete": True,
-                        "window": {"complete": True}},
-    }
+    from test_observation_status import projected_record
+    record = projected_record()
+    record.update(content_sha256=content, run_id="synthetic-feedback-fixture",
+                  target_id=TARGET, evidence_origin="synthetic_feedback_fixture",
+                  surface_id="P01", boundary_class=boundary, parameter_class=boundary)
+    return record
 
 
 class ExploratoryFeedbackLoop(unittest.TestCase):
@@ -288,7 +278,8 @@ class ExploratoryFeedbackLoop(unittest.TestCase):
 
         def runtime(config, output_dir):
             calls.append(config)
-            return fixture_pair(config, pathlib.Path(output_dir) / "fixture", fresh_matches=True)
+            from test_feedback_epoch_runner import adapter_runtime
+            return adapter_runtime(config, output_dir)
 
         _, result = self.cycle("executed", corpus, feedback, scheduler,
                                execute=True, runtime=runtime)
@@ -302,10 +293,11 @@ class ExploratoryFeedbackLoop(unittest.TestCase):
         self.assertTrue(feedback.events[0]["coverage"])
         self.assertGreaterEqual(result["budget"]["executed"], 1)
         offer = row["corpus_offer"]
-        # Success alone is deliberately not a corpus admission reason.
-        self.assertFalse(offer["admitted"], offer)
-        self.assertEqual(offer["reason"], "success_only")
-        self.assertNotIn(offer["content_sha256"], corpus.entries)
+        # Pass alone is insufficient; this upgraded raw fixture also observes
+        # a new projection-backed edge, which is an independent admission reason.
+        self.assertTrue(offer["admitted"], offer)
+        self.assertEqual(offer["reason"], "new_state_edge")
+        self.assertIn(offer["content_sha256"], corpus.entries)
         self.assertEqual(result["corpus"]["entry_count"], len(corpus.entries))
         # An offline injected fixture is plumbing evidence, never a SUT candidate.
         self.assertEqual(result["budget"].get("candidates", 0), 0)

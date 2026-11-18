@@ -133,6 +133,13 @@ def target_declarations():
 # that cannot be explained.
 # ---------------------------------------------------------------------------
 
+F2_WINDOWS_TARGET = "discovery.interruption_recovery.fuzz_windows_v1"
+F2_WINDOWS_CAPABILITY = "f2_windows_v1"
+F2_WINDOWS_RUNTIME_TARGET = "discovery.interruption_recovery"
+F2_ANCHOR_TIMING_POLICY = "f2_anchor_not_before_v1"
+F2_ANCHOR_LATENESS_TOLERANCE_SEC = 0.5
+
+
 EXPLORATORY_TARGET_IDS = (
     "discovery.late_endpoint.fuzz_v1",
     "discovery.late_join_delivery.fuzz_v1",
@@ -189,8 +196,8 @@ _EXPLORATORY_SCOPE = {
 }
 
 
-def exploratory_target_declarations():
-    """Build the five exploratory targets, resolving every catalog reference.
+def exploratory_target_declarations(*, runtime_capability=None):
+    """Build legacy targets plus an explicitly opted-in runtime capability.
 
     A surface whose runtime binding is missing is still declared here (so the
     capability gap is visible and reviewable) but the returned target records
@@ -199,6 +206,10 @@ def exploratory_target_declarations():
     from r2f.core.semantic_target import SemanticTarget
     from r2f.modules.s1 import fuzz_catalog
 
+    from .topology_targets import TOPOLOGY_CAPABILITY
+
+    if runtime_capability not in (None, F2_WINDOWS_CAPABILITY, TOPOLOGY_CAPABILITY):
+        raise ValueError("unsupported exploratory runtime_capability: " + str(runtime_capability))
     base = target_declarations()
     targets = {}
     for target_id in EXPLORATORY_TARGET_ORDER:
@@ -265,4 +276,81 @@ def exploratory_target_declarations():
             data["state_preconditions"] = [dict(p.to_dict()) for p in source.state_preconditions]
             data["state_steps"] = [dict(s.to_dict()) for s in source.state_steps]
         targets[target_id] = SemanticTarget.from_dict(data)
+    if runtime_capability == F2_WINDOWS_CAPABILITY:
+        target = f2_windows_target_declaration()
+        targets[target.target_id] = target
+    if runtime_capability == TOPOLOGY_CAPABILITY:
+        from .topology_targets import topology_target_declaration
+        target = topology_target_declaration()
+        targets[target.target_id] = target
     return targets
+
+
+def f2_windows_target_declaration():
+    """New rev0 window target; never mutate a legacy declaration in place."""
+    from r2f.core.semantic_target import SemanticTarget
+    from .fuzz_catalog import f2_live_contract
+
+    source = target_declarations()[F2_WINDOWS_RUNTIME_TARGET]
+    data = source.to_dict()
+    data.update(
+        target_id=F2_WINDOWS_TARGET, target_revision=0,
+        intent_and_scope=(
+            "Explicit F2 E02/M07 window count/restore interval and E03/M06 "
+            "anchor offset over 1..3 discovery-drop windows. Unresolved runtime "
+            "guards require fresh pair-bound raw evidence before each action; "
+            "planning is not reached, mutation application, hit or execution."),
+        mutation_slots=[{"mutation_kind": "discovery_drop", "carrier": "wire_proxy",
+                         "parameters": {}}],
+        exploration_contract=f2_live_contract(),
+        observation_contract={
+            "schema": "s1.exploratory.v1",
+            "reuses": source.target_id,
+            "reuse_kind": "runtime_adapter_and_observation_schema",
+            "required_schema": source.observation_contract["schema"],
+            "required_sources": list(source.observation_contract["sources"]),
+            "surfaces": ["E02", "E03"], "pending_surface_ids": [],
+            "activation": "F2", "runtime_capability": F2_WINDOWS_CAPABILITY,
+            "max_runtime_windows": 3, "max_chain_length": 1,
+            "surface_dependencies": {
+                "E03": {"requires_surface_ids": ["E02"],
+                        "dependency_kind": "target_capability_and_complete_window_input",
+                        "operation_order_if_composed": ["E02", "E03"]}},
+            "runtime_guards": {
+                "E02": "fresh_match_and_previous_window_restored_before_drop",
+                "E03": "named_anchor_observed_before_eligible_drop"},
+            "anchor_timing_policy": F2_ANCHOR_TIMING_POLICY,
+            "anchor_lateness_tolerance_sec": F2_ANCHOR_LATENESS_TOLERANCE_SEC,
+            "anchor_timing_contract": {
+                "fresh_match": {
+                    "raw_event": "discovery_precondition_snapshot",
+                    "identity": "fresh_bidirectional_match_bound_to_current_pair",
+                    "not": "earliest_unobserved_network_match"},
+                "previous_restore_confirmed": {
+                    "raw_event": "discovery_recovery_confirmed",
+                    "window": "immediately_previous_window"},
+                "clock": "monotonic",
+                "eligible_drop": "max(anchor_monotonic + trigger_offset_sec, "
+                                 "previous_recovery_monotonic + previous_restore_interval_sec)",
+                "first_window_previous_recovery_bound": "not_applicable",
+                "actual_install": "eligible_drop <= install <= eligible_drop + tolerance",
+                "timing_miss": "harness_incomplete_not_sut_candidate",
+                "verification": "runtime_and_adapter_independent_raw_recomputation"},
+            "operation_hit_contract": {
+                "E02": "exact_window_count_and_restore_intervals",
+                "E03": {
+                    "anchor": "parameters.anchor selects an anchor class, not the first window",
+                    "affected_window_indices": "[i for i,w in enumerate(environment_windows) "
+                                               "if w.trigger_anchor == parameters.anchor]",
+                    "offset": "every affected window trigger_offset_sec == parameters.offset_sec",
+                    "empty_affected_window_set": "input_rejected",
+                    "fresh_match_indices": [0],
+                    "previous_restore_confirmed_indices": "1..count-1 (requires count>=2)"},
+                "each_window": ["pair_bound_nonzero_discovery_drop_counter",
+                                "restore_discovery_activity", "fresh_graph_and_bidirectional_match",
+                                "postrestore_delivery"],
+                "aggregate_or_window_count_only_hit": False},
+            "evidence": "no exploratory run is implied by this declaration",
+        },
+    )
+    return SemanticTarget.from_dict(data)

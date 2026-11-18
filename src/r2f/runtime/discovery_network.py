@@ -171,24 +171,33 @@ def _host_identity():
     }
 
 
-def namespace_command(argv, *, python_executable=None):
+def namespace_command(argv, *, python_executable=None, pid_mount=False):
     """Build, never execute, an unshare wrapper. argv is an argument sequence.
 
     Keep the launch environment (including PYTHONPATH and ROS setup). The inner
     wrapper writes no stdout, preserving controller/worker JSONL protocols.
     The launcher must be an unprivileged host user without CAP_NET_ADMIN.
+    pid_mount=True opts the entire controller subtree into a fresh PID/mount
+    namespace with private procfs. It changes no kernel authentication checks.
     """
     if not isinstance(argv, (list, tuple)) or not argv or any(
         not isinstance(a, str) or not a or '\0' in a for a in argv
     ):
         raise ValueError('argv must be a nonempty sequence of nonempty strings')
+    if type(pid_mount) is not bool:
+        raise ValueError('pid_mount must be bool')
     host = _host_identity()
     if host['host_uid'] == 0 or host['host_cap_eff'] & (1 << 12):
         raise NetworkIsolationError('launcher must be nonroot without host CAP_NET_ADMIN')
     if _PROOF_ENV in os.environ:
         raise NetworkIsolationError('nested discovery namespace launch is not supported')
+    # Default stays byte-for-byte compatible. PIDNS init owns the entire
+    # optional workload; the supervisor kills it even on abrupt group exit.
+    isolation = ['unshare', '--user', '--map-root-user', '--net']
+    if pid_mount:
+        isolation += ['--pid', '--fork', '--mount', '--mount-proc', '--kill-child=SIGKILL']
     return [
-        'unshare', '--user', '--map-root-user', '--net', '--',
+        *isolation, '--',
         python_executable or sys.executable, '-B', '-m', __name__, '_enter',
         json.dumps(host, sort_keys=True), '--', *argv,
     ]

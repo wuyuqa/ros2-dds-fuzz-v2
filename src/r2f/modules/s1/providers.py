@@ -11,7 +11,9 @@ from r2f.core.mutation_plan import (
     ExplorationContract, MutationPlan, MutationProposal, validate_plan,
 )
 from .targets import (EXECUTION_ORDER, EXPLORATORY_RUNTIME_TARGET,
-                      EXPLORATORY_TARGET_ORDER)
+                      EXPLORATORY_TARGET_ORDER, F2_WINDOWS_TARGET, F2_WINDOWS_CAPABILITY,
+                      F2_WINDOWS_RUNTIME_TARGET,
+                      F2_ANCHOR_TIMING_POLICY, F2_ANCHOR_LATENESS_TOLERANCE_SEC)
 
 
 _KINDS = dict(zip(EXECUTION_ORDER, ('late_joiner', 'late_joiner',
@@ -265,25 +267,157 @@ def _exploratory_base_input(target_id):
     """The reviewed semantic default payload for the reused runtime backend."""
     from r2f.campaign.identity import semantic_input
 
-    runtime_target = EXPLORATORY_RUNTIME_TARGET.get(target_id)
+    runtime_target = (F2_WINDOWS_RUNTIME_TARGET if target_id == F2_WINDOWS_TARGET
+                      else EXPLORATORY_RUNTIME_TARGET.get(target_id))
     if runtime_target is None:
         raise ExploratoryInputError(
             f"{target_id}: no live runtime backend is wired for this target")
     return semantic_input("mutated", None, target_id=runtime_target)
 
 
-def _plan_capabilities(contract):
-    return dict(EXPLORATORY_ACTIVATION_CAPABILITIES)
+def _plan_capabilities(contract, *, target_id=None, carrier=None, mutation_kind=None):
+    # The default remains single-window.  A target name alone cannot grant a
+    # different carrier, backend or a generation-only surface live admission.
+    from r2f.runtime.ros2_pair import (RECOVERY_FUZZ_TARGET,
+                                       exploratory_runtime_capabilities)
+
+    caps = {**EXPLORATORY_ACTIVATION_CAPABILITIES, "multi_window": False}
+    route = exploratory_runtime_capabilities().get(target_id, {})
+    if not isinstance(route, dict):
+        route = {}
+    maximum = route.get("max_runtime_windows")
+    route_surfaces = route.get("surfaces")
+    if (target_id == F2_WINDOWS_TARGET and carrier == "wire_proxy"
+            and mutation_kind == "discovery_drop"
+            and route.get("runtime_capability") == F2_WINDOWS_CAPABILITY
+            and route.get("implemented") is True
+            and route.get("backend") == "discovery_namespace"
+            and route.get("carrier") == carrier
+            and route.get("mutation_kind") == mutation_kind
+            and route.get("multi_window") is True
+            and type(maximum) is int and 1 <= maximum <= 3
+            and isinstance(route_surfaces, (tuple, list))
+            and all(isinstance(sid, str) for sid in route_surfaces)
+            and len(route_surfaces) == 2 and set(route_surfaces) == {"E02", "E03"}):
+        from .fuzz_catalog import F2_LIVE_SURFACE_BINDINGS
+        caps.update(activation=("F2",), mutators=("M06", "M07"),
+                    surface_kinds=("environment",),
+                    runtime_bindings=tuple(binding for _, binding
+                                           in F2_LIVE_SURFACE_BINDINGS.values()),
+                    multi_window=True, max_runtime_windows=maximum,
+                    runtime_capability=F2_WINDOWS_CAPABILITY)
+    if (target_id == RECOVERY_FUZZ_TARGET and carrier == "wire_proxy"
+            and mutation_kind == "discovery_drop"
+            and route.get("implemented") is True
+            and route.get("backend") == "discovery_namespace"
+            and route.get("carrier") == carrier
+            and route.get("mutation_kind") == mutation_kind
+            and route.get("multi_window") is True
+            and type(maximum) is int and 1 < maximum <= 3):
+        caps.update(multi_window=True, max_runtime_windows=maximum)
+    return caps
 
 
-def validate_exploratory_plan(plan, contract):
-    """Validate one plan against the exploratory runtime capability set."""
-    result = validate_plan(plan, capabilities=_plan_capabilities(contract),
-                           contract=contract)
-    if result.status != "valid":
+def validate_exploratory_plan(plan, contract, *, target_id=None, carrier=None,
+                              mutation_kind=None):
+    """Validate a plan against the capabilities of its explicit execution route."""
+    if not isinstance(plan, MutationPlan):
+        plan = MutationPlan.from_dict(plan)
+    caps = _plan_capabilities(contract, target_id=target_id, carrier=carrier,
+                              mutation_kind=mutation_kind)
+    # Chained counters belong to discovery_drop, never to the netem carrier.
+    environment_mutation = plan.final_config.get("environment_mutation")
+    if environment_mutation is not None and environment_mutation != {"kind": "discovery_drop"}:
+        caps["multi_window"] = False
+    f2_route = (target_id == F2_WINDOWS_TARGET
+                and caps.get("runtime_capability") == F2_WINDOWS_CAPABILITY)
+    if target_id == F2_WINDOWS_TARGET and not f2_route:
+        raise ExploratoryInputError("f2_windows_runtime_route_capability_not_available")
+    result = validate_plan(plan, capabilities=caps, contract=contract)
+    if f2_route and result.status in {"valid", "needs_observation"}:
+        _validate_f2_windows_input(plan, contract, maximum=caps["max_runtime_windows"])
+    if result.status != "valid" and not (f2_route and result.status == "needs_observation"):
         raise ExploratoryInputError(
             f"plan is not live-routable ({result.status}): " + "; ".join(result.reasons))
     return result
+
+
+def _validate_f2_windows_input(plan, contract, *, maximum):
+    """Structural admission only; runtime must discharge every guard from raw.
+
+    E03's E02 dependency is provided by this exact closed target contract and
+    its complete materialized windows, not a forged E02 executed operation.
+    """
+    from .fuzz_catalog import f2_live_contract
+    from r2f.runtime.discovery_network import validate_window_plan
+
+    if not isinstance(contract, ExplorationContract):
+        contract = ExplorationContract.from_dict(contract)
+    if contract.to_dict() != f2_live_contract().to_dict():
+        raise ExploratoryInputError("f2_windows_contract_mismatch")
+    if len(plan.operations) != 1:
+        raise ExploratoryInputError("f2_windows_v1 requires exactly one operation")
+    operation = plan.operations[0]
+    if operation.applicability_status != "needs_observation":
+        raise ExploratoryInputError("f2_windows_runtime_guard_must_remain_needs_observation")
+    for guard in ("anchor_observed", "post_match_observed"):
+        if guard in operation.parameters and operation.parameters[guard] is not False:
+            raise ExploratoryInputError("f2_windows_observation_cannot_be_supplied_by_plan:" + guard)
+    config = plan.final_config
+    if (config.get("runtime_capability") != F2_WINDOWS_CAPABILITY
+            or config.get("anchor_timing_policy") != F2_ANCHOR_TIMING_POLICY
+            or type(config.get("anchor_lateness_tolerance_sec")) not in (int, float)
+            or config["anchor_lateness_tolerance_sec"] != F2_ANCHOR_LATENESS_TOLERANCE_SEC):
+        raise ExploratoryInputError("f2_windows_anchor_timing_contract_mismatch")
+    # Reuse the same pure canonical-control gate as planning/capsule replay;
+    # a directly prepared plan must not sneak extra stimulus controls into F2.
+    from r2f.campaign.exploratory_input import runtime_input
+    try:
+        runtime_input(config, backend="discovery_namespace")
+    except ValueError as exc:
+        raise ExploratoryInputError(str(exc)) from exc
+    if "environment_mutation" in config:
+        raise ExploratoryInputError("f2_windows_only_discovery_drop_is_supported")
+    windows = config.get("environment_windows")
+    if not isinstance(windows, list) or not 1 <= len(windows) <= maximum:
+        raise ExploratoryInputError("f2_windows_requires_complete_1_to_3_window_input")
+    fields = {"window_id", "window_index", "trigger_anchor", "trigger_offset_sec",
+              "drop_duration_sec", "restore_interval_sec"}
+    for index, window in enumerate(windows):
+        if not isinstance(window, dict) or set(window) != fields:
+            raise ExploratoryInputError("f2_windows_missing_or_unknown_window_fields")
+        if type(window["window_index"]) is not int or window["window_index"] != index:
+            raise ExploratoryInputError("f2_windows_indices_must_be_sequential_from_zero")
+        anchor = "fresh_match" if index == 0 else "previous_restore_confirmed"
+        if window["trigger_anchor"] != anchor:
+            raise ExploratoryInputError("f2_windows_anchor_order_mismatch")
+    try:
+        validate_window_plan(windows)
+    except ValueError as exc:
+        raise ExploratoryInputError("f2_windows_invalid_window: " + str(exc)) from exc
+    expected = [{"schema": "r2f.runtime-window/v1", **window} for window in windows]
+    if canonical_hash(plan.runtime_windows) != canonical_hash(expected):
+        raise ExploratoryInputError("f2_windows_plan_and_final_input_differ")
+    parameters = operation.parameters
+    if operation.surface_id == "E02":
+        if (type(parameters.get("window_count")) is not int
+                or parameters["window_count"] != len(windows)
+                or any(type(parameters.get("restore_interval_sec")) not in (int, float)
+                       or parameters["restore_interval_sec"] != window["restore_interval_sec"]
+                       for window in windows)):
+            raise ExploratoryInputError("f2_windows_e02_count_or_interval_binding_mismatch")
+        affected = [0]
+        offset = parameters.get("anchor_offset_sec")
+        if parameters.get("anchor") != "fresh_match":
+            raise ExploratoryInputError("f2_windows_e02_anchor_binding_mismatch")
+    else:
+        anchor = parameters.get("anchor")
+        affected = [index for index, window in enumerate(windows)
+                    if window["trigger_anchor"] == anchor]
+        offset = parameters.get("offset_sec")
+    if (not affected or type(offset) not in (int, float)
+            or any(offset != windows[index]["trigger_offset_sec"] for index in affected)):
+        raise ExploratoryInputError("f2_windows_operation_anchor_or_offset_binding_mismatch")
 
 
 def _operation_inputs(plan):
@@ -323,13 +457,18 @@ class S1ExploratoryMutationProvider:
         if not isinstance(plan, MutationPlan):
             plan = MutationPlan.from_dict(plan)
         contract = self.contract_for(scenario.target_id)
+        if scenario.target_id == F2_WINDOWS_TARGET and (
+                scenario.arm != "mutated" or not _accepts(scenario, self._targets)):
+            raise ExploratoryInputError("f2_windows_requires_registered_mutated_discovery_drop_scenario")
         if not contract.surfaces:
             pending = scenario.target.observation_contract.get("pending_surface_ids", [])
             raise ExploratoryInputError(
                 f"{scenario.target_id}: no live routable surface "
                 f"(capability pending: {','.join(pending) or 'unspecified'}); "
                 "refusing to prepare a live input")
-        validate_exploratory_plan(plan, contract)
+        validation = validate_exploratory_plan(plan, contract, target_id=scenario.target_id,
+                                  carrier=scenario.carrier,
+                                  mutation_kind=scenario.mutation_kind)
         if plan.rng_seed != scenario.seed:
             raise ExploratoryInputError(
                 "plan rng_seed does not match the scenario seed; refusing to "
@@ -370,7 +509,7 @@ class S1ExploratoryMutationProvider:
             "mutation_parameters": deepcopy(scenario.mutation_parameters),
             "final_input": submitted,
             "input_layer_receipts": receipts,
-            "plan_status": "valid",
+            "plan_status": validation.status,
         }
 
     def prepare(self, scenario):
@@ -397,7 +536,7 @@ class S1ExploratoryCarrier(S1Carrier):
     """
 
     def apply(self, scenario, prepared, *, execution):
-        if scenario.target_id not in EXPLORATORY_TARGET_ORDER:
+        if scenario.target_id not in self._targets:
             raise ExploratoryInputError("not an exploratory target: " + scenario.target_id)
         if not isinstance(prepared, dict):
             raise ExploratoryInputError("prepared exploratory input must be a dict")
@@ -425,7 +564,8 @@ class S1ExploratoryOracle(S1Oracle):
         if scenario.target_id == "discovery.match_compatibility.fuzz_v1":
             from .oracles import evaluate_match_compatibility_guard
             return evaluate_match_compatibility_guard(facts)
-        runtime_target = EXPLORATORY_RUNTIME_TARGET.get(scenario.target_id)
+        runtime_target = (F2_WINDOWS_RUNTIME_TARGET if scenario.target_id == F2_WINDOWS_TARGET
+                          else EXPLORATORY_RUNTIME_TARGET.get(scenario.target_id))
         if runtime_target is None:
             raise ExploratoryInputError("no oracle backend for " + scenario.target_id)
         from .oracles import evaluate_primary
@@ -433,6 +573,12 @@ class S1ExploratoryOracle(S1Oracle):
 
 
 def exploratory_service_bindings(targets):
+    from .topology_targets import TOPOLOGY_TARGET
+    if TOPOLOGY_TARGET in targets:
+        from .topology_services import topology_service_bindings
+        legacy = {key: target for key, target in targets.items() if key != TOPOLOGY_TARGET}
+        return {**exploratory_service_bindings(legacy),
+                **topology_service_bindings({TOPOLOGY_TARGET: targets[TOPOLOGY_TARGET]})}
     provider = S1ExploratoryMutationProvider(targets)
     facts = S1FactProducer()
     oracle = S1ExploratoryOracle()

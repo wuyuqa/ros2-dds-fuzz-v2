@@ -39,6 +39,8 @@ ENVIRONMENT_MUTATION_KINDS = ('discovery_drop', 'discovery_netem')
 CLOCK_GUARD_NS = 50_000_000
 RECOVERY_ACTIVITY_LIMIT = 32768
 
+from .ros2_pair import F2_WINDOWS_TARGET, f2_windows_operations
+
 
 def recovery_capture_spec(*, output_dir, run_id, domain_id, netns_identity, limits=None):
     """Build the third target's bounded observer spec without changing global defaults."""
@@ -102,6 +104,8 @@ def discovery_carrier_kind(config):
 
 def normalize_discovery_config(config):
     c = dict(config)
+    if c.get('target_id') == F2_WINDOWS_TARGET:
+        f2_windows_operations(c)
     params = c['mutation_parameters']
     for key, default in (('drop_duration_sec', 3.0), ('recovery_timeout_sec', 8.0), ('counter_interval_sec', 0.25)):
         value = c.get(key, params.get(key, default))
@@ -317,11 +321,12 @@ def _write_role_profiles(output_dir, config):
     root = Path(output_dir) / 'profiles'
     root.mkdir(exist_ok=True)
     records, environments = {}, {}
-    # reader2..reader9 are churn roles; each receives its own resolved vendor
-    # profile so an explicit override never inherits a mismatched transport
-    # configuration from the base reader.
+    # Every churn role receives its own resolved vendor profile. Append
+    # writer2 so its FastDDS participant ID is unique without changing any
+    # existing role's index or profile hash.
     for index, role in enumerate(('writer', 'reader', 'reader2', 'reader3', 'reader4',
-                                  'reader5', 'reader6', 'reader7', 'reader8', 'reader9')):
+                                  'reader5', 'reader6', 'reader7', 'reader8', 'reader9',
+                                  'writer2')):
         rmw = role_rmw(config, role)
         path = root / (role + '.xml')
         if path.exists():
@@ -496,6 +501,16 @@ def run_discovery_pair(config, output_dir, result):
             os.fsync(raw.fileno())
             raw.close()
             result['raw_sha256'] = hashlib.sha256(raw_path.read_bytes()).hexdigest()
+            if c.get('target_id') == F2_WINDOWS_TARGET:
+                result['operation_receipts'] = []
+                for event in events:
+                    if event.get('event') != 'f2_operation_receipt':
+                        continue
+                    payload = dict(event['receipt'], raw_event_ref=event['raw_event_ref'])
+                    selected = [_f2_event(events, ref) for ref in payload['evidence_refs']] + [event]
+                    payload['raw_refs'] = [{'path': str(raw_path), 'sha256': result['raw_sha256'],
+                                            'event_index': e['event_index']} for e in selected]
+                    result['operation_receipts'].append(payload)
             if projection:
                 from .projection_pair import finalize_projection
                 finalize_projection(result)
@@ -888,8 +903,11 @@ def reader_destroy_schedule(c, count):
 
 def validate_reader_churn_config(c):
     """Fail closed on all new in-window fields; no silent no-op configs."""
+    for field in ('reader_recreate_in_window', 'publish_burst_in_window'):
+        if type(c.get(field, False)) is not bool:
+            raise RuntimeError(field + ' must be a boolean')
     plan = c.get('runtime_windows', [])
-    durations = [plan[0]['drop_duration_sec']] if plan else [float(c.get('drop_duration_sec', 3.0))]
+    durations = [item['drop_duration_sec'] for item in plan] if plan else [float(c.get('drop_duration_sec', 3.0))]
     # Validate each requested stimulus even when the arm is neutral: an invalid
     # exploratory config must not appear as a healthy baseline/control run.
     for duration in durations:
@@ -933,14 +951,125 @@ def window_churn_schedule(c, drop_duration_sec):
         _schedule_event(schedule, 'writer_create', 0.0, 'writer2')
         _schedule_event(schedule, 'writer_publish', 0.0, 'writer2')
         _schedule_event(schedule, 'writer_destroy', 0.9, 'writer2')
+    if c.get('publish_burst_in_window') is True:
+        _schedule_event(schedule, 'pair_publish', 0.0, 'writer')
     # Stable sort: for equal fractions creation (reader then writer2) occurs
     # before destruction, and destruction preserves role order.  This is
     # deterministic and therefore testable without a clock.
     order = {'reader_create': 0, 'writer_create': 1, 'writer_publish': 2,
-             'reader_destroy': 3, 'writer_destroy': 4}
+             'pair_publish': 2, 'reader_destroy': 3, 'writer_destroy': 4}
     schedule.sort(key=lambda item: (item['fraction'], order[item['kind']],
                                     item.get('role') or ''))
     return schedule
+
+
+def _churn_ref(events, token):
+    # Namespace and host raw use different index keys. The append-only list
+    # position is the local boundary authority, not a producer's claimed index.
+    index = token.get('namespace_event_index', token.get('event_index'))
+    if type(index) is not int or not 0 <= index < len(events) or events[index] is not token:
+        index = next(i for i, event in enumerate(events) if event is token)
+    return {'raw_event_ref': token.get('raw_event_ref'), 'local_event_index': index,
+            'namespace_event_index': token.get('namespace_event_index')}
+
+
+def _churn_identity(token):
+    identity = {key: token.get(key) for key in ('pid', 'endpoint_generation')}
+    if (type(identity['pid']) is not int or identity['pid'] <= 0
+            or not isinstance(identity['endpoint_generation'], str)
+            or not identity['endpoint_generation']):
+        raise RuntimeError('churn_worker_identity_incomplete')
+    if 'worker_generation' in token:
+        identity['worker_generation'] = token['worker_generation']
+    return identity
+
+
+def _churn_process(pool, role):
+    process = getattr(pool, 'workers', {}).get(role)
+    if (type(getattr(process, 'pid', None)) is not int or process.pid <= 0
+            or not callable(getattr(process, 'poll', None))):
+        raise RuntimeError('churn_process_identity_missing:' + role)
+    return process
+
+
+def _churn_current(pool, events, role):
+    process = _churn_process(pool, role)
+    pid = process.pid
+    tokens = [e for e in events if e['event'] == 'endpoint_created'
+              and e.get('role') == role and e.get('pid') == pid]
+    if not tokens:
+        raise RuntimeError('churn_current_endpoint_missing:' + role)
+    token = tokens[-1]
+    _churn_identity(token)
+    return token
+
+
+def _churn_timeout(deadline_ns, startup_timeout_sec):
+    remaining = (deadline_ns - time.monotonic_ns()) / 1e9
+    if remaining <= 0:
+        raise RuntimeError('window_churn_deadline_exceeded')
+    return min(startup_timeout_sec, remaining)
+
+
+def _fresh_churn_events(events, boundary):
+    for index in range(boundary, len(events)):
+        token = events[index]
+        # If an index is supplied it must describe this new append, not an
+        # old receipt copied into a later list position.
+        if all(key not in token or (type(token[key]) is int and token[key] == index)
+               for key in ('namespace_event_index', 'event_index')):
+            yield token
+
+
+def _churn_wait(pool, events, boundary, role, kind, identity, timeout, label,
+                *, after_monotonic_ns=None, **fields):
+    def candidates():
+        return [e for e in _fresh_churn_events(events, boundary) if e['event'] == kind
+                and e.get('role') == role
+                and (after_monotonic_ns is None or (type(e.get('monotonic_ns')) is int
+                     and e['monotonic_ns'] >= after_monotonic_ns))
+                and all(e.get(key) == value for key, value in {**identity, **fields}.items())]
+    pool.wait(lambda: bool(candidates()), timeout, label)
+    tokens = candidates()
+    if len(tokens) != 1:
+        raise RuntimeError('churn_missing_or_duplicate_evidence:' + label)
+    return tokens[0]
+
+
+def _stop_churn_role(pool, events, role, *, emit, startup_timeout_sec,
+                     deadline_ns=None, reason='window_cleanup', requested_fraction=None):
+    token = _churn_current(pool, events, role)
+    identity = _churn_identity(token)
+    prefix = ('writer' if role.startswith('writer') else
+              'reader' if role.startswith('reader') else 'probe')
+    requested_ns = time.monotonic_ns()
+    # One shared absolute budget includes command submission, shutdown and exit.
+    stop_deadline = requested_ns + int(startup_timeout_sec * 1e9)
+    if deadline_ns is not None:
+        stop_deadline = min(stop_deadline, deadline_ns)
+    request = emit('window_churn_action_requested', action=prefix + '_destroy',
+                   command='stop', requested_monotonic_ns=requested_ns,
+                   deadline_monotonic_ns=stop_deadline, worker_role=role,
+                   worker_identity=identity, endpoint_ref=_churn_ref(events, token),
+                   reason=reason, requested_fraction=requested_fraction)
+    boundary = len(events)
+    _churn_timeout(stop_deadline, startup_timeout_sec)
+    command_id = pool.command(role, 'stop')
+    shutdown = _churn_wait(pool, events, boundary, role, 'worker_shutdown', identity,
+        _churn_timeout(stop_deadline, startup_timeout_sec), role + '_stop',
+        stop_command_id=command_id, after_monotonic_ns=requested_ns)
+    process = _churn_process(pool, role)
+    pool.wait(lambda: process.poll() is not None,
+              _churn_timeout(stop_deadline, startup_timeout_sec), role + '_exit')
+    if process.returncode != 0:
+        raise RuntimeError('churn_worker_exit_failed:' + role)
+    return emit('discovery_' + prefix + '_destroyed', role=role,
+                **{prefix + '_gid': token.get('endpoint_gid'), prefix + '_pid': identity['pid']},
+                generation=identity['endpoint_generation'], worker_identity=identity,
+                reason=reason, pair_member=False, requested_fraction=requested_fraction,
+                command_id=command_id, returncode=process.returncode, process_exit_observed=True,
+                action_request_ref=(request or {}).get('raw_event_ref'),
+                endpoint_ref=_churn_ref(events, token), shutdown_ref=_churn_ref(events, shutdown))
 
 
 def run_window_churn(pool, schedule, events, *, window_start_ns,
@@ -948,124 +1077,322 @@ def run_window_churn(pool, schedule, events, *, window_start_ns,
                      pre_match_count, publish_burst_count,
                      publish_burst_interval_sec, config=None,
                      prior_created=(), prior_destroyed=()):
-    """Execute one validated create/destroy timeline inside a drop window.
+    """Execute real actions, with fresh per-command, per-process evidence.
 
-    window_start_ns is the monotonic instant the window opened; each item's
-    fraction is resolved against window_duration_sec to an absolute due time.
-    No action is ever back-dated: the raw create/shutdown event remains the
-    authority, and requested_fraction is recorded as the plan reference only.
-    Destructive actions require a prior created role and a real worker_shutdown
-    token. The original pair roles are never referenced here.
+    No historical-token fallback: list boundaries apply even to producers that
+    do not assign event_index (namespace raw uses namespace_event_index).
+    Same-role reuse is legal only after the previous process really exited.
     """
     pending = list(schedule)
-    # Chain-level state: a role created in an earlier window is still live, and
-    # one destroyed there must not be silently recreated by a later window's
-    # identical schedule.
-    created_roles = set(prior_created)
-    destroyed_roles = set(prior_destroyed)
-    deadline_ns = window_start_ns + int(window_duration_sec * 1_000_000_000)
+    created_roles, destroyed_roles = set(prior_created), set(prior_destroyed)
+    deadline_ns = window_start_ns + int(window_duration_sec * 1e9)
     while pending and time.monotonic_ns() < deadline_ns:
         item = pending[0]
-        due_ns = window_start_ns + int(item['fraction'] * window_duration_sec * 1_000_000_000)
+        due_ns = window_start_ns + int(item['fraction'] * window_duration_sec * 1e9)
         if time.monotonic_ns() < due_ns:
-            pool.pump(min(0.05, max(0.0, (due_ns - time.monotonic_ns()) / 1e9)))
+            pool.pump(min(0.05, max(0.0, (min(due_ns, deadline_ns) - time.monotonic_ns()) / 1e9)))
             continue
         pending.pop(0)
-        kind, role_name = item['kind'], item['role']
-        if kind == 'reader_create':
-            if role_name in created_roles and role_name not in destroyed_roles:
-                # Idempotent: the window chain runs one churn schedule per
-                # window, so a role created in an earlier window is still the
-                # current generation. Re-starting it would emit a second
-                # endpoint_created for the same role and corrupt identity.
-                continue
-            # Bind the token to *this* generation: an earlier window may have
-            # left a stale endpoint_created token for the same role name.
-            previous_index = [e['event_index'] for e in events
-                              if e['event'] == 'endpoint_created' and e.get('role') == role_name
-                              and type(e.get('event_index')) is int]
-            pool.start(role_name)
-            boundary_index = previous_index[-1] if previous_index else None
+        kind, role = item['kind'], item['role']
+        if ((kind.startswith('reader_') and role not in {'reader%d' % i for i in range(2, 10)})
+                or (kind.startswith('writer_') and role != 'writer2')
+                or (kind == 'pair_publish' and role != 'writer')):
+            raise RuntimeError('invalid_window_churn_role:' + str(role))
+        if kind in ('reader_create', 'writer_create'):
+            if role in created_roles and role not in destroyed_roles:
+                emit('window_churn_action_rejected', action=kind, worker_role=role,
+                     reason='churn_role_still_live', requested_fraction=item['fraction'])
+                raise RuntimeError('churn_role_still_live:' + role)
+            previous = [e for e in events if e['event'] == 'endpoint_created' and e.get('role') == role]
+            generations = {e.get('endpoint_generation') for e in previous}
+            requested_ns = time.monotonic_ns()
+            request = emit('window_churn_action_requested', action=kind, worker_role=role,
+                           requested_monotonic_ns=requested_ns, requested_fraction=item['fraction'],
+                           window_start_ns=window_start_ns,
+                           deadline_monotonic_ns=deadline_ns)
+            boundary = len(events)
+            _churn_timeout(deadline_ns, startup_timeout_sec)
+            pool.start(role)
+            process = _churn_process(pool, role)
+            pid = process.pid
+            starts = [e for e in _fresh_churn_events(events, boundary)
+                      if e['event'] == 'process_started' and e.get('role') == role]
+            if (len(starts) != 1 or starts[0].get('pid') != pid
+                    or type(starts[0].get('worker_generation')) is not int):
+                raise RuntimeError('churn_process_started_missing_or_duplicate:' + role)
+            started = starts[0]
 
-            def created_since(index=boundary_index, role=role_name):
-                candidates = [e for e in events
-                              if e['event'] == 'endpoint_created' and e.get('role') == role]
-                if index is None:
-                    return candidates
-                newer = [e for e in candidates
-                         if type(e.get('event_index')) is int and e['event_index'] > index]
-                # A producer without event indices cannot prove the boundary;
-                # in that case the newest candidate is the only available token.
-                return newer or candidates
+            def created():
+                return [e for e in _fresh_churn_events(events, boundary) if e['event'] == 'endpoint_created'
+                        and e.get('role') == role and e.get('pid') == pid
+                        and isinstance(e.get('endpoint_generation'), str)
+                        and e['endpoint_generation'] and e['endpoint_generation'] not in generations
+                        and type(e.get('monotonic_ns')) is int and e['monotonic_ns'] >= requested_ns
+                        and e.get('worker_generation') == started['worker_generation']
+                        and _churn_ref(events, e)['local_event_index'] > _churn_ref(events, started)['local_event_index']]
 
-            pool.wait(lambda created_since=created_since: bool(created_since()),
-                      startup_timeout_sec, role_name + '_created')
-            token = created_since()[-1]
+            pool.wait(lambda: bool(created()), _churn_timeout(deadline_ns, startup_timeout_sec), role + '_created')
+            tokens = created()
+            if len(tokens) != 1:
+                raise RuntimeError('churn_missing_or_duplicate_evidence:' + role + '_created')
+            token = tokens[0]
+            identity = _churn_identity(token)
+            if not token.get('endpoint_gid'):
+                raise RuntimeError('churn_endpoint_gid_missing:' + role)
             if config is not None:
-                require_role_rmw(config, role_name, token)
-            created_roles.add(role_name)
-            emit('discovery_reader_recreated', reader_gid=token.get('endpoint_gid'),
-                 reader_pid=token.get('pid'), generation=token.get('endpoint_generation'),
-                 pair_member=False, role=role_name,
-                 recreate_index=int(role_name[len('reader'):]) - 1,
-                 requested_fraction=item['fraction'])
-        elif kind == 'reader_destroy':
-            if role_name not in created_roles or role_name in destroyed_roles:
-                raise RuntimeError('reader_destroy_before_create:' + role_name)
-            token = next(e for e in events if e['event'] == 'endpoint_created'
-                         and e.get('role') == role_name)
-            pool.command(role_name, 'stop')
-            pool.wait(lambda role_name=role_name: any(
-                e['event'] == 'worker_shutdown' and e.get('role') == role_name for e in events),
-                startup_timeout_sec, role_name + '_stop')
-            destroyed_roles.add(role_name)
-            emit('discovery_reader_destroyed', role=role_name,
-                 reader_gid=token.get('endpoint_gid'), reader_pid=token.get('pid'),
-                 generation=token.get('endpoint_generation'),
-                 reason='planned_in_window_churn', pair_member=False,
-                 requested_fraction=item['fraction'])
-        elif kind == 'writer_create':
-            pool.start(role_name)
-            pool.wait(lambda role_name=role_name: any(
-                e['event'] == 'endpoint_created' and e.get('role') == role_name for e in events),
-                startup_timeout_sec, role_name + '_created')
-            token = next(e for e in events if e['event'] == 'endpoint_created'
-                         and e.get('role') == role_name)
-            if config is not None:
-                require_role_rmw(config, role_name, token)
-            created_roles.add(role_name)
-            emit('discovery_writer_recreated', writer_gid=token.get('endpoint_gid'),
-                 writer_pid=token.get('pid'), generation=token.get('endpoint_generation'),
-                 pair_member=False, role=role_name)
-        elif kind == 'writer_publish':
-            if role_name not in created_roles:
-                raise RuntimeError('writer_publish_before_create:' + role_name)
+                require_role_rmw(config, role, token)
+            created_roles.add(role)
+            destroyed_roles.discard(role)
+            prefix = 'reader' if kind == 'reader_create' else 'writer'
+            emit('discovery_' + prefix + '_recreated', role=role,
+                 **{prefix + '_gid': token['endpoint_gid'], prefix + '_pid': identity['pid']},
+                 generation=identity['endpoint_generation'], worker_identity=identity, pair_member=False,
+                 recreate_index=int(role[len(prefix):]) - 1,
+                 requested_fraction=item['fraction'],
+                 action_request_ref=(request or {}).get('raw_event_ref'),
+                 endpoint_ref=_churn_ref(events, token),
+                 process_ref=_churn_ref(events, started))
+        elif kind in ('reader_destroy', 'writer_destroy'):
+            if role not in created_roles or role in destroyed_roles:
+                raise RuntimeError(kind + '_before_create:' + role)
+            _stop_churn_role(pool, events, role, emit=emit,
+                startup_timeout_sec=startup_timeout_sec, deadline_ns=deadline_ns,
+                reason='planned_in_window_churn', requested_fraction=item['fraction'])
+            destroyed_roles.add(role)
+        elif kind in ('writer_publish', 'pair_publish'):
+            if kind == 'writer_publish' and (role not in created_roles or role in destroyed_roles):
+                raise RuntimeError('writer_publish_before_create:' + role)
+            token = _churn_current(pool, events, role)
+            identity = _churn_identity(token)
             sequences = list(range(pre_match_count, pre_match_count + publish_burst_count))
-            command_id = pool.command(role_name, 'publish_burst', sequences=sequences,
-                                      phase='writer2_churn',
-                                      interval_sec=publish_burst_interval_sec)
-            emit('publish_burst_submitted', command_id=command_id,
-                 sequences=sequences, phase='writer2_churn',
-                 controller_waits_for_ack=False, role=role_name, pair_member=False)
-        elif kind == 'writer_destroy':
-            if role_name not in created_roles or role_name in destroyed_roles:
-                raise RuntimeError('writer_destroy_before_create:' + role_name)
-            token = next(e for e in events if e['event'] == 'endpoint_created'
-                         and e.get('role') == role_name)
-            pool.command(role_name, 'stop')
-            pool.wait(lambda role_name=role_name: any(
-                e['event'] == 'worker_shutdown' and e.get('role') == role_name for e in events),
-                startup_timeout_sec, role_name + '_stop')
-            destroyed_roles.add(role_name)
-            emit('discovery_writer_destroyed', role=role_name,
-                 writer_gid=token.get('endpoint_gid'), writer_pid=token.get('pid'),
-                 generation=token.get('endpoint_generation'),
-                 reason='planned_in_window_churn', pair_member=False)
+            phase = 'window_burst' if kind == 'pair_publish' else 'writer2_churn'
+            requested_ns = time.monotonic_ns()
+            request = emit('window_churn_action_requested', action=kind, worker_role=role,
+                           requested_monotonic_ns=requested_ns, deadline_monotonic_ns=deadline_ns,
+                           worker_identity=identity, sequences=sequences, requested_fraction=item['fraction'])
+            boundary = len(events)
+            _churn_timeout(deadline_ns, startup_timeout_sec)
+            command_id = pool.command(role, 'publish_burst', sequences=sequences,
+                                      phase=phase, interval_sec=publish_burst_interval_sec)
+            emit('publish_burst_submitted', command_id=command_id, role=role,
+                 sequences=sequences, phase=phase, worker_identity=identity,
+                 controller_waits_for_ack=True, pair_member=kind == 'pair_publish',
+                 action_request_ref=(request or {}).get('raw_event_ref'))
+            ack = _churn_wait(pool, events, boundary, role, 'command_done', identity,
+                _churn_timeout(deadline_ns, startup_timeout_sec), role + '_burst',
+                command_id=command_id, burst_count=len(sequences), after_monotonic_ns=requested_ns)
+            ack_index = _churn_ref(events, ack)['local_event_index']
+            sends = [e for e in _fresh_churn_events(events, boundary) if e['event'] == 'send'
+                     and _churn_ref(events, e)['local_event_index'] < ack_index
+                     and type(e.get('monotonic_ns')) is int and e['monotonic_ns'] >= requested_ns
+                     and e.get('role') == role and e.get('phase') == phase
+                     and all(e.get(key) == value for key, value in identity.items())]
+            if [e.get('send_sequence') for e in sends] != sequences:
+                raise RuntimeError('churn_burst_send_evidence_incomplete:' + role)
+            emit('publish_burst_completed', role=role, command_id=command_id,
+                 worker_identity=identity, phase=phase, sequences=sequences,
+                 ack_ref=_churn_ref(events, ack),
+                 send_refs=[_churn_ref(events, event) for event in sends],
+                 action_request_ref=(request or {}).get('raw_event_ref'))
         else:
             raise RuntimeError('unknown_window_churn_action:' + str(kind))
+        if time.monotonic_ns() >= deadline_ns:
+            raise RuntimeError('window_churn_deadline_exceeded')
     if pending:
         raise RuntimeError('window_churn_schedule_incomplete')
     return {'created_roles': sorted(created_roles), 'destroyed_roles': sorted(destroyed_roles)}
+
+
+def _run_window_stimuli(c, active, pool, events, emit, start_ns, duration_sec,
+                        progress, *, prior_created=(), prior_destroyed=()):
+    """Both drop and netem use the same scheduler, without extending a window.
+
+    Continue carrier counters and trajectory sampling during due-time and
+    command waits; OwnerCheckedPool.wait still owns health/channel checking.
+    """
+    schedule = window_churn_schedule(c, duration_sec) if active else []
+    if not schedule:
+        return {'created_roles': list(prior_created), 'destroyed_roles': list(prior_destroyed)}
+    deadline_ns = start_ns + int(duration_sec * 1e9)
+
+    class ProgressPool:
+        def __getattr__(self, name):
+            return getattr(pool, name)
+
+        def pump(self, timeout=0.05):
+            progress()
+            pool.pump(timeout)
+
+        def wait(self, predicate, timeout, label):
+            def observed():
+                if time.monotonic_ns() < deadline_ns:
+                    progress()
+                return predicate()
+            return pool.wait(observed, timeout, label)
+
+    return run_window_churn(ProgressPool(), schedule, events, window_start_ns=start_ns,
+        window_duration_sec=duration_sec, startup_timeout_sec=c['startup_timeout_sec'], emit=emit,
+        pre_match_count=c['pre_match_count'], publish_burst_count=c.get('publish_burst_count', 32),
+        publish_burst_interval_sec=c.get('publish_burst_interval_sec', 0.0), config=c,
+        prior_created=prior_created, prior_destroyed=prior_destroyed)
+
+
+def _cleanup_window_roles(pool, events, roles, destroyed, c, emit):
+    for role in sorted(set(roles) - set(destroyed)):
+        _stop_churn_role(pool, events, role, emit=emit,
+                         startup_timeout_sec=c['startup_timeout_sec'])
+        destroyed.add(role)
+
+
+def _f2_event(events, reference):
+    found = [e for e in events if e.get('raw_event_ref') == reference and reference is not None]
+    if len(found) != 1:
+        raise WindowGateError('f2_anchor_missing_or_ambiguous')
+    return found[0]
+
+
+def _f2_anchor_deadline(c, plan, index, events, endpoints, precondition, previous_ref):
+    """Discharge a real runtime guard, before any new window is installed."""
+    anchor = _f2_event(events, precondition['raw_event_ref'] if index == 0 else previous_ref)
+    expected_kind = 'discovery_precondition_snapshot' if index == 0 else 'discovery_recovery_confirmed'
+    expected_label = 'fresh_match' if index == 0 else 'previous_restore_confirmed'
+    if (anchor.get('event') != expected_kind or plan['trigger_anchor'] != expected_label
+            or anchor.get('role') != 'controller'
+            or any(anchor.get(k) != c[k] for k in ('run_id', 'domain_id'))
+            or type(anchor.get('monotonic_ns')) is not int
+            or anchor['monotonic_ns'] > time.monotonic_ns()):
+        raise WindowGateError('f2_anchor_identity_or_future_boundary')
+    if index == 0:
+        if anchor.get('satisfied') is not True:
+            raise WindowGateError('f2_anchor_precondition_not_satisfied')
+        bindings, matched = anchor['bindings'], anchor['matched']
+        proof_after_ns = endpoints['reader']['created_monotonic_ns']
+    else:
+        if (anchor.get('window_index') != index - 1
+                or anchor.get('window_id') != c['runtime_windows'][index - 1]['window_id']
+                or anchor.get('receipt', {}).get('recovery_verified') is not True):
+            raise WindowGateError('f2_anchor_previous_recovery_not_confirmed')
+        boundaries = [e for e in events if e.get('event') == 'discovery_restore_boundary'
+                      and e.get('window_index') == index - 1]
+        if (len(boundaries) != 1 or boundaries[0].get('restored') is not True
+                or not boundaries[0]['monotonic_ns'] <= anchor['monotonic_ns']):
+            raise WindowGateError('f2_anchor_previous_restore_boundary_missing')
+        proof_after_ns = boundaries[0]['post_restore_monotonic_ns']
+        bindings = anchor['receipt']['pair_bindings']
+        matched = anchor['receipt']['activity_receipt']['fresh_graph_count']
+    initial = precondition['bindings']
+    admissions = [e for e in events if e.get('event') == 'namespace_host_admission_verified']
+    if (len(admissions) != 1 or any(initial.get('isolation', {}).get(k) != admissions[0].get('isolation', {}).get(k)
+            for k in ('net_namespace', 'user_namespace'))):
+        raise WindowGateError('f2_anchor_namespace_identity_mismatch')
+    if (bindings.get('worker_pids') != {r: t['pid'] for r, t in endpoints.items()}
+            or bindings.get('worker_start_ticks') != initial.get('worker_start_ticks')
+            or bindings.get('only_pair_bound_udp_sockets') is not True
+            or any(bindings.get('isolation', {}).get(k) != initial.get('isolation', {}).get(k)
+                   for k in ('net_namespace', 'user_namespace'))):
+        raise WindowGateError('f2_anchor_namespace_or_process_identity_mismatch')
+    refs = []
+    position = {e.get('raw_event_ref'): n for n, e in enumerate(events)}
+    for role, token in endpoints.items():
+        match = _f2_event(events, matched['matches'][role])
+        graph = _f2_event(events, matched['graphs'][role])
+        acks = [e for e in events if e.get('event') == 'command_done'
+                and e.get('role') == role and e.get('command_id') == match.get('command_id')]
+        requests = [e for e in events if e.get('event') == 'match_snapshot_requested'
+                    and e.get('role') == role and e.get('command_id') == match.get('command_id')]
+        if len(acks) != 1 or len(requests) != 1:
+            raise WindowGateError('f2_anchor_fresh_match_command_evidence_missing')
+        request, ack = requests[0], acks[0]
+        proof = (request, match, graph, ack)
+        if (match.get('event') != 'match_snapshot' or graph.get('event') != 'graph_snapshot'
+                or type(match.get('matched_count')) is not int or match['matched_count'] != 1
+                or graph.get('command_id') != match.get('command_id')
+                or match.get('endpoint_gid') != token.get('endpoint_gid')
+                or match.get('count_api') != ('get_subscription_count' if role == 'writer' else 'get_publisher_count')
+                or not max(token['created_monotonic_ns'], proof_after_ns) <= request.get('requested_monotonic_ns', -1)
+                    <= match.get('sampled_monotonic_ns', -1) <= match['monotonic_ns']
+                or any(any(e.get(k) != token.get(k) for k in ('pid', 'endpoint_generation', 'rmw_identifier'))
+                       for e in (match, graph, ack))
+                or not position[request['raw_event_ref']] < position[match['raw_event_ref']]
+                    < position[graph['raw_event_ref']] < position[ack['raw_event_ref']]
+                    < position[anchor['raw_event_ref']]
+                or not request['monotonic_ns'] <= match['monotonic_ns'] <= graph['monotonic_ns']
+                    <= ack['monotonic_ns'] <= anchor['monotonic_ns']):
+            raise WindowGateError('f2_anchor_match_identity_or_chronology_invalid')
+        refs.extend(e['raw_event_ref'] for e in proof)
+    anchor_ns = anchor['monotonic_ns']
+    offset_due = anchor_ns + round(plan['trigger_offset_sec'] * 1e9)
+    interval_due = (anchor_ns + round(c['runtime_windows'][index - 1]['restore_interval_sec'] * 1e9)
+                    if index else anchor_ns)
+    return {'anchor_ref': anchor['raw_event_ref'], 'anchor_monotonic_ns': anchor_ns,
+            'matched_event_refs': refs, 'offset_due_monotonic_ns': offset_due,
+            'prior_interval_due_monotonic_ns': interval_due,
+            'earliest_due_monotonic_ns': max(offset_due, interval_due)}
+
+
+def _emit_f2_operation_receipts(c, events, emit):
+    """Executed operations cite their own windows, never an E01 aggregate."""
+    from .ros2_pair import f2_windows_operations
+    operations = f2_windows_operations(c)
+    for op in operations:
+        windows, refs = [], []
+        for index, plan in enumerate(c['runtime_windows']):
+            selected = {}
+            for name in ('discovery_window_timing', 'discovery_drop_begin', 'discovery_drop_end',
+                         'discovery_recovery_confirmed', 'discovery_window_restore_verified'):
+                found = [e for e in events if e.get('event') == name and e.get('window_index') == index]
+                if len(found) != 1:
+                    raise WindowGateError('f2_operation_window_evidence_missing:' + name)
+                selected[name] = found[0]
+            dropped, restored = selected['discovery_drop_begin'], selected['discovery_drop_end']
+            hi = events.index(restored)
+            counters = [e for e in events[hi + 1:] if e.get('event') == 'discovery_window_counter']
+            if not counters or any(e.get('event') == 'discovery_drop_begin' for e in events[hi + 1:events.index(counters[0])]):
+                raise WindowGateError('f2_operation_counter_missing')
+            counter = counters[0]
+            from .discovery_network import window_counter_delta
+            delta = window_counter_delta(dropped['receipt'], restored['receipt'])
+            if any(counter.get(k) != delta[k] for k in ('packets_delta', 'bytes_delta', 'hit', 'table')):
+                raise WindowGateError('f2_operation_counter_mismatch')
+            timing, recovery, verified = (selected[k] for k in ('discovery_window_timing',
+                'discovery_recovery_confirmed', 'discovery_window_restore_verified'))
+            good = (timing.get('status') == 'observed' and restored['receipt'].get('restored') is True
+                    and recovery['receipt'].get('recovery_verified') is True
+                    and verified.get('recovery_confirmed') is True)
+            item = {'window_id': plan['window_id'], 'window_index': index,
+                    'complete': good, 'hit': good and delta['hit'],
+                    'packets_delta': delta['packets_delta'],
+                    'raw_refs': {name: event['raw_event_ref'] for name, event in selected.items()},
+                    'counter_ref': counter['raw_event_ref']}
+            windows.append(item)
+            refs.extend(list(item['raw_refs'].values()) + [item['counter_ref']])
+        closing = [e for e in events if e.get('event') == 'window_close' and e.get('window') == 'post_restore_delivery']
+        final = [e for e in events if e.get('event') == 'state_step_after' and e.get('step_id') == 'observe_final_graph'
+                 and e.get('satisfied') is True]
+        complete = all(w['complete'] for w in windows) and len(closing) == len(final) == 1
+        refs.extend(e['raw_event_ref'] for e in closing + final)
+        affected = op['affected_window_indices']
+        if op['surface_id'] == 'E03':
+            observed_parameters = {'anchor': op['parameters']['anchor'],
+                'requested_offset_sec': op['parameters']['offset_sec'],
+                'actual_offsets': [{'window_index': i, 'anchor_ref': _f2_event(events, windows[i]['raw_refs']['discovery_window_timing'])['anchor_ref'],
+                    'actual_offset_sec': (_f2_event(events, windows[i]['raw_refs']['discovery_window_timing'])['actual_install_monotonic_ns']
+                                          - _f2_event(events, windows[i]['raw_refs']['discovery_window_timing'])['anchor_monotonic_ns']) / 1e9}
+                                   for i in affected]}
+        else:
+            observed_parameters = {'actual_window_count': len(windows),
+                'actual_restore_intervals_sec': [(_f2_event(events, w['raw_refs']['discovery_window_timing'])['actual_install_monotonic_ns']
+                                                 - _f2_event(events, w['raw_refs']['discovery_window_timing'])['anchor_monotonic_ns']) / 1e9
+                                                for w in windows[1:]],
+                'trailing_interval_status': 'not_applicable_no_next_window'}
+        payload = {'schema': 'r2f.f2-window-operation/v1', 'op_id': op['op_id'],
+                   'surface_id': op['surface_id'], 'mutator_id': op['mutator_id'],
+                   'affected_window_indices': affected, 'observed_parameters': observed_parameters,
+                   'plan_hash': c['mutation_plan_sha256'], 'status': 'executed' if complete else 'incomplete',
+                   'applied': complete, 'hit': complete and all(w['hit'] for w in windows),
+                   'effect_observed': complete and all(w['hit'] for w in windows),
+                   'window_count': len(windows), 'windows': windows, 'evidence_refs': refs}
+        emit('f2_operation_receipt', receipt=payload)
 
 
 def _run_window_chain(c, active, receipt, emit, step, activity, activity_is_pair_observed,
@@ -1082,6 +1409,7 @@ def _run_window_chain(c, active, receipt, emit, step, activity, activity_is_pair
     handler keeps the original error and still cleans up the carrier.
     """
     plans = c['runtime_windows']
+    f2_timing = c.get('target_id') == F2_WINDOWS_TARGET
     multi = True
     ledger = WindowLedger(plans)
     previous_recovery_ref = precondition['raw_event_ref']
@@ -1098,7 +1426,12 @@ def _run_window_chain(c, active, receipt, emit, step, activity, activity_is_pair
             anchor_ref = precondition['raw_event_ref'] if index == 0 else previous_recovery_ref
             if index and active and not (window_recovery_activity[-1] and window_fresh_recovery[-1]):
                 raise WindowGateError('previous_window_recovery_not_confirmed')
-            if plan['trigger_offset_sec']:
+            timing = (_f2_anchor_deadline(c, plan, index, events, endpoints, precondition, previous_recovery_ref)
+                      if f2_timing else None)
+            if timing is not None:
+                while time.monotonic_ns() < timing['earliest_due_monotonic_ns']:
+                    pool.pump(min(0.05, (timing['earliest_due_monotonic_ns'] - time.monotonic_ns()) / 1e9))
+            elif plan['trigger_offset_sec']:
                 offset_deadline = time.monotonic() + plan['trigger_offset_sec']
                 while time.monotonic() < offset_deadline:
                     pool.pump(min(0.05, max(0.0, offset_deadline - time.monotonic())))
@@ -1117,64 +1450,78 @@ def _run_window_chain(c, active, receipt, emit, step, activity, activity_is_pair
                     # never reuse the pre-first-window match snapshot.
                     window_precondition['evidence_ref'] = previous_recovery_ref
                     window_precondition['previous_restore_confirmed'] = True
+                actual_start_ns = time.monotonic_ns()
                 begin = carrier.start(match_receipt=window_precondition)
                 receipt.update(configured=begin['configured'], applied=begin['applied'])
                 ledger.start(index, begin)
                 emit('discovery_drop_begin', receipt=begin, mutation_receipt=dict(receipt), **window_fields)
                 drop_wall_ns = time.time_ns()
+                if timing is not None:
+                    installed = begin.get('drop_applied_monotonic_ns')
+                    due = timing['earliest_due_monotonic_ns']
+                    valid = (type(installed) is int and due <= actual_start_ns <= installed <= time.monotonic_ns()
+                             and installed - due <= round(c['anchor_lateness_tolerance_sec'] * 1e9))
+                    timing.update(actual_start_monotonic_ns=actual_start_ns, actual_install_monotonic_ns=installed,
+                                  overshoot_ns=(installed - due if type(installed) is int else None),
+                                  status='observed' if valid else 'incomplete',
+                                  reason=None if valid else 'harness_anchor_timing_miss')
+                    emit('discovery_window_timing', **timing, **{k: v for k, v in window_fields.items() if k != 'anchor_ref'})
             emit('window_open', window='discovery_interruption', active_drop=active, **window_fields)
-            # Start an independent probe participant after the drop is active.
-            # It publishes to a distinct topic solely to generate real discovery
-            # announcements; it never joins the writer/reader pair.
-            if active and c.get('discovery_probe', False):
-                pool.start('probe')
-                pool.wait(lambda: any(e['event'] == 'endpoint_created' and e.get('role') == 'probe' for e in events),
-                          c['startup_timeout_sec'], 'probe_created')
-                probe_token = next(e for e in events if e['event'] == 'endpoint_created' and e.get('role') == 'probe')
-                emit('discovery_probe_created', probe_gid=probe_token.get('endpoint_gid'),
-                     probe_pid=probe_token.get('pid'), probe_topic=c.get('probe_topic'),
-                     pair_member=False)
-            burst_command_id = None
-            churn = window_churn_schedule(c, plan['drop_duration_sec']) if active else []
-            churn_result = run_window_churn(
-                pool, churn, events, window_start_ns=time.monotonic_ns(),
-                window_duration_sec=plan['drop_duration_sec'],
-                startup_timeout_sec=c['startup_timeout_sec'], emit=emit,
-                pre_match_count=c['pre_match_count'],
-                publish_burst_count=c.get('publish_burst_count', 32),
-                publish_burst_interval_sec=c.get('publish_burst_interval_sec', 0.0),
-                config=c, prior_created=chain_created, prior_destroyed=chain_destroyed)
-            created_roles = set(churn_result['created_roles'])
-            destroyed_roles = set(churn_result['destroyed_roles'])
-            chain_created |= created_roles
-            chain_destroyed |= destroyed_roles
-            if active and c.get('publish_burst_in_window', False):
-                burst_count = c.get('publish_burst_count', 32)
-                if type(burst_count) is not int or not 1 <= burst_count <= MAX_PUBLISH_BURST_COUNT:
-                    raise RuntimeError('publish_burst_count must be an integer in 1..'
-                                       + str(MAX_PUBLISH_BURST_COUNT))
-                burst_sequences = list(range(c['pre_match_count'],
-                                             c['pre_match_count'] + burst_count))
-                burst_command_id = pool.command('writer', 'publish_burst',
-                                                sequences=burst_sequences, phase='window_burst', interval_sec=c.get('publish_burst_interval_sec', 0.0))
-                emit('publish_burst_submitted', command_id=burst_command_id,
-                     sequences=burst_sequences, phase='window_burst',
-                     controller_waits_for_ack=False)
+            # The original input window owns one deadline, including all
+            # startup/stop/command waits. Churn must never buy another window.
             trajectory_start_ns = time.monotonic_ns()
-            deadline_ns = trajectory_start_ns + int(plan['drop_duration_sec'] * 10**9)
+            deadline_ns = trajectory_start_ns + int(plan['drop_duration_sec'] * 1e9)
             trajectory = _RecoveryMatchTrajectory(events, endpoints, emit, trajectory_start_ns, deadline_ns, matched)
             trajectories.append(trajectory)
+            created_roles, destroyed_roles = set(chain_created), set(chain_destroyed)
             restored_this = False
+
+            def progress():
+                nonlocal window_counter_hit
+                if active:
+                    counter = carrier.counters()
+                    window_counter_hit = window_counter_hit or counter['hit']
+                    emit('discovery_drop_counter', receipt=counter, **window_fields)
+                trajectory.poll(pool)
+
             try:
-                while time.monotonic() < deadline_ns / 10**9:
-                    if active:
-                        counter = carrier.counters()
-                        window_counter_hit = window_counter_hit or counter['hit']
-                        emit('discovery_drop_counter', receipt=counter, **window_fields)
-                    trajectory.poll(pool)
-                    remaining = max(0, deadline_ns / 10**9 - time.monotonic())
+                if timing is not None and timing['status'] != 'observed':
+                    raise WindowGateError('harness_anchor_timing_miss')
+                # The optional probe is never the judged delivery pair. Its
+                # process lifecycle still needs this window's fresh evidence.
+                if active and c.get('discovery_probe', False):
+                    previous = {e.get('endpoint_generation') for e in events
+                                if e['event'] == 'endpoint_created' and e.get('role') == 'probe'}
+                    request = emit('window_churn_action_requested', action='probe_create',
+                                   worker_role='probe', **window_fields)
+                    boundary_index = len(events)
+                    pool.start('probe')
+                    probe_pid = pool.workers['probe'].pid
+                    def probe_created():
+                        return [e for e in _fresh_churn_events(events, boundary_index) if e['event'] == 'endpoint_created'
+                                and e.get('role') == 'probe' and e.get('pid') == probe_pid
+                                and e.get('endpoint_generation') not in previous
+                                and isinstance(e.get('endpoint_generation'), str)]
+                    pool.wait(lambda: bool(probe_created()),
+                              _churn_timeout(deadline_ns, c['startup_timeout_sec']), 'probe_created')
+                    if len(probe_created()) != 1:
+                        raise RuntimeError('churn_missing_or_duplicate_evidence:probe_created')
+                    probe_token = probe_created()[0]
+                    emit('discovery_probe_created', probe_gid=probe_token.get('endpoint_gid'),
+                         probe_pid=probe_pid, worker_identity=_churn_identity(probe_token),
+                         probe_topic=c.get('probe_topic'), pair_member=False,
+                         action_request_ref=(request or {}).get('raw_event_ref'),
+                         endpoint_ref=_churn_ref(events, probe_token))
+                churn_result = _run_window_stimuli(c, active, pool, events, emit,
+                    trajectory_start_ns, plan['drop_duration_sec'], progress,
+                    prior_created=chain_created, prior_destroyed=chain_destroyed)
+                created_roles = set(churn_result['created_roles'])
+                destroyed_roles = set(churn_result['destroyed_roles'])
+                while time.monotonic_ns() < deadline_ns:
+                    progress()
+                    remaining = max(0, (deadline_ns - time.monotonic_ns()) / 1e9)
                     pause(min(c['counter_interval_sec'], remaining,
-                              max(0, (trajectory.next_due_ns - time.monotonic_ns()) / 10**9)))
+                              max(0, (trajectory.next_due_ns - time.monotonic_ns()) / 1e9)))
                 during = activity(drop_wall_ns, 'discovery_interruption')
                 window_activity_ok = activity_is_pair_observed(during['activity'])
             finally:
@@ -1187,23 +1534,15 @@ def _run_window_chain(c, active, receipt, emit, step, activity, activity_is_pair
                     emit('discovery_window_counter', **{k: v for k, v in delta.items() if k != 'event'})
                     receipt['applied'] = bool(receipt['applied'] and restored_this)
                     window_counter_hit = delta['hit']
-            if active and 'probe' in pool.workers:
-                pool.command('probe', 'stop')
-                pool.wait(lambda: any(e['event'] == 'worker_shutdown' and e.get('role') == 'probe' for e in events),
-                          c['startup_timeout_sec'], 'probe_stop')
+            if active and c.get('discovery_probe', False):
+                _stop_churn_role(pool, events, 'probe', emit=emit,
+                                 startup_timeout_sec=c['startup_timeout_sec'])
             if active:
-                # Close the remainder of this window's optional generations.
-                # Roles already destroyed by the plan are not stopped twice,
-                # and neither optional generation is allowed to persist into
-                # the post-restore pair contract.
-                cleanup_roles = (set(created_roles) | {'writer2' if c.get('writer_churn_in_window') is True else ''}) - destroyed_roles
-                for role_name in sorted(role for role in cleanup_roles if role):
-                    if role_name in pool.workers and not pool.is_stopped(role_name):
-                        pool.command(role_name, 'stop')
-                        pool.wait(lambda role_name=role_name: any(
-                            e['event'] == 'worker_shutdown' and e.get('role') == role_name for e in events),
-                            c['startup_timeout_sec'], role_name + '_stop')
-                        destroyed_roles.add(role_name)
+                _cleanup_window_roles(pool, events, created_roles, destroyed_roles, c, emit)
+            # Track the final state, including post-window cleanup. A newly
+            # created generation already cleared its predecessor's destroyed
+            # marker; the next window cannot mistake it for a historical role.
+            chain_created, chain_destroyed = created_roles, destroyed_roles
             window_restored.append(restored_this if active else None)
             window_hits.append(window_counter_hit)
             window_drop_activity.append(window_activity_ok)
@@ -1272,13 +1611,13 @@ def _run_window_chain(c, active, receipt, emit, step, activity, activity_is_pair
                 'restored': restored_this if active else None,
                 'restore_boundary_ref': boundary['raw_event_ref'],
                 'calendar_clock': result_clock,
-                'counter': ledger.records[index]['counter']})
+                'counter': ledger.records[index]['counter'] if active else None})
             emit('discovery_window_restore_verified', window_index=index, window_id=plan['window_id'],
                  restored=restored_this if active else None,
                  recovery_confirmed=bool(active and window_recovery_ok and window_fresh),
                  counter_hit=bool(window_counter_hit),
                  restore_interval_sec=plan['restore_interval_sec'])
-            if plan['restore_interval_sec']:
+            if plan['restore_interval_sec'] and not f2_timing:
                 pause(plan['restore_interval_sec'])
             if index < len(plans) - 1 and active and not (window_recovery_ok and window_fresh):
                 raise WindowGateError('next_window_requires_previous_restore_evidence')
@@ -1485,14 +1824,24 @@ def _run_netem_window(c, active, receipt, emit, step, activity, activity_is_pair
     deadline_ns = trajectory_start_ns + int(window_sec * 10**9)
     trajectory = _RecoveryMatchTrajectory(events, endpoints, emit, trajectory_start_ns, deadline_ns, matched)
     activity_ok = False
+    created_roles, destroyed_roles = set(), set()
+
+    def progress():
+        nonlocal last_counter
+        if installed:
+            last_counter = carrier.counters()
+            sample(last_counter)
+        trajectory.poll(pool)
+
     try:
-        while time.monotonic() < deadline_ns / 10**9:
-            if installed:
-                last_counter = carrier.counters()
-                sample(last_counter)
-            trajectory.poll(pool)
-            pause(min(c['counter_interval_sec'], max(0, deadline_ns / 10**9 - time.monotonic()),
-                      max(0, (trajectory.next_due_ns - time.monotonic_ns()) / 10**9)))
+        churn_result = _run_window_stimuli(c, installed, pool, events, emit,
+            trajectory_start_ns, window_sec, progress)
+        created_roles = set(churn_result['created_roles'])
+        destroyed_roles = set(churn_result['destroyed_roles'])
+        while time.monotonic_ns() < deadline_ns:
+            progress()
+            pause(min(c['counter_interval_sec'], max(0, (deadline_ns - time.monotonic_ns()) / 1e9),
+                      max(0, (trajectory.next_due_ns - time.monotonic_ns()) / 1e9)))
         during = activity(drop_wall_ns, 'discovery_netem_window')
         activity_ok = activity_is_pair_observed(during['activity'])
     finally:
@@ -1526,6 +1875,8 @@ def _run_netem_window(c, active, receipt, emit, step, activity, activity_is_pair
                      responsibility_layer=NETEM_RESPONSIBILITY_LAYER,
                      hit_semantics=netem_hit_semantics(scope),
                      restore_receipt=end)
+    if installed:
+        _cleanup_window_roles(pool, events, created_roles, destroyed_roles, c, emit)
     restore_wall_ns, restore_mono_ns = time.time_ns(), time.monotonic_ns()
     boundary = emit('discovery_restore_boundary', restored=restored if installed else None,
                     neutral=not installed, netem_was_installed=installed,
@@ -1983,8 +2334,10 @@ def _body(request, owner_channel):
                                          else bool(netem['data_plane_counter_hit'])),
                     data_plane_observation_reason=data_plane_facts[1],
                     data_group_packets=netem['data_group_packets'])
-        elif not c.get('window_chain_requested'):
-            # Legacy single-window path: behaviour is preserved, including the
+        elif (not c.get('window_chain_requested')
+              and not window_churn_schedule(c, c['drop_duration_sec'])
+              and not c.get('discovery_probe', False)):
+            # Legacy without optional stimuli: behaviour is preserved, including the
             # restore-in-finally drop loop that its AST contract test inspects
             # directly inside this function body.
             if active:
@@ -2104,6 +2457,11 @@ def _body(request, owner_channel):
             emit('fault_control_receipt', fault_id=c['fault_id'], omitted_sequence=omitted, applied=len(omissions) == 1,
                  omission_event_ref=omissions[0]['raw_event_ref'] if omissions else None,
                  responsibility_layer='harness', candidate_eligible=False)
+        if c.get('target_id') == F2_WINDOWS_TARGET:
+            _emit_f2_operation_receipts(c, events, emit)
+            ops = [e['receipt'] for e in events if e.get('event') == 'f2_operation_receipt']
+            receipt['hit'] = bool(ops and all(o['hit'] for o in ops))
+            receipt['effect_observed'] = bool(ops and all(o['effect_observed'] for o in ops))
         result.update(runtime_status='completed', reason=None)
     except Exception as exc:
         import traceback as _tb

@@ -323,23 +323,58 @@ class NamespaceWiring(unittest.TestCase):
 
 class ChurnIdentityWiring(unittest.TestCase):
     class Pool:
+        class Process:
+            def __init__(self, pid):
+                self.pid, self.returncode = pid, None
+
+            def poll(self):
+                return self.returncode
+
         def __init__(self, events, rmw):
             self.events, self.rmw = events, rmw
+            self.workers, self.generations, self.identities = {}, {}, {}
+            self.command_id = 0
+
+        def emit(self, event, **fields):
+            token = dict(event=event, monotonic_ns=time.monotonic_ns(),
+                         namespace_event_index=len(self.events),
+                         raw_event_ref=f'mock#{len(self.events)}', **fields)
+            self.events.append(token)
+            return token
 
         def pump(self, timeout=0.05):
             pass
 
         def start(self, role):
-            self.events.append({'event': 'endpoint_created', 'role': role,
-                                'rmw_identifier': self.rmw, 'endpoint_gid': 'aa',
-                                'pid': 1, 'endpoint_generation': 'g'})
+            previous = self.workers.get(role)
+            if previous is not None and previous.poll() is None:
+                raise AssertionError('offline role still live: ' + role)
+            generation = self.generations.get(role, 0) + 1
+            self.generations[role] = generation
+            process = self.Process(1000 + sum(self.generations.values()))
+            self.workers[role] = process
+            identity = dict(pid=process.pid, worker_generation=generation,
+                            endpoint_generation=f'{role}-generation-{generation}')
+            self.identities[role] = identity
+            self.emit('process_started', role=role, **identity)
+            self.emit('endpoint_created', role=role, rmw_identifier=self.rmw,
+                      endpoint_gid=f'{role}-gid-{generation}', **identity)
 
         def wait(self, predicate, timeout, label):
             if not predicate():
-                raise AssertionError('predicate_not_met')
+                raise AssertionError('predicate_not_met: ' + label)
 
         def command(self, role, command, **fields):
-            return 1
+            if command != 'stop':
+                raise AssertionError('unexpected offline command: ' + command)
+            self.command_id += 1
+            identity = self.identities[role]
+            self.emit('worker_command_requested', role=role, command=command,
+                      command_id=self.command_id, **identity)
+            self.emit('worker_shutdown', role=role, stop_command_id=self.command_id,
+                      **identity)
+            self.workers[role].returncode = 0
+            return self.command_id
 
     def test_reader2_recreation_uses_its_own_vendor(self):
         from r2f.runtime.namespace_pair import run_window_churn

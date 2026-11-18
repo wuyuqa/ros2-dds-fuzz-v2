@@ -4,6 +4,9 @@ import json
 import math
 import re
 import uuid
+import time
+import os
+from copy import deepcopy
 
 from r2f.core import Registry, compile_scenario
 from r2f.core.evidence import canonical_hash
@@ -11,11 +14,22 @@ from r2f.core.replay import ReplayCapsule
 from r2f.modules.s1.module import register
 from r2f.modules.s1.targets import EXECUTION_ORDER
 from r2f.reports.candidate_report import candidate_ledger
-from r2f.reports.run_report import audit_report, identity_hashes, report_digest, write_json
+from r2f.reports.run_report import (
+    audit_report, identity_hashes, report_digest, write_json,
+    boundary_qualification_for_row, execution_boundary_qualification,
+)
 from .identity import runtime_config, semantic_input, source_manifest
 from .runtime_adapter import ingest_execution
 from .scheduler import first_slice_cells, control_references
 from .triage import attribute
+
+# The normal host path stays the historical default.  `isolated_netns` is an
+# explicit host-side supervisor; it never turns an injected fixture into live
+# evidence. These choices resolve exact callable identities; choosing a formal
+# callable does not establish namespace/cleanup or real-execution qualification.
+HOST_RUNTIME = 'host'
+ISOLATED_RUNTIME = 'isolated_netns'
+RUNTIME_BOUNDARIES = (HOST_RUNTIME, ISOLATED_RUNTIME)
 
 
 def plan_campaign(output_dir, *, repo=None, run_id=None, domain_id=173, seed=0,
@@ -100,7 +114,28 @@ def plan_campaign(output_dir, *, repo=None, run_id=None, domain_id=173, seed=0,
 
 
 def _persist(output_dir, report):
-    ledger = candidate_ledger(report["rows"])
+    eligible_rows, boundary_exclusions = [], []
+    for row in report["rows"]:
+        qualification = boundary_qualification_for_row(output_dir, row, report)
+        if qualification["status"] in {"not_applicable", "qualified"}:
+            if qualification["status"] == "qualified":
+                # Boundary eligibility is only a prerequisite. Candidate/control
+                # and seal admission still belong to the existing core gates.
+                row.update(boundary_qualification=qualification, boundary_eligible=True)
+            eligible_rows.append(row)
+        else:
+            # Keep raw/judged/actual_run history intact. Only admission changes.
+            row.update(boundary_qualification=qualification, candidate_eligible=False,
+                       feedback_eligible=False, seal_eligible=False)
+            boundary_exclusions.append({"cell_id": row["cell_id"],
+                                        "qualification": qualification,
+                                        "actual_run": row.get("actual_run"),
+                                        "raw_path": row.get("raw_path"),
+                                        "raw_sha256": row.get("raw_sha256")})
+    ledger = candidate_ledger(eligible_rows)
+    if boundary_exclusions:
+        ledger["boundary_exclusions"] = boundary_exclusions
+
     ledger_path = output_dir / "candidate_ledger.json"
     write_json(ledger_path, ledger)
     report.update(candidate_ledger_path=str(ledger_path), candidate_ledger_sha256=canonical_hash(ledger))
@@ -121,23 +156,148 @@ def _persist(output_dir, report):
     return report
 
 
-def run_campaign(output_dir, *, runtime=None, execute=False, **options):
+def runtime_for_boundary(runtime_boundary=HOST_RUNTIME):
+    """Resolve the exact formal runtime callable for an explicit boundary.
+
+    No profile/capsule field grants this capability: only the caller's
+    validated host/isolated choice selects a real runtime.  An injected
+    callable is handled by the callers and remains offline contract evidence.
+    """
+    if runtime_boundary == HOST_RUNTIME:
+        from r2f.runtime.ros2_pair import run_pair
+        return run_pair
+    if runtime_boundary == ISOLATED_RUNTIME:
+        from r2f.runtime.execution_boundary import run_isolated_runtime
+        return run_isolated_runtime
+    raise ValueError('unsupported runtime_boundary: ' + repr(runtime_boundary))
+
+
+def _boundary_execution_config(config, runtime_boundary):
+    """Return an execution-only config copy with an explicit boundary switch.
+
+    The deterministic capsule/final input/plan are untouched.  The isolated
+    switch lives only in `execution_boundary`; a descriptive profile string is
+    never consulted here.
+    """
+    if runtime_boundary == HOST_RUNTIME:
+        return config
+    if runtime_boundary != ISOLATED_RUNTIME:
+        raise ValueError('unsupported runtime_boundary: ' + repr(runtime_boundary))
+    copied = deepcopy(config)
+    current = copied.get('execution_boundary')
+    if current is None:
+        existing = {}
+    elif isinstance(current, str):
+        # Profile prose is descriptive only.  It is replaced in the execution
+        # copy, never interpreted as a switch.
+        existing = {}
+    elif not isinstance(current, dict):
+        raise ValueError('execution_boundary must be prose or an options object')
+    else:
+        existing = current
+    unknown = set(existing) - {'enabled', 'timeout_sec', 'term_grace_sec',
+                               'kill_wait_sec', 'startup_timeout_sec'}
+    if unknown:
+        raise ValueError('execution boundary options conflict with profile text: '
+                         + ','.join(sorted(unknown)))
+    enabled = existing.get('enabled', True)
+    if enabled is not True:
+        raise ValueError('execution boundary switch must be exactly true')
+    options = {key: existing[key] for key in ('timeout_sec', 'term_grace_sec', 'kill_wait_sec',
+                                               'startup_timeout_sec') if key in existing}
+    copied['execution_boundary'] = dict(options, enabled=True)
+    return copied
+
+
+def _runtime_execution_config(config, *, execute, runtime, runtime_boundary=HOST_RUNTIME):
+    """Bind topology execute intent, never live GO or execution qualification.
+
+    Caller-supplied intent is not authoritative. Only an explicit execute and
+    the exact canonical callable for this boundary may set it, in a deep copy
+    separate from semantic input/capsule identity. All runtime gates still run.
+    """
+    execution_config = _boundary_execution_config(config, runtime_boundary)
+    from r2f.runtime.topology_route import topology_route_requested
+    intended = (execute is True and topology_route_requested(execution_config)
+                and _is_formal_runtime(runtime, runtime_boundary))
+    if not intended and "live_execution_go" not in execution_config:
+        return execution_config
+    copied = deepcopy(execution_config)
+    copied.pop("live_execution_go", None)
+    if intended:
+        copied["live_execution_go"] = True
+    return copied
+
+
+def runtime_formality(runtime, runtime_boundary=HOST_RUNTIME):
+    """Exact canonical callable for the selected boundary, or None."""
+    if runtime_boundary not in RUNTIME_BOUNDARIES:
+        raise ValueError('unsupported runtime_boundary: ' + repr(runtime_boundary))
+    canonical = runtime_for_boundary(runtime_boundary)
+    return canonical if runtime is canonical else None
+
+
+def _is_formal_runtime(runtime, runtime_boundary=HOST_RUNTIME):
+    """Only the exact canonical callable for the selected boundary is formal."""
+    if not callable(runtime):
+        return False
+    canonical = runtime_for_boundary(runtime_boundary)
+    return runtime is canonical
+
+
+def _resolve_execution_runtime(runtime=None, runtime_boundary=HOST_RUNTIME):
+    """Select a callable by identity, before producing any execution artifacts.
+
+    Names, module strings, wrappers and equality overloads grant no formality.
+    An arbitrary injected callable is admitted only on the offline host path.
+    """
+    canonical = runtime_for_boundary(runtime_boundary)
+    selected = canonical if runtime is None else runtime
+    if not callable(selected):
+        raise ValueError('runtime must be callable')
+    formal = selected is canonical
+    if runtime_boundary == ISOLATED_RUNTIME and not formal:
+        raise ValueError('isolated_netns requires the canonical execution boundary runtime')
+    return selected, formal
+
+
+def run_campaign(output_dir, *, runtime=None, execute=False,
+                 runtime_boundary=HOST_RUNTIME, **options):
     """Sequential cells, never parallel campaigns. Default is offline plan only.
 
     The owner coordinates actual execution; execute=True is an explicit action.
     An injected runner is for contract testing and is not proof of ROS execution.
     """
     output_dir = Path(output_dir).resolve()
+    if runtime_boundary not in RUNTIME_BOUNDARIES:
+        raise ValueError('unsupported runtime_boundary: ' + repr(runtime_boundary))
+    formal = False
+    if execute:
+        runtime, formal = _resolve_execution_runtime(runtime, runtime_boundary)
     report = plan_campaign(output_dir, **options)
+    report.update(runtime_boundary=runtime_boundary, formal_runtime=formal)
+    # Execution switches are persisted separately from capsule/input identity.
+    # Planned qualification is pending; it is NOT an execution admission veto.
+    for planned in report["rows"]:
+        config_path = Path(planned["runtime_config_path"])
+        config = json.loads(config_path.read_text())
+        execution_config = _runtime_execution_config(
+            config, execute=execute, runtime=runtime, runtime_boundary=runtime_boundary)
+        if execution_config != config:
+            write_json(config_path, execution_config)
+        if runtime_boundary == ISOLATED_RUNTIME:
+            planned["boundary_qualification"] = execution_boundary_qualification(runtime_boundary)
     if not execute:
         return _persist(output_dir, report)
-    if runtime is None:
-        from r2f.runtime.ros2_pair import run_pair
-        runtime = run_pair
     manifest = json.loads(Path(report["manifest_path"]).read_text())
     repo = Path(manifest["source_manifest"]["source_repo"])
-    if runtime.__module__ == "r2f.runtime.ros2_pair" and manifest["source_manifest"].get("source_frozen") is not True:
+    source = manifest["source_manifest"]
+    if formal and (source.get("source_frozen") is not True
+                   or runtime_boundary == ISOLATED_RUNTIME and (
+                       source.get("dirty_behavior_paths") != [] or not source.get("head")
+                       or not source.get("behavior_tree_sha256"))):
         report["abort_reason"] = "source_behavior_not_tracked_and_clean_at_HEAD"
+        report["runtime_boundary"] = runtime_boundary
         return _persist(output_dir, report)
     registry = Registry()
     register(registry)
@@ -147,6 +307,9 @@ def run_campaign(output_dir, *, runtime=None, execute=False, **options):
             report["abort_reason"] = "source_repo_HEAD_or_behavior_tree_changed"
             break
         config = json.loads(Path(planned["runtime_config_path"]).read_text())
+        config = _runtime_execution_config(
+            config, execute=execute, runtime=runtime, runtime_boundary=runtime_boundary)
+        write_json(planned["runtime_config_path"], config)
         capsule = ReplayCapsule.from_dict(json.loads(Path(planned["replay_path"]).read_text()))
         from r2f.core.scenario import Scenario
         scenario = Scenario.from_dict(capsule.input["scenario"])
@@ -175,6 +338,16 @@ def run_campaign(output_dir, *, runtime=None, execute=False, **options):
                 row["capsule_execution_error"] = str(exc)
         write_json(planned["replay_path"], capsule.to_dict())
         report["rows"][index] = row
+        qualification = execution_boundary_qualification(runtime_boundary, config=config,
+                                                      result=result, row=row, formal_runtime=formal,
+                                                      output_root=runtime_dir)
+        if qualification["status"] != "not_applicable":
+            row["boundary_qualification"] = qualification
+        if qualification["status"] not in {"not_applicable", "qualified"}:
+            row.update(boundary_qualification=qualification, candidate_eligible=False,
+                       feedback_eligible=False, seal_eligible=False)
+            report["abort_reason"] = qualification["reason_code"]
+            break
         if source_manifest(repo) != manifest["source_manifest"]:
             report["abort_reason"] = "source_repo_HEAD_or_behavior_tree_changed"
             break
@@ -185,7 +358,9 @@ def run_campaign(output_dir, *, runtime=None, execute=False, **options):
     for row in report["rows"]:
         rmw, repeat = row["rmw"], row["repeat"]
         controls = [by_id.get(f"{rmw}.{arm}.{repeat}", {}) for arm in ("baseline", "transparent", "mutated", "negative")]
-        passed = all(c.get("execution_stage") == "judged" and validate_control(dict(c, control_kind=kind, transparency_expected="no_effect_or_expected_pass"))
+        passed = all(c.get("execution_stage") == "judged"
+                     and c.get("boundary_qualification", {}).get("status", "not_applicable") in {"not_applicable", "qualified"}
+                     and validate_control(dict(c, control_kind=kind, transparency_expected="no_effect_or_expected_pass"))
                      for c, kind in zip(controls, ("health", "transparency", "mutation", "fault")))
         equal_payload = controls[0].get("actual_submitted_payload_sha256") == controls[1].get("actual_submitted_payload_sha256")
         row.update(controls_support_sut=passed and equal_payload, provenance_supports_sut=passed and equal_payload)
@@ -215,7 +390,7 @@ import tempfile as _tempfile
 
 from r2f.core.evidence import INPUT_SCHEMA_V2, effective_input_hash
 from r2f.core.mutators import (
-    MUTATORS, WIDE_SAMPLING_KINDS, _wide_kinds, make_rng, mutate, mutate_wide,
+    MUTATORS, WIDE_SAMPLING_KINDS, _wide_kinds, make_rng, mutate, mutate_f2, mutate_wide,
 )
 from r2f.core.mutation_plan import compose, compose_chain
 from r2f.core.scenario import Scenario
@@ -225,6 +400,15 @@ from r2f.modules.s1.fuzz_catalog import catalog_digest
 from .corpus import Corpus, content_identity
 from .feedback import FeedbackLog, observation_complete, tool_error
 from .scheduler import ExploratoryScheduler, required_catalog_hash
+from .exploratory_input import (CONTROL_FIELDS, PROFILE_CONTROL_FIELDS,
+                                apply_profile_controls, runtime_input,
+                                validate_profile_fields, validate_f2_profile,
+                                F2_WINDOWS_CAPABILITY, F2_WINDOWS_TARGET,
+                                F2_SURFACE_MUTATORS)
+
+from r2f.modules.s1.topology_targets import (
+    TOPOLOGY_TARGET, TOPOLOGY_CAPABILITY, TOPOLOGY_SURFACE, TOPOLOGY_MUTATOR,
+)
 
 EXPLORATORY_CYCLE_SCHEMA = "r2f.s1-exploratory-cycle/v1"
 
@@ -275,7 +459,24 @@ _EXPLORATORY_ROUTES = {
 #: F1 exploratory targets whose declared carrier/backend can be generated by
 #: this runner.  Derived from the route table so a target cannot be enabled
 #: without a concrete backend/carrier pair.
-_F1_CYCLE_TARGETS = frozenset(_EXPLORATORY_ROUTES)
+_EXPLORATORY_ROUTES[F2_WINDOWS_TARGET] = {
+    "family": "discovery_namespace", "backend": "discovery_namespace",
+    "carrier": "wire_proxy", "mutation_kind": "discovery_drop",
+    "runtime_capability": F2_WINDOWS_CAPABILITY,
+    # Dispatch admission is explicit, not a claim that this source is live
+    # qualified. Runtime observations/locks/source gates remain mandatory.
+    "execution_admitted": True,
+}
+_EXPLORATORY_ROUTES[TOPOLOGY_TARGET] = {
+    "family": "topology_program", "backend": "topology_pair",
+    "carrier": "ros2_endpoint", "mutation_kind": "endpoint_program",
+    "runtime_capability": TOPOLOGY_CAPABILITY,
+    # Admission selects the existing canonical dispatcher, not live qualification.
+    "execution_admitted": True,
+}
+_F1_CYCLE_TARGETS = frozenset(t for t, route in _EXPLORATORY_ROUTES.items()
+                              if "runtime_capability" not in route)
+_F2_CYCLE_TARGETS = frozenset({F2_WINDOWS_TARGET})
 
 #: Public projection QoS fields the projection_pair runtime actually consumes.
 #: Catalog annotations (deadline_class, special_value_classes) are input-model
@@ -294,7 +495,11 @@ class ExploratoryCycleError(ValueError):
     """Raised when an exploratory cycle cannot be constructed honestly."""
 
 
-def _atomic_json(path, value):
+class _F2InputRejection(ExploratoryCycleError):
+    """Pre-compose F2 guard failure; never an executed/runtime result."""
+
+
+def _atomic_json(path, value, *, durable=False):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = json.dumps(value, sort_keys=True, indent=2, allow_nan=False) + "\n"
@@ -302,7 +507,16 @@ def _atomic_json(path, value):
     try:
         with _os.fdopen(fd, "w") as handle:
             handle.write(payload)
+            if durable:
+                handle.flush()
+                _os.fsync(handle.fileno())
         _os.replace(temporary, path)
+        if durable:
+            directory = _os.open(str(path.parent), _os.O_RDONLY | _os.O_DIRECTORY)
+            try:
+                _os.fsync(directory)
+            finally:
+                _os.close(directory)
     except BaseException:
         try:
             _os.unlink(temporary)
@@ -324,7 +538,11 @@ def _load_profile(profile):
         if not isinstance(profile.get(key), list) or not profile[key]:
             raise ExploratoryCycleError("profile " + key + " is required")
     _profile_wide_settings(profile)
-    return json.loads(json.dumps(profile))
+    try:
+        validate_profile_fields(profile)
+    except ValueError as exc:
+        raise ExploratoryCycleError(str(exc)) from exc
+    return json.loads(json.dumps(profile, allow_nan=False))
 
 
 def _profile_wide_settings(profile):
@@ -407,6 +625,28 @@ def _application_phase(surface):
 
 
 def _derive_rng_seed(scheduler, selection, entry):
+    if getattr(scheduler, "policy", None) == "fair":
+        # Fair's audit selection hash deliberately retains feedback identity.
+        # Only its scheduler-authenticated model decision may drive generation.
+        decision = selection.get("decision_sha256")
+        if not isinstance(decision, str) or not re.fullmatch(r"[0-9a-f]{64}", decision):
+            raise ExploratoryCycleError("fair scheduler requires a valid decision_sha256")
+        sequence = selection.get("sequence")
+        if type(sequence) is not int or not 0 <= sequence < len(scheduler.selection_log):
+            raise ExploratoryCycleError("fair decision_sha256 has no accepted selection")
+        accepted = scheduler.selection_log[sequence]
+        event = {key: value for key, value in selection.items() if key != "entry"}
+        if (event != accepted or entry.get("content_sha256") != accepted.get("content_sha256")
+                or not isinstance(accepted.get("decision_context"), dict)
+                or canonical_hash(accepted["decision_context"]) != decision):
+            raise ExploratoryCycleError("fair decision_sha256 differs from the accepted scheduler event")
+        material = canonical_hash({
+            "cycle_rng_seed": scheduler.rng_seed,
+            "decision_sha256": decision,
+            "sequence": sequence,
+            "parent_content_sha256": entry["content_sha256"],
+        })
+        return int(material[:16], 16)
     material = canonical_hash({
         "cycle_rng_seed": scheduler.rng_seed,
         "selection_sha256": selection["selection_sha256"],
@@ -417,6 +657,51 @@ def _derive_rng_seed(scheduler, selection, entry):
 
 
 _OFFLINE_EVIDENCE_ORIGINS = frozenset({"fixture", "synthetic", "offline"})
+
+
+class _TopologyInputRejection(ValueError):
+    def __init__(self, detail, attempts):
+        super().__init__(detail)
+        self.attempts = attempts
+
+
+def _topology_generation(parent, profile, rng_seed):
+    """Bounded explicit S1 bridge, not a default MUTATORS entry.
+
+    Candidate failures are input generation diagnostics, never runtime attempts.
+    Every accepted layer is rebuilt by the core bridge from the original parent
+    and the saved ordered requests, using its documented seed+i scheme.
+    """
+    from r2f.modules.s1.topology_input import make_topology_plan
+    from .exploratory_input import validate_topology_profile
+    validate_topology_profile(profile)
+    if not isinstance(parent, dict) or set(parent) != {"topology_program"}:
+        raise _TopologyInputRejection("topology_parent_shape_mismatch", [])
+    requests, attempts, plan = [], [], None
+    rng = make_rng(rng_seed)
+    for index in range(profile["chain_length"]):
+        operators = list(profile["operator_whitelist"])
+        rng.shuffle(operators)
+        for operator in operators:
+            request = {"operator_id": operator}
+            try:
+                proposed = make_topology_plan(parent["topology_program"], requests + [request], rng_seed=rng_seed)
+                if any(op.applicability_status in {"rejected", "blocked"} for op in proposed.operations):
+                    raise ValueError("topology_deliberate_guard_or_blocked_layer_not_executable")
+            except ValueError as exc:
+                attempts.append({"layer_index": index, "operator_id": operator,
+                                 "status": "rejected", "reason": str(exc)})
+                continue
+            attempts.append({"layer_index": index, "operator_id": operator, "status": "accepted"})
+            requests.append(request)
+            plan = proposed
+            break
+        else:
+            raise _TopologyInputRejection("topology_no_applicable_content_changing_operator:layer=" + str(index), attempts)
+    return plan, {"schema": "r2f.topology-generation/v1", "rng_seed": rng_seed,
+                  "operator_whitelist": list(profile["operator_whitelist"]),
+                  "requests": requests, "attempts": attempts,
+                  "chain_length": len(plan.operations), "execution_evidence": False}
 
 
 def _evidence_origin(runtime_result):
@@ -441,12 +726,55 @@ def _flatten_surface_values(surface, config):
         current = config
         for part in path.split("."):
             if not isinstance(current, dict) or part not in current:
-                current = None
-                break
+                raise ValueError("submitted_parameter_missing:" + path)
             current = current[part]
-        if current is not None:
-            values[path] = current
+        if current is None:
+            raise ValueError("submitted_parameter_null:" + path)
+        values[path] = current
     return values
+
+
+def _plan_surface_bindings(plan, contract):
+    """Derive audit metadata for every saved operation, never a new hash layer.
+
+    Keep first-occurrence operation order and each surface's input-path order.
+    Shared paths must agree exactly; a missing declaration is not a no-op.
+    A valid single-operation input retains its historical projection bytes.
+    """
+    surfaces = list(dict.fromkeys(op.surface_id for op in plan.operations))
+    if not surfaces:
+        raise ValueError("submitted_surfaces_missing")
+    submitted = {}
+    for surface_id in surfaces:
+        surface = contract.surface_by_id.get(surface_id)
+        if surface is None:
+            raise ValueError("submitted_surface_not_in_contract:" + surface_id)
+        if not surface.input_paths:
+            raise ValueError("submitted_surface_input_paths_missing:" + surface_id)
+        if plan.final_config.get("runtime_capability") == F2_WINDOWS_CAPABILITY and surface_id in F2_SURFACE_MUTATORS:
+            windows = _validate_explicit_recovery_windows(plan.final_config.get("environment_windows"))
+            operation = next(op for op in plan.operations if op.surface_id == surface_id)
+            anchor = operation.parameters.get("anchor")
+            applicable = [w for w in windows if w["trigger_anchor"] == anchor]
+            if not applicable:
+                raise ValueError("f2_previous_restore_anchor_requires_multiple_windows")
+            offset_key = "anchor_offset_sec" if surface_id == "E02" else "offset_sec"
+            offset = operation.parameters.get(offset_key)
+            if type(offset) not in (int, float) or any(
+                    w["trigger_offset_sec"] != offset for w in applicable):
+                raise ValueError("f2_affected_window_offset_binding_mismatch")
+            projected = {"environment_windows.count": len(windows),
+                         "environment_windows.restore_interval_sec": windows[0]["restore_interval_sec"],
+                         "environment_windows.anchor": anchor,
+                         "environment_windows.anchor_offset_sec": offset}
+            values = {path: projected[path] for path in surface.input_paths}
+        else:
+            values = _flatten_surface_values(surface, plan.final_config)
+        for path, value in values.items():
+            if path in submitted and canonical_hash(submitted[path]) != canonical_hash(value):
+                raise ValueError("submitted_parameter_conflict:" + path)
+            submitted[path] = value
+    return surfaces, submitted
 
 
 def _wide_generation_requested(profile):
@@ -479,7 +807,7 @@ def _layer_rng(rng_seed, layer_index, surface_id):
     return make_rng(int(material[:16], 16))
 
 
-def _chain_surfaces(contract, surface, chain_length):
+def _chain_surfaces(contract, surface, chain_length, allowed_surfaces=None):
     """Deterministic ordered layer surfaces for one chain length.
 
     The entry surface is always layer 0.  Additional layers are the other
@@ -493,7 +821,8 @@ def _chain_surfaces(contract, surface, chain_length):
     order = [surface]
     if chain_length == 1:
         return order
-    others = sorted(s for s in contract.surface_by_id if s != surface.surface_id)
+    others = sorted(s for s in contract.surface_by_id if s != surface.surface_id
+                    and (allowed_surfaces is None or s in allowed_surfaces))
     while len(order) < chain_length:
         selected = None
         from r2f.core.mutation_plan import (
@@ -622,6 +951,21 @@ def _adapt_parent(target_id, route, parent):
             raise ValueError("recovery parent is missing: " + ",".join(missing))
         receipt.update(required_fields=["drop_duration_sec", "recovery_timeout_sec",
                                         "counter_interval_sec"])
+    if target_id == F2_WINDOWS_TARGET and isinstance(adapted.get("environment_windows"), list):
+        # M06/M07 write declared logical paths. Preserve the concrete parent
+        # windows in an audited pre-compose projection; never patch a finished
+        # operation or re-label its input_after hash.
+        windows = _validate_explicit_recovery_windows(adapted["environment_windows"])
+        adapted["environment_windows"] = {
+            "count": len(windows), "windows": windows,
+            "anchor": "fresh_match", "anchor_offset_sec": windows[0]["trigger_offset_sec"],
+            "restore_interval_sec": windows[0]["restore_interval_sec"],
+        }
+        receipt["f2_logical_parent_projection"] = {
+            "concrete_windows_preserved": True, "before_compose": True,
+            "source_windows_sha256": canonical_hash(parent["environment_windows"]),
+            "logical_windows_sha256": canonical_hash(adapted["environment_windows"]),
+        }
     return adapted, receipt
 
 
@@ -681,7 +1025,7 @@ def _validate_explicit_recovery_windows(windows, *, recovery_timeout_sec=None,
                 raise ValueError(f"runtime_window.{key} must be a number")
             if not math.isfinite(value):
                 raise ValueError(f"runtime_window.{key} must be finite")
-            values[key] = value
+            values[key] = float(value)
         if not 0 < values["drop_duration_sec"] <= 8:
             raise ValueError("runtime_window.drop_duration_sec must be in (0,8]")
         if not 0 <= values["trigger_offset_sec"] <= 8:
@@ -748,16 +1092,200 @@ def _recovery_windows(drop_duration_sec, windows=None, *, recovery_timeout_sec=N
         "drop_duration_sec": drop_duration_sec, "restore_interval_sec": 0.0,
     }
     runtime_window = {key: value for key, value in core_window.items() if key != "schema"}
+    # Same bounds/budget checks as explicit plans, without changing the legacy
+    # single-window representation or its historical hashes.
+    _validate_explicit_recovery_windows(
+        [runtime_window], recovery_timeout_sec=recovery_timeout_sec, max_seconds=max_seconds)
     return core_window, runtime_window
 
 
+def _materialize_recovery_windows(config):
+    """Resolve inherited/catalog window input without discarding its order."""
+    value = config["environment_windows"]
+    if isinstance(value, list):
+        return _validate_explicit_recovery_windows(value)
+    if not isinstance(value, dict) or not value:
+        raise ValueError("environment_windows must be a nonempty window plan")
+    allowed = {"count", "restore_interval_sec", "windows", "anchor", "anchor_offset_sec"}
+    unknown = set(value) - allowed
+    if unknown:
+        raise ValueError("unsupported environment_windows field:" + ",".join(sorted(unknown)))
+    count = value.get("count")
+    if type(count) is not int or not 1 <= count <= 3:
+        raise ValueError("environment_windows.count must be an integer in 1..3")
+    for field in ("restore_interval_sec", "anchor_offset_sec"):
+        if field in value and (type(value[field]) not in (int, float)
+                               or not math.isfinite(value[field]) or not 0 <= value[field] <= 8):
+            raise ValueError("invalid environment_windows." + field)
+    f2_windows = config.get("runtime_capability") == F2_WINDOWS_CAPABILITY
+    anchor = value.get("anchor", "fresh_match")
+    if anchor != "fresh_match" and not (f2_windows and anchor == "previous_restore_confirmed"):
+        raise ValueError("environment_windows.anchor must be fresh_match")
+    if anchor == "previous_restore_confirmed" and count == 1:
+        raise ValueError("f2_previous_restore_anchor_requires_multiple_windows")
+    declared = value.get("windows")
+    if "windows" in value and (not isinstance(declared, list) or len(declared) != count):
+        raise ValueError("environment_windows.windows must match count")
+    windows = []
+    for position in range(count):
+        window = (dict(declared[position]) if declared is not None
+                  and isinstance(declared[position], dict) else {})
+        if declared is not None and not window:
+            raise ValueError("environment_windows.windows requires nonempty window objects")
+        # M07 catalog metadata is not an executable begin/end receipt.
+        for key in ("begin", "end", "restore", "requires_previous_restore"):
+            if key in window:
+                expected = position > 0 if key == "requires_previous_restore" else True
+                if window.pop(key) is not expected:
+                    raise ValueError("invalid environment_windows.windows." + key)
+        window.setdefault("window_id", "post_match_window_%d" % (position + 1))
+        window.setdefault("window_index", position)
+        window.setdefault("trigger_anchor", "fresh_match" if position == 0 else "previous_restore_confirmed")
+        window.setdefault("trigger_offset_sec", value.get("anchor_offset_sec", 0.0)
+                          if position == 0 and anchor == "fresh_match" else 0.0)
+        if f2_windows and window["trigger_anchor"] == anchor:
+            window["trigger_offset_sec"] = value.get("anchor_offset_sec", 0.0)
+        window.setdefault("drop_duration_sec", config.get("drop_duration_sec"))
+        window.setdefault("restore_interval_sec", value.get("restore_interval_sec", 0.0))
+        windows.append(window)
+    return _validate_explicit_recovery_windows(windows)
+
+
+def _compose_recovery_inputs(parent, proposals, *, max_seconds=None):
+    """Synchronize proposals before compose; never rewrite a finished plan.
+
+    An E01 duration write applies to every inherited window.  Other mutations
+    preserve per-window durations/order.  The extra top-level changes are part
+    of the same operation's input_after hash, not a post-compose repair.
+    """
+    from dataclasses import replace
+    from r2f.core.mutation_plan import _apply_changes
+    from r2f.runtime.namespace_pair import validate_reader_churn_config
+
+    current = json.loads(json.dumps(parent))
+    if "environment_windows" in current:
+        _materialize_recovery_windows(current)  # reject invalid inherited plans
+    rebased = []
+    origin = "single_window_default"
+    for proposal in proposals:
+        changes = dict(proposal.changes)
+        after = _apply_changes(current, changes)
+        explicit = proposal.runtime_windows
+        if explicit:
+            _, resolved = _recovery_windows(after.get("drop_duration_sec"), explicit)
+            origin = "m07_explicit"
+        elif "environment_windows" in after:
+            resolved = _materialize_recovery_windows(after)
+            origin = "final_environment_windows"
+        else:
+            resolved = None
+        if resolved is not None:
+            if "drop_duration_sec" in changes:
+                resolved = [dict(window, drop_duration_sec=after["drop_duration_sec"])
+                            for window in resolved]
+            # Replace the declarative mapping/dotted writes with one concrete
+            # submitted list, including its mutation in the operation chain.
+            resolved = _validate_explicit_recovery_windows(resolved)
+            changes = {key: value for key, value in changes.items()
+                       if not key.startswith("environment_windows.")}
+            changes["environment_windows"] = resolved
+            after = _apply_changes(current, changes)
+        rebased.append(replace(proposal, input_before=current, input_after=after,
+                               changes=changes, runtime_windows=[]))
+        current = after
+    explicit = current.get("environment_windows") if "environment_windows" in current else None
+    built = _recovery_windows(
+        current.get("drop_duration_sec"), explicit,
+        recovery_timeout_sec=current.get("recovery_timeout_sec"), max_seconds=max_seconds)
+    core, runtime = ([built[0]], [built[1]]) if isinstance(built[0], dict) else built
+    # Validate every stimulus against every window, not just the first window
+    # used by the runtime's historical input checker.
+    for window in runtime:
+        try:
+            validate_reader_churn_config(dict(current, runtime_windows=[window]))
+        except RuntimeError as exc:
+            raise ValueError(str(exc)) from exc
+    return rebased, core, runtime, origin
+
+
+def _producer_identity():
+    pid = os.getpid()
+    try:
+        start = Path(f"/proc/{pid}/stat").read_text().rsplit(") ", 1)[1].split()[19]
+    except (OSError, IndexError):
+        start = None
+    return {"pid": pid, "start_ticks": start}
+
+
+def _producer_active(owner):
+    """True/False/None: unknown owner identity is not permission to resume."""
+    if (not isinstance(owner, dict) or type(owner.get("pid")) is not int
+            or owner["pid"] <= 0 or not isinstance(owner.get("start_ticks"), str)):
+        return None
+    try:
+        start = Path(f"/proc/{owner['pid']}/stat").read_text().rsplit(") ", 1)[1].split()[19]
+    except FileNotFoundError:
+        return False
+    except (OSError, IndexError):
+        return None
+    return start == owner["start_ticks"]
+
+
+def _persist_topology_exploratory_report(output_dir, cycle, registry):
+    """Use the existing exploratory report/ledger schema, never required seal."""
+    from r2f.reports.candidate_report import exploratory_candidate_ledger
+    from r2f.reports.run_report import (EXPLORATORY_SCHEMA, exploratory_report_digest,
+                                       audit_exploratory_report, _topology_artifact_qualification)
+    target = registry.get_target(TOPOLOGY_TARGET)
+    from r2f.core.mutators import TOPOLOGY_MUTATOR_SPECS
+    mutators = {TOPOLOGY_MUTATOR: TOPOLOGY_MUTATOR_SPECS[TOPOLOGY_MUTATOR].to_dict()}
+    model = {"catalog_digest": catalog_digest(), "mutator_catalog": mutators,
+             "mutator_catalog_sha256": canonical_hash(mutators)}
+    report = {"schema_version": EXPLORATORY_SCHEMA, "campaign_kind": "exploratory",
+              "run_id": cycle["run_id"], "profile": cycle["profile"],
+              "source_manifest": cycle["source_manifest"], "model": model,
+              "identity": {"profile_sha256": canonical_hash(cycle["profile"]),
+                           "source_sha256": canonical_hash(cycle["source_manifest"]),
+                           "model_sha256": canonical_hash(model), "rule_sha256": canonical_hash(target.rule_contract),
+                           "target_sha256": canonical_hash(target.to_dict())},
+              "required_catalog_sha256": required_catalog_hash(), "rows": cycle["rows"],
+              "budget": cycle["budget"], "last_state": cycle["last_state"], "abort": cycle["abort"],
+              "runtime_boundary": cycle["runtime_boundary"], "runtime_formal": cycle["runtime_formal"],
+              "control_references": [], "review_records": []}
+    eligible, exclusions = [], []
+    for row in cycle["rows"]:
+        try:
+            qualified = _topology_artifact_qualification(output_dir, row, report)
+        except (OSError, ValueError, TypeError, KeyError) as exc:
+            qualified = {"real_ros_execution": False, "qualification_errors": [str(exc)]}
+        if qualified["real_ros_execution"]:
+            eligible.append(row)
+        else:
+            exclusions.append({"cell_id": row.get("cell_id"), "actual_run": row.get("actual_run"),
+                               "execution_stage": row.get("execution_stage"), "raw_path": row.get("raw_path"),
+                               "raw_sha256": row.get("raw_sha256"),
+                               "qualification_errors": qualified["qualification_errors"]})
+    ledger = exploratory_candidate_ledger(eligible)
+    if exclusions:
+        ledger["execution_exclusions"] = exclusions
+    _atomic_json(output_dir / "candidate_ledger.json", ledger)
+    report.update(candidate_ledger_path="candidate_ledger.json", candidate_ledger_sha256=canonical_hash(ledger))
+    report["report_sha256"] = exploratory_report_digest(report)
+    path = output_dir / "report.json"
+    _atomic_json(path, report)
+    report["audit"] = audit_exploratory_report(path)
+    _atomic_json(path, report)
+    return path
+
+
 def run_exploratory_cycle(output_dir, *, corpus, feedback, scheduler, profile, runtime=None,
-                          execute=False, repo=None, run_id=None, max_inputs=1,
-                          domain_id=173):
+                          execute=False, repo=None, run_id=None, max_inputs=None,
+                          domain_id=173, continuation=None, checkpoint_hook=None,
+                          runtime_boundary=HOST_RUNTIME):
     """Run one bounded feedback-driven exploratory cycle.
 
     ``execute=False`` performs no runtime call: rows stay ``planned`` and no
-    feedback is recorded.  ``execute=True`` requires an injected runtime; the
+    feedback is recorded.  ``execute=True`` requires a runtime callable; the
     carrier dispatches the plan-bearing v2 identity, so the runner passes the
     same single digest it wrote to the capsule and runtime config.
     """
@@ -771,11 +1299,39 @@ def run_exploratory_cycle(output_dir, *, corpus, feedback, scheduler, profile, r
         raise ExploratoryCycleError("scheduler feedback prefix does not match the supplied log")
     if scheduler.feedback_identity_at_start != feedback.identity():
         raise ExploratoryCycleError("scheduler feedback identity drift")
+    if runtime_boundary not in RUNTIME_BOUNDARIES:
+        raise ExploratoryCycleError("unsupported runtime_boundary: " + repr(runtime_boundary))
+    if execute and not callable(runtime):
+        raise ExploratoryCycleError("execute=True requires a runtime callable")
+    formal_runtime = False
+    if execute:
+        try:
+            runtime, formal_runtime = _resolve_execution_runtime(runtime, runtime_boundary)
+        except ValueError as exc:
+            raise ExploratoryCycleError(str(exc)) from exc
+    profile = _load_profile(profile)
+    declared_budget = profile.get("budget", {})
+    if not isinstance(declared_budget, dict):
+        raise ExploratoryCycleError("profile budget must be an object")
+    max_inputs = declared_budget.get("max_inputs", 1) if max_inputs is None else max_inputs
     if type(max_inputs) is not int or max_inputs < 1:
         raise ExploratoryCycleError("max_inputs must be a positive integer")
-    if execute and not callable(runtime):
-        raise ExploratoryCycleError("execute=True requires an injected runtime callable")
-    profile = _load_profile(profile)
+    max_seconds = declared_budget.get("max_seconds")
+    if max_seconds is not None and (type(max_seconds) not in (int, float)
+            or not math.isfinite(max_seconds) or max_seconds <= 0):
+        raise ExploratoryCycleError("budget.max_seconds must be finite and positive")
+    warmup = declared_budget.get("warmup_inputs", scheduler.warmup)
+    if type(warmup) is not int or warmup < 0:
+        raise ExploratoryCycleError("budget.warmup_inputs must be a nonnegative integer")
+    if scheduler.selection_log and scheduler.warmup != warmup:
+        raise ExploratoryCycleError("cannot change warmup after selection")
+    scheduler.warmup = warmup
+    if continuation is not None and not isinstance(continuation, dict):
+        raise ExploratoryCycleError("continuation must be an object")
+    continuation = deepcopy(continuation or {})
+    if checkpoint_hook is not None and not callable(checkpoint_hook):
+        raise ExploratoryCycleError("checkpoint_hook must be callable")
+    started = time.monotonic()
     _sync_sampling(scheduler, profile)
     sampling_kinds, sampling_weight, chain_length = _profile_wide_settings(profile)
 
@@ -790,7 +1346,8 @@ def run_exploratory_cycle(output_dir, *, corpus, feedback, scheduler, profile, r
 
     source = source_manifest(repo)
     registry = Registry()
-    register_exploratory(registry, include_required=False)
+    register_exploratory(registry, include_required=False,
+                         runtime_capability=profile.get("runtime_capability"))
     manifest = {
         "schema_version": 1, "campaign_kind": "exploratory", "run_id": run_id,
         "profile": profile, "profile_id": profile["profile_id"],
@@ -798,20 +1355,155 @@ def run_exploratory_cycle(output_dir, *, corpus, feedback, scheduler, profile, r
         "catalog_digest": catalog_digest(),
         "required_catalog_sha256": required_catalog_hash(),
         "target_ids": list(profile["target_ids"]),
-        "exploration_order": list(EXPLORATORY_TARGET_ORDER),
+        "exploration_order": list(EXPLORATORY_TARGET_ORDER) + (
+            [F2_WINDOWS_TARGET] if profile.get("runtime_capability") == F2_WINDOWS_CAPABILITY else
+            [TOPOLOGY_TARGET] if profile.get("runtime_capability") == TOPOLOGY_CAPABILITY else []),
         "input_identity_schema": INPUT_SCHEMA_V2,
         "required_matrix_changed": False, "maturity_denominator_changed": False,
         "execution_boundary": profile.get("execution_boundary"),
+        "runtime_boundary": runtime_boundary,
     }
     _atomic_json(output_dir / "manifest.json", manifest)
 
-    rows, rejected, budget = [], [], {
-        "planned": 0, "generated": 0, "attempted": 0, "executed": 0,
-        "aborted": 0, "interrupted": 0, "max_inputs": max_inputs,
-    }
+    counters = ("selected", "planned", "generated", "attempted", "actual",
+                "executed", "aborted", "interrupted")
+    previous = continuation.get("budget", {})
+    if not isinstance(previous, dict):
+        raise ExploratoryCycleError("continuation budget must be an object")
+    budget = {}
+    for key in counters:
+        value = previous.get(key, 0)
+        if type(value) is not int or value < 0:
+            raise ExploratoryCycleError("invalid continuation budget " + key)
+        budget[key] = value
+    elapsed_before = previous.get("elapsed_sec", 0.0)
+    if (type(elapsed_before) not in (int, float) or not math.isfinite(elapsed_before)
+            or elapsed_before < 0):
+        raise ExploratoryCycleError("invalid continuation elapsed_sec")
+    seen, seen_actual = set(), set()
+    for key, destination in (("seen_input_hashes", seen), ("seen_actual_hashes", seen_actual)):
+        values = continuation.get(key, [])
+        if not isinstance(values, list) or any(not isinstance(v, str) or not re.fullmatch(r"[0-9a-f]{64}", v) for v in values):
+            raise ExploratoryCycleError("invalid continuation " + key)
+        destination.update(values)
+    if not seen_actual <= seen:
+        raise ExploratoryCycleError("actual input hashes must be selected input hashes")
+    initial_counts = dict(budget)
+    budget.update(max_inputs=max_inputs, max_seconds=max_seconds,
+                  warmup_inputs=warmup, unique_inputs=len(seen), unique_actual=len(seen_actual))
+    rows, rejected, row_sequences = [], [], []
+    pending = continuation.get("pending_selection")
+    if pending is not None:
+        if (not isinstance(pending, dict) or not isinstance(pending.get("entry"), dict)
+                or not scheduler.selection_log
+                or pending.get("selection_sha256") != scheduler.selection_log[-1].get("selection_sha256")
+                or pending.get("sequence") != scheduler.selection_log[-1].get("sequence")):
+            raise ExploratoryCycleError("pending selection is not the last accepted selection")
+    last_case_ref = continuation.get("last_case_ref")
+    submission_state = continuation.get("submission_state")
+    producer = _producer_identity()
+    resume_uncertainty = None
+    if pending is not None:
+        if submission_state != "prepared" or not isinstance(last_case_ref, dict):
+            resume_uncertainty = "pending_submission_state_or_owner_unknown"
+        else:
+            try:
+                old_case = Path(last_case_ref["case_dir"]).resolve()
+                old_output = Path(last_case_ref["output_dir"]).resolve()
+                marker = old_case / "submission_intent.json"
+                runtime_dir = old_case / "runtime"
+                if (old_case != old_output / "cases" / last_case_ref["cell_id"]
+                        or last_case_ref["cell_id"] != pending.get("cell_id", last_case_ref["cell_id"])
+                        or not (old_case / "row.json").is_file()
+                        or marker.exists() or (old_case / "submission.json").exists()
+                        or runtime_dir.exists()):
+                    resume_uncertainty = "pending_has_submission_runtime_or_unknown_case"
+                old_row = json.loads((old_case / "row.json").read_text())
+                old_capsule = json.loads((old_case / "capsule.json").read_text())
+                if (old_row.get("execution_stage") != "planned" or old_row.get("actual_run") is not False
+                        or old_row.get("workspace_executed") is True
+                        or old_capsule.get("execution") is not None or old_capsule.get("execution_history")):
+                    resume_uncertainty = "pending_has_execution_evidence"
+                if continuation.get("execute_requested") is not False:
+                    if _producer_active(continuation.get("producer")) is not False:
+                        resume_uncertainty = "pending_runtime_owner_alive_or_unknown"
+            except (KeyError, TypeError, OSError, ValueError):
+                resume_uncertainty = "pending_case_owner_cannot_be_verified"
+    cycle_ids = {entry.get("cycle_id") for entry in corpus.entries.values() if entry.get("cycle_id")}
+    cycle_id = continuation.get("cycle_id") or (next(iter(cycle_ids)) if len(cycle_ids) == 1 else None)
+
+    def update_elapsed():
+        budget["elapsed_sec"] = elapsed_before + max(0.0, time.monotonic() - started)
+        return max_seconds is not None and budget["elapsed_sec"] >= max_seconds
+
+    def checkpoint(phase):
+        update_elapsed()
+        if checkpoint_hook is not None:
+            checkpoint_hook({
+                "schema": "r2f.exploratory-checkpoint-state/v1", "phase": phase,
+                "run_id": run_id, "cycle_id": cycle_id, "profile": profile,
+                "source_manifest": source, "corpus": corpus.to_dict(),
+                "feedback": feedback.to_dict(), "scheduler": scheduler.to_dict(),
+                "budget": deepcopy(budget), "seen_input_hashes": sorted(seen),
+                "seen_actual_hashes": sorted(seen_actual),
+                "next_selection_sequence": len(scheduler.selection_log),
+                "pending_selection": deepcopy(pending), "last_case_ref": deepcopy(last_case_ref),
+                "submission_state": submission_state, "execute_requested": bool(execute),
+                "producer": producer,
+                "target_manifest": [registry.get_target(t).to_dict() for t in profile["target_ids"]],
+                "required_catalog_sha256": required_catalog_hash(),
+                "row_count": len(rows), "stop_reason": stop_reason,
+            })
+
+    def planned(row, selection):
+        nonlocal pending, last_case_ref, submission_state
+        pending = deepcopy(selection)
+        case = output_dir / "cases" / row["cell_id"]
+        last_case_ref = {"cell_id": row["cell_id"], "output_dir": str(output_dir),
+                         "case_dir": str(case), "row_path": str(case / "row.json"),
+                         "runtime_dir": str(case / "runtime"), "capsule_path": str(case / "capsule.json"),
+                         "runtime_config_path": str(case / "runtime_config.json"),
+                         "submission_marker_path": str(case / "submission_intent.json")}
+        submission_state = "prepared"
+        digest = row.get("content_sha256")
+        if digest:
+            seen.add(digest)
+        budget["unique_inputs"] = len(seen)
+        checkpoint("planned")
+
+    def submitted(row, selection):
+        nonlocal submission_state
+        submission_state = "submitted"
+        _atomic_json(Path(last_case_ref["submission_marker_path"]), {
+            "schema": "r2f.exploratory-submission/v1", "status": "submitted_or_uncertain",
+            "cell_id": row["cell_id"], "sequence": selection["sequence"],
+            "content_sha256": row["content_sha256"], "execute_requested": True,
+            "owner": producer, "selection_sha256": selection["selection_sha256"],
+            "effective_input_sha256": row["effective_input_sha256"],
+            "source_manifest": source, "case_ref": deepcopy(last_case_ref),
+            "actual_run_claimed": False}, durable=True)
+        checkpoint("planned")
+
     abort = None
     stop_reason = None
-    last_state = {"planned": 0, "executed": 0, "cell_id": None, "sequence": None}
+    if resume_uncertainty is not None:
+        abort = {"reason_code": "resume_pending_execution_uncertain", "detail": resume_uncertainty,
+                 "last_case_ref": deepcopy(last_case_ref)}
+        stop_reason = abort["reason_code"]
+        manifest["abort"] = abort
+        _atomic_json(output_dir / "manifest.json", manifest)
+    if not abort and formal_runtime and (
+            source.get("source_frozen") is not True
+            or (runtime_boundary == ISOLATED_RUNTIME or profile.get("runtime_capability") == TOPOLOGY_CAPABILITY) and (
+                source.get("dirty_behavior_paths") != [] or not source.get("head")
+                or not source.get("behavior_tree_sha256"))):
+        abort = {"reason_code": "source_behavior_not_tracked_and_clean_at_HEAD",
+                 "detail": "real runtime requires tracked behavior clean at HEAD"}
+        stop_reason = abort["reason_code"]
+        manifest["abort"] = abort
+        _atomic_json(output_dir / "manifest.json", manifest)
+    last_state = {"planned": budget["planned"], "executed": budget["executed"],
+                  "cell_id": None, "sequence": None}
 
     def reject(sequence, entry, detail):
         row = {
@@ -828,26 +1520,40 @@ def run_exploratory_cycle(output_dir, *, corpus, feedback, scheduler, profile, r
             "generation_status": "rejected",
             "reason_code": detail,
         }
-        rows.append(row); rejected.append(row)
+        rejected.append(row)
         budget["planned"] += 1
         return row
 
-    for sequence in range(max_inputs):
+    while not abort and (pending is not None or budget["selected"] < max_inputs):
+        if update_elapsed():
+            stop_reason = "cycle_deadline_reached"
+            break
         if not corpus.selectable():
             stop_reason = "selection_exhausted"
             break
         try:
-            selection = scheduler.next()
+            if pending is not None:
+                selection = deepcopy(pending)
+                # Regenerate the already persisted plan in the new output tree;
+                # this is not a second selection or a second planned input.
+                budget["planned"] -= 1
+                budget["generated"] -= 1
+            else:
+                selection = scheduler.next()
+                budget["selected"] += 1
         except ValueError as exc:
             stop_reason = "selection_error:" + str(exc)
             break
+        sequence = selection["sequence"]
         entry = selection["entry"]
         target_id = entry.get("target_id")
         rmw = entry.get("rmw")
 
-        if target_id not in EXPLORATORY_TARGET_ORDER:
+        if target_id not in manifest["exploration_order"]:
             row = reject(sequence, entry, "target_not_in_exploratory_catalog")
-        elif target_id not in _F1_CYCLE_TARGETS:
+        elif target_id not in ({TOPOLOGY_TARGET} if profile.get("runtime_capability") == TOPOLOGY_CAPABILITY
+                               else _F2_CYCLE_TARGETS if profile.get("runtime_capability") == F2_WINDOWS_CAPABILITY
+                               else _F1_CYCLE_TARGETS):
             row = reject(sequence, entry,
                          "unsupported_capability:f1_cycle_target_not_enabled")
         elif rmw not in profile["rmws"]:
@@ -871,7 +1577,13 @@ def run_exploratory_cycle(output_dir, *, corpus, feedback, scheduler, profile, r
                     if not isinstance(parent, dict) or not parent:
                         raise ExploratoryCycleError(
                             "corpus entry requires a nonempty parent final_config")
-                    mutator_ids = [mid for mid in surface.mutator_ids if mid in MUTATORS]
+                    f2_windows = profile.get("runtime_capability") == F2_WINDOWS_CAPABILITY
+                    mutator_ids = ([TOPOLOGY_MUTATOR] if target_id == TOPOLOGY_TARGET
+                                   and profile.get("runtime_capability") == TOPOLOGY_CAPABILITY
+                                   else [F2_SURFACE_MUTATORS[surface_id]] if f2_windows
+                                   and surface_id in F2_SURFACE_MUTATORS
+                                   and F2_SURFACE_MUTATORS[surface_id] in surface.mutator_ids
+                                   else [mid for mid in surface.mutator_ids if mid in MUTATORS])
                     # A sampled-range boundary (e.g. E01 log_range) is M03;
                     # endpoint boundaries are M01.  Never feed a sampling class
                     # to M01 or silently use the first mutator.
@@ -888,7 +1600,7 @@ def run_exploratory_cycle(output_dir, *, corpus, feedback, scheduler, profile, r
                         mutator_id = requested if requested in mutator_ids else (
                             preferred if preferred in mutator_ids else (mutator_ids[0] if mutator_ids else None))
                     row = None
-                    wide_profile = _wide_generation_requested(profile)
+                    wide_profile = _wide_generation_requested(profile) and target_id != TOPOLOGY_TARGET
                     declared_kinds, _, declared_depth = _profile_wide_settings(profile)
                     if wide_profile and declared_kinds is not None:
                         supported = set(_wide_kinds(surface, parent))
@@ -902,7 +1614,7 @@ def run_exploratory_cycle(output_dir, *, corpus, feedback, scheduler, profile, r
                                 "unsupported_capability:all_supported_sampling_kinds_zero_weight")
                     if row is None and wide_profile and declared_depth > 1:
                         try:
-                            _chain_surfaces(contract, surface, declared_depth)
+                            _chain_surfaces(contract, surface, declared_depth, profile["surfaces"])
                         except ExploratoryCycleError as exc:
                             row = reject(sequence, entry, str(exc))
                     if row is None:
@@ -912,26 +1624,76 @@ def run_exploratory_cycle(output_dir, *, corpus, feedback, scheduler, profile, r
                         elif mutator_id not in mutator_ids:
                             row = reject(sequence, entry, "mutator_not_declared:" + str(mutator_id))
                         else:
-                            row = _generate_case(sequence, entry, target, contract, surface,
-                                                parent, mutator_id, target_id, rmw, selection,
-                                                scheduler, source, repo, run_id, profile,
-                                                domain_id, registry, output_dir, budget,
-                                                execute, runtime, corpus, feedback)
+                            try:
+                                row = _generate_case(sequence, entry, target, contract, surface,
+                                                    parent, mutator_id, target_id, rmw, selection,
+                                                    scheduler, source, repo, run_id, profile,
+                                                    domain_id, registry, output_dir, budget,
+                                                    execute, runtime, corpus, feedback,
+                                                    planned_hook=planned, submission_hook=submitted,
+                                                    deadline_reached=update_elapsed,
+                                                    runtime_boundary=runtime_boundary)
+                            except _TopologyInputRejection as exc:
+                                row = reject(sequence, entry, "topology_input_rejected:" + str(exc))
+                                row.update(topology_generation_attempts=exc.attempts,
+                                           candidate_eligible=False, attribution="harness_input_generation")
+                            except _F2InputRejection as exc:
+                                row = reject(sequence, entry, str(exc))
         if row is None:
             stop_reason = "generation_failed"
             break
+        row_sequences.append({"cycle_row_index": len(rows), "selection_sequence": sequence,
+                              "cell_id": row["cell_id"]})
         rows.append(row)
+        if row.get("actual_run") is True or row.get("workspace_executed") is True:
+            budget["actual"] += 1
+            if row.get("content_sha256"):
+                seen_actual.add(row["content_sha256"])
+        budget["unique_actual"] = len(seen_actual)
+        pending = None
+        submission_state = "recorded"
+        if not isinstance(last_case_ref, dict) or last_case_ref.get("cell_id") != row["cell_id"]:
+            last_case_ref = {"cell_id": row["cell_id"], "output_dir": str(output_dir),
+                             "case_dir": str(output_dir / "cases" / row["cell_id"])}
+        # Preserve the row annotations before checkpointing accepted feedback.
+        _atomic_json(output_dir / "cases" / row["cell_id"] / "row.json", row)
+        checkpoint("recorded")
         last_state = {"planned": budget["planned"], "executed": budget["executed"],
                       "cell_id": row["cell_id"], "sequence": sequence,
                       "execution_stage": row["execution_stage"]}
-        if source_manifest(repo) != source:
+        qualification = row.get("boundary_qualification", {})
+        if execute and qualification.get("status") in {"unknown", "invalid"}:
+            abort = {"reason_code": "execution_boundary_qualification_failed",
+                     "qualification_reason": qualification["reason_code"],
+                     "after_row_index": len(rows) - 1,
+                     "detail": "runtime evidence retained; boundary qualification failed"}
+            stop_reason = abort["reason_code"]
+            manifest["abort"] = abort
+            manifest["boundary_qualification"] = qualification
+            _atomic_json(output_dir / "manifest.json", manifest)
+            break
+        if row.get("abort_reason") == "cycle_deadline_reached":
+            stop_reason = "cycle_deadline_reached"
+            break
+        # Latch the pre-submit drift failure: a subsequent source snapshot
+        # returning to its old value cannot turn an aborted row into a live
+        # cycle.  No runtime/execution receipt exists on this branch.
+        if (row.get("abort_reason") == "source_repo_HEAD_or_behavior_tree_changed"
+                or source_manifest(repo) != source):
             abort = {"reason_code": "source_repo_HEAD_or_behavior_tree_changed",
                      "after_row_index": len(rows) - 1,
                      "detail": "source identity changed during the cycle"}
+            stop_reason = abort["reason_code"]
             break
 
     if not execute and stop_reason is None:
         stop_reason = "execute_false_planned_only"
+    if stop_reason is None and budget["selected"] >= max_inputs:
+        stop_reason = "max_inputs_reached"
+    update_elapsed()
+    cycle_budget = {key: budget[key] - initial_counts[key] for key in counters}
+    cycle_budget["elapsed_sec"] = budget["elapsed_sec"] - elapsed_before
+    checkpoint("final")
     result = {
         "schema_version": EXPLORATORY_CYCLE_SCHEMA,
         "campaign_kind": "exploratory",
@@ -944,6 +1706,13 @@ def run_exploratory_cycle(output_dir, *, corpus, feedback, scheduler, profile, r
         "rows": rows,
         "rejected": rejected,
         "budget": budget,
+        "cycle_budget": cycle_budget,
+        "row_sequences": row_sequences,
+        "continuation": {"cycle_id": cycle_id, "budget": deepcopy(budget),
+                         "seen_input_hashes": sorted(seen), "seen_actual_hashes": sorted(seen_actual),
+                         "pending_selection": deepcopy(pending), "last_case_ref": deepcopy(last_case_ref),
+                         "submission_state": submission_state, "execute_requested": bool(execute),
+                         "producer": producer},
         "last_state": last_state,
         "abort": abort,
         "stop_reason": stop_reason,
@@ -952,10 +1721,18 @@ def run_exploratory_cycle(output_dir, *, corpus, feedback, scheduler, profile, r
         "feedback": feedback.to_dict(),
         "corpus": corpus.to_dict(),
         "maturity_scope": "exploratory only; required 72 denominator unchanged and not claimed",
+        "runtime_boundary": runtime_boundary,
+        "runtime_formal": bool(formal_runtime),
     }
+    if runtime_boundary == ISOLATED_RUNTIME:
+        result["boundary_qualifications"] = {
+            row["cell_id"]: row.get("boundary_qualification", execution_boundary_qualification(runtime_boundary))
+            for row in rows}
     _atomic_json(output_dir / "selection_log.json", scheduler.to_dict())
     _atomic_json(output_dir / "feedback.json", feedback.to_dict())
     _atomic_json(output_dir / "corpus.json", corpus.to_dict())
+    if profile.get("runtime_capability") == TOPOLOGY_CAPABILITY:
+        result["report_path"] = str(_persist_topology_exploratory_report(output_dir, result, registry))
     _atomic_json(output_dir / "cycle.json", result)
     return result
 
@@ -963,7 +1740,8 @@ def run_exploratory_cycle(output_dir, *, corpus, feedback, scheduler, profile, r
 def _generate_case(sequence, entry, target, contract, surface, parent, mutator_id,
                   target_id, rmw, selection, scheduler, source, repo, run_id, profile,
                   domain_id, registry, output_dir, budget, execute, runtime,
-                  corpus, feedback):
+                  corpus, feedback, *, planned_hook=None, submission_hook=None,
+                  deadline_reached=None, runtime_boundary=HOST_RUNTIME):
     """Generate one planned case; optionally advance the execution gates."""
     target_id = target.target_id
     route = _route(target_id)
@@ -978,12 +1756,33 @@ def _generate_case(sequence, entry, target, contract, surface, parent, mutator_i
             f"{route['mutation_kind']}/{route['carrier']}")
 
     adapted_parent, adaptation = _adapt_parent(target_id, route, parent)
+    before_controls = canonical_hash(adapted_parent)
+    # Action-program profiles have their own validated envelope; pair/F2
+    # controls must never be projected into the submitted program identity.
+    if target_id != TOPOLOGY_TARGET:
+        adapted_parent = apply_profile_controls(
+            adapted_parent, profile, backend=route["backend"])
+    if CONTROL_FIELDS & set(adapted_parent):
+        adaptation["runtime_control_projection"] = {
+            "profile_fields": sorted(PROFILE_CONTROL_FIELDS & set(profile)),
+            "submitted_fields": sorted(CONTROL_FIELDS & set(adapted_parent)),
+            "parent_before_controls_sha256": before_controls,
+            "parent_after_controls_sha256": canonical_hash(adapted_parent),
+            "normalized_before_compose": True,
+        }
     rng_seed = _derive_rng_seed(scheduler, selection, entry)
     sampling_kinds, sampling_weight, chain_length = _profile_wide_settings(profile)
-    wide = _wide_generation_requested(profile)
+    topology = target_id == TOPOLOGY_TARGET
+    wide = _wide_generation_requested(profile) and not topology
     sampling_kind = selection.get("sampling_kind") if wide else None
     sampling_filtered = []
-    if wide:
+    if topology:
+        if entry.get("executable") is False or entry.get("case_kind") == "guard_negative":
+            raise _TopologyInputRejection("topology_guard_seed_non_executable", [])
+        plan, topology_generation = _topology_generation(adapted_parent, profile, rng_seed)
+        proposal = plan.operations[0]  # metadata only; actual plan is core-authored
+        mutator_id = TOPOLOGY_MUTATOR
+    elif wide:
         supported = set(_wide_kinds(surface, adapted_parent))
         if sampling_kinds is not None:
             # A profile may declare kinds this surface cannot honour.  Every
@@ -1000,7 +1799,8 @@ def _generate_case(sequence, entry, target, contract, surface, parent, mutator_i
             # a mismatch means the declaration and corpus disagree.
             raise ExploratoryCycleError(
                 "sampling kind was filtered but the scheduler declared one")
-        layer_surfaces = _chain_surfaces(contract, surface, profile.get("chain_length", 1))
+        layer_surfaces = _chain_surfaces(contract, surface, profile.get("chain_length", 1),
+                                         profile["surfaces"])
         proposals = []
         current = adapted_parent
         for index, layer_surface in enumerate(layer_surfaces):
@@ -1017,30 +1817,39 @@ def _generate_case(sequence, entry, target, contract, surface, parent, mutator_i
         sampling_kind = proposal.parameters.get("sampling_kind")
     else:
         rng = make_rng(rng_seed)
-        proposal = mutate(adapted_parent, surface, rng,
-                          context={"application_phase": _application_phase(surface),
-                                   "boundary_class": entry.get("boundary_class")},
-                          mutator_id=mutator_id)
+        context = {"application_phase": _application_phase(surface),
+                   "boundary_class": entry.get("boundary_class")}
+        if target_id == F2_WINDOWS_TARGET:
+            validate_f2_profile(profile)
+            if mutator_id != F2_SURFACE_MUTATORS.get(surface.surface_id):
+                raise ExploratoryCycleError("f2_windows_mutator_not_enabled")
+            # M06/M07 stay unregistered in the global default mutator API.
+            # No anchor_observed/post_match_observed is supplied by planning.
+            proposal = mutate_f2(adapted_parent, surface, rng, context=context,
+                                 mutator_id=mutator_id)
+        else:
+            proposal = mutate(adapted_parent, surface, rng, context=context,
+                              mutator_id=mutator_id)
 
     windows, runtime_windows = [], []
     if route["backend"] == "discovery_namespace":
-        explicit = proposal.runtime_windows or None
-        dropped = proposal.input_after.get("drop_duration_sec")
-        recovery_timeout = proposal.input_after.get(
-            "recovery_timeout_sec", adapted_parent.get("recovery_timeout_sec"))
-        max_seconds = (profile.get("budget") or {}).get("max_seconds")
-        if max_seconds is None:
-            max_seconds = adapted_parent.get("max_seconds")
-        built = _recovery_windows(
-            dropped, explicit, recovery_timeout_sec=recovery_timeout,
-            max_seconds=max_seconds)
-        if isinstance(built[0], dict):
-            windows, runtime_windows = [built[0]], [built[1]]
+        max_seconds = adapted_parent.get("max_seconds")
+        try:
+            synchronized, windows, runtime_windows, window_source = _compose_recovery_inputs(
+                adapted_parent, proposals if wide else [proposal], max_seconds=max_seconds)
+        except ValueError as exc:
+            if target_id == F2_WINDOWS_TARGET:
+                raise _F2InputRejection("f2_input_rejected:" + str(exc)) from exc
+            raise
+        if wide:
+            proposals = synchronized
         else:
-            windows, runtime_windows = built
+            proposal = synchronized[0]
         adaptation["runtime_windows"] = runtime_windows
-        adaptation["runtime_window_source"] = "m07_explicit" if explicit else "single_window_default"
-    if wide:
+        adaptation["runtime_window_source"] = window_source
+    if topology:
+        pass  # _topology_generation already returns the validated core plan
+    elif wide:
         # The runner is the single authority that normalizes the explicit plan
         # to 0-based core/runtime shapes; strip proposal windows so they are not
         # appended twice by compose_chain.
@@ -1097,6 +1906,7 @@ def _generate_case(sequence, entry, target, contract, surface, parent, mutator_i
     result_path = case_dir / "runtime" / "runtime_result.json"
     row_path = case_dir / "row.json"
 
+    fuzz_surfaces, submitted_parameters = _plan_surface_bindings(plan, contract)
     config = {
         "run_id": run_id, "campaign_id": run_id, "cell_id": cell_id,
         "target_id": target_id, "target_revision": target.target_revision,
@@ -1115,8 +1925,8 @@ def _generate_case(sequence, entry, target, contract, surface, parent, mutator_i
         "input_layer_receipts": effective["input_layer_receipts"],
         "mutation_plan": plan.to_dict(),
         "mutation_plan_sha256": canonical_hash(plan.to_dict()),
-        "fuzz_surfaces": [surface.surface_id],
-        "submitted_parameters": _flatten_surface_values(surface, plan.final_config),
+        "fuzz_surfaces": fuzz_surfaces,
+        "submitted_parameters": submitted_parameters,
         "content_sha256": child_content,
         "runtime_route": route,
         "parent_adaptation": adaptation,
@@ -1139,27 +1949,16 @@ def _generate_case(sequence, entry, target, contract, surface, parent, mutator_i
         config["sampling_kind"] = sampling_kind
         config["chain_depth"] = len(plan.operations)
     config.update(json.loads(json.dumps(plan.final_config)))
-    # F3 exploratory stimulus: start a second reader generation inside the
-    # drop window.  This is a runtime action, not part of the submitted config
-    # identity.
-    if profile.get('reader_recreate_in_window') is True:
-        config['reader_recreate_in_window'] = True
-    if route["backend"] == "projection_pair":
-        # Both roles must run the mutated public profile.  Deriving them from the
-        # plan's final qos keeps one authoritative submitted value instead of
-        # letting a stale pre-mutation copy survive in the role fields.
-        role_qos = json.loads(json.dumps(plan.final_config.get("qos")))
-        config["writer_qos"] = json.loads(json.dumps(role_qos))
-        config["reader_qos"] = json.loads(json.dumps(role_qos))
-    if runtime_windows:
-        # namespace_pair reads environment_windows.  The plan's own windows are
-        # the single submitted authority: projecting the *runtime* shape here
-        # would silently rewrite the submitted value whenever a surface mutation
-        # changed a duration, and the binding check would then fail closed on a
-        # difference the input never had.
-        submitted_windows = plan.final_config.get("environment_windows")
-        config["environment_windows"] = json.loads(json.dumps(
-            submitted_windows if submitted_windows is not None else runtime_windows))
+    # Same submitted controls in plan, capsule and runtime; the only derived
+    # projection is public role QoS, never a post-hash profile override.
+    config.update(runtime_input(plan.final_config, backend=route["backend"],
+                                runtime_capability=profile.get("runtime_capability")))
+    if topology:
+        config.update(runtime_capability=TOPOLOGY_CAPABILITY, plan_hash=plan.plan_hash(),
+                      topology_generation=topology_generation)
+    if runtime_windows and "environment_windows" not in plan.final_config:
+        # Preserve the historical E01 single-window input shape.
+        config["environment_windows"] = json.loads(json.dumps(runtime_windows))
 
     binding = {"status": "not_checked", "silent_normalization": False,
                "backend": route["backend"], "carrier": carrier}
@@ -1167,15 +1966,21 @@ def _generate_case(sequence, entry, target, contract, surface, parent, mutator_i
         from r2f.runtime.ros2_pair import (
             exploratory_bindings, normalize_config, require_binding_preserved,
         )
-        normalized = normalize_config(config)
+        if topology:
+            from r2f.runtime.topology_route import validate_topology_route
+            validate_topology_route(config)
+            normalized = deepcopy(config)
+        else:
+            normalized = normalize_config(config)
         if route["backend"] == "projection_pair":
             from r2f.runtime.projection_pair import normalize_projection_config
             normalized = normalize_projection_config(normalized)
         elif route["backend"] == "discovery_namespace":
             from r2f.runtime.namespace_pair import normalize_discovery_config
             normalized = normalize_discovery_config(normalized)
-        expected = exploratory_bindings(normalized)
-        require_binding_preserved(expected, normalized)
+        if not topology:
+            expected = exploratory_bindings(normalized)
+            require_binding_preserved(expected, normalized)
         # The normalized config must not change the submitted plan values.
         # Numeric widening (int -> float) by the runtime normalizer is recorded,
         # not treated as a new input; any other change is a binding error.
@@ -1199,44 +2004,6 @@ def _generate_case(sequence, entry, target, contract, surface, parent, mutator_i
         config["input_identity_schema"] = INPUT_SCHEMA_V2
         config["effective_input_sha256"] = digest
         config["effective_input"] = effective
-        if profile.get('reader_recreate_in_window') is True:
-            config['reader_recreate_in_window'] = True
-            if 'reader_recreate_delay_sec' in profile:
-                config['reader_recreate_delay_sec'] = profile['reader_recreate_delay_sec']
-            if 'reader_recreate_at_fraction' in profile:
-                config['reader_recreate_at_fraction'] = profile['reader_recreate_at_fraction']
-            if 'reader_recreate_count' in profile:
-                config['reader_recreate_count'] = profile['reader_recreate_count']
-            if 'reader_recreate_interval_sec' in profile:
-                config['reader_recreate_interval_sec'] = profile['reader_recreate_interval_sec']
-            if 'publish_burst_in_window' in profile:
-                config['publish_burst_in_window'] = profile['publish_burst_in_window']
-            if 'publish_burst_count' in profile:
-                config['publish_burst_count'] = profile['publish_burst_count']
-            if 'publish_burst_interval_sec' in profile:
-                config['publish_burst_interval_sec'] = profile['publish_burst_interval_sec']
-            for key in ('reader_recreate_fractions', 'reader_destroy_fractions',
-                        'writer_churn_in_window', 'environment_mutation'):
-                if key in profile:
-                    config[key] = profile[key]
-        # Carrier-scoped delivery coverage is independent of the reader-churn
-        # switch: a netem profile has no churn but still needs this flag.
-        if profile.get('netem_covers_delivery') is not None:
-            config['netem_covers_delivery'] = profile['netem_covers_delivery']
-        # Mixed-vendor: the per-role vendor map is a real input, so it must be
-        # part of the submitted config rather than a runtime-side default.
-        # ``profile['rmws']`` is the vendor *list* the corpus iterates, so the
-        # per-role map keeps its own key.
-        if isinstance(profile.get('role_rmws'), dict):
-            config['rmws'] = dict(profile['role_rmws'])
-        # Multi-endpoint projection: the role list is a submitted input, so it
-        # must reach the runtime config verbatim rather than being a runtime
-        # default that the adapter cannot cross-check.
-        if profile.get('projection_roles') is not None:
-            config['projection_roles'] = list(profile['projection_roles'])
-        if isinstance(profile.get('projection_role_qos'), dict):
-            config['projection_role_qos'] = json.loads(
-                json.dumps(profile['projection_role_qos']))
         binding = {"status": "preserved", "silent_normalization": False,
                    "submitted_config_sha256": canonical_hash(plan.final_config),
                    "normalized_config_sha256": canonical_hash(normalized),
@@ -1285,16 +2052,29 @@ def _generate_case(sequence, entry, target, contract, surface, parent, mutator_i
         row["chain_depth"] = len(plan.operations)
         row["fuzz_generation"] = dict(config["fuzz_generation"])
 
+    if topology:
+        row.update(runtime_capability=TOPOLOGY_CAPABILITY, topology_generation=topology_generation,
+                   chain_depth=len(plan.operations), candidate_eligible=False)
+
+    config = _runtime_execution_config(
+        config, execute=execute, runtime=runtime, runtime_boundary=runtime_boundary)
+    qualification = execution_boundary_qualification(runtime_boundary, config=config)
+    if qualification["status"] not in {"not_applicable", "qualified"}:
+        row.update(runtime_boundary=runtime_boundary, boundary_qualification=qualification)
+        if not execute:
+            row.update(candidate_eligible=False, feedback_eligible=False, seal_eligible=False)
+
     _atomic_json(plan_path, plan.to_dict())
     _atomic_json(capsule_path, capsule.to_dict())
     _atomic_json(config_path, config)
     budget["planned"] += 1
     budget["generated"] += 1
 
+    _atomic_json(row_path, row)
+    if planned_hook is not None:
+        planned_hook(row, selection)
     if not execute:
-        _atomic_json(row_path, row)
         return row
-
     if route["execution_admitted"] is not True:
         # Planned generation is verified for this backend; live execution is not.
         # Refuse explicitly instead of producing an unlabelled pseudo-run.
@@ -1306,17 +2086,47 @@ def _generate_case(sequence, entry, target, contract, surface, parent, mutator_i
         _atomic_json(row_path, row)
         return row
 
-    budget["attempted"] += 1
-    case_dir.joinpath("runtime").mkdir(parents=True, exist_ok=True)
+    if source_manifest(repo) != source:
+        row["execution_stage"] = "aborted"
+        row["abort_reason"] = "source_repo_HEAD_or_behavior_tree_changed"
+        row["reason_code"] = row["abort_reason"]
+        row["blocked_reason"] = row["abort_reason"]
+        budget["aborted"] += 1
+        _atomic_json(row_path, row)
+        return row
     if binding["status"] != "preserved":
         row["reason_code"] = "binding_not_preserved"
         row["blocked_reason"] = "binding_not_preserved:" + str(binding.get("detail"))
         _atomic_json(row_path, row)
         return row
+    if deadline_reached is not None and deadline_reached():
+        row.update(execution_stage="aborted", abort_reason="cycle_deadline_reached",
+                   reason_code="cycle_deadline_reached", blocked_reason="cycle_deadline_reached")
+        budget["aborted"] += 1
+        _atomic_json(row_path, row)
+        return row
+    if submission_hook is not None:
+        submission_hook(row, selection)
+    # Snapshot persistence may itself take time or overlap a source edit.  The
+    # fence is deliberately conservative; it is not an execution receipt.
+    reason = None
+    if source_manifest(repo) != source:
+        reason = "source_repo_HEAD_or_behavior_tree_changed"
+    elif deadline_reached is not None and deadline_reached():
+        reason = "cycle_deadline_reached"
+    if reason is not None:
+        row.update(execution_stage="aborted", abort_reason=reason,
+                   reason_code=reason, blocked_reason=reason)
+        budget["aborted"] += 1
+        _atomic_json(row_path, row)
+        return row
+    budget["attempted"] += 1
+    case_dir.joinpath("runtime").mkdir(parents=True, exist_ok=True)
     try:
         runtime_result = services.carrier.apply(
             scenario, effective,
-            execution={"config": config, "output_dir": result_path.parent,
+            execution={"config": config,
+                       "output_dir": result_path.parent,
                        "runtime": runtime})
     except Exception as exc:
         import traceback as _traceback
@@ -1355,6 +2165,41 @@ def _generate_case(sequence, entry, target, contract, surface, parent, mutator_i
     if row.get("execution_stage") == "judged" and row.get("actual_run") is True:
         budget["executed"] += 1
 
+    qualification = execution_boundary_qualification(runtime_boundary, config=config,
+                                                  result=runtime_result, row=row,
+                                                  formal_runtime=_is_formal_runtime(runtime, runtime_boundary),
+                                                  output_root=result_path.parent)
+    if qualification["status"] != "not_applicable":
+        row.update(boundary_qualification=qualification, boundary_eligible=qualification["eligible"])
+    if qualification["status"] not in {"not_applicable", "qualified"}:
+        # An unexpected boundary wrapper result may still carry a real inner
+        # run. Preserve its stage, raw and actual counters; do not feed it into
+        # corpus novelty or the scheduler's feedback epoch.
+        row.update(boundary_qualification=qualification, candidate_eligible=False,
+                   feedback_eligible=False, seal_eligible=False,
+                   corpus_offer={"accepted": False, "reason": qualification["reason_code"]})
+        _atomic_json(row_path, row)
+        return row
+
+    if topology:
+        # N-endpoint evidence has its own raw/environment/worker gates. A
+        # successful inner result or caller-supplied qualification is not enough.
+        from .replay import _qualification, DEFAULT_RUNTIME, ISOLATED_RUNTIME as ISOLATED_ORIGIN
+        origin = (ISOLATED_ORIGIN if runtime_boundary == ISOLATED_RUNTIME else DEFAULT_RUNTIME
+                  ) if _is_formal_runtime(runtime, runtime_boundary) else "injected_runtime"
+        qualified = _qualification(origin, config, runtime_result, row, output_root=result_path.parent)
+        row["execution_qualification"] = qualified
+        if not qualified["real_ros_execution"]:
+            row.update(candidate_eligible=False, feedback_eligible=False, seal_eligible=False,
+                       corpus_offer={"accepted": False, "reason": "topology_execution_not_qualified"})
+            # The append-only feedback ledger also accounts for attempts. Add
+            # an explicitly incomplete evidence projection, not a rewritten
+            # execution row: no coverage/edge/novelty, actual flags preserved.
+            feedback.record(dict(row, evidence_errors=["topology_execution_not_qualified"]))
+            scheduler.advance_feedback(feedback)
+            _atomic_json(row_path, row)
+            return row
+
     complete = False
     row["observed_edge"] = None
     try:
@@ -1386,6 +2231,8 @@ def _generate_case(sequence, entry, target, contract, surface, parent, mutator_i
         observed_edge=row.get("observed_edge"),
         oracle_verdict=row.get("oracle_verdict"), tool_error=tool_error(row))
     row["corpus_offer"] = offer
+    _atomic_json(row_path, row)
     feedback.record(row)
+    scheduler.advance_feedback(feedback)
     _atomic_json(row_path, row)
     return row

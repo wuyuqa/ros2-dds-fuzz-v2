@@ -122,26 +122,60 @@ class ChurnPlanValidation(unittest.TestCase):
                          sorted(item['fraction'] for item in schedule))
 
 
+class FakeLifecycleProcess:
+    def __init__(self, pid):
+        self.pid, self.returncode = pid, None
+
+    def poll(self):
+        return self.returncode
+
+
 class FakeLifecyclePool:
     def __init__(self, clock, events, emit):
         self.clock, self.events, self.emit = clock, events, emit
-        self.workers = {'writer': object(), 'reader': object()}
+        self.workers = {'writer': FakeLifecycleProcess(100),
+                        'reader': FakeLifecycleProcess(101)}
         self.started, self.commands, self.stopped = [], [], set()
+        self.generations, self.identities = {}, {}
 
     def start(self, role):
+        previous = self.workers.get(role)
+        if previous is not None and previous.poll() is None:
+            raise AssertionError('offline role still live: ' + role)
         self.started.append(role)
-        self.workers[role] = object()
-        self.emit('endpoint_created', role=role, endpoint_gid=role + '-gid',
-                  pid=1000 + len(self.started), endpoint_generation=role + '-generation',
-                  monotonic_ns=self.clock.now)
+        generation = self.generations.get(role, 0) + 1
+        self.generations[role] = generation
+        process = FakeLifecycleProcess(1000 + len(self.started))
+        self.workers[role] = process
+        self.stopped.discard(role)
+        identity = dict(pid=process.pid, worker_generation=generation,
+                        endpoint_generation=f'{role}-generation-{generation}')
+        self.identities[role] = identity
+        self.emit('process_started', role=role, **identity)
+        self.emit('endpoint_created', role=role, endpoint_gid=f'{role}-gid-{generation}',
+                  **identity)
         return role
 
     def command(self, role, command, **fields):
         self.commands.append((role, command, fields))
+        command_id = len(self.commands)
+        identity = self.identities[role]
+        self.emit('worker_command_requested', role=role, command=command,
+                  command_id=command_id, **identity)
         if command == 'stop':
+            self.emit('worker_shutdown', role=role, stop_command_id=command_id,
+                      **identity)
+            self.workers[role].returncode = 0
             self.stopped.add(role)
-            self.emit('worker_shutdown', role=role, monotonic_ns=self.clock.now)
-        return len(self.commands)
+        elif command == 'publish_burst':
+            for sequence in fields['sequences']:
+                self.emit('send', role=role, send_sequence=sequence,
+                          phase=fields['phase'], **identity)
+            self.emit('command_done', role=role, command_id=command_id,
+                      burst_count=len(fields['sequences']), **identity)
+        else:
+            raise AssertionError('unexpected offline command: ' + command)
+        return command_id
 
     def wait(self, predicate, timeout, label, **kwargs):
         if not predicate():
@@ -172,6 +206,8 @@ class InWindowLifecycleOrder(unittest.TestCase):
         events = []
         def emit(event, **fields):
             fields.setdefault('monotonic_ns', clock.now)
+            fields.setdefault('namespace_event_index', len(events))
+            fields.setdefault('raw_event_ref', f'mock#{len(events)}')
             token = dict(event=event, **fields)
             events.append(token)
             return token
@@ -202,6 +238,8 @@ class InWindowLifecycleOrder(unittest.TestCase):
         events = []
         def emit(event, **fields):
             fields.setdefault('monotonic_ns', clock.now)
+            fields.setdefault('namespace_event_index', len(events))
+            fields.setdefault('raw_event_ref', f'mock#{len(events)}')
             token = dict(event=event, **fields)
             events.append(token)
             return token

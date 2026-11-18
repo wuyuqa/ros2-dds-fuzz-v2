@@ -196,10 +196,11 @@ class PlanCapsuleV2(unittest.TestCase):
             with self.subTest(missing=key), self.assertRaises(ValueError):
                 validate_replay_input(bad)
 
-    def test_v2_replay_is_declared_tool_gap_not_a_silent_v1_fallback(self):
+    def test_v2_replay_requires_plan_aware_opt_in_not_a_silent_v1_fallback(self):
         from r2f.core.replay import rerun_conformance
         scenario, _ = plan_scenario()
         capsule = ReplayCapsule.from_scenario(scenario, source_manifest=SOURCE, origin_domain=51)
+        original_input = copy.deepcopy(capsule.input)
         calls = []
 
         def runner(s, domain):
@@ -208,9 +209,10 @@ class PlanCapsuleV2(unittest.TestCase):
 
         result = rerun_conformance(capsule, runner, domain=52)
         self.assertEqual(result["status"], "fail_artifact")
-        self.assertEqual(result["reason_code"], "v2_exploratory_replay_not_implemented")
+        self.assertEqual(result["reason_code"], "v2_plan_aware_runner_required")
         self.assertEqual(calls, [])
         # The saved plan/input is retained byte-identically; nothing is regenerated.
+        self.assertEqual(capsule.input, original_input)
         self.assertEqual(capsule.to_dict()["input"], json.loads(json.dumps(capsule.input)))
         restored = ReplayCapsule.from_dict(capsule.to_dict())
         self.assertTrue(validate_replay_input(restored.input))

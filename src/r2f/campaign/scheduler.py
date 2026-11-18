@@ -4,10 +4,15 @@ Required routing is unchanged and deterministic.  Exploratory routing uses a
 fixed 20/40/40 cycle: uniform over all executable seeds, uncovered
 surface x boundary classes, then rare observed edges.  Empty pools fall back in
 a fixed order.  Selection is a pure function of the feedback log, RNG seed and
-corpus snapshot; it never executes anything.
+corpus snapshot; it never executes anything.  Explicit ``policy="fair"`` instead
+traverses declared input classes using only selection history, not runtime
+feedback.  Neither policy is a BFS/DFS state planner or execution evidence.
 """
+from fractions import Fraction
 from itertools import product
 import random
+import re
+from copy import deepcopy
 
 from r2f.core.evidence import canonical_hash
 from r2f.modules.s1.targets import RMWS, EXECUTION_ORDER
@@ -37,6 +42,33 @@ def required_catalog_hash():
     return canonical_hash(S1Module().to_dict())
 
 
+def validated_feedback(events):
+    """Validate the full ordered event bytes, not only the coverage summary."""
+    if not isinstance(events, list):
+        raise ValueError("feedback events must be a list")
+    for event in events:
+        if not isinstance(event, dict):
+            raise ValueError("feedback event must be a dict")
+        for field in ("event_sha256", "content_sha256"):
+            if not isinstance(event.get(field), str) or not re.fullmatch(r"[0-9a-f]{64}", event[field]):
+                raise ValueError("invalid feedback " + field)
+        if event["event_sha256"] != canonical_hash({k: v for k, v in event.items() if k != "event_sha256"}):
+            raise ValueError("feedback event hash mismatch")
+        if any(type(event.get(k)) is not bool for k in ("executed", "coverage", "complete", "tool_error")):
+            raise ValueError("invalid feedback execution/coverage flags")
+        if event["coverage"] != event["complete"] or (event["complete"] and (event["tool_error"] or not event["executed"])):
+            raise ValueError("feedback coverage requires complete executed non-tool observation")
+        if not event["complete"] and event.get("edge_id") is not None:
+            raise ValueError("incomplete feedback cannot claim an edge")
+        surface = event.get("surface_class")
+        if surface is not None and (not isinstance(surface, list) or len(surface) not in (2, 3) or
+                any(not isinstance(v, str) or not v for v in surface)):
+            raise ValueError("invalid feedback surface class")
+        if event.get("edge_id") is not None and (not isinstance(event["edge_id"], str) or not event["edge_id"]):
+            raise ValueError("invalid feedback edge")
+    return FeedbackLog.from_events(events)
+
+
 class ExploratoryScheduler:
     """Pure selection over one corpus snapshot and one ordered feedback log.
 
@@ -50,34 +82,74 @@ class ExploratoryScheduler:
 
     WEIGHTS = (("uniform", 20), ("uncovered", 40), ("rare_edge", 40))
     FALLBACK = ("uniform", "uncovered", "rare_edge")
+    POLICIES = ("feedback", "fair")
+    FAIR_DIMENSIONS = ("target_id", "surface_id", "boundary_class", "variant_id",
+                       "chain_depth", "sampling_kind")
     _surface_cache = None
 
     def __init__(self, corpus, feedback=None, *, rng_seed=0, warmup=10,
-                 sampling_kinds=None, sampling_weight=None):
+                 sampling_kinds=None, sampling_weight=None, policy=None):
         if not isinstance(corpus, Corpus):
             raise ValueError("exploratory scheduler requires a Corpus")
         if type(rng_seed) is not int or rng_seed < 0:
             raise ValueError("rng_seed must be a nonnegative integer")
         if type(warmup) is not int or warmup < 0:
             raise ValueError("warmup must be a nonnegative integer")
+        if policy is not None and (not isinstance(policy, str) or policy not in self.POLICIES):
+            raise ValueError("unknown scheduler policy")
+        # None is the byte-compatible historical path, not an explicit policy
+        # marker. Keep the distinction even though both use feedback internally.
+        self._policy = "feedback" if policy is None else policy
+        self._explicit_policy = policy is not None
         self.corpus = corpus
         source_log = feedback if isinstance(feedback, FeedbackLog) else FeedbackLog.from_events(feedback or [])
-        # Freeze the feedback prefix at construction.  Selections made by this
-        # scheduler must remain reproducible even if the caller appends more
-        # observations between next() calls.  Later events belong to a later
-        # scheduler instance and a distinct selection identity.
+        # Freeze until explicit advance_feedback; external append cannot alter
+        # an already accepted prefix or historical selection identity.
         self.feedback_event_count = len(source_log.events)
         self.feedback_identity_at_start = source_log.identity()
-        self.feedback = FeedbackLog.from_events(source_log.events)
+        self.feedback = validated_feedback(source_log.events)
         if self.feedback.identity() != self.feedback_identity_at_start:
             raise ValueError("feedback snapshot identity drift")
         self.rng_seed = rng_seed
         self.warmup = warmup
         self.selection_log = []
+        self.feedback_epochs = [self._epoch()]
+        self.selection_contexts = []
         self.sampling_kinds = None
         self.sampling_weight = None
         if sampling_kinds is not None or sampling_weight is not None:
             self.configure_sampling(sampling_kinds, sampling_weight)
+
+    @property
+    def policy(self):
+        """Canonical strategy name; omitted policy still serializes as legacy."""
+        return self._policy
+
+    def _epoch(self):
+        return {"feedback_event_count": len(self.feedback.events),
+                "feedback_events_sha256": canonical_hash(self.feedback.events),
+                "feedback_identity": self.feedback.identity()}
+
+    def advance_feedback(self, feedback):
+        """Accept only an unchanged prefix plus append; never observe implicitly.
+
+        Epochs and per-selection corpus snapshots are immutable audit context.
+        A caller appending to the shared log affects next() only after this call.
+        """
+        if not isinstance(feedback, FeedbackLog):
+            raise ValueError("advance_feedback requires a FeedbackLog")
+        if self._epoch() != self.feedback_epochs[-1]:
+            raise ValueError("accepted feedback epoch was modified")
+        current = validated_feedback(feedback.events)
+        count = len(self.feedback.events)
+        if len(current.events) < count or current.events[:count] != self.feedback.events:
+            raise ValueError("feedback must be append-only; prefix drift/truncation")
+        if len(current.events) != count:
+            self.feedback = current
+            self.feedback_epochs.append(self._epoch())
+        self.feedback_event_count = len(self.feedback.events)
+        self.feedback_identity_at_start = self.feedback.identity()
+        return deepcopy(self.feedback_epochs[-1])
 
     def configure_sampling(self, sampling_kinds, sampling_weight=None):
         """Validate and install the opt-in sampling namespace.
@@ -113,6 +185,8 @@ class ExploratoryScheduler:
             normalized[kind] = weight
         if not any(normalized.values()):
             raise ValueError("sampling_weight must not be all zero")
+        if self.selection_log and (self.sampling_kinds != sampling_kinds or self.sampling_weight != normalized):
+            raise ValueError("sampling configuration cannot change after selection")
         self.sampling_kinds = list(sampling_kinds)
         self.sampling_weight = normalized
 
@@ -231,11 +305,121 @@ class ExploratoryScheduler:
             return self._rare(rows)
         raise ValueError("unknown exploratory pool")
 
+    @classmethod
+    def _fair_classes(cls, entry):
+        """Declared input axes only; observation/retention fields are excluded.
+
+        A missing chain depth stays unknown, never an inferred execution depth.
+        Variant falls back to the declared seed id for older corpus formats.
+        """
+        values = {name: entry.get(name) for name in cls.FAIR_DIMENSIONS}
+        values["variant_id"] = entry.get("variant_id") or entry.get("seed_id")
+        for name, value in values.items():
+            if name == "chain_depth":
+                if value is not None and (type(value) is not int or value < 1):
+                    raise ValueError("fair chain_depth must be a positive integer or missing")
+            elif value is not None and not isinstance(value, str):
+                raise ValueError("fair input class must be a string: " + name)
+        return values
+
+    def _fair_tie(self, candidates, material, stage):
+        """Stable, seeded tie-break over a canonical model-only candidate list."""
+        ordered = sorted(candidates, key=canonical_hash)
+        digest = canonical_hash({"decision": material, "stage": stage})
+        return random.Random(int(digest[:32], 16)).choice(ordered)
+
+    def _fair_sampling(self, entry, material):
+        """Weighted least-selection shares, with no feedback-derived entropy."""
+        supported = sorted(set(self._supported_sampling_kinds(entry)))
+        declared = list(self.sampling_kinds)
+        positive = [kind for kind in declared
+                    if kind in supported and self.sampling_weight[kind] > 0]
+        if not positive:
+            meta = {"declared": declared, "supported": supported, "eligible": []}
+            if any(kind in supported for kind in declared):
+                meta["reason"] = "all_supported_kinds_zero_weight"
+            return None, meta
+        used = {kind: sum(event.get("sampling_kind") == kind for event in self.selection_log)
+                for kind in positive}
+        # Fractions avoid float rounding and give configured weights true
+        # long-run shares, not merely tie-breaking preference.
+        floor = min(Fraction(used[kind], self.sampling_weight[kind]) for kind in positive)
+        candidates = sorted(kind for kind in positive
+                            if Fraction(used[kind], self.sampling_weight[kind]) == floor)
+        sampling_input = {"model": material, "kinds": declared,
+                          "weight": dict(self.sampling_weight), "supported": supported}
+        chosen = self._fair_tie(candidates, sampling_input, "sampling")
+        return chosen, {"declared": declared, "supported": supported,
+                        "eligible": candidates, "used_counts": used,
+                        "weights": {kind: self.sampling_weight[kind] for kind in positive}}
+
+    def _fair_event(self, rows, sequence):
+        """Equal sibling shares down the input hierarchy, then content leaves.
+
+        Row count cannot buy a class a larger share. Every tie and the final
+        decision token use this projection, never a feedback hash, oracle,
+        observed edge, corpus retention rank, or execution context. Historical
+        classes live in events so corpus additions/removals do not rewrite them.
+        """
+        eligible = sorted(({
+            "content_sha256": row["content_sha256"],
+            "input_classes": self._fair_classes(row),
+        } for row in rows), key=lambda row: row["content_sha256"])
+        history = [{key: deepcopy(event[key])
+                    for key in ("sequence", "content_sha256", "input_classes")}
+                   | {"sampling_kind": event.get("sampling_kind")}
+                   for event in self.selection_log]
+        material = {"policy": "fair", "rng_seed": self.rng_seed,
+                    "sequence": sequence, "eligible": eligible, "history": history}
+        candidates, prior, prefix = eligible, history, {}
+        for dimension in self.FAIR_DIMENSIONS:
+            values = {canonical_hash(row["input_classes"][dimension]): row["input_classes"][dimension]
+                      for row in candidates}
+            used = {key: sum(item["input_classes"][dimension] == value for item in prior)
+                    for key, value in values.items()}
+            floor = min(used.values())
+            tied = [values[key] for key in sorted(values) if used[key] == floor]
+            value = self._fair_tie(tied, material, {"dimension": dimension, "prefix": prefix})
+            prefix = {**prefix, dimension: value}
+            candidates = [row for row in candidates if row["input_classes"][dimension] == value]
+            prior = [item for item in prior if item["input_classes"][dimension] == value]
+        used = {row["content_sha256"]: sum(item["content_sha256"] == row["content_sha256"]
+                                          for item in prior)
+                for row in candidates}
+        floor = min(used.values())
+        tied = [row for row in candidates if used[row["content_sha256"]] == floor]
+        selected = self._fair_tie(tied, material, {"dimension": "content_sha256", "prefix": prefix})
+        chosen = self._record(selected["content_sha256"])
+        material["chosen"] = deepcopy(selected)
+        event = {"sequence": sequence,
+                 "phase": "warmup" if sequence < self.warmup else "exploratory",
+                 "pool": "fair", "used_pool": "fair", "requested_pool": "fair",
+                 "fallback_chain": [], "weighted": False, "candidate_count": len(rows),
+                 "seed_id": chosen.get("seed_id"), "content_sha256": chosen["content_sha256"],
+                 "input_classes": deepcopy(selected["input_classes"]),
+                 "feedback_identity": self.feedback.identity()}
+        material["sampling"] = None
+        if self.sampling_kinds is not None:
+            kind, meta = self._fair_sampling(chosen, material)
+            event.update(sampling_kind=kind, sampling=meta)
+            if kind is None:
+                event["sampling_error"] = "no_supported_sampling_kind"
+            material["sampling"] = {"kinds": list(self.sampling_kinds),
+                                    "weight": dict(self.sampling_weight),
+                                    "kind": kind, "selection": deepcopy(meta)}
+        event["decision_context"] = material
+        event["decision_sha256"] = canonical_hash(material)
+        return chosen, event
+
     def next(self):
-        """Select one entry on a 5-step 20/40/40 cycle; warm-up is deterministic."""
+        """Select using the legacy feedback cycle or explicit model-only fairness."""
+        if self._epoch() != self.feedback_epochs[-1]:
+            raise ValueError("accepted feedback epoch was modified")
         rows = self._rows()
         sequence = len(self.selection_log)
-        if sequence < self.warmup:
+        if self.policy == "fair":
+            chosen, event = self._fair_event(rows, sequence)
+        elif sequence < self.warmup:
             # Interleave variants before repeating a variant across RMWs so a short
             # warm-up covers distinct boundary classes.
             ordered = sorted(rows, key=lambda r: (r.get("rmw") or "",
@@ -277,16 +461,27 @@ class ExploratoryScheduler:
                      "weighted": True, "candidate_count": len(pool),
                      "seed_id": chosen.get("seed_id"), "content_sha256": chosen["content_sha256"],
                      "feedback_identity": self.feedback.identity()}
-        if self.sampling_kinds is not None:
+        if self.policy != "fair" and self.sampling_kinds is not None:
             sampling_kind, sampling_meta = self._choose_sampling_kind(
                 sequence, chosen, token=chosen["content_sha256"])
             event["sampling_kind"] = sampling_kind
             event["sampling"] = sampling_meta
             if sampling_kind is None:
                 event["sampling_error"] = "no_supported_sampling_kind"
+        if self._explicit_policy:
+            event["policy"] = self.policy
         event["selection_sha256"] = canonical_hash(event)
         self.selection_log.append(event)
-        return dict(event, entry=self._record(chosen["content_sha256"]))
+        context = {"sequence": sequence, "feedback_epoch": len(self.feedback_epochs) - 1,
+                   **self._epoch(), "selection_sha256": event["selection_sha256"],
+                   "corpus": self.corpus.to_dict(),
+                   "sampling": ({"kinds": list(self.sampling_kinds), "weight": dict(self.sampling_weight)}
+                                if self.sampling_kinds is not None else None)}
+        if self._explicit_policy:
+            context["policy"] = self.policy
+        context["context_sha256"] = canonical_hash(context)
+        self.selection_contexts.append(context)
+        return dict(deepcopy(event), entry=deepcopy(self._record(chosen["content_sha256"])))
 
     def _record(self, digest):
         return self.corpus.entries[digest]
@@ -297,18 +492,89 @@ class ExploratoryScheduler:
         return [self.next() for _ in range(count)]
 
     def to_dict(self):
-        result = {"schema": "r2f.s1-selection-log/v1", "rng_seed": self.rng_seed,
-                  "warmup": self.warmup, "feedback_identity": self.feedback_identity_at_start,
-                  "feedback_event_count": self.feedback_event_count,
-                  "selection_identity": canonical_hash({"rng_seed": self.rng_seed, "warmup": self.warmup,
-                      "feedback_identity": self.feedback_identity_at_start,
-                      "feedback_event_count": self.feedback_event_count,
-                      "selections": [e["selection_sha256"] for e in self.selection_log]}),
-                  "selections": list(self.selection_log)}
+        result = {"schema": "r2f.s1-selection-log/v2", "rng_seed": self.rng_seed,
+                  "warmup": self.warmup, "feedback_identity": self.feedback.identity(),
+                  "feedback_event_count": len(self.feedback.events),
+                  "feedback_events_sha256": canonical_hash(self.feedback.events),
+                  "feedback_epochs": deepcopy(self.feedback_epochs),
+                  "selection_contexts": deepcopy(self.selection_contexts),
+                  "selections": deepcopy(self.selection_log)}
         if self.sampling_kinds is not None:
-            result["sampling"] = {"kinds": list(self.sampling_kinds),
-                                  "weight": dict(self.sampling_weight)}
+            result["sampling"] = {"kinds": list(self.sampling_kinds), "weight": dict(self.sampling_weight)}
+        if self._explicit_policy:
+            result["policy"] = self.policy
+        result["selection_identity"] = canonical_hash(result)
         return result
+
+    @classmethod
+    def from_dict(cls, state, corpus, feedback):
+        """Replay each historical selection against its own corpus and epoch."""
+        if not isinstance(state, dict) or state.get("schema") != "r2f.s1-selection-log/v2":
+            raise ValueError("unsupported resumable selection log")
+        if state.get("selection_identity") != canonical_hash({k: v for k, v in state.items() if k != "selection_identity"}):
+            raise ValueError("selection state hash mismatch")
+        policy = state.get("policy")
+        if "policy" in state and (not isinstance(policy, str) or policy not in cls.POLICIES):
+            raise ValueError("unknown scheduler policy in selection state")
+        full = validated_feedback(feedback.events)
+        count = state.get("feedback_event_count")
+        if type(count) is not int or count < 0 or count > len(full.events):
+            raise ValueError("selection feedback prefix is missing")
+        accepted = validated_feedback(full.events[:count])
+        if (accepted.identity() != state.get("feedback_identity") or
+                canonical_hash(accepted.events) != state.get("feedback_events_sha256")):
+            raise ValueError("selection feedback prefix identity drift")
+        epochs, contexts, events = (state.get(k) for k in ("feedback_epochs", "selection_contexts", "selections"))
+        if not isinstance(epochs, list) or not epochs or not isinstance(contexts, list) or not isinstance(events, list) or len(events) != len(contexts):
+            raise ValueError("selection contexts/epochs are incomplete")
+        previous = -1
+        for epoch in epochs:
+            n = epoch.get("feedback_event_count")
+            if type(n) is not int or n <= previous or n > count:
+                raise ValueError("feedback epoch order drift")
+            prefix = validated_feedback(full.events[:n])
+            if epoch != {"feedback_event_count": n, "feedback_events_sha256": canonical_hash(prefix.events), "feedback_identity": prefix.identity()}:
+                raise ValueError("feedback epoch hash drift")
+            previous = n
+        if previous != count:
+            raise ValueError("feedback epoch terminal count differs")
+        first = epochs[0]["feedback_event_count"]
+        scheduler = cls(corpus, validated_feedback(full.events[:first]),
+                        rng_seed=state["rng_seed"], warmup=state["warmup"], policy=policy)
+        last_epoch = 0
+        for sequence, (context, event) in enumerate(zip(contexts, events)):
+            if not isinstance(context, dict) or not isinstance(event, dict):
+                raise ValueError("selection event/context must be objects")
+            if ("policy" in context) != ("policy" in state) or context.get("policy") != policy:
+                raise ValueError("selection context policy drift")
+            if ("policy" in event) != ("policy" in state) or event.get("policy") != policy:
+                raise ValueError("selection event policy drift")
+            if context.get("context_sha256") != canonical_hash({k: v for k, v in context.items() if k != "context_sha256"}):
+                raise ValueError("selection corpus/context hash mismatch")
+            epoch_id = context.get("feedback_epoch")
+            if type(epoch_id) is not int or not last_epoch <= epoch_id < len(epochs):
+                raise ValueError("selection feedback epoch is invalid")
+            while last_epoch < epoch_id:
+                last_epoch += 1
+                scheduler.advance_feedback(validated_feedback(full.events[:epochs[last_epoch]["feedback_event_count"]]))
+            scheduler.corpus = Corpus.from_dict(context["corpus"])
+            sampling = context.get("sampling")
+            if sampling is not None:
+                scheduler.configure_sampling(sampling["kinds"], sampling["weight"])
+            rebuilt = scheduler.next()
+            rebuilt.pop("entry")
+            if rebuilt != event or scheduler.selection_contexts[-1] != context:
+                raise ValueError("selection cannot be reproduced from historical corpus/prefix")
+        while last_epoch + 1 < len(epochs):
+            last_epoch += 1
+            scheduler.advance_feedback(validated_feedback(full.events[:epochs[last_epoch]["feedback_event_count"]]))
+        scheduler.corpus = corpus
+        sampling = state.get("sampling")
+        if sampling is not None:
+            scheduler.configure_sampling(sampling["kinds"], sampling["weight"])
+        if scheduler.to_dict() != state:
+            raise ValueError("selection state cannot be reproduced")
+        return scheduler
 
 
 def replay_selection(log, corpus, feedback_events):
@@ -317,8 +583,20 @@ def replay_selection(log, corpus, feedback_events):
     Events appended after the recorded prefix are ignored for this run; the
     prefix identity itself must still match exactly and in order.
     """
+    if isinstance(log, dict) and log.get("schema") == "r2f.s1-selection-log/v2":
+        scheduler = ExploratoryScheduler.from_dict(log, corpus, validated_feedback(list(feedback_events)))
+        return {"schema": "r2f.s1-selection-replay/v2", "valid": True,
+                "selection_identity": scheduler.to_dict()["selection_identity"],
+                "selections": deepcopy(scheduler.selection_log)}
     if not isinstance(log, dict) or log.get("schema") != "r2f.s1-selection-log/v1":
         raise ValueError("unsupported selection log")
+    # New policy/decision records are v2-only: the v1 hash-only replay must
+    # not accidentally endorse unverified additive decision fields.
+    new_keys = {"policy", "decision_context", "decision_sha256"}
+    if (new_keys.intersection(log) or
+            any(new_keys.intersection(event) for event in log.get("selections", [])
+                if isinstance(event, dict))):
+        raise ValueError("v1 selection log cannot carry policy/decision fields")
     count = log.get("feedback_event_count")
     if type(count) is not int or count < 0 or count > len(feedback_events):
         raise ValueError("selection log requires its recorded feedback prefix")

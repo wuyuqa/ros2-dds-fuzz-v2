@@ -589,10 +589,46 @@ class RequiredTargetBehaviourTests(unittest.TestCase):
         self.assertFalse(result['real_execution'])
 
     def test_exploratory_target_ids_are_unchanged_in_declarations(self):
-        self.assertEqual(set(EXPLORATORY_TARGETS), {
+        from r2f.core import Registry
+        from r2f.modules.s1.module import register_exploratory
+        from r2f.modules.s1.targets import F2_WINDOWS_CAPABILITY, F2_WINDOWS_TARGET
+
+        legacy_targets = {
             'discovery.late_endpoint.fuzz_v1', 'discovery.late_join_delivery.fuzz_v1',
-            PROJECTION_FUZZ, RECOVERY_FUZZ, 'discovery.match_compatibility.fuzz_v1'})
+            PROJECTION_FUZZ, RECOVERY_FUZZ, 'discovery.match_compatibility.fuzz_v1'}
+        default = Registry()
+        register_exploratory(default, include_required=False)
+        self.assertEqual(set(default.targets), legacy_targets)
+        with self.assertRaises(KeyError):
+            default.get_target(F2_WINDOWS_TARGET)
+        with self.assertRaises(KeyError):
+            default.get_services(F2_WINDOWS_TARGET)
+        # The runtime directory describes routes; it does not grant registry access.
+        self.assertEqual(set(EXPLORATORY_TARGETS), legacy_targets | {F2_WINDOWS_TARGET})
+        opted = Registry()
+        register_exploratory(opted, include_required=False,
+                             runtime_capability=F2_WINDOWS_CAPABILITY)
+        self.assertEqual(set(opted.targets), legacy_targets | {F2_WINDOWS_TARGET})
+        self.assertEqual({tid: opted.get_target(tid).to_dict() for tid in legacy_targets},
+                         {tid: default.get_target(tid).to_dict() for tid in legacy_targets})
+        self.assertEqual(EXPLORATORY_TARGETS[F2_WINDOWS_TARGET]['runtime_capability'],
+                         F2_WINDOWS_CAPABILITY)
         self.assertNotIn(PROJECTION_FUZZ, (LEGACY_PROJECTION, LEGACY_RECOVERY))
+
+    def test_unknown_capabilities_cannot_register_targets_or_services(self):
+        from r2f.core import Registry
+        from r2f.modules.s1.module import register_exploratory
+        from r2f.modules.s1.targets import F2_WINDOWS_TARGET
+
+        for capability in ("F2", "", False, True, 0, "f2_windows_v2", "*"):
+            with self.subTest(capability=capability):
+                registry = Registry()
+                with self.assertRaisesRegex(ValueError, "runtime_capability"):
+                    register_exploratory(registry, runtime_capability=capability)
+                self.assertEqual(dict(registry.targets), {})
+                self.assertEqual(dict(registry.modules), {})
+                with self.assertRaises(KeyError):
+                    registry.get_services(F2_WINDOWS_TARGET)
 
     def test_required_normalization_defaults_are_unchanged(self):
         c = normalize_config({'run_id': 'legacy-defaults', 'domain_id': 173,

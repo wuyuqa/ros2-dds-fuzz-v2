@@ -1,0 +1,120 @@
+{
+  "schema_version": "r2f.s1-fuzz-profile/v1",
+  "profile_id": "s1-fuzz-endpoint-chains",
+  "campaign_kind": "exploratory",
+  "enabled": false,
+  "seed_catalog_status": "authored_t02",
+  "description": "Explicit P01+W02 two-layer endpoint mutation plans, one target per cycle. P01 selects the zero boundary from a nonzero authored parent; legacy finite witness semantics are unchanged. This is offline input composition, not runtime evidence.",
+  "required_catalog_included": false,
+  "target_ids": [
+    "discovery.late_endpoint.fuzz_v1",
+    "discovery.late_join_delivery.fuzz_v1"
+  ],
+  "surfaces": [
+    "P01",
+    "W02"
+  ],
+  "seed_specs": [
+    {
+      "seed_id": "P01",
+      "target_id": "discovery.late_endpoint.fuzz_v1",
+      "boundary_class": "zero",
+      "executable": true
+    },
+    {
+      "seed_id": "W02",
+      "target_id": "discovery.late_join_delivery.fuzz_v1",
+      "boundary_class": "finite",
+      "executable": true
+    }
+  ],
+  "pending_seed_ids": [
+    "E02",
+    "E03",
+    "G01"
+  ],
+  "pending_surfaces": [
+    "E02",
+    "E03",
+    "G01"
+  ],
+  "composition": {
+    "mode": "per_case_endpoint_chain",
+    "parameter_surfaces": [
+      "P01",
+      "W02"
+    ],
+    "environment_surfaces": [],
+    "max_environment_windows": 0,
+    "status": "offline_mutation_plan_only; two ordered content layers, no execution or hit claim"
+  },
+  "cycles": [
+    {
+      "cycle_id": "late-endpoint-chain",
+      "target_id": "discovery.late_endpoint.fuzz_v1",
+      "surfaces": [
+        "P01",
+        "W02"
+      ],
+      "runner_slice": "endpoint_pair_slice",
+      "seed_specs": [
+        {
+          "seed_id": "P01",
+          "target_id": "discovery.late_endpoint.fuzz_v1",
+          "boundary_class": "zero",
+          "executable": true
+        }
+      ]
+    },
+    {
+      "cycle_id": "late-join-chain",
+      "target_id": "discovery.late_join_delivery.fuzz_v1",
+      "surfaces": [
+        "P01",
+        "W02"
+      ],
+      "runner_slice": "endpoint_pair_slice",
+      "seed_specs": [
+        {
+          "seed_id": "W02",
+          "target_id": "discovery.late_join_delivery.fuzz_v1",
+          "boundary_class": "finite",
+          "executable": true
+        }
+      ]
+    }
+  ],
+  "declared_seed_specs_union": [
+    {
+      "seed_id": "P01",
+      "target_id": "discovery.late_endpoint.fuzz_v1",
+      "boundary_class": "zero",
+      "executable": true
+    },
+    {
+      "seed_id": "W02",
+      "target_id": "discovery.late_join_delivery.fuzz_v1",
+      "boundary_class": "finite",
+      "executable": true
+    }
+  ],
+  "rmws": [
+    "rmw_cyclonedds_cpp",
+    "rmw_fastrtps_cpp"
+  ],
+  "execution_boundary": "offline corpus construction and two-layer planning only; enabled=false; not runtime execution, effect, candidate or seal evidence; no F2 multiwindow activation; real ROS execution requires explicit owner GO and source/lock/domain checks",
+  "budget": {
+    "max_inputs": 36,
+    "warmup_inputs": 4,
+    "max_seconds": 1200
+  },
+  "corpus": {
+    "capacity": 256,
+    "bucket_limit": 3
+  },
+  "controls": {
+    "required": true,
+    "policy": "per source+rmw+target contract+recipe"
+  },
+  "chain_length": 2
+}
