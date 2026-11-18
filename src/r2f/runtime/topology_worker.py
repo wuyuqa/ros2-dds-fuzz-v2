@@ -1481,7 +1481,7 @@ class RosTopologyBackend:
             self._emit("topology_worker_exit", returncode=receipt.get("returncode"),
                        **{k: handle.get(k) for k in ("logical_id", "generation", "endpoint_gid", "pid", "pgid", "process_start_ticks", "endpoint_generation")})
             self._emit("worker_exit", returncode=receipt.get("returncode"),
-                       **{k: handle.get(k) for k in ("logical_id", "generation", "endpoint_gid", "pid", "process_start_ticks", "endpoint_generation")})
+                       **{k: handle.get(k) for k in ("logical_id", "generation", "endpoint_gid", "pid", "pgid", "process_start_ticks", "endpoint_generation")})
         identity = {k: handle.get(k) for k in ("logical_id", "generation", "endpoint_gid", "pid", "pgid",
                                                "process_start_ticks", "endpoint_generation")}
         self._emit("topology_endpoint_destroyed", role=handle["role"], **identity,
@@ -1586,7 +1586,7 @@ class RosTopologyBackend:
                     self._emit("topology_worker_exit", returncode=receipt.get("returncode"),
                                **{k: handle.get(k) for k in ("logical_id", "generation", "endpoint_gid", "pid", "pgid", "process_start_ticks", "endpoint_generation")})
                     self._emit("worker_exit", returncode=receipt.get("returncode"),
-                               **{k: handle.get(k) for k in ("logical_id", "generation", "endpoint_gid", "pid", "process_start_ticks", "endpoint_generation")})
+                               **{k: handle.get(k) for k in ("logical_id", "generation", "endpoint_gid", "pid", "pgid", "process_start_ticks", "endpoint_generation")})
             except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
                 errors.append({"error": type(exc).__name__, "detail": str(exc)})
         alive = [p.process.pid for p in self.processes
