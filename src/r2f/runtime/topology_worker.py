@@ -474,6 +474,205 @@ def _public_qos_kwargs(qos):
     return kwargs
 
 
+
+class CycloneMatchedPeerObserver:
+    """Read existing process-local DDS entities; never create or instrument one.
+
+    Public CycloneDDS 0.10.5 ABI only. The library MUST already be mapped by the
+    RMW in this worker. RCL pointers are never cast to vendor-private objects.
+    Handles have process-local scope; only the copied GUIDs cross the worker
+    boundary. Failure/incomplete/racing enumerations deliberately have no peer
+    proof fields accepted by the projection consumer.
+    """
+    SCHEMA = "r2f.cyclone-matched-peer-observation/v1"
+    C_ABI_PROBE_SHA256 = "979a4a0a59e49f248eb9eb954e4137aea943595b01cbafb89050ac1f6ac0fab0"
+    C_ABI_PROBE_SOURCE_SHA256 = "46ed3f9ae8d2df687d3e647e20d4c3cfa2e8774e3275d26e4429283ad8f5b694"
+    VERIFIED_C_ABIS = (('35ceb2bc0c8a19745050826cdf84845357dd89098e5ffd51b93a4a7937d693d1', '9a63f94ee673c5efddb337a7dd012e4c98960b10ce256dcc3a7b4c331fabf5b5', (64, 0, 16, 32, 40, 48, 56)),)
+    VERIFIED_C_HEADERS = {'/opt/ros/jazzy/include/CycloneDDS/dds/dds.h': '35ceb2bc0c8a19745050826cdf84845357dd89098e5ffd51b93a4a7937d693d1', '/opt/ros/jazzy/include/CycloneDDS/dds/export.h': 'fdf2229d1cb37d8a57c147e768d7b42f735976cd42adacdaccc70043cd450469', '/opt/ros/jazzy/include/CycloneDDS/dds/features.h': 'f1c7cbdb42eede111f7b8cf8e61bdfbda1596f9086bbd4c1785e37a7319ac697', '/opt/ros/jazzy/include/CycloneDDS/dds/ddsc/dds_basic_types.h': '53f7f02ce723ecc3f4a45fc1c7e0b050c5bedfd68614e0111182a8598f14c6b8', '/opt/ros/jazzy/include/CycloneDDS/dds/ddsrt/time.h': '3050907039419bbaaef63a0be8fecc8d66aaee023712b7bef5f132b0ba926a25', '/opt/ros/jazzy/include/CycloneDDS/dds/config.h': 'f9eb858b057c643ad4dcba489cb94b3c1dbf667116858e07510ea2656a66ef52', '/opt/ros/jazzy/include/CycloneDDS/dds/ddsrt/types.h': 'fe6dcdfd0f45560c0fe11202d4abaa0baf1f5289073b797c76e3dc6de3cfb996', '/opt/ros/jazzy/include/CycloneDDS/dds/ddsrt/types/posix.h': 'f2541f643665f17e3a5e916ad216e143b8e99dc3498a609f305cbc584444104c', '/opt/ros/jazzy/include/CycloneDDS/dds/ddsrt/retcode.h': 'de1d07082289f2578d2b57739d62df33c319e10ece6320ac775a6d2e2bdceedb', '/opt/ros/jazzy/include/CycloneDDS/dds/ddsrt/log.h': '7c10558cf25254870021446471ff740321785b588598dbf41e907b02b3f986d0', '/opt/ros/jazzy/include/CycloneDDS/dds/ddsrt/attributes.h': '5a4f6d101bebd049b56e96088aa339258b3d57ebb81d3cd2311d5bdd6c567c38', '/opt/ros/jazzy/include/CycloneDDS/dds/ddsc/dds_public_impl.h': '8129a989c21dfd7ed7d1d5194aa1473c7bbd9af4c08b38ebccea0f8a15d9be8a', '/opt/ros/jazzy/include/CycloneDDS/dds/ddsrt/align.h': 'bda2ca56cf563007f39268608e25030a1883d9b3ac742e28aa87c6c9d5121ce4', '/opt/ros/jazzy/include/CycloneDDS/dds/ddsc/dds_public_alloc.h': 'c615a1e4c552b98f16ba29dd30cad697c6a90334f9b1f222cb7fde3cb1ac3e5e', '/opt/ros/jazzy/include/CycloneDDS/dds/ddsc/dds_opcodes.h': '0de425493ca5c1f273e147f809e225eac414cfaad43b28b2f3373fc34d5c8009', '/opt/ros/jazzy/include/CycloneDDS/dds/ddsrt/static_assert.h': '26f1bf25b4aa0db38518223761235e75f55f42365a795bb2e0b4b40a7cade69b', '/opt/ros/jazzy/include/CycloneDDS/dds/ddsc/dds_public_qos.h': '241a23a86737b929fb141cffa2514e1de6c2297dc784b64227238db60a925ddc', '/opt/ros/jazzy/include/CycloneDDS/dds/ddsc/dds_public_qosdefs.h': '914ac31fec83a25f22456ed6b8a610428ef59902c6b4447394bebc96c14aadb9', '/opt/ros/jazzy/include/CycloneDDS/dds/ddsc/dds_public_error.h': 'cb15af587ba62bf24185e7cc2bd61ac45486e0ada603a0180b82aa9b18dbd273', '/opt/ros/jazzy/include/CycloneDDS/dds/ddsc/dds_public_status.h': 'a25ea12a098a7484fd7a814f658c83d782173c035e238f89804c809ad252e59d', '/opt/ros/jazzy/include/CycloneDDS/dds/ddsc/dds_public_listener.h': '9f785db8b9a00082cfe278826f30de618217ea2eb1b78e9419a341bafa505632', '/opt/ros/jazzy/include/CycloneDDS/dds/version.h': '57674091945002fd69395e208a0a98d504905948cd6ef9a3a04b017310045e55'}
+    MAX_ENTITIES = 512
+    MAX_PEERS = 256
+
+    def __init__(self):
+        import ctypes as c
+        import hashlib
+        self.c = c
+
+        class Guid(c.Structure):
+            _fields_ = [("v", c.c_uint8 * 16)]
+
+        class Endpoint(c.Structure):
+            _fields_ = [("key", Guid), ("participant_key", Guid),
+                        ("participant_instance_handle", c.c_uint64),
+                        ("topic_name", c.c_char_p), ("type_name", c.c_char_p),
+                        ("qos", c.c_void_p)]
+
+        self.Guid, self.Endpoint = Guid, Endpoint
+        # Restrict the hand-declared ABI; unknown installations are a capability
+        # gap, not an excuse to dereference undocumented RMW internals.
+        library = Path("/opt/ros/jazzy/lib/x86_64-linux-gnu/libddsc.so.0.10.5").resolve()
+        header = Path("/opt/ros/jazzy/include/CycloneDDS/dds/dds.h")
+        mapped = set()
+        mapping_identity = []
+        for row in Path("/proc/self/maps").read_text().splitlines():
+            fields = row.split(maxsplit=5)
+            if len(fields) == 6 and "/libddsc.so" in fields[5]:
+                mapped.add(fields[5])
+                mapping_identity.append({"device": fields[3], "inode": fields[4], "offset": fields[2]})
+        if (mapped != {str(library)} or c.sizeof(Endpoint) != 64
+                or c.sizeof(c.c_void_p) != 8 or not hasattr(os, "RTLD_NOLOAD")):
+            raise ValueError("loaded_cyclone_library_or_abi_not_unique")
+        stat = library.stat()
+        if (not mapping_identity or sum(int(row["offset"], 16) == 0 for row in mapping_identity) != 1
+                or any(int(row["inode"]) != stat.st_ino
+                       or tuple(int(v, 16) for v in row["device"].split(":")) != (os.major(stat.st_dev), os.minor(stat.st_dev))
+                       for row in mapping_identity)):
+            raise ValueError("loaded_cyclone_mapping_instance_or_inode_not_unique")
+        import platform
+        if platform.machine() != "x86_64" or sys.byteorder != "little" or c.sizeof(c.c_ulong) != 8:
+            raise ValueError("native_endpoint_c_abi_platform_unsupported")
+        if any(hashlib.sha256(Path(path).read_bytes()).hexdigest() != digest
+               for path, digest in self.VERIFIED_C_HEADERS.items()):
+            raise ValueError("native_endpoint_c_header_fingerprint_changed")
+        actual_layout = (c.sizeof(Endpoint), *(getattr(Endpoint, name).offset for name in
+                          ("key", "participant_key", "participant_instance_handle", "topic_name", "type_name", "qos")))
+        abi_key = (hashlib.sha256(header.read_bytes()).hexdigest(),
+                   hashlib.sha256(library.read_bytes()).hexdigest(), actual_layout)
+        if abi_key not in self.VERIFIED_C_ABIS:
+            raise ValueError("native_endpoint_c_abi_probe_unverified")
+        self.lib = c.CDLL(str(library), mode=os.RTLD_NOLOAD | os.RTLD_LOCAL)
+        entity, handle = c.c_int32, c.c_uint64
+        self.lib.dds_lookup_participant.argtypes = [c.c_uint32, c.POINTER(entity), c.c_size_t]
+        self.lib.dds_lookup_participant.restype = c.c_int32
+        self.lib.dds_get_children.argtypes = [entity, c.POINTER(entity), c.c_size_t]
+        self.lib.dds_get_children.restype = c.c_int32
+        self.lib.dds_get_guid.argtypes = [entity, c.POINTER(Guid)]
+        self.lib.dds_get_guid.restype = c.c_int32
+        self.lib.dds_get_domainid.argtypes = [entity, c.POINTER(c.c_uint32)]
+        self.lib.dds_get_domainid.restype = c.c_int32
+        for kind in ("subscriptions", "publications"):
+            function = getattr(self.lib, "dds_get_matched_" + kind)
+            function.argtypes = [entity, c.POINTER(handle), c.c_size_t]
+            function.restype = c.c_int32
+        for kind in ("subscription", "publication"):
+            function = getattr(self.lib, "dds_get_matched_" + kind + "_data")
+            function.argtypes = [entity, handle]
+            function.restype = c.POINTER(Endpoint)
+        self.lib.dds_builtintopic_free_endpoint.argtypes = [c.POINTER(Endpoint)]
+        self.lib.dds_builtintopic_free_endpoint.restype = None
+        self.provenance = {"library": str(library),
+                           "library_sha256": hashlib.sha256(library.read_bytes()).hexdigest(),
+                           "header": str(header),
+                           "header_sha256": hashlib.sha256(header.read_bytes()).hexdigest(),
+                           "abi": "CycloneDDS-0.10.5-lp64-endpoint64",
+                           "c_probe_sha256": self.C_ABI_PROBE_SHA256,
+                           "c_probe_source_sha256": self.C_ABI_PROBE_SOURCE_SHA256,
+                           "c_probe_layout": actual_layout,
+                           "header_fingerprints": dict(self.VERIFIED_C_HEADERS),
+                           "loaded_mapping_identity": mapping_identity,
+                           "attachment": "existing_process_local_entities_no_instrumentation",
+                           "creates_entities": False}
+
+    def _enumerate(self, function, *args, peers=False):
+        c = self.c
+        capacity = self.MAX_PEERS if peers else self.MAX_ENTITIES
+        array = ((c.c_uint64 if peers else c.c_int32) * capacity)()
+        count = function(*args, array, capacity)
+        if type(count) is not int or not 0 <= count <= capacity:
+            raise ValueError("native_enumeration_error_or_capacity_exceeded")
+        values = list(array[:count])
+        if any(value <= 0 for value in values) or len(values) != len(set(values)):
+            raise ValueError("native_handles_invalid_or_aliased")
+        return sorted(values)
+
+    def _guid(self, handle):
+        guid = self.Guid()
+        return bytes(guid.v).hex() if self.lib.dds_get_guid(handle, self.c.byref(guid)) == 0 else None
+
+    def _locate(self, domain, gid):
+        roots = self._enumerate(self.lib.dds_lookup_participant, domain)
+        pending, seen, edges, matches = list(roots), set(), [], []
+        while pending:
+            handle = pending.pop()
+            if handle in seen or len(seen) >= self.MAX_ENTITIES:
+                raise ValueError("entity_inventory_cycle_alias_or_capacity_exceeded")
+            seen.add(handle)
+            if self._guid(handle) == gid:
+                matches.append(handle)
+            children = self._enumerate(self.lib.dds_get_children, handle)
+            edges.append([handle, children])
+            pending.extend(children)
+        if len(matches) != 1:
+            raise ValueError("local_gid_not_unique_in_existing_entities")
+        observed = self.c.c_uint32()
+        if (self.lib.dds_get_domainid(matches[0], self.c.byref(observed)) != 0
+                or observed.value != domain):
+            raise ValueError("local_entity_domain_mismatch")
+        return matches[0], sorted(edges)
+
+    def sample(self, domain, gid, kind):
+        began = time.monotonic_ns()
+        result = {"schema": self.SCHEMA, "complete": False, "provenance": self.provenance,
+                  "domain_id": domain, "local_gid": gid, "role_kind": kind,
+                  "started_monotonic_ns": began}
+        try:
+            if (type(domain) is not int or not 0 <= domain < 2**32
+                    or not isinstance(gid, str) or re.fullmatch(r"[0-9a-f]{32}", gid) is None
+                    or gid == "0" * 32 or kind not in ("writer", "reader")):
+                raise ValueError("native_observation_input_identity_invalid")
+            local, inventory = self._locate(domain, gid)
+            suffix = "subscription" if kind == "writer" else "publication"
+            enum = getattr(self.lib, "dds_get_matched_" + suffix + "s")
+            data = getattr(self.lib, "dds_get_matched_" + suffix + "_data")
+            handles = self._enumerate(enum, local, peers=True)
+            peers = []
+            for handle in handles:
+                pointer = data(local, handle)
+                if not pointer:
+                    raise ValueError("matched_endpoint_data_unavailable")
+                try:
+                    row = pointer.contents
+                    peers.append({"instance_handle": handle,
+                                  "endpoint_gid": bytes(row.key.v).hex(),
+                                  "participant_gid": bytes(row.participant_key.v).hex(),
+                                  "topic_name": row.topic_name.decode("utf-8") if row.topic_name else None,
+                                  "type_name": row.type_name.decode("utf-8") if row.type_name else None})
+                finally:
+                    self.lib.dds_builtintopic_free_endpoint(pointer)
+            gids = [row["endpoint_gid"] for row in peers]
+            if (len(set(gids)) != len(gids) or gid in gids or "0" * 32 in gids
+                    or self._enumerate(enum, local, peers=True) != handles
+                    or self._locate(domain, gid) != (local, inventory)):
+                raise ValueError("matched_peer_or_local_inventory_changed_or_aliased")
+            result.update(complete=True, local_handle=local, peers=peers,
+                          matched_peer_gids=gids, entity_inventory=inventory,
+                          enumeration_api="dds_get_matched_" + suffix + "s",
+                          data_api="dds_get_matched_" + suffix + "_data",
+                          lookup_api="dds_lookup_participant+dds_get_children+dds_get_guid",
+                          limitations=["bounded_stable_samples_not_atomic_or_continuous_match",
+                                       "instance_handles_are_process_local_not_wire_guids"])
+        except (ValueError, TypeError, OSError, UnicodeError, AttributeError) as exc:
+            result.update(complete=False, reason=str(exc))
+        result["ended_monotonic_ns"] = time.monotonic_ns()
+        return result
+
+
+def _matched_peer_fields(observer, domain, gid, kind, count_before, count_after, observation):
+    """Expose the existing projection protocol only for a complete raw sample."""
+    result = {"native_peer_observation": observation, "peer_gids_complete": False}
+    peers = observation.get("matched_peer_gids", [])
+    if (observer is not None and observation.get("complete") is True
+            and type(count_before) is int and type(count_after) is int
+            and count_before == count_after == len(peers)
+            and observation.get("local_gid") == gid
+            and observation.get("domain_id") == domain
+            and observation.get("role_kind") == kind):
+        result.update(peer_proof_source="dds_matched_endpoint_api",
+                      peer_gids_complete=True, matched_peer_gids=peers)
+    else:
+        result["peer_observation_limitation"] = observation.get("reason", "native_and_public_counts_differ")
+    return result
+
+
 def _worker_main(argv):
     """Child entry point: one endpoint generation, strict JSONL on stdout."""
     if len(argv) != 3:
@@ -646,9 +845,24 @@ def _worker_main(argv):
                 emit("worker_stopping", command_id=command_id)
                 break
             if command["command"] == "snapshot":
+                count_api = (endpoint.get_subscription_count if kind == "writer"
+                             else endpoint.get_publisher_count)
+                count_before = count_api()
+                observer = None
+                observation = {"complete": False, "reason": "rmw_has_no_public_peer_observer"}
+                if rmw_identifier == "rmw_cyclonedds_cpp":
+                    try:
+                        observer = CycloneMatchedPeerObserver()
+                        observation = observer.sample(config["domain_id"], local_gid, kind)
+                    except (ValueError, OSError, AttributeError) as exc:
+                        observation = {"complete": False, "reason": str(exc)}
+                count_after = count_api()
+                peer_fields = _matched_peer_fields(
+                    observer, config["domain_id"], local_gid, kind,
+                    count_before, count_after, observation)
                 emit("match_snapshot", command_id=command_id,
-                     matched_count=(endpoint.get_subscription_count() if kind == "writer"
-                                    else endpoint.get_publisher_count()),
+                     matched_count=count_after, public_count_before=count_before,
+                     **peer_fields,
                      endpoint_gid=local_gid, sampled_monotonic_ns=time.monotonic_ns(),
                      count_api="get_subscription_count" if kind == "writer"
                      else "get_publisher_count")

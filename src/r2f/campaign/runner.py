@@ -724,19 +724,20 @@ def _topology_generation(parent, profile, rng_seed):
                   "chain_length": len(plan.operations), "execution_evidence": False}
 
 
-def _evidence_origin(runtime_result):
-    """Preserve real provenance and relabel offline fixtures explicitly.
+def _evidence_origin(runtime_result, *, runtime=None, runtime_boundary=HOST_RUNTIME):
+    """Label the selected callable's source, never its execution qualification.
 
-    ``offline_fixture`` is still an offline contract result: it can never be a
-    real SUT candidate or seal.  The label is distinct from ``injected_runtime``
-    so downstream reports do not confuse a labelled fixture with an unknown
-    injected callable.
+    Result-supplied strings/real flags cannot attest a callable. Explicit
+    fixtures stay offline even when returned by a canonical callable. A formal
+    source label also covers failed/blocked attempts: artifact qualification,
+    actual execution, candidate admission and seal gates remain independent.
     """
     origin = runtime_result.get("evidence_origin")
-    if origin in _OFFLINE_EVIDENCE_ORIGINS:
+    if isinstance(origin, str) and origin in (_OFFLINE_EVIDENCE_ORIGINS | {"offline_fixture"}):
         return "offline_fixture"
-    if isinstance(origin, str) and origin:
-        return origin
+    if _is_formal_runtime(runtime, runtime_boundary):
+        from .replay import DEFAULT_RUNTIME, ISOLATED_RUNTIME as ISOLATED_ORIGIN
+        return ISOLATED_ORIGIN if runtime_boundary == ISOLATED_RUNTIME else DEFAULT_RUNTIME
     return "injected_runtime"
 
 
@@ -2405,7 +2406,8 @@ def _generate_case(sequence, entry, target, contract, surface, parent, mutator_i
         "input_identity_schema": INPUT_SCHEMA_V2,
         "effective_input_sha256": digest,
         "binding": binding,
-        "evidence_origin": _evidence_origin(runtime_result),
+        "evidence_origin": _evidence_origin(runtime_result, runtime=runtime,
+                                            runtime_boundary=runtime_boundary),
     })
     if wide:
         row.update({"sampling_kind": sampling_kind,
@@ -2428,11 +2430,15 @@ def _generate_case(sequence, entry, target, contract, surface, parent, mutator_i
         row.update(boundary_qualification=qualification, boundary_eligible=qualification["eligible"])
     if qualification["status"] not in {"not_applicable", "qualified"}:
         # An unexpected boundary wrapper result may still carry a real inner
-        # run. Preserve its stage, raw and actual counters; do not feed it into
-        # corpus novelty or the scheduler's feedback epoch.
+        # run. Preserve its stage, raw and actual counters. The append-only
+        # feedback epoch accounts for attempts, not just qualified coverage.
         row.update(boundary_qualification=qualification, candidate_eligible=False,
                    feedback_eligible=False, seal_eligible=False,
                    corpus_offer={"accepted": False, "reason": qualification["reason_code"]})
+        # Only this ledger projection is incomplete; do not rewrite raw facts
+        # or qualify the execution row. No coverage, edge or corpus novelty.
+        feedback.record(dict(row, evidence_errors=["boundary_execution_not_qualified"]))
+        scheduler.advance_feedback(feedback)
         _atomic_json(row_path, row)
         return row
 

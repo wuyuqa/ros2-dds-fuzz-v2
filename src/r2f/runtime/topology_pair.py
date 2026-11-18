@@ -132,8 +132,88 @@ def _gid_set(rows):
     return {row.get("endpoint_gid") for row in rows if row.get("endpoint_gid")}
 
 
+
+def _direct_peer_membership(token, peer, snapshot, events, *, before_index=None):
+    """Validate the command-bound complete peer list against raw identities.
+
+    No expected graph/QoS model participates. Unknown or aliased peer GIDs,
+    incomplete capture and changed generations are not membership evidence.
+    """
+    match = snapshot["match_snapshot"]
+    if "peer_gids_complete" not in match and "peer_proof_source" not in match:
+        return None, "per_peer_api_absent"
+    if (match.get("peer_proof_source") != "dds_matched_endpoint_api"
+            or match.get("peer_gids_complete") is not True
+            or not isinstance(match.get("matched_peer_gids"), list)):
+        return None, "per_peer_api_incomplete"
+    gids = match["matched_peer_gids"]
+    def valid_gid(gid):
+        return (isinstance(gid, str) and len(gid) == 32 and gid != "0" * 32
+                and all(ch in "0123456789abcdef" for ch in gid))
+    if (not all(valid_gid(gid) for gid in [token.get("endpoint_gid"), peer.get("endpoint_gid"), *gids])
+            or len(set(gids)) != len(gids) or match["matched_count"] != len(gids)
+            or token.get("endpoint_gid") in gids):
+        return None, "per_peer_gid_alias_or_count_invalid"
+    if events is None:
+        return None, "per_peer_raw_chain_required"
+    try:
+        chain = _delivery_snapshot_chain(token, snapshot.get("command_id"), events,
+                                         after_index=0, before_index=before_index)
+    except TopologyBackendError as exc:
+        return None, "per_peer_chain_invalid:" + str(exc)
+    if (any(key not in chain[1] or chain[1][key] != value for key, value in match.items())
+            or any(key not in chain[2] or chain[2][key] != value
+                   for key, value in snapshot["graph_snapshot"].items())):
+        return None, "per_peer_snapshot_not_raw_backed"
+    request = chain[0]
+    limit = len(events) if before_index is None else before_index
+    live = []
+    for created in events[:request["event_index"]]:
+        if created.get("event") != "endpoint_created":
+            continue
+        retired = [e for e in events[created["event_index"] + 1:limit]
+                   if e.get("event") in {"endpoint_destroyed", "topology_endpoint_destroyed", "worker_exit"}
+                   and e.get("logical_id") == created.get("logical_id")
+                   and e.get("generation") == created.get("generation")]
+        if not retired:
+            live.append(created)
+    for field in ("logical_id", "endpoint_gid", "endpoint_generation", "pid"):
+        values = [row.get(field) for row in live]
+        if None in values or len(set(values)) != len(values):
+            return None, "per_peer_live_identity_alias:" + field
+    opposite = "reader" if worker_role_kind(token.get("role")) == "writer" else "writer"
+    inventory = [e for e in live if worker_role_kind(e.get("role")) == opposite
+                 and e.get("topic") == token.get("topic")]
+    known = {e.get("endpoint_gid") for e in inventory}
+    for queried, role in ((token, worker_role_kind(token.get("role"))), (peer, opposite)):
+        bound = [e for e in live if e.get("logical_id") == queried.get("logical_id")]
+        if (len(bound) != 1 or worker_role_kind(bound[0].get("role")) != role
+                or any(queried.get(key) is None or bound[0].get(key) != queried[key]
+                       for key in ("generation", "endpoint_gid", "endpoint_generation", "pid",
+                                   "process_start_ticks", "topic", "message_type"))):
+            return None, "per_peer_query_identity_not_current_raw_generation"
+    if (not set(gids) <= known
+            or (peer.get("topic") == token.get("topic") and peer.get("endpoint_gid") not in known)):
+        return None, "per_peer_scope_missing_raw_generation"
+    for name, kind in (("publishers", "writer"), ("subscriptions", "reader")):
+        rows = snapshot["graph_snapshot"][name]
+        graph_gids = [row.get("endpoint_gid") for row in rows]
+        raw_members = [e for e in live if worker_role_kind(e.get("role")) == kind
+                       and e.get("topic") == token.get("topic")]
+        raw_gids = {e.get("endpoint_gid") for e in raw_members}
+        for row in rows:
+            bound = [e for e in raw_members if e.get("endpoint_gid") == row.get("endpoint_gid")]
+            if (len(bound) != 1 or not row.get("topic_type")
+                    or row["topic_type"] != bound[0].get("message_type", bound[0].get("type_name"))):
+                return None, "per_peer_graph_and_raw_type_differ"
+        if (not all(valid_gid(gid) for gid in graph_gids)
+                or len(graph_gids) != len(set(graph_gids)) or set(graph_gids) != raw_gids):
+            return None, "per_peer_graph_and_raw_scope_differ"
+    return peer["endpoint_gid"] in gids, None
+
+
 def pair_graph_facts(writer_handle, reader_handle, writer_snapshot, reader_snapshot,
-                     *, snapshot_command_id=None, real_ros=False):
+                     *, snapshot_command_id=None, real_ros=False, raw_events=None, before_index=None):
     """One directed pair fact from the two endpoint-specific fresh snapshots."""
     fact = {
         "schema": PAIR_FACT_SCHEMA,
@@ -163,10 +243,6 @@ def pair_graph_facts(writer_handle, reader_handle, writer_snapshot, reader_snaps
         "execution_evidence": bool(real_ros),
         "candidate_eligible": False,
     }
-    if writer_handle.get("topic") != reader_handle.get("topic"):
-        fact["status"] = "incompatible"
-        fact["reasons"] = ["topic_mismatch"]
-        return fact
     if not _snapshot_complete(writer_snapshot) or not _snapshot_complete(reader_snapshot):
         fact["reasons"] = ["incomplete_snapshot"]
         return fact
@@ -183,6 +259,34 @@ def pair_graph_facts(writer_handle, reader_handle, writer_snapshot, reader_snaps
         return fact
     if rmatch.get("endpoint_gid") != reader_handle.get("endpoint_gid"):
         fact["reasons"].append("reader_snapshot_gid_mismatch")
+        return fact
+    direct = [_direct_peer_membership(token, peer, snap, raw_events, before_index=before_index)
+              for token, peer, snap in ((writer_handle, reader_handle, writer_snapshot),
+                                        (reader_handle, writer_handle, reader_snapshot))]
+    # Missing on BOTH ends preserves the qualified legacy 1W1R path. A present
+    # but incomplete/contradictory native sample must never fall back to it.
+    if any(reason != "per_peer_api_absent" for _, reason in direct):
+        if any(value is None for value, _ in direct):
+            fact["reasons"] = [reason or "peer_api_other_end_incomplete" for _, reason in direct
+                               if reason is not None]
+        elif all(value for value, _ in direct):
+            if writer_in_reader and reader_in_writer:
+                fact.update(status="matched", identity_basis="direct_bidirectional_matched_peer_api",
+                            limitations=["snapshot_scope_only_not_continuous_match_or_delivery_ack"])
+            else:
+                fact["reasons"] = ["per_peer_api_and_graph_contradict"]
+        elif not any(value for value, _ in direct):
+            fact.update(status="unmatched", identity_basis="direct_bidirectional_matched_peer_api",
+                        reasons=["peer_absent_from_both_complete_matched_lists"],
+                        limitations=["snapshot_absence_only_not_persistent_nonmatch_or_disappearance"])
+        else:
+            fact["reasons"] = ["per_peer_api_directional_disagreement"]
+        return fact
+    if writer_handle.get("topic") != reader_handle.get("topic"):
+        # Compatibility alone never supplies a direct match/nonmatch proof.
+        # Keep legacy classification only when both direct API samples absent.
+        fact["status"] = "incompatible"
+        fact["reasons"] = ["topic_mismatch"]
         return fact
     if wmatch["matched_count"] > 0 or rmatch["matched_count"] > 0:
         if not (writer_in_reader and reader_in_writer):
@@ -590,6 +694,72 @@ def _delivery_snapshot_chain(token, command_id, events, *, after_index, before_i
     return chain
 
 
+
+def _delivery_no_obligation_basis(opened, events):
+    """Fresh observed identity/type or complete direct NONE, never QoS intent.
+
+    This applies only to the capture beginning at this open. It does not claim
+    a persistent absence/disappearance, and cannot forgive an older obligation.
+    """
+    start = opened.get("event_index")
+    if type(start) is not int or not 0 <= start < len(events):
+        return None
+    tokens, snapshots = {}, {}
+    try:
+        for role in ("writer", "reader"):
+            candidates = [e for e in events[:start] if e.get("event") == "endpoint_created"
+                          and e.get("logical_id") == opened.get(role)
+                          and e.get("generation") == opened.get(role + "_generation")]
+            if len(candidates) != 1:
+                return None
+            token = tokens[role] = candidates[0]
+            if (worker_role_kind(token.get("role")) != role or token.get("run_id") != opened.get("run_id")
+                    or token.get("endpoint_gid") != opened.get(role + "_gid")):
+                return None
+            if any(e.get("event") in {"endpoint_destroyed", "topology_endpoint_destroyed", "worker_exit"}
+                   and e.get("logical_id") == token["logical_id"] and e.get("generation") == token["generation"]
+                   for e in events[token["event_index"]+1:start]):
+                return None
+            refs = opened.get("snapshot_refs", {}).get(token["logical_id"], [])
+            if not isinstance(refs, list) or len(refs) != 4 or any(type(i) is not int or not 0 <= i < start for i in refs):
+                return None
+            chain = _delivery_snapshot_chain(token, events[refs[0]].get("command_id"), events,
+                after_index=opened["snapshot_start_ref"], before_index=start)
+            if (refs != [e["event_index"] for e in chain]
+                    or not token["monotonic_ns"] <= chain[0]["monotonic_ns"] <= chain[-1]["monotonic_ns"] <= opened["monotonic_ns"]):
+                return None
+            snapshots[role] = {"complete": True, "command_id": chain[1]["command_id"],
+                               "match_snapshot": chain[1], "graph_snapshot": chain[2]}
+            own = [row for row in chain[2]["publishers" if role == "writer" else "subscriptions"]
+                   if row.get("endpoint_gid") == token["endpoint_gid"]]
+            if (len(own) != 1 or not isinstance(token.get("message_type"), str) or not token.get("topic")
+                    or own[0].get("topic_type") != token["message_type"]):
+                return None
+        w, r = tokens["writer"], tokens["reader"]
+        if w["endpoint_gid"] == r["endpoint_gid"]:
+            return None
+        reason = None
+        if w["topic"] != r["topic"]:
+            reason = "actual_endpoint_topic_mismatch"
+        elif w["message_type"] != r["message_type"]:
+            reason = "actual_endpoint_type_mismatch"
+        else:
+            pair = pair_graph_facts(w, r, snapshots["writer"], snapshots["reader"],
+                                    raw_events=events, before_index=start)
+            if (pair["status"] == "unmatched"
+                    and pair.get("identity_basis") == "direct_bidirectional_matched_peer_api"):
+                reason = "both_complete_direct_peer_lists_exclude_pair"
+        if reason is None:
+            return None
+        return {"reason": reason, "snapshot_refs": opened["snapshot_refs"],
+                "writer_gid": w["endpoint_gid"], "reader_gid": r["endpoint_gid"],
+                "writer_topic": w["topic"], "reader_topic": r["topic"],
+                "writer_type": w["message_type"], "reader_type": r["message_type"],
+                "scope": "open_snapshot_only_not_persistent_nonmatch", "obligation": "not_applicable"}
+    except (TopologyBackendError, KeyError, TypeError, IndexError):
+        return None
+
+
 def _delivery_window_evidence(opened, events, *, before_index=None):
     """Conservative 1W1R closure using the consumer's existing raw protocol.
 
@@ -637,13 +807,40 @@ def _delivery_window_evidence(opened, events, *, before_index=None):
                 "expected_sequences": [], "received_sequences": [], "missing_sequences": [],
                 "gap_evidence": [], "send_refs": [], "receive_refs": [], "attribution": "unknown"}
     w, r = tokens["writer"], tokens["reader"]
+    no_obligation = _delivery_no_obligation_basis(opened, prefix)
+    claims = [e for e in rows if e.get("event") == "topology_delivery_no_obligation"
+              and e.get("open_ref") == start]
+    if claims:
+        claim = claims[0]
+        valid = (len(claims) == 1 and no_obligation is not None and not reasons
+                 and all(claim.get(key) == value for key, value in no_obligation.items())
+                 and all(claim.get(key) == opened.get(key) for key in _PAIR_KEY)
+                 and type(claim.get("monotonic_ns")) is int
+                 and opened["monotonic_ns"] <= claim["monotonic_ns"] <= end_ns
+                 and not any(e.get("event") == "send" and e.get("logical_id") == w["logical_id"]
+                             and e["event_index"] < claim["event_index"] for e in rows)
+                 and not any(e.get("event") == "topology_delivery_window_interrupted"
+                             and e.get("open_ref") == start for e in rows))
+        if valid:
+            return {"window_complete": True, "closure_status": "no_obligation",
+                    "no_obligation_ref": claim["event_index"], "no_obligation_reason": no_obligation["reason"],
+                    "reasons": [], "expected_sequences": [], "received_sequences": [],
+                    "missing_sequences": [], "gap_evidence": [], "send_refs": [], "receive_refs": [],
+                    "attribution": "not_applicable"}
+        reasons.append("no_obligation_receipt_not_raw_supported")
+    elif no_obligation is not None:
+        reasons.append("no_obligation_receipt_missing")
+    direct_peer_match = False
     if len(chains) == 2:
         snaps = {role: {"complete": True, "command_id": chain[1]["command_id"],
                         "match_snapshot": chain[1], "graph_snapshot": chain[2]}
                  for role, chain in chains.items()}
-        pair = pair_graph_facts(w, r, snaps["writer"], snaps["reader"])
-        # Only a snapshot-scope unique pair is supported here. Do not emit a
-        # controlled-isolation/per-peer match claim from these aggregate APIs.
+        pair = pair_graph_facts(w, r, snaps["writer"], snaps["reader"],
+                                raw_events=events, before_index=start)
+        direct_peer_match = (pair["status"] == "matched" and
+                             pair.get("identity_basis") == "direct_bidirectional_matched_peer_api")
+        # N-peer windows require the actual complete per-peer API proof before
+        # open. Aggregate-only observations retain the legacy unique-pair gate.
         if pair["status"] != "matched":
             reasons.append("snapshot_scope_pair_not_matched")
     else:
@@ -676,7 +873,7 @@ def _delivery_window_evidence(opened, events, *, before_index=None):
         if len(inventory) != 1:
             reasons.append("send_sequence_not_raw_unique")
         active, _ = _raw_active_writer_inventory(prefix, w["logical_id"], send["monotonic_ns"])
-        if active != 1:
+        if active != 1 and not direct_peer_match:
             reasons.append("active_writer_generation_not_raw_unique")
         expected[seq] = send
     requests = [e for e in rows if e.get("event") == "topology_delivery_window_publish_requested"
@@ -704,12 +901,26 @@ def _delivery_window_evidence(opened, events, *, before_index=None):
         if not bound(sample, r, "reader_gid") or not in_clock(sample):
             reasons.append("receive_identity_or_window_invalid")
             continue
+        if publisher is None and sample.get("payload_writer_id") not in (None, w["logical_id"]):
+            other_sends = [e for e in prefix if e.get("event") == "send"
+                           and e.get("payload_sha256") == sample.get("payload_sha256")
+                           and e.get("run_id") == sample.get("payload_run_id")]
+            if len(other_sends) == 1:
+                other = other_sends[0]
+                other_pair = {**pair, "writer": other.get("logical_id"),
+                              "writer_generation": other.get("generation"),
+                              "writer_gid": other.get("writer_gid")}
+                witness, _ = payload_delivery_witness(other_pair, sample, prefix)
+                if witness is not None:
+                    continue
+            reasons.append("other_writer_payload_not_raw_bound")
+            continue
         seq = sample.get("send_sequence")
         if type(seq) is not int or seq not in expected:
             reasons.append("receive_without_current_window_send")
             continue
         active, _ = _raw_active_writer_inventory(prefix, w["logical_id"], sample["monotonic_ns"])
-        if active != 1:
+        if active != 1 and not direct_peer_match:
             reasons.append("receive_active_writer_generation_not_raw_unique")
             continue
         basis = "direct_publisher_gid"
@@ -794,7 +1005,7 @@ def _pair_rows(handles, snapshot, events, *, real_ros=False):
         for reader in readers:
             rows.append(pair_graph_facts(
                 writer, reader, snaps.get(writer["logical_id"]), snaps.get(reader["logical_id"]),
-                snapshot_command_id=snapshot.get("command_id"), real_ros=real_ros))
+                snapshot_command_id=snapshot.get("command_id"), real_ros=real_ros, raw_events=events))
     return rows
 
 
@@ -1247,9 +1458,12 @@ def run_topology(program, config, output_dir, *, backend=None):
 
     delivery_windows = {}
 
-    def close_delivery_windows(reason=None, *, endpoint_id=None, topic=None):
+    def close_delivery_windows(reason=None, *, endpoint_id=None, topic=None, no_obligation_only=False):
         """End the capture, not the DDS obligation; interruptions stay raw."""
         for key, opened in list(delivery_windows.items()):
+            if no_obligation_only and not any(e.get("event") == "topology_delivery_no_obligation"
+                    and e.get("open_ref") == opened["event_index"] for e in events[opened["event_index"]+1:]):
+                continue
             if endpoint_id is not None and endpoint_id not in (opened["writer"], opened["reader"]) and topic != opened.get("topic"):
                 continue
             if reason is not None:
@@ -1308,6 +1522,20 @@ def run_topology(program, config, output_dir, *, backend=None):
                     match_scope="snapshot_scope_only_not_per_peer_match_proof",
                     fixture=not backend.real_ros, candidate_eligible=False,
                     execution_evidence=bool(backend.real_ros))
+            # Keep a window skeleton for every observed pair. Only an actual
+            # pre-open no-obligation proof may exempt its delivery inventory.
+            opened = delivery_windows[key]
+            no_obligation = _delivery_no_obligation_basis(opened, events)
+            if no_obligation is not None:
+                claims = [e for e in events[opened["event_index"]+1:]
+                          if e.get("event") == "topology_delivery_no_obligation"
+                          and e.get("open_ref") == opened["event_index"]]
+                if not claims:
+                    emit("topology_delivery_no_obligation", **dict(zip(_PAIR_KEY, key)),
+                         open_ref=opened["event_index"], **no_obligation,
+                         fixture=not backend.real_ros, candidate_eligible=False,
+                         execution_evidence=bool(backend.real_ros))
+                continue
             # This is a controller request, not proof of any actual send. The
             # close independently checks its exact raw publish-return inventory.
             emit("topology_delivery_window_publish_requested", **dict(zip(_PAIR_KEY, key)),
@@ -1423,7 +1651,7 @@ def run_topology(program, config, output_dir, *, backend=None):
                     and all(close.get(k) == evidence.get(k) for k in
                             ("expected_sequences", "received_sequences", "missing_sequences",
                              "send_refs", "receive_refs", "sentinel_sequence", "sentinel_send_ref",
-                             "sentinel_receive_ref", "gap_evidence"))):
+                             "sentinel_receive_ref", "gap_evidence", "no_obligation_ref", "no_obligation_reason", "closure_status"))):
                 windows_ok = False
                 missing.append("raw_delivery_window_incomplete:" + str(close["event_index"]))
         if any(e.get("event") == "runtime_abort" for e in events):
@@ -1799,6 +2027,7 @@ def run_topology(program, config, output_dir, *, backend=None):
                         prepare_delivery_windows(st["handle"], aid, sequences)
                         publish = backend.publish_batch(
                             st["handle"], sequences, float(interval), aid, payload=payload)
+                        close_delivery_windows(endpoint_id=eid, no_obligation_only=True)
                     except TopologyUnsupported as exc:
                         interrupt_writer_windows(eid, "publish_batch_unsupported")
                         record_guard(action, exc.code, str(exc), kind="capability",

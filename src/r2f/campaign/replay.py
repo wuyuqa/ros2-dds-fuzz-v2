@@ -329,6 +329,45 @@ def _worker_qualification(config, metadata, events):
     return errors
 
 
+def _topology_worker_role_matches(config, worker, token):
+    """Bind the endpoint kind and exact worker alias independently.
+
+    Use the producer's declaration-order, four-per-kind alias assignment, not
+    a prefix/digit heuristic (worker_role_kind alone also parses higher digits).
+    Explicit raw alias fields must agree; none may mask another via fallback.
+    """
+    from r2f.runtime.topology_worker import worker_role_for, worker_role_kind
+
+    program = config.get('topology_program')
+    if not isinstance(program, dict) or not isinstance(program.get('endpoints'), list):
+        return False
+    bindings, ordinals = {}, {'writer': 0, 'reader': 0}
+    for endpoint in program['endpoints']:
+        if not isinstance(endpoint, dict):
+            return False
+        logical_id, kind = endpoint.get('logical_id'), endpoint.get('role')
+        if (not isinstance(logical_id, str) or not logical_id or logical_id in bindings
+                or kind not in ('writer', 'reader')):
+            return False
+        try:
+            alias = worker_role_for(kind, ordinals[kind])
+        except ValueError:
+            return False
+        bindings[logical_id] = (kind, alias)
+        ordinals[kind] += 1
+    logical_id = token.get('logical_id')
+    if not isinstance(logical_id, str) or logical_id not in bindings:
+        return False
+    kind, alias = bindings[logical_id]
+    return (worker.get('endpoint_role') == kind
+            and worker_role_kind(alias) == kind
+            and worker.get('role') == alias
+            and token.get('role') == alias
+            and any(key in token for key in ('worker_role', 'topology_worker_role'))
+            and all(token[key] == alias for key in ('worker_role', 'topology_worker_role', 'role')
+                    if key in token))
+
+
 def _topology_worker_errors(config, result):
     """Verify N-generation worker references against raw, never a pair count.
 
@@ -376,8 +415,7 @@ def _topology_worker_errors(config, result):
                         'pid', 'pgid', 'process_start_ticks', 'worker_generation'):
                 if worker.get(key) is None or worker.get(key) != token.get(key):
                     raise ValueError('worker_token_identity_mismatch:' + key)
-            if (worker.get('endpoint_role') != token.get('role')
-                    or worker.get('role') != token.get('worker_role', token.get('topology_worker_role'))):
+            if not _topology_worker_role_matches(config, worker, token):
                 raise ValueError('worker_role_mismatch')
             if (worker.get('fixture') is not False or worker.get('real_ros') is not True
                     or token.get('real_ros') is not True or token.get('backend') != 'ros2_public_api'):

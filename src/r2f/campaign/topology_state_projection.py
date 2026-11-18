@@ -52,6 +52,7 @@ from copy import deepcopy
 import hashlib
 import json
 import math
+import re
 from pathlib import Path
 
 from r2f.core.evidence import canonical_hash
@@ -330,6 +331,48 @@ class _Projection:
                 gids = [_gid(gid) for gid in row["matched_peer_gids"]]
                 if None in gids or len(gids) != len(set(gids)) or row["matched_count"] != len(gids):
                     raise ValueError("per_peer_list_count_contradiction")
+                # Same strict local raw universe as the producer: an extra
+                # unbound peer or missing/aliased generation is not a complete
+                # observation of this captured topology. No expected QoS graph.
+                active = {}
+                for event in self.prefix(boundary):
+                    eid = event.get("logical_id")
+                    if event["event"] == "endpoint_created" and event["event_index"] < chain[0]["event_index"]:
+                        active[eid] = event
+                    elif event["event"] in ("endpoint_destroyed", "topology_endpoint_destroyed", "worker_exit"):
+                        if eid in active and event.get("generation") == active[eid].get("generation"):
+                            active.pop(eid)
+                for key in ("endpoint_gid", "endpoint_generation", "pid"):
+                    values = [event.get(key) for event in active.values()]
+                    if None in values or len(set(values)) != len(values):
+                        raise ValueError("direct_peer_scope_identity_alias_or_missing:" + key)
+                for name, role in (("publishers", "writer"), ("subscriptions", "reader")):
+                    raw = [event for eid, event in active.items()
+                           if self.roles.get(eid) == role and event.get("topic") == token["topic"]]
+                    graph_rows = chain[2][name]
+                    graph_gids = [_gid(event.get("endpoint_gid")) for event in graph_rows]
+                    raw_gids = {_gid(event.get("endpoint_gid")) for event in raw}
+                    if (None in graph_gids or len(set(graph_gids)) != len(graph_gids)
+                            or set(graph_gids) != raw_gids):
+                        raise ValueError("direct_peer_graph_and_raw_scope_differ")
+                    for graph_row in graph_rows:
+                        known = [event for event in raw if _gid(event["endpoint_gid"]) == _gid(graph_row["endpoint_gid"])]
+                        if (len(known) != 1 or not _text(known[0].get("message_type"))
+                                or graph_row.get("topic_type") != known[0]["message_type"]):
+                            raise ValueError("direct_peer_graph_and_raw_type_differ")
+                opposite = "reader" if self.roles.get(token["logical_id"]) == "writer" else "writer"
+                known = {_gid(event["endpoint_gid"]) for eid, event in active.items()
+                         if self.roles.get(eid) == opposite and event.get("topic") == token["topic"]}
+                for queried, role in ((token, self.roles.get(token["logical_id"])), (peer, opposite)):
+                    bound = active.get(queried["logical_id"])
+                    if (bound is None or re.fullmatch(role + r"[1-9]?", str(bound.get("role"))) is None
+                            or any(queried.get(key) is None or bound.get(key) != queried[key]
+                                   for key in ("generation", "endpoint_gid", "endpoint_generation", "pid",
+                                               "process_start_ticks", "topic", "message_type"))):
+                        raise ValueError("direct_peer_query_identity_not_current_raw_generation")
+                if (not set(gids) <= known or (peer["topic"] == token["topic"]
+                        and _gid(peer["endpoint_gid"]) not in known)):
+                    raise ValueError("direct_peer_gid_not_bound_to_current_raw_scope")
                 direct.append(_gid(peer["endpoint_gid"]) in gids)
             else:
                 direct.append(None)
@@ -412,6 +455,57 @@ class _Projection:
         if close.get("window_complete") is not True:
             raise ValueError("delivery_window_capture_incomplete")
         rows = [e for e in prefix if opened["event_index"] < e["event_index"] < close["event_index"]]
+        claims = [e for e in rows if e["event"] == "topology_delivery_no_obligation"
+                  and e.get("open_ref") == opened["event_index"]]
+        if claims or close.get("closure_status") == "no_obligation":
+            if len(claims) != 1:
+                raise ValueError("no_obligation_receipt_missing_or_duplicate")
+            claim = claims[0]
+            self.pair_bound(claim, w, r)
+            self.chain_order([opened, claim, close])
+            reason = None
+            types = []
+            for token, chain, name in ((w, wc, "publishers"), (r, rc, "subscriptions")):
+                if any(token.get(key) is None or row.get(key) != token[key]
+                       for row in chain for key in ("logical_id", "generation", "pid", "process_start_ticks", "endpoint_generation")):
+                    raise ValueError("no_obligation_snapshot_worker_identity_incomplete")
+                own = [row for row in chain[2][name] if _gid(row.get("endpoint_gid")) == _gid(token["endpoint_gid"])]
+                if (len(own) != 1 or not _text(token.get("message_type"))
+                        or own[0].get("topic_type") != token["message_type"]):
+                    raise ValueError("no_obligation_actual_type_not_raw_bound")
+                types.append(token["message_type"])
+            if w["topic"] != r["topic"]:
+                reason = "actual_endpoint_topic_mismatch"
+            elif types[0] != types[1]:
+                reason = "actual_endpoint_type_mismatch"
+            elif matched == "none" and isolation is None:
+                reason = "both_complete_direct_peer_lists_exclude_pair"
+            # UNKNOWN or directional match is never NONE. QoS incompatibility
+            # predicted by the model is deliberately not an exemption source.
+            if reason is None:
+                raise ValueError("no_obligation_not_proved_by_actual_endpoints_or_direct_none")
+            fields = {"reason": reason, "writer_gid": w["endpoint_gid"], "reader_gid": r["endpoint_gid"],
+                      "writer_topic": w["topic"], "reader_topic": r["topic"],
+                      "writer_type": types[0], "reader_type": types[1],
+                      "scope": "open_snapshot_only_not_persistent_nonmatch", "obligation": "not_applicable",
+                      "snapshot_refs": {t["logical_id"]: [e["event_index"] for e in chain]
+                                        for t, chain in ((w, wc), (r, rc))}}
+            if (any(claim.get(key) != value for key, value in fields.items())
+                    or opened.get("snapshot_refs") != fields["snapshot_refs"]
+                    or any(close.get(key) != [] for key in ("expected_sequences", "received_sequences", "missing_sequences", "gap_evidence", "send_refs", "receive_refs"))
+                    or close.get("no_obligation_ref") != claim["event_index"]
+                    or close.get("no_obligation_reason") != reason
+                    or close.get("closure_status") != "no_obligation"
+                    or any(e["event"] == "send" and e.get("logical_id") == w["logical_id"]
+                           and e["event_index"] < claim["event_index"] for e in rows)
+                    or any(e["event"] == "topology_delivery_window_interrupted"
+                           and e.get("open_ref") == opened["event_index"] for e in rows)):
+                raise ValueError("no_obligation_receipt_or_close_contradicts_raw")
+            return "no_obligation", [w, r, opened, claim, close, *wc, *rc], {
+                "expected": [], "received": [], "missing": [], "attribution": "not_applicable",
+                "no_obligation_reason": reason, "no_obligation_ref": self.ref(claim),
+                "observed_match_used": matched, "cross_writer_order_required": False,
+                "limitation": "snapshot_scope_only_not_persistent_nonmatch"}
         sends = [e for e in rows if e["event"] == "send" and e.get("logical_id") == w["logical_id"]]
         expected = {}
         for event in sends:

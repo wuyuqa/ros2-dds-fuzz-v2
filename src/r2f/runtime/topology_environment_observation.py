@@ -14,6 +14,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import time
 
 from . import discovery_network as network
@@ -145,7 +146,30 @@ class _KernelProbe:
         commands = []
         try:
             for argv in _COMMANDS:
-                commands.append(network._execute(argv))
+                # The launcher may intentionally retain a minimal PATH without
+                # sbin. Resolve only these fixed read-only tools; do not mutate
+                # process PATH or bypass _execute's kernel isolation checks.
+                executable = shutil.which(argv[0])
+                method = "inherited_path"
+                if executable is None:
+                    executable = shutil.which(argv[0], path="/usr/sbin:/sbin:/usr/bin:/bin")
+                    method = "fixed_system_path"
+                if executable is None:
+                    # Preserve the original fail-closed tool_missing receipt.
+                    commands.append(network._execute(argv))
+                    continue
+                executed = [executable, *argv[1:]]
+                try:
+                    row = network._execute(executed)
+                except network.DiscoveryNetworkError as exc:
+                    receipt = dict(exc.receipt)
+                    receipt.update(argv=list(argv), executed_argv=executed,
+                                   tool_resolution=method)
+                    raise network.DiscoveryNetworkError(str(exc), receipt) from exc
+                row = dict(row)
+                row.update(argv=list(argv), executed_argv=executed,
+                           tool_resolution=method)
+                commands.append(row)
         except (network.DiscoveryNetworkError, network.NetworkIsolationError, OSError) as exc:
             raise ObservationUnavailable("network_readback_failed:" + str(exc), {
                 "commands": commands, "failed_command": getattr(exc, "receipt", {})}) from exc

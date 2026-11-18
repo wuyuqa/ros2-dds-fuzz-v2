@@ -205,8 +205,36 @@ def test_no_match_proof_does_not_forbid_original_publish(tmp_path, mode):
     assert runtime["status"] == "executed"
     assert any(e["event"] == "send" for e in events)
     assert not any(r["code"] == "publish_batch_error" for r in runtime["guard_receipts"])
-    assert not _closed(events)["window_complete"] and not boundary["window_complete"]
-    assert all(p["delivery_closure"] == "unknown" for p in projection["state_after"]["pairs"])
+    if mode == "incompatible":
+        claims = [e for e in events if e["event"] == "topology_delivery_no_obligation"]
+        assert len(claims) == 1 and claims[0]["reason"] == "actual_endpoint_topic_mismatch"
+        claim = claims[0]
+        created = {role: [e for e in events if e["event"] == "endpoint_created"
+                         and e.get("logical_id") == claim[role]
+                         and e.get("generation") == claim[role + "_generation"]]
+                   for role in ("writer", "reader")}
+        assert all(len(rows) == 1 for rows in created.values())
+        assert created["writer"][0]["topic"] != created["reader"][0]["topic"]
+        for role in ("writer", "reader"):
+            token = created[role][0]
+            assert token["endpoint_gid"] == claim[role + "_gid"]
+            refs = claim["snapshot_refs"][token["logical_id"]]
+            chain = [events[index] for index in refs]
+            assert [row["event"] for row in chain] == [
+                "topology_snapshot_requested", "match_snapshot", "graph_snapshot", "command_done"]
+            assert len({row["command_id"] for row in chain}) == 1
+            assert chain[-1]["event_index"] < claim["open_ref"] < claim["event_index"]
+            own = [row for row in chain[2]["publishers" if role == "writer" else "subscriptions"]
+                   if row["endpoint_gid"] == token["endpoint_gid"]]
+            assert len(own) == 1 and own[0]["topic_type"] == token["message_type"]
+        assert _closed(events)["window_complete"] and boundary["window_complete"]
+        assert _closed(events)["expected_sequences"] == []
+        assert _closed(events)["no_obligation_ref"] == claim["event_index"]
+        assert all(p["delivery_closure"] == "no_obligation" for p in projection["state_after"]["pairs"])
+        assert not runtime["candidate_eligible"] and not projection["eligible"]
+    else:
+        assert not _closed(events)["window_complete"] and not boundary["window_complete"]
+        assert all(p["delivery_closure"] == "unknown" for p in projection["state_after"]["pairs"])
 
 
 @pytest.mark.parametrize("ack", ["missing", "duplicate"])

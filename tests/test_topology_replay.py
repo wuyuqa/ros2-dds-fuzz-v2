@@ -208,10 +208,12 @@ def worker_artifacts(root):
     events, workers = [result['events'][0]], []
     raw = root / 'raw.jsonl'
     for index, role in enumerate(('writer', 'reader')):
-        token = {'logical_id': role + '_fixture', 'generation': 1, 'pid': 200 + index,
+        endpoint = next(spec for spec in config['topology_program']['endpoints']
+                        if spec['role'] == role)
+        token = {'logical_id': endpoint['logical_id'], 'generation': 1, 'pid': 200 + index,
                  'pgid': 200 + index, 'process_start_ticks': 1000 + index,
                  'endpoint_gid': 'fixture-gid-' + str(index), 'endpoint_generation': 'fixture-epoch-' + str(index),
-                 'worker_generation': 1, 'worker_role': 'topology_' + role, 'role': role,
+                 'worker_generation': 1, 'worker_role': role, 'role': role,
                  'real_ros': True, 'backend': 'ros2_public_api', 'domain_id': 81,
                  'observed_domain_id': 81, 'domain_observation_source': 'worker_environment',
                  'rmw_identifier': config['rmw']}
