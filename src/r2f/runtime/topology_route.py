@@ -18,7 +18,9 @@ from r2f.modules.s1.topology_input import (
     validate_topology_plan, topology_input_layer_receipts,
 )
 from .topology_worker import OFFLINE_BACKEND, ROS_BACKEND, OfflineTopologyBackend, RosTopologyBackend
-from .topology_operator_application import audit_operator_application
+from .topology_operator_application import (
+    audit_operator_application, is_deadline_configuration_delay,
+)
 
 AUDIT_SCHEMA = "r2f.topology-application-audit/v1"
 ROUTE_SCHEMA = "r2f.topology-route-binding/v1"
@@ -622,19 +624,22 @@ def audit_topology_application(plan, input_layer_receipts, runtime):
         netem_audit_status = (audit.get("netem_application") or {}).get("status")
         operator_records = {}
         for index, receipt in enumerate(input_layer_receipts):
-            if receipt["operator_id"] in CONFIGURATION_AUDIT_OPERATORS:
+            if (receipt["operator_id"] in CONFIGURATION_AUDIT_OPERATORS
+                    or is_deadline_configuration_delay(receipt)):
                 record = audit_operator_application([receipt], events, program, fixture=fixture)[0]
                 record["layer_index"] = index
                 operator_records[index] = record
         for index, receipt in enumerate(input_layer_receipts):
             operator = receipt["operator_id"]
+            configuration_audit = (operator in CONFIGURATION_AUDIT_OPERATORS
+                                   or is_deadline_configuration_delay(receipt))
             before, after = receipt["input_before"], receipt["input_after"]
             layer = {"layer_index": index, "op_id": plan.operations[index].op_id,
                      "operator_id": operator, "input_before": deepcopy(before), "input_after": deepcopy(after),
                      "status": "unknown", "reasons": [], "raw_refs": [], "hit": False,
                      "execution_evidence": False, "candidate_eligible": False}
             audit["layers"].append(layer)
-            if operator not in SUPPORTED_OPERATORS:
+            if operator not in SUPPORTED_OPERATORS and not configuration_audit:
                 reasons = ["operator_application_auditor_not_implemented:" + operator]
                 if operator in NETEM_NAMED_OPERATORS:
                     # The netem window is a config-level environment mutation
@@ -717,7 +722,7 @@ def audit_topology_application(plan, input_layer_receipts, runtime):
                     if not creation_actions:
                         layer["reasons"].append("configured_endpoint_never_created:" + eid)
                     affected.update(a["action_id"] for a in creation_actions)
-            if operator in CONFIGURATION_AUDIT_OPERATORS:
+            if configuration_audit:
                 operator_record = deepcopy(operator_records[index])
                 layer["operator_application"] = operator_record
                 for key in ("configuration_application_observed", "application_kind", "qos_delta", "relation_pair", "observed_qos", "dds_contract",
@@ -752,14 +757,14 @@ def audit_topology_application(plan, input_layer_receipts, runtime):
                                  for ref in sorted(set(layer["raw_refs"] + [bindings[0]["event_index"]]))]
             if not layer["reasons"]:
                 layer.update(status=observed_status, execution_evidence=bool(real),
-                             hit=bool(real and (operator not in CONFIGURATION_AUDIT_OPERATORS
+                             hit=bool(real and (not configuration_audit
                                                 or operator_record.get("configuration_intervention_proven") is True)))
-                if operator in CONFIGURATION_AUDIT_OPERATORS:
+                if configuration_audit:
                     layer.update(
                         configuration_intervention_proven=(
                             operator_record.get("configuration_intervention_proven") is True),
                         effect_observed=False)
-            if operator in CONFIGURATION_AUDIT_OPERATORS:
+            if configuration_audit:
                 layer["operator_application"].update(
                     status=layer["status"], raw_refs=deepcopy(layer["raw_refs"]),
                     execution_evidence=bool(real and not layer["reasons"]),

@@ -346,6 +346,30 @@ def test_deleted_actual_artifacts_do_not_turn_attempt_into_preplan_rejection(fou
     assert 'has_submission_or_plan_history' in errors[0], errors
 
 
+@pytest.mark.parametrize('resign_task', [False, True])
+def test_laundered_actual_history_denied_even_if_task_rejection_is_resigned(four_rows, resign_task):
+    root, report = four_rows
+    actual = report['rows'][1]
+    fake = deepcopy(report['rows'][0])
+    fake['cell_id'] = report['run_id'] + '.0001.rejected'
+    fake['input_search'] = deepcopy(actual['input_search'])
+    fake['input_search'].update(status='rejected', actual=False, execution=None)
+    fake['topology_generation_attempts'] = [deepcopy(fake['input_search']['mutation_request'])]
+    shutil.rmtree(Path(actual['runtime_config_path']).parent)
+    if resign_task:
+        checkpoint = read(root / 'checkpoint.json')
+        task = next(t for t in checkpoint['state']['scheduler']['frontier']['tasks']
+                    if t['task_id'] == fake['input_search']['task_id'])
+        task.update(status='rejected', actual=False, execution=None, reason=fake['reason_code'])
+        checkpoint['checkpoint_sha256'] = canonical_hash({k: v for k, v in checkpoint.items()
+                                                        if k != 'checkpoint_sha256'})
+        write(root / 'checkpoint.json', checkpoint)
+    errors = []
+    assert not audit._verify_exploratory_row(root, fake, report, errors)
+    assert 'has_submission_or_plan_history' in errors[0], errors
+    assert not fake.get('candidate_eligible')
+
+
 @pytest.mark.parametrize('damage', ['checkpoint_list', 'frontier_list', 'duplicate_task', 'cyclic_parent'])
 def test_malformed_resigned_checkpoint_is_invalid_not_exception(four_rows, damage):
     root, report = four_rows

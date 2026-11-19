@@ -242,6 +242,98 @@ def _bind_execution_input(row, config, capsule):
     return row
 
 
+def _topology_comparison_view(capsule, execution, *, config, result, origin, output_root):
+    """Requalify a hash-bound comparison copy; never consume attachment labels.
+
+    Both original and fresh executions use this path. The caller fixes the
+    artifact directory, not a path supplied in raw or in a saved assessment.
+    Qualification, ingest, provider, identity and signature gates are rerun.
+    """
+    from .topology_candidate_assessment import TARGET, finalize_assessment
+    from r2f.core.replay import validate_replay_input, _v2_execution_input
+    from r2f.reports.run_report import execution_boundary_qualification
+    if capsule.input.get('target_id') != TARGET:
+        return _copy_json(execution)
+    validate_replay_input(capsule.input)
+    _v2_execution_input(execution, capsule.input)
+    if (execution.get('execution_stage') != 'judged' or execution.get('actual_run') is not True
+            or 'input_terminal' in execution or execution.get('oracle_verdict') not in {'pass', 'fail'}
+            or origin not in FORMAL_RUNTIMES):
+        raise ValueError('topology_comparison_requires_formal_judged_outcome')
+    for key in ('scenario', 'mutation_plan', 'effective_input', 'effective_input_sha256', 'source_manifest'):
+        if canonical_hash(config.get(key)) != canonical_hash(capsule.input.get(key)):
+            raise ValueError('topology_comparison_config_input_mismatch:' + key)
+    for key in ('run_id', 'target_id', 'target_revision', 'rmw', 'arm', 'repeat', 'seed'):
+        if config.get(key) != execution.get(key):
+            raise ValueError('topology_comparison_execution_config_mismatch:' + key)
+    source = config.get('source_manifest') or {}
+    if (not source.get('source_repo')
+            or canonical_hash(source_manifest(Path(source['source_repo']))) != canonical_hash(source)):
+        raise ValueError('topology_comparison_current_source_mismatch')
+    scenario = Scenario.from_dict(capsule.input['scenario'])
+    services = _registered_target(capsule)[1]
+    recalculated = ingest_execution(scenario, config, result, capsule, services=services)
+    for key in ('execution_stage', 'actual_run', 'abort_reason', 'execution_source', 'typed_facts',
+                'oracle', 'oracle_verdict', 'rule_id', 'mutation_receipt', 'observed_effect',
+                'precondition_receipts', 'observation_receipts', 'fault_control_receipt', 'neutral_receipt',
+                'raw_path', 'raw_sha256', 'runtime_status', 'runtime_reason', 'runtime_execution_metadata',
+                'input_terminal', 'diagnostic_oracle', 'ingestion_error', 'tool_error'):
+        if canonical_hash(execution.get(key)) != canonical_hash(recalculated.get(key)):
+            raise ValueError('topology_comparison_recomputed_ingest_differs:' + key)
+    qualified = _qualification(origin, config, result, recalculated, output_root=output_root)
+    if qualified.get('real_ros_execution') is not True or qualified.get('qualification_errors') != []:
+        raise ValueError('topology_comparison_execution_not_qualified')
+    boundary = 'isolated_netns' if origin == ISOLATED_RUNTIME else 'host'
+    boundary_result = execution_boundary_qualification(boundary, config=config, result=result,
+        row=recalculated, formal_runtime=True, output_root=output_root)
+    if boundary_result.get('status') not in {'qualified', 'not_applicable'}:
+        raise ValueError('topology_comparison_boundary_not_qualified')
+    view = _copy_json(execution)
+    # Clear stale derived denials/errors rather than granting them authority.
+    # Real ingestion/tool errors were compared above and still block finalization.
+    finalize_assessment(scenario, config, capsule, view, boundary=boundary_result, qualification=qualified)
+    view['comparison_binding'] = {
+        'schema': 'r2f.topology-replay-comparison/v1',
+        'input_sha256': canonical_hash(capsule.input),
+        'execution_sha256': canonical_hash(execution),
+        'original_execution_sha256': canonical_hash(capsule.execution),
+        'execution_history_sha256': canonical_hash(capsule.execution_history),
+        'config_sha256': canonical_hash(config), 'result_sha256': canonical_hash(result),
+        'qualification_sha256': canonical_hash(qualified),
+        'boundary_qualification_sha256': canonical_hash(boundary_result),
+        'raw_sha256': execution.get('raw_sha256'),
+    }
+    return view
+
+
+def _original_topology_context(capsule_path):
+    """Pinned original runner layout; saved row/raw paths cannot select roots."""
+    case = Path(capsule_path).resolve().parent
+    report_path = case.parents[1] / 'report.json' if case.parent.name == 'cases' else case / 'report.json'
+    report = _json(report_path)
+    boundary = report.get('runtime_boundary', 'host')
+    if boundary not in {'host', 'isolated_netns'}:
+        raise ValueError('topology_comparison_original_boundary_invalid')
+    formal = report.get('formal_runtime', report.get('runtime_formal')) is True
+    origin = (ISOLATED_RUNTIME if boundary == 'isolated_netns' else DEFAULT_RUNTIME) if formal else 'injected_runtime'
+    return dict(config=_json(case / 'runtime_config.json'),
+                result=_json(case / 'runtime' / 'runtime_result.json'),
+                origin=origin, output_root=case / 'runtime'), [
+                    case / 'runtime_config.json', case / 'runtime' / 'runtime_result.json', report_path]
+
+
+def _replay_comparison_view(capsule, execution, *, original, capsule_path, origin, context):
+    from .topology_candidate_assessment import TARGET
+    if capsule.input.get('target_id') != TARGET:
+        return _copy_json(execution)
+    if original:
+        arguments, _ = _original_topology_context(capsule_path)
+    else:
+        arguments = dict(config=context['config'], result=context['runtime_result'],
+                         origin=origin, output_root=context['output_root'])
+    return _topology_comparison_view(capsule, execution, **arguments)
+
+
 def _worker_counts(config):
     """Expected process instances from the exact runtime backend and input."""
     from r2f.runtime.ros2_pair import EXPLORATORY_TARGETS
@@ -785,6 +877,12 @@ def replay_cell(capsule_path, *, output_dir, domain_id, runtime=None,
                 report['original_artifacts'].append(ref)
                 if not ref['available'] or ref['sha256'] != execution.get('raw_sha256'):
                     raise _Failure('fail_artifact', 'original_raw_invalid', 'original raw artifact missing or SHA256 differs', phase)
+        if (capsule.input.get('target_id') == 'discovery.endpoint_topology.fuzz_v1'
+                and capsule.execution is not None):
+            _, comparison_paths = _original_topology_context(capsule_path)
+            for path in comparison_paths:
+                if not any(ref['path'] == str(path) for ref in report['original_artifacts']):
+                    report['original_artifacts'].append(_reference(path))
         phase = 'preflight'
         _check_domain(capsule, domain_id)
         before = source_manifest(REPO)
@@ -866,7 +964,11 @@ def replay_cell(capsule_path, *, output_dir, domain_id, runtime=None,
                 raise context['failure'] from exc
 
         phase = 'runtime'
-        attempt = rerun_conformance(capsule, runner, domain=domain_id, plan_aware=True)
+        def comparison_view(execution, *, original):
+            return _replay_comparison_view(capsule, execution, original=original,
+                capsule_path=capsule_path, origin=origin, context=context)
+        attempt = rerun_conformance(capsule, runner, domain=domain_id, plan_aware=True,
+                                   comparison_view=comparison_view)
         if context.get('failure'):
             failure = context['failure']
             attempt.update(status=failure.status, failure_reason=str(failure), reason_code=failure.code, phase=failure.phase)
@@ -1021,7 +1123,13 @@ def audit_replay(report_path) -> dict:
                     if attempt.get('comparison_basis') != 'execution_success_only' or attempt.get('comparison_matches_original') is not False or new.get('execution_stage') != 'judged':
                         errors.append('execution-only comparison misrepresented')
                 else:
-                    before, after = conformance_signature(original.execution), conformance_signature(new)
+                    comparison_context = dict(config=_json(root / 'runtime_config.json'),
+                        runtime_result=_json(root / 'runtime_returned.json'), output_root=root / 'runtime')
+                    before_view = _replay_comparison_view(original, original.execution, original=True,
+                        capsule_path=report['capsule_path'], origin=report['execution_origin'], context=comparison_context)
+                    after_view = _replay_comparison_view(original, new, original=False,
+                        capsule_path=report['capsule_path'], origin=report['execution_origin'], context=comparison_context)
+                    before, after = conformance_signature(before_view), conformance_signature(after_view)
                     matches = before is not None and after is not None and canonical_hash(before) == canonical_hash(after)
                     if attempt['status'] != ('pass' if matches else 'inconclusive') or attempt.get('comparison_matches_original') is not matches or canonical_hash(attempt.get('original_signature')) != canonical_hash(before) or canonical_hash(attempt.get('replay_signature')) != canonical_hash(after):
                         errors.append('oracle/typed signature comparison mismatch')

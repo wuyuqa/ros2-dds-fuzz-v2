@@ -44,7 +44,7 @@ REJECTION_REASONS = frozenset({
 CONTENT_IDENTITY_SCHEMA = "r2f.corpus-content/v2"
 # Only the known topology target/program changes domain. Generic F1 roots,
 # derived RNG anchors and historical goldens retain corpus-content/v2.
-TOPOLOGY_CONTENT_IDENTITY_SCHEMA = "r2f.corpus-content/topology-v3"
+TOPOLOGY_CONTENT_IDENTITY_SCHEMA = "r2f.corpus-content/topology-v4"
 
 
 def _topology_content_domain(entry, final):
@@ -83,6 +83,49 @@ def _project_topology_depth_selector(op, parameters):
         context.pop("boundary_class", None)
         if not context:
             request.pop("context", None)
+
+def _project_topology_generation_route(op, parameters):
+    """Canonicalize only the audited generation.action/next slot aliases.
+
+    The handler appends the same recreate action for either slot, ignoring the
+    wildcard selection index. Actual endpoint/generation/action order remains
+    in final_config. Keep every full plan/receipt and effective input unchanged;
+    unknown requests or audit obligations do not qualify for this projection.
+    """
+    from r2f.core.mutation_plan import ACTION_PROGRAM_LAYER_SCHEMA
+    if (op["application_phase"] != "compile_time"
+            or op["surface_id"] != "S1.topology.program"
+            or op["mutator_id"] != "I2.topology_program.v1"
+            or set(op["parameters"]) != {"operator_id", "slot_id", "request", "seed", "input_layer_receipts"}
+            or parameters.get("operator_id") != "generation.action"
+            or op["applicability_result"] != {"status": "applicable", "expected_disposition": "expect_pass",
+                                              "execution_evidence": False, "candidate_eligible": False}):
+        return
+    slot = parameters.get("slot_id")
+    if slot == "S1.topology.actions":
+        requested_slot = slot
+    elif isinstance(slot, str) and re.fullmatch(r"S1\.topology\.generation#(?:0|[1-9][0-9]*)", slot):
+        requested_slot = "S1.topology.generation"
+    else:
+        return
+    if parameters.get("request") != {"operator_id": "generation.action", "slot_id": requested_slot,
+                                     "context": {"variant": "next"}}:
+        return
+    layers = parameters.get("input_layer_receipts")
+    expected = {"schema": ACTION_PROGRAM_LAYER_SCHEMA, "input_path": "topology_program",
+                "program_schema": "r2f.s1-topology-program/v1", "operator_id": "generation.action",
+                "slot_id": slot, "expected_disposition": "expect_pass"}
+    if not isinstance(layers, list) or layers != [expected]:
+        return
+    raw = op["parameters"]["input_layer_receipts"][0]
+    if (raw.get("execution_evidence") is not False or raw.get("candidate_eligible") is not False
+            or raw.get("case_hash_role") != "v2_envelope_dedupe_only"):
+        return
+    # Only these three selector labels change on the semantic projection copy.
+    parameters["slot_id"] = "S1.topology.actions"
+    parameters["request"]["slot_id"] = "S1.topology.actions"
+    layers[0]["slot_id"] = "S1.topology.actions"
+
 
 INPUT_IDENTITY_KEYS = (
     "target_id", "target_revision", "rmw", "contract_hash",
@@ -161,6 +204,7 @@ def _content_operations(operations, *, topology_domain=False):
         parameters = _content_operation_parameters(op["parameters"])
         if topology_domain:
             _project_topology_depth_selector(op, parameters)
+            _project_topology_generation_route(op, parameters)
         if op["application_phase"] == "compile_time":
             for key in _CONTENT_SELECTION_PARAMETERS.get(op["mutator_id"], ()):
                 parameters.pop(key, None)
@@ -225,7 +269,7 @@ def content_identity(entry):
     """Hash final semantic input, not seed lineage or full replay provenance.
 
     Version policy: only the exact known topology target/program uses the
-    topology-v3 domain, for roots AND derived inputs. Generic inputs retain v2.
+    topology-v4 domain, for roots AND derived inputs. Generic inputs retain v2.
     Existing stored hashes are never auto-migrated.
     Full effective_input_hash, MutationPlan hashes and historical artifacts are
     intentionally untouched.  All payload dictionaries are copied losslessly.

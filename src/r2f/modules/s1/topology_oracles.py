@@ -62,29 +62,40 @@ def _result():
             "seal_eligible": False, "diagnostic_only": True, "fact_values": {}}
 
 
+def _assessed_result(scenario, facts, result):
+    # Provider-local evidence eligibility is not formal admission. Publish an
+    # explicit scoped receipt; common ingest recomputes it and runner discharges
+    # the pending boundary/topology qualifications before row eligibility.
+    from r2f.campaign.topology_candidate_assessment import provider_assessment
+    receipt = provider_assessment(scenario, facts, result)
+    result["candidate_assessment"] = receipt
+    result["candidate_eligible"] = receipt["eligible_at_scope"]
+    return result
+
+
 def evaluate_topology(scenario, facts):
     result = _result()
     if scenario.target_id != TOPOLOGY_TARGET:
         result.update(verdict="not_applicable", reason_codes=["topology_exact_target_required"])
-        return result
+        return _assessed_result(scenario, facts, result)
     try:
         _typed(facts)
     except ValueError as exc:
         result["reason_codes"] = [str(exc)]
-        return result
+        return _assessed_result(scenario, facts, result)
     if facts.get("tool_error"):
         result.update(reason_codes=["topology_tool_failure"], responsibility_layer="harness")
-        return result
+        return _assessed_result(scenario, facts, result)
     if facts.get("evidence_error") or facts.get("diagnostic_valid") is not True:
         result["reason_codes"] = ["topology_evidence_incomplete:" + str(facts.get("evidence_error", "raw_audit_not_complete"))]
-        return result
+        return _assessed_result(scenario, facts, result)
     if facts.get("guard_rejected_by") == "harness":
         result.update(verdict="not_applicable", reason_codes=["harness_guard_rejection_not_sut_rejection"],
                       responsibility_layer="harness")
-        return result
+        return _assessed_result(scenario, facts, result)
     if facts.get("endpoint_identity_complete") is not True:
         result["reason_codes"] = ["topology_endpoint_identity_incomplete"]
-        return result
+        return _assessed_result(scenario, facts, result)
     graph_values, delivery_values, reasons, residuals = [], [], [], []
     for pair in facts.get("pairs", []):
         detail = {"writer": pair["writer"], "reader": pair["reader"],
@@ -154,7 +165,7 @@ def evaluate_topology(scenario, facts):
         result.update(verdict="not_applicable", reason_codes=["no_applicable_pair_obligation"])
     else:
         result["reason_codes"] = sorted(set(reasons or ["topology_evidence_incomplete"]))
-    return result
+    return _assessed_result(scenario, facts, result)
 
 
 def resolve_evaluator(evaluator_id):

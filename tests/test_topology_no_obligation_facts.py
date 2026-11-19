@@ -237,7 +237,7 @@ def test_middle_gap_requires_later_received_sentinel_tail_stays_unknown(tmp_path
     assert all(p["delivery_closure"] != "no_obligation" for p in facts["pairs"])
 
 
-def test_fresh_second_window_match_is_not_exempted_by_first_none(tmp_path):
+def _none_then_matched_windows(tmp_path):
     class BecomesMatched(ObservedPeers):
         def __init__(self): super().__init__(auto_match=False)
         def publish_batch(self, *args, **kwargs):
@@ -252,6 +252,11 @@ def test_fresh_second_window_match_is_not_exempted_by_first_none(tmp_path):
     later["params"]["start_sequence"] += first["params"]["count"]
     program["actions"].insert(program["actions"].index(first) + 1, later)
     runtime, config = produce(tmp_path, program=program, backend=BecomesMatched())
+    return runtime, config, later
+
+
+def test_fresh_second_window_match_is_not_exempted_by_first_none(tmp_path):
+    runtime, config, later = _none_then_matched_windows(tmp_path)
     closes = [e for e in runtime["events"] if e["event"] == "topology_delivery_window_closed"]
     assert [e["closure_status"] for e in closes] == ["no_obligation", "closed"]
     facts, oracle = consume(runtime, config)
@@ -259,6 +264,41 @@ def test_fresh_second_window_match_is_not_exempted_by_first_none(tmp_path):
     assert facts["pairs"][0]["proofs"]["delivery_closure"]["detail"]["expected"] == list(range(
         later["params"]["start_sequence"], later["params"]["start_sequence"] + later["params"]["count"]))
     assert oracle["verdict"] == "pass", oracle
+
+
+@pytest.mark.parametrize("damage", ["claim", "close", "ack", "generation", "open_ref"])
+def test_earlier_empty_window_history_must_be_independently_valid(tmp_path, damage):
+    runtime, config, _ = _none_then_matched_windows(tmp_path)
+    def tamper(events):
+        opened = next(e for e in events if e["event"] == "topology_delivery_window_open")
+        claim = next(e for e in events if e["event"] == "topology_delivery_no_obligation")
+        close = next(e for e in events if e["event"] == "topology_delivery_window_closed")
+        if damage == "claim": claim["event"] = "untrusted_no_obligation_claim"
+        elif damage == "close": close["window_complete"] = False
+        elif damage == "generation": claim["reader_generation"] += 1
+        elif damage == "open_ref": close["open_ref"] = 0
+        else:
+            ack = events[opened["snapshot_refs"]["r0"][-1]]
+            assert ack["event"] == "command_done"
+            ack["command_id"] += 1000
+    rewrite(runtime, tamper)
+    facts, oracle = consume(runtime, config)
+    assert facts["unresolved_historical_obligations"]
+    assert oracle["verdict"] == "unknown", oracle
+    assert not oracle["candidate_eligible"]
+
+
+def test_earlier_empty_window_does_not_exempt_later_matched_gap(tmp_path):
+    runtime, config, later = _none_then_matched_windows(tmp_path)
+    def omit_middle(events):
+        victim = next(e for e in events if e["event"] == "receive"
+                      and e.get("send_sequence") == later["params"]["start_sequence"] + 1)
+        victim["event"] = "offline_omitted_middle_receive"
+    rewrite(runtime, omit_middle)
+    facts, oracle = consume(runtime, config)
+    assert oracle["verdict"] != "pass", oracle
+    assert not oracle["candidate_eligible"]
+    assert facts["pairs"][0]["delivery_closure"] != "no_obligation"
 
 
 @pytest.mark.parametrize("fault", ["incomplete_api", "unknown_peer", "api_absent"])
@@ -389,3 +429,27 @@ def test_full_no_obligation_branch_all_actual_topics_differ_passes_without_missi
         assert detail["no_obligation_ref"] in pair["proofs"]["delivery_closure"]["refs"]
     assert facts["unresolved_historical_obligations"] == []
     assert oracle["verdict"] == "pass", oracle
+
+
+@pytest.mark.parametrize("damage", ["unknown", "not_applicable", "proofs", "detail", "open_ref", "close_ref"])
+def test_incomplete_empty_window_refs_fail_closed_without_exception(tmp_path, damage):
+    from r2f.campaign.topology_adapter import _Audit, _no_obligation_send_covered
+    program = model.generate_program(7, writers=1, readers=1)
+    for endpoint in program["endpoints"]:
+        endpoint["topic"] = "/safe-empty-proof/" + endpoint["role"]
+    runtime, config = produce(tmp_path, program=program)
+    facts, oracle = consume(runtime, config)
+    assert oracle["verdict"] == "pass"
+    pairs = deepcopy(facts["pairs"])
+    pair = pairs[0]
+    if damage in {"unknown", "not_applicable"}:
+        pair["delivery_closure"] = damage
+        pair["proofs"]["delivery_closure"]["detail"] = {}
+    elif damage == "proofs": pair.pop("proofs")
+    elif damage == "detail": pair["proofs"]["delivery_closure"]["detail"] = None
+    else: pair["proofs"]["delivery_closure"]["detail"].pop(damage)
+    audit = _Audit(runtime["events"], runtime, config)
+    audit.identity()
+    sends = [event for event in runtime["events"] if event["event"] == "send"]
+    assert sends
+    assert all(_no_obligation_send_covered(audit, pairs, send) is False for send in sends)

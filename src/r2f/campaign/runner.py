@@ -2413,7 +2413,10 @@ def _generate_case(sequence, entry, target, contract, surface, parent, mutator_i
         row.update({"sampling_kind": sampling_kind,
                     "chain_depth": len(plan.operations),
                     "fuzz_generation": dict(config["fuzz_generation"])})
-    if row.get("actual_run") is True:
+    # Capsule's strict successful/failure execution schema cannot represent a
+    # reached non-success terminal. Keep its sealed input unchanged; the unified
+    # row/runtime artifacts retain this versioned actual attempt in full.
+    if row.get("actual_run") is True and "input_terminal" not in row:
         try:
             capsule.record_execution(row)
         except ValueError as exc:
@@ -2422,13 +2425,20 @@ def _generate_case(sequence, entry, target, contract, surface, parent, mutator_i
     if row.get("execution_stage") == "judged" and row.get("actual_run") is True:
         budget["executed"] += 1
 
+    def persist_topology_candidate_assessment(boundary, formal):
+        if not topology:
+            return
+        from .topology_candidate_assessment import finalize_assessment, capsule_attachment
+        finalize_assessment(scenario, config, capsule, row, boundary=boundary, qualification=formal)
+        _atomic_json(capsule_path, capsule_attachment(capsule, row))
+
     qualification = execution_boundary_qualification(runtime_boundary, config=config,
                                                   result=runtime_result, row=row,
                                                   formal_runtime=_is_formal_runtime(runtime, runtime_boundary),
                                                   output_root=result_path.parent)
     if qualification["status"] != "not_applicable":
         row.update(boundary_qualification=qualification, boundary_eligible=qualification["eligible"])
-    if qualification["status"] not in {"not_applicable", "qualified"}:
+    if qualification["status"] not in {"not_applicable", "qualified", "terminal_unqualified"}:
         # An unexpected boundary wrapper result may still carry a real inner
         # run. Preserve its stage, raw and actual counters. The append-only
         # feedback epoch accounts for attempts, not just qualified coverage.
@@ -2437,6 +2447,7 @@ def _generate_case(sequence, entry, target, contract, surface, parent, mutator_i
                    corpus_offer={"accepted": False, "reason": qualification["reason_code"]})
         # Only this ledger projection is incomplete; do not rewrite raw facts
         # or qualify the execution row. No coverage, edge or corpus novelty.
+        persist_topology_candidate_assessment(qualification, None)
         feedback.record(dict(row, evidence_errors=["boundary_execution_not_qualified"]))
         scheduler.advance_feedback(feedback)
         _atomic_json(row_path, row)
@@ -2450,16 +2461,45 @@ def _generate_case(sequence, entry, target, contract, surface, parent, mutator_i
                   ) if _is_formal_runtime(runtime, runtime_boundary) else "injected_runtime"
         qualified = _qualification(origin, config, runtime_result, row, output_root=result_path.parent)
         row["execution_qualification"] = qualified
+        if "input_terminal" in row:
+            from r2f.reports.run_report import topology_nohit_continuation
+            try:
+                terminal = topology_nohit_continuation(config, runtime_result, row, qualified)
+            except (OSError, ValueError, KeyError, TypeError) as exc:
+                terminal = False
+                qualified["qualification_errors"].append("topology_nohit_terminal_invalid:" + str(exc))
+            row.update(candidate_eligible=False, feedback_eligible=False, seal_eligible=False,
+                       corpus_offer={"accepted": False, "reason": "topology_mutation_nohit"})
+            if not terminal:
+                row["boundary_qualification"] = {"status": "invalid", "eligible": False,
+                    "reason_code": "topology_nohit_terminal_invalid",
+                    "errors": qualified["qualification_errors"]}
+            persist_topology_candidate_assessment(qualification, qualified)
+            # Account an actual attempt, not completeness, coverage or novelty.
+            feedback.record(dict(row, evidence_errors=["topology_mutation_nohit"]))
+            scheduler.advance_feedback(feedback)
+            _atomic_json(row_path, row)
+            return row
         if not qualified["real_ros_execution"]:
+            if (runtime_result.get("real_execution") is True
+                    and (runtime_result.get("mutation_receipt") or {}).get("hit") is False):
+                # A damaged no-hit attempt without a valid terminal must not
+                # silently proceed on host either. This is not a label waiver.
+                row["boundary_qualification"] = {"status": "invalid", "eligible": False,
+                    "reason_code": "topology_nohit_terminal_missing_or_invalid",
+                    "errors": qualified["qualification_errors"]}
             row.update(candidate_eligible=False, feedback_eligible=False, seal_eligible=False,
                        corpus_offer={"accepted": False, "reason": "topology_execution_not_qualified"})
             # The append-only feedback ledger also accounts for attempts. Add
             # an explicitly incomplete evidence projection, not a rewritten
             # execution row: no coverage/edge/novelty, actual flags preserved.
+            persist_topology_candidate_assessment(qualification, qualified)
             feedback.record(dict(row, evidence_errors=["topology_execution_not_qualified"]))
             scheduler.advance_feedback(feedback)
             _atomic_json(row_path, row)
             return row
+
+        persist_topology_candidate_assessment(qualification, qualified)
 
     complete = False
     row["observed_edge"] = None

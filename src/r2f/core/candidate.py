@@ -1,6 +1,7 @@
 """Append-only lifecycle audit of already observed conformance anomalies."""
 
 import re
+import json
 import os
 from dataclasses import dataclass, field
 from enum import Enum
@@ -45,16 +46,203 @@ def _endpoint_pair(value, field):
     return value
 
 
+
+TOPOLOGY_IDENTITY_SCHEMA = "r2f.topology-candidate-identity/v1"
+_TOPOLOGY_FACTS_SCHEMA = "r2f.s1-topology-facts/v1"
+_TOPOLOGY_TARGET = "discovery.endpoint_topology.fuzz_v1"
+
+
+def topology_observation_identity(row):
+    """Project existing N-endpoint evidence; never invent a representative pair.
+
+    This is an observation identity, not an admission/qualification receipt.
+    Raw verification remains mandatory at lifecycle intake.
+    """
+    facts = row.get("typed_facts", {})
+    return snapshot({"schema": TOPOLOGY_IDENTITY_SCHEMA, "run_id": row.get("run_id"),
+                     "raw": facts.get("raw"),
+                     "endpoint_lineage": facts.get("endpoint_lineage"),
+                     "pairs": facts.get("pairs")})
+
+
+def _validate_topology_identity(row, identity):
+    facts = row.get("typed_facts", {})
+    if row.get("target_id") != _TOPOLOGY_TARGET or facts.get("schema") != _TOPOLOGY_FACTS_SCHEMA:
+        raise ValueError("topology identity requires exact target and typed facts schema")
+    if canonical_hash(identity) != canonical_hash(topology_observation_identity(row)):
+        raise ValueError("topology identity differs from run/raw/typed facts")
+    raw = identity.get("raw")
+    if not isinstance(raw, dict) or raw != {"path": row.get("raw_path"), "sha256": row.get("raw_sha256")}:
+        raise ValueError("topology raw identity differs from observation")
+    verify_raw(raw["path"], raw["sha256"])
+    try:
+        with open(raw["path"], encoding="utf-8") as stream:
+            events = [json.loads(line) for line in stream if line.strip()]
+    except (OSError, ValueError) as exc:
+        raise ValueError("topology raw events unreadable") from exc
+    if not events or any(not isinstance(e, dict) or e.get("run_id") != row.get("run_id")
+                         or type(e.get("event_index")) is not int or e["event_index"] != i
+                         for i, e in enumerate(events)):
+        raise ValueError("topology raw run/event identity mismatch")
+
+    def reference(ref):
+        if not isinstance(ref, dict) or ref.get("path") != raw["path"] or ref.get("sha256") != raw["sha256"]:
+            raise ValueError("topology proof reference crosses raw identity")
+        index = ref.get("event_index")
+        if type(index) is not int or not 0 <= index < len(events):
+            raise ValueError("topology proof event index invalid")
+        return events[index]
+
+    program = (row.get("final_input") or {}).get("topology_program", {})
+    declarations = program.get("endpoints", [])
+    if not isinstance(declarations, list) or not declarations:
+        raise ValueError("topology endpoint roles missing")
+    roles = {}
+    for endpoint in declarations:
+        if not isinstance(endpoint, dict):
+            raise ValueError("topology endpoint declaration invalid")
+        logical_id, role = endpoint.get("logical_id"), endpoint.get("role")
+        nonempty(logical_id, "topology logical_id")
+        if logical_id in roles or role not in {"writer", "reader"}:
+            raise ValueError("topology endpoint role missing or ambiguous")
+        roles[logical_id] = role
+    lineage = identity.get("endpoint_lineage")
+    if not isinstance(lineage, list) or not lineage:
+        raise ValueError("topology endpoint lineage missing")
+    tokens, gids, generations = {}, set(), set()
+    for endpoint in lineage:
+        if not isinstance(endpoint, dict):
+            raise ValueError("topology lineage record invalid")
+        logical_id, generation = endpoint.get("logical_id"), endpoint.get("generation")
+        if logical_id not in roles or type(generation) is not int or generation < 1:
+            raise ValueError("topology lineage role/generation invalid")
+        key = (logical_id, generation)
+        if key in tokens:
+            raise ValueError("topology duplicate endpoint generation")
+        for name in ("endpoint_gid", "endpoint_generation"):
+            nonempty(endpoint.get(name), "topology lineage." + name)
+        for name in ("pid", "process_start_ticks"):
+            if type(endpoint.get(name)) is not int or endpoint[name] < 1:
+                raise ValueError("topology lineage process identity invalid")
+        if endpoint["endpoint_gid"] in gids or endpoint["endpoint_generation"] in generations:
+            raise ValueError("topology reused endpoint instance identity")
+        gids.add(endpoint["endpoint_gid"])
+        generations.add(endpoint["endpoint_generation"])
+        event = reference(endpoint.get("creation_ref"))
+        if event.get("event") != "endpoint_created" or any(
+                event.get(name) != endpoint.get(name) for name in
+                ("logical_id", "generation", "endpoint_gid", "endpoint_generation", "pid", "process_start_ticks")):
+            raise ValueError("topology lineage differs from raw creation identity")
+        if not re.fullmatch(roles[logical_id] + r"[0-9]*", str(event.get("role", ""))):
+            raise ValueError("topology endpoint role differs from raw creation")
+        tokens[key] = endpoint
+    pairs = identity.get("pairs")
+    if not isinstance(pairs, list) or not pairs:
+        raise ValueError("topology requires concrete directed pairs, not total counts")
+    seen = set()
+    for pair in pairs:
+        if not isinstance(pair, dict):
+            raise ValueError("topology pair invalid")
+        keys = []
+        for role in ("writer", "reader"):
+            logical_id, generation = pair.get(role), pair.get(role + "_generation")
+            if not isinstance(logical_id, str) or type(generation) is not int:
+                raise ValueError("topology pair role/generation missing")
+            key = (logical_id, generation)
+            if roles.get(logical_id) != role or key not in tokens:
+                raise ValueError("topology pair crosses endpoint role/generation")
+            keys.append(key)
+        edge = tuple(keys)
+        if edge in seen:
+            raise ValueError("topology directed pair ambiguous")
+        seen.add(edge)
+        proofs = pair.get("proofs")
+        if not isinstance(proofs, dict) or not proofs:
+            raise ValueError("topology pair proof references missing")
+        refs = []
+        for proof in proofs.values():
+            if not isinstance(proof, dict) or not isinstance(proof.get("refs"), list):
+                raise ValueError("topology pair proof references invalid")
+            refs.extend(proof["refs"])
+        if not refs:
+            raise ValueError("topology pair proof references missing")
+        def proof_references(value):
+            if isinstance(value, dict):
+                if "event_index" in value or "path" in value:
+                    reference(value)
+                else:
+                    for member in value.values():
+                        proof_references(member)
+            elif isinstance(value, list):
+                for member in value:
+                    proof_references(member)
+        proof_references(pair)
+        # Evidence must at least name both actual instances; a count is not an edge.
+        for key in keys:
+            if tokens[key]["creation_ref"] not in refs:
+                raise ValueError("topology pair lacks endpoint creation proof")
+    if row.get("oracle_verdict") == "fail":
+        # Bind the oracle's explicit anomaly objects to existing directed pairs.
+        # Do not derive an anomaly from N counts, or change the primary verdict.
+        closure = (row.get("oracle") or {}).get("closure", {}).get("pairs", [])
+        applicable = False
+        for subject in closure:
+            if not isinstance(subject, dict):
+                raise ValueError("topology anomaly subject invalid")
+            key = ((subject.get("writer"), subject.get("writer_generation")),
+                   (subject.get("reader"), subject.get("reader_generation")))
+            if key not in seen:
+                raise ValueError("topology anomaly subject crosses directed pair identity")
+            pair = next(p for p in pairs if (
+                (p["writer"], p["writer_generation"]), (p["reader"], p["reader_generation"])) == key)
+            # These are identity applicability checks on typed oracle objects,
+            # not a replacement oracle or a re-evaluation of its verdict.
+            missing = pair.get("proofs", {}).get("delivery_closure", {}).get("detail", {}).get("missing", [])
+            if (subject.get("missing") and subject["missing"] == missing
+                    or pair.get("compatibility") == "incompatible" and (
+                        pair.get("observed_match") in {"bidirectional", "writer_only", "reader_only"}
+                        or bool(pair.get("communication_witnesses")))):
+                applicable = True
+        if not applicable:
+            raise ValueError("topology anomaly requires concrete applicable pair objects")
+
+
+def _validate_topology_admission(row):
+    """Respect declared qualification denials; identity never promotes them."""
+    facts, oracle = row.get("typed_facts", {}), row.get("oracle", {})
+    if any(value is not True for value in (row.get("candidate_eligible"),
+                                           facts.get("candidate_eligible"), oracle.get("candidate_eligible"))):
+        raise ValueError("topology candidate qualification not granted")
+    if row.get("oracle_verdict") != "fail" or oracle.get("verdict") != "fail":
+        raise ValueError("topology candidate requires primary fail")
+    if (facts.get("fixture") is not False or facts.get("control_excluded") is not False
+            or facts.get("tool_error") is not False or oracle.get("diagnostic_only") is not False
+            or any(facts.get(key) is not True for key in
+                   ("execution_evidence", "source_provenance_qualified", "environment_healthy",
+                    "process_healthy", "observation_complete", "endpoint_identity_complete"))):
+        raise ValueError("topology candidate requires qualified complete natural evidence")
+
+
 def _validate_observation_identity(row):
     facts = row.get("typed_facts", {})
     if not isinstance(facts, dict):
         raise ValueError("typed_facts must be a dict for identity binding")
+    if facts.get("schema") == _TOPOLOGY_FACTS_SCHEMA and (
+            not isinstance(row.get("endpoint_identity"), dict)
+            or row["endpoint_identity"].get("schema") != TOPOLOGY_IDENTITY_SCHEMA):
+        raise ValueError("topology observation requires versioned N-endpoint identity")
     present = False
     for field in ("endpoint_identity", "instrumentation_identity"):
         if field not in row:
             continue
         present = True
         identity = row[field]
+        if (field == "endpoint_identity" and isinstance(identity, dict)
+                and identity.get("schema") == TOPOLOGY_IDENTITY_SCHEMA):
+            _validate_topology_identity(row, identity)
+            continue
+        if field == "endpoint_identity" and facts.get("schema") == _TOPOLOGY_FACTS_SCHEMA:
+            raise ValueError("topology observation requires versioned N-endpoint identity")
         _identity_members(identity, field)
         if isinstance(identity, str):
             # Retain the existing opaque-string contract. If endpoint facts are
@@ -144,6 +332,9 @@ class CandidateLifecycle:
     def _validate_admission(self):
         self._validate_observed()
         row = self.evidence
+        if (isinstance(row.get("endpoint_identity"), dict)
+                and row["endpoint_identity"].get("schema") == TOPOLOGY_IDENTITY_SCHEMA):
+            _validate_topology_admission(row)
         if row.get("arm") == "negative" or row.get("control_kind") or row.get("candidate_source") == "control":
             raise ValueError("control rows cannot enter SUT candidates")
         if row.get("responsibility_layer") in {"harness", "mutation"} or row.get("reason_code") in {

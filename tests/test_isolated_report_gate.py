@@ -248,6 +248,26 @@ class IsolatedReportGate(unittest.TestCase):
         self.assertFalse(audit['sealed'])
         self.assertIn('boundary_runtime_not_completed', audit['boundary_qualifications'][row['cell_id']]['errors'])
 
+    def assert_unqualified_attempt_without_novelty(self, result, corpus, feedback, scheduler, before):
+        """Attempt accounting is not complete observation or novelty credit."""
+        after = feedback.to_dict()
+        self.assertEqual(len(after['events']), len(before[1]['events']) + 1)
+        self.assertEqual(after['events'][:-1], before[1]['events'])
+        attempt = after['events'][-1]
+        self.assertTrue(attempt['executed'])
+        self.assertIs(attempt['coverage'], False)
+        self.assertIs(attempt['complete'], False)
+        self.assertIsNone(attempt['edge_id'])
+        self.assertNotIn('edge_provenance', attempt)
+        self.assertEqual(after['edge_counts'], before[1]['edge_counts'])
+        self.assertEqual(after['covered_surfaces'], before[1]['covered_surfaces'])
+        self.assertEqual(corpus.to_dict(), before[0])
+        self.assertEqual(scheduler.feedback_event_count, len(before[1]['events']) + 1)
+        self.assertEqual(scheduler.feedback_identity_at_start, feedback.identity())
+        self.assertEqual(result['budget']['actual'], 1)
+        self.assertEqual(result['budget']['attempted'], 1)
+        self.assertFalse(result['rows'][0].get('candidate_eligible'))
+
     def test_exploratory_unexpected_wrapper_keeps_actual_counts_but_no_novelty(self):
         runtime = Mock(side_effect=inner_success_cleanup_failure)
         result, corpus, feedback, scheduler, before = self.cycle('wrapper-cycle', runtime=runtime)
@@ -260,9 +280,8 @@ class IsolatedReportGate(unittest.TestCase):
         self.assertEqual(result['budget']['executed'], 1)  # actual inner run, NOT maturity
         self.assertEqual(row['boundary_qualification']['status'], 'invalid')
         self.assertFalse(row['feedback_eligible'])
-        self.assertEqual(feedback.to_dict(), before[1])
-        self.assertEqual(corpus.to_dict(), before[0])
-        self.assertEqual(scheduler.feedback_event_count, 0)
+        self.assert_unqualified_attempt_without_novelty(
+            result, corpus, feedback, scheduler, before)
         self.assertFalse(row['corpus_offer']['accepted'])
         self.assertEqual(self.load(row['runtime_result_path'])['runtime_status'], 'failed')
 
@@ -415,9 +434,8 @@ class IsolatedReportGate(unittest.TestCase):
         self.assertEqual(result['budget']['attempted'], 1)
         self.assertEqual(result['budget']['actual'], 1)
         self.assertEqual(result['budget']['executed'], 1)
-        self.assertEqual(feedback.to_dict(), before[1])
-        self.assertEqual(corpus.to_dict(), before[0])
-        self.assertEqual(scheduler.feedback_event_count, 0)
+        self.assert_unqualified_attempt_without_novelty(
+            result, corpus, feedback, scheduler, before)
         row = result['rows'][0]
         self.assertEqual(row['execution_stage'], 'judged')
         self.assertTrue(row['actual_run'])

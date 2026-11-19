@@ -329,6 +329,77 @@ def _evaluate_oracle(services, scenario, facts):
                 "forbidden_residuals": [], "closure": {}}, diagnostic
 
 
+NOHIT_TERMINAL_SCHEMA = "r2f.topology-nohit-terminal/v1"
+
+
+def topology_nohit_terminal(config, runtime, row):
+    """Exact single-input terminal, not a success/coverage qualification.
+
+    Callers must additionally run strict runtime qualification and independently
+    audit the boundary. This shape alone never grants continuation.
+    """
+    if (config.get("target_id") != "discovery.endpoint_topology.fuzz_v1"
+            or config.get("arm") != "mutated" or row.get("execution_stage") != "reached"
+            or row.get("actual_run") is not True or runtime.get("real_execution") is not True
+            or runtime.get("runtime_status") != "completed" or runtime.get("status") != "executed"
+            or row.get("abort_reason") or row.get("ingestion_error") or row.get("tool_error")):
+        raise ValueError("topology_nohit_terminal_context_invalid")
+    from r2f.core.execution import validate_execution
+    validate_execution(row)
+    if [entry.get("execution_stage") for entry in row.get("stage_history", [])] != [
+            "modelled", "expressible", "planned", "precondition_executed", "reached"]:
+        raise ValueError("topology_nohit_terminal_stage_history_invalid")
+    receipt = MutationReceipt.from_dict(runtime.get("mutation_receipt")).to_dict()
+    if (receipt["hit"] is not False or receipt["effect_observed"] is not False
+            or not all(receipt[k] for k in ("planned", "submitted", "carrier_admitted"))
+            or row.get("mutation_receipt") != receipt):
+        raise ValueError("topology_nohit_terminal_receipt_invalid")
+    facts = row.get("typed_facts") or {}
+    if (facts.get("evidence_error") or facts.get("tool_error") not in (None, False)
+            or facts.get("fixture") is not False
+            or not all(facts.get(k) is True for k in (
+                "diagnostic_valid", "execution_evidence", "source_provenance_qualified",
+                "environment_healthy", "process_healthy", "preconditions_reached", "endpoint_identity_complete"))):
+        raise ValueError("topology_nohit_terminal_evidence_incomplete")
+    application = facts.get("application_audit") or {}
+    if (application.get("canonical_receipt_matches") is not True
+            or application.get("mutation_receipt") != receipt
+            or application.get("status") not in {"incomplete", "application_observed"}
+            or application.get("execution_evidence") is not True
+            or application.get("fixture") is not False
+            or application.get("raw_path") != runtime.get("raw_path")
+            or application.get("raw_sha256") != runtime.get("raw_sha256")):
+        raise ValueError("topology_nohit_terminal_application_receipt_invalid")
+    verify_raw(runtime["raw_path"], runtime["raw_sha256"])
+    events = read_events(runtime["raw_path"])
+    if (events != runtime.get("events") or row.get("raw_path") != runtime["raw_path"]
+            or row.get("raw_sha256") != runtime["raw_sha256"]
+            or any(type(e.get("event_index")) is not int or e["event_index"] != i
+                   or e.get("run_id") != config["run_id"] or e.get("domain_id") != config["domain_id"]
+                   for i, e in enumerate(events))
+            or _one(events, "runtime_end").get("mutation_receipt") != receipt):
+        raise ValueError("topology_nohit_terminal_raw_identity_invalid")
+    cleanup = runtime.get("cleanup_receipt") or {}
+    cleanup_event = _one(events, "topology_cleanup")
+    if (cleanup.get("closed") is not True or cleanup.get("survivors") not in (None, [])
+            or cleanup.get("errors") not in (None, []) or cleanup_event.get("receipt") != cleanup):
+        raise ValueError("topology_nohit_terminal_cleanup_invalid")
+    source = config.get("source_manifest") or {}
+    if (source.get("source_frozen") is not True or source.get("dirty_behavior_paths") != []
+            or not source.get("head") or not source.get("behavior_tree_sha256")
+            or row.get("source_manifest") != source
+            or row.get("effective_input_sha256") != config.get("effective_input_sha256")):
+        raise ValueError("topology_nohit_terminal_source_input_invalid")
+    return {"schema": NOHIT_TERMINAL_SCHEMA, "kind": "completed_without_mutation_hit",
+            "execution_stage": "reached", "qualified": False,
+            "reason_code": "topology_mutation_nohit", "mutation_receipt": receipt,
+            "source_sha256": canonical_hash(source), "effective_input_sha256": config["effective_input_sha256"],
+            "raw_path": runtime["raw_path"], "raw_sha256": runtime["raw_sha256"],
+            "facts_sha256": canonical_hash(facts), "cleanup_sha256": canonical_hash(cleanup),
+            "preconditions_sha256": canonical_hash(row.get("precondition_receipts")),
+            "diagnostic_oracle_sha256": canonical_hash(row.get("diagnostic_oracle"))}
+
+
 def ingest_execution(scenario, config, runtime, capsule, *, services=None):
     """Advance only through core gates; failures end as aborted with raw retained."""
     if services is None:
@@ -338,6 +409,12 @@ def ingest_execution(scenario, config, runtime, capsule, *, services=None):
                                         runtime_capability=config.get("runtime_capability"))
         else:
             services = resolve_services(scenario.target_id)
+    def attach_candidate_assessment(row):
+        if scenario.target_id == "discovery.endpoint_topology.fuzz_v1":
+            from .topology_candidate_assessment import ingest_assessment
+            return ingest_assessment(scenario, config, capsule, row)
+        return row
+
     record = ExecutionRecord(config["run_id"], scenario)
     audit = {"runtime_status": runtime.get("runtime_status"), "runtime_reason": runtime.get("reason"),
              "actual_run": runtime.get("real_execution") is True,
@@ -377,11 +454,11 @@ def ingest_execution(scenario, config, runtime, capsule, *, services=None):
         record.abort(runtime.get("reason") or "runtime_preflight_blocked")
         facts = {"runtime_blocked": True, "environment_healthy": False, "process_healthy": False}
         oracle = evaluate_once()
-        return dict(record.to_dict(), **audit, typed_facts=facts, oracle=oracle,
+        return attach_candidate_assessment(dict(record.to_dict(), **audit, typed_facts=facts, oracle=oracle,
                     oracle_verdict=oracle["verdict"], rule_id=oracle["rule_id"],
                     raw_path=runtime.get("raw_path"), raw_sha256=runtime.get("raw_sha256"),
                     runtime_execution_metadata=None, environment=runtime.get("environment", {}),
-                    observation_receipts=runtime.get("observation_receipts", []), environment_raw_evidence=raw_audit)
+                    observation_receipts=runtime.get("observation_receipts", []), environment_raw_evidence=raw_audit))
     try:
         verify_raw(runtime["raw_path"], runtime["raw_sha256"])
         events = read_events(runtime["raw_path"])
@@ -393,6 +470,8 @@ def ingest_execution(scenario, config, runtime, capsule, *, services=None):
             raise ValueError("raw run/domain identity mismatch")
         end = _one(events, "runtime_end")
         receipt = MutationReceipt.from_dict(runtime["mutation_receipt"])
+        if scenario.target_id == "discovery.endpoint_topology.fuzz_v1":
+            audit["mutation_receipt"] = receipt.to_dict()
         if end.get("mutation_receipt") != receipt.to_dict():
             raise ValueError("raw mutation receipt differs from runtime metadata")
         facts, failure = _produce_facts(services, {"events": events, "runtime": runtime, "config": config})
@@ -429,6 +508,23 @@ def ingest_execution(scenario, config, runtime, capsule, *, services=None):
                 from .projection_adapter import projection_fault_receipt
                 fault_control = projection_fault_receipt(events, config, runtime["discovery_projection"])
         else:
+            if scenario.target_id == "discovery.endpoint_topology.fuzz_v1" and receipt.hit is False:
+                # A completed input may terminate at reached without qualifying
+                # mutation, oracle, coverage or candidate admission.
+                row = dict(record.to_dict(), **audit)
+                row.update(domain_id=config["domain_id"], typed_facts=facts,
+                           diagnostic_oracle=oracle,
+                           oracle={"rule_id": oracle["rule_id"], "rule_role": "primary",
+                                   "verdict": "not_applicable", "reason_codes": ["topology_mutation_nohit"],
+                                   "forbidden_residuals": [], "closure": {}},
+                           oracle_verdict="not_applicable", rule_id=oracle["rule_id"],
+                           raw_path=runtime.get("raw_path"), raw_sha256=runtime.get("raw_sha256"),
+                           runtime_execution_metadata=runtime.get("execution_metadata") or runtime.get("execution"),
+                           observation_receipts=runtime.get("observation_receipts", []),
+                           environment=runtime.get("environment", {}),
+                           candidate_eligible=False, feedback_eligible=False, seal_eligible=False)
+                row["input_terminal"] = topology_nohit_terminal(config, runtime, row)
+                return attach_candidate_assessment(row)
             if receipt.applied is True and receipt.hit is not True:
                 # Submitted/applied but with no observable effect: keep the
                 # terminal state at reached and report mutation_ineffective.
@@ -466,7 +562,7 @@ def ingest_execution(scenario, config, runtime, capsule, *, services=None):
                            runtime_execution_metadata=runtime.get("execution_metadata") or runtime.get("execution"),
                            observation_receipts=runtime.get("observation_receipts", []),
                            environment=runtime.get("environment", {}))
-                return row
+                return attach_candidate_assessment(row)
             record.advance(ExecutionStage.MUTATION_APPLIED, mutation_receipt=receipt.to_dict())
         if facts.get("evidence_error"):
             raise ValueError(facts["evidence_error"])
@@ -495,4 +591,4 @@ def ingest_execution(scenario, config, runtime, capsule, *, services=None):
     if "observation" in runtime:
         from .observations import qualify_observation
         row["instrumentation_observation"] = qualify_observation(row, runtime, config, capsule=capsule)
-    return row
+    return attach_candidate_assessment(row)

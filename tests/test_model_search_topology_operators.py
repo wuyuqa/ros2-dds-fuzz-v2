@@ -158,6 +158,11 @@ def test_chain_remains_explicitly_unsupported(length):
 
 
 def test_old_descriptor_and_ledger_remain_identical_to_frozen_card():
+    from r2f.campaign.corpus import CONTENT_IDENTITY_SCHEMA, TOPOLOGY_CONTENT_IDENTITY_SCHEMA
+    assert CONTENT_IDENTITY_SCHEMA == 'r2f.corpus-content/v2'
+    assert TOPOLOGY_CONTENT_IDENTITY_SCHEMA == 'r2f.corpus-content/topology-v4'
+    # The old ac3143bb frontier used generic-v2, not topology-v3.
+    # Descriptor/applicability stay fixed; only topology root/task/RNG identities change.
     # The old schema must not silently acquire classes or change applicability.
     doc=original_profile();f=fresh(doc)['scheduler'].frontier
     ledger=next(iter(f.nodes.values()))['sampling_applicability']
@@ -165,10 +170,11 @@ def test_old_descriptor_and_ledger_remain_identical_to_frozen_card():
     assert any(r['reason']=='handler_not_supported_in_first_slice' for r in ledger)
     assert not any('sampling_scope' in r for r in ledger)
     assert f.topology_descriptor['sampler']=='explicit-consumed-context/v1'
-    # Read-only calculation against the frozen old ten-file card.
+    # Frozen descriptor/ledger retained; frontier explicitly binds topology-v4.
     from r2f.core.evidence import canonical_hash
     assert f.topology_descriptor['descriptor_sha256']=='9689aec389dd801ba8eaff00a7b4fdc3b9a22ef7604eb9af1c790e24e6cd894b'
-    assert canonical_hash(f.to_dict())=='ac3143bb98b32d9dee52722d9e4c620323d1291b2cc6c1ccea9139a17fbcb97f'
+    assert canonical_hash(ledger)=='a20db8636a3ea853e85f8a5465fca44e4961270b3b0d8afffb36616fe91064a0'
+    assert canonical_hash(f.to_dict())=='de1021858c6e60f93ad8200be593dc147d80d998d539ab2a064917b4963646ff'
 
 
 def test_task_tamper_rejected_and_rejection_reason_regenerated():

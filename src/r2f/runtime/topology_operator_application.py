@@ -1,6 +1,6 @@
 """Independent application auditor for topology parameter/relation operators.
 
-Scope: ``relation.pair``, ``timing.shift``, ``lease.value`` and initial
+Scope: exact ``env.delay`` deadline slots, ``relation.pair``, ``timing.shift``, ``lease.value`` and initial
 ``filter.expr`` (plus the
 already-audited ``param.enum`` / ``queue.depth`` / ``param.boundary`` field
 checks this module can re-verify).  Every verdict here is read from hashed raw
@@ -45,7 +45,18 @@ RELATION_OPERATORS = ("relation.pair",)
 TIMING_OPERATORS = ("timing.shift", "lease.value")
 FILTER_OPERATORS = ("filter.expr",)
 INTERVENTION_OPERATORS = RELATION_OPERATORS + TIMING_OPERATORS + FILTER_OPERATORS
+# Unconditionally audited operator names. Slot-qualified support is separate:
+# env.delay on an endpoint deadline is NOT a network netem delay.
 AUDITED_OPERATORS = PARAMETER_OPERATORS + INTERVENTION_OPERATORS
+DEADLINE_DELAY_SLOT = "S1.topology.qos.deadline"
+
+
+def is_deadline_configuration_delay(receipt):
+    """Select only the existing endpoint deadline slot, never a netem window."""
+    slot = receipt.get("slot_id")
+    return (receipt.get("operator_id") == "env.delay" and isinstance(slot, str)
+            and slot.split("#", 1)[0] == DEADLINE_DELAY_SLOT)
+
 
 #: Program-side QoS field -> public ``rclpy.qos.QoSProfile`` field name.
 PUBLIC_QOS_FIELD = {
@@ -516,6 +527,82 @@ def audit_timing_operator(layer_index, receipt, events, program, *, fixture, ope
     return record
 
 
+def audit_deadline_delay(layer_index, receipt, events, program, *, fixture):
+    """Exact endpoint configuration intervention, NOT deadline/network effect.
+
+    Snapshot mapping, raw reflection and every created generation use the same
+    D022 gates as the timing operators. The slot index must address the sole
+    changed endpoint field. Additional raw API chronology is checked here only;
+    existing operators' contracts are not redefined by this bounded repair.
+    """
+    record = audit_timing_operator(layer_index, receipt, events, program,
+                                   fixture=fixture, operator="env.delay")
+    before, after = receipt["input_before"], receipt["input_after"]
+    slot = receipt.get("slot_id", "")
+    base, sep, text = slot.partition("#")
+    endpoints = before.get("endpoints", [])
+    index = int(text) if text.isdecimal() else -1
+    exact = (base == DEADLINE_DELAY_SLOT and sep == "#" and str(index) == text
+             and 0 <= index < len(endpoints))
+    if exact:
+        eid = endpoints[index]["logical_id"]
+        delta = record["qos_delta"]
+        exact = (len(delta) == 1 and delta[0]["logical_id"] == eid
+                 and delta[0]["index"] == index and delta[0]["field"] == "deadline_sec")
+        if exact:
+            expected_after = deepcopy(before)
+            expected_after["endpoints"][index]["qos"]["deadline_sec"] = delta[0]["value"]
+            exact = canonical_hash(expected_after) == canonical_hash(after)
+    if not exact:
+        record["reasons"].append("deadline_delay_exact_endpoint_slot_mismatch")
+    elif not fixture:
+        # No requested_qos or controller config echo can substitute for qos.
+        # _bound_creations already binds raw endpoint identity and create ACK.
+        for created in (e for e in events if e.get("event") == "endpoint_created"
+                        and e.get("logical_id") == eid):
+            identity_keys = ("logical_id", "generation", "endpoint_generation", "pid",
+                             "process_start_ticks", "run_id", "domain_id", "worker_role",
+                             "topology_worker_role", "topology_logical_id", "topology_generation",
+                             "backend", "real_ros", "rmw_identifier", "observed_domain_id")
+            starts = [e for e in events if e.get("event") == "endpoint_create_begin"
+                      and all(e.get(k) == created.get(k) for k in identity_keys)]
+            action = next((a for a in program["actions"]
+                           if a.get("op") in {"create", "recreate"}
+                           and a.get("endpoint_id") == eid
+                           and a.get("generation") == created.get("generation")), None)
+            begins = [e for e in events if e.get("event") == "topology_action_begin"
+                      and action is not None and e.get("action_id") == action["action_id"]]
+            ends = [e for e in events if e.get("event") == "topology_action_done"
+                    and action is not None and e.get("action_id") == action["action_id"]]
+            source = ("get_publishers_info_by_topic" if endpoints[index]["role"] == "writer"
+                      else "get_subscriptions_info_by_topic")
+            if (len(starts) != 1 or len(begins) != 1 or len(ends) != 1
+                    or created.get("identity_source") != source
+                    or type(created.get("observed_domain_id")) is not int
+                    or created.get("observed_domain_id") != created.get("domain_id")
+                    or created.get("rmw_identifier") not in {"rmw_cyclonedds_cpp", "rmw_fastrtps_cpp"}):
+                record["reasons"].append("deadline_delay_api_readback_binding_missing:" + eid)
+                continue
+            start, begin, end = starts[0], begins[0], ends[0]
+            times = [begin.get("monotonic_ns"), start.get("monotonic_ns"),
+                     created.get("created_monotonic_ns"), created.get("monotonic_ns"),
+                     end.get("monotonic_ns")]
+            indices = [e.get("event_index") for e in (begin, start, created, end)]
+            if (any(type(t) is not int or t <= 0 for t in times)
+                    or not times[0] < times[1] <= times[2] <= times[3] < times[4]
+                    or created.get("create_begin_monotonic_ns") != times[1]
+                    or any(type(i) is not int for i in indices)
+                    or not indices[0] < indices[1] < indices[2] < indices[3]):
+                record["reasons"].append("deadline_delay_api_readback_chronology_mismatch:" + eid)
+            record["raw_refs"].append(start.get("event_index"))
+    record["effect_scope"] = "endpoint_deadline_configuration_only_not_deadline_semantics_or_netem"
+    record["effect_observation"] = "unknown_deadline_semantic_effect_not_measured"
+    record["limitations"] = ["deadline_event_or_violation_not_measured",
+                             "network_delay_not_measured_by_this_slot",
+                             "configuration_intervention_is_not_semantic_effect"]
+    return record
+
+
 def _audit_filter_operator(layer_index, receipt, events, program, *, fixture):
     """Audit initial reader CFT creation/readback, without interpreting samples."""
     record = _record(layer_index, "filter.expr", "S1.topology.filter")
@@ -678,18 +765,23 @@ def _audit_filter_operator(layer_index, receipt, events, program, *, fixture):
 def audit_operator_application(plan_receipts, events, program, *, fixture):
     """Per-layer records for every operator this module can attest.
 
-    Operators outside :data:`AUDITED_OPERATORS` are returned with an explicit
+    Operators outside :data:`AUDITED_OPERATORS` and the exact deadline-delay slot
+    are returned with an explicit
     named gap so a caller can merge this mapping without treating them as
     either supported or as an SUT effect.
     """
     records = {}
     for index, receipt in enumerate(plan_receipts):
         operator = receipt.get("operator_id")
-        if operator not in AUDITED_OPERATORS:
+        deadline_delay = is_deadline_configuration_delay(receipt)
+        intervention = operator in INTERVENTION_OPERATORS or deadline_delay
+        if operator not in AUDITED_OPERATORS and not deadline_delay:
             record = _record(index, operator, receipt.get("slot_id", ""))
             record.update(status="unsupported",
                           reasons=["operator_application_auditor_not_implemented:" + str(operator)])
             records[index] = record
+        elif deadline_delay:
+            records[index] = audit_deadline_delay(index, receipt, events, program, fixture=fixture)
         elif operator == "relation.pair":
             records[index] = audit_relation_pair(index, receipt, events, program, fixture=fixture)
         elif operator in TIMING_OPERATORS:
@@ -707,14 +799,14 @@ def audit_operator_application(plan_receipts, events, program, *, fixture):
                 _check_configuration(record, delta, events, program, receipt["input_after"], fixture=fixture)
                 record["effect_scope"] = "endpoint_public_configuration_only_not_timed_lifecycle"
             records[index] = record
-        if operator in INTERVENTION_OPERATORS and operator != "filter.expr":
+        if intervention and operator != "filter.expr":
             _public_configuration_intervention(records[index], receipt, program)
         if (not records[index]["reasons"] and records[index]["status"] == "unknown"
                 and operator not in FILTER_OPERATORS):
             records[index]["configuration_application_observed"] = True
             records[index]["status"] = ("fixture_application_observed" if fixture
                                         else "artifact_application_observed")
-            if operator in INTERVENTION_OPERATORS and operator not in FILTER_OPERATORS:
+            if intervention and operator not in FILTER_OPERATORS:
                 records[index]["configuration_intervention_proven"] = True
                 records[index]["hit"] = False  # route grants hit only after formal qualification
             # Only the enclosing route can qualify formal execution from raw

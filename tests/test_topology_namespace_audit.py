@@ -102,11 +102,19 @@ class SyntheticNested(SyntheticBoundary):
             'process_scan': {'ok': True}, 'old_lock_scan': {'ok': True}}
         emit('environment_preflight', ok=True, environment=deepcopy(self.env))
         self.workers, self.worker_bindings = [], []
-        for number, role in enumerate(('writer', 'reader')):
-            token = {'logical_id': role + '_synthetic', 'generation': 1, 'worker_generation': 1,
+        from r2f.runtime.topology_worker import worker_role_for
+        ordinals = {'writer': 0, 'reader': 0}
+        # Schema-only workers follow the declared endpoints, not invented IDs.
+        # This remains fabricated fixture scope, never a live execution claim.
+        for number, endpoint in enumerate(config['topology_program']['endpoints']):
+            role = endpoint['role']
+            alias = worker_role_for(role, ordinals[role])
+            ordinals[role] += 1
+            token = {'logical_id': endpoint['logical_id'], 'generation': 1, 'worker_generation': 1,
                 'pid': 9 + number, 'pgid': 9 + number, 'process_start_ticks': 2300 + number,
-                'endpoint_gid': ('a' if number else 'b') * 32, 'endpoint_generation': role + '-synthetic-epoch',
-                'role': role, 'worker_role': 'topology_' + role, 'real_ros': True, 'backend': 'ros2_public_api',
+                'endpoint_gid': format(number + 1, '032x'),
+                'endpoint_generation': endpoint['logical_id'] + '-synthetic-epoch',
+                'role': alias, 'worker_role': alias, 'real_ros': True, 'backend': 'ros2_public_api',
                 'observed_domain_id': 181, 'domain_observation_source': 'worker_environment', 'rmw_identifier': config['rmw']}
             def worker_event(kind, **fields):
                 row = emit(kind, **dict(token, **fields))
@@ -122,7 +130,7 @@ class SyntheticNested(SyntheticBoundary):
             cleanup = worker_event('endpoint_destroyed', cleanup_status='closed')
             worker = {k: deepcopy(token[k]) for k in ('logical_id', 'generation', 'pid', 'pgid',
                        'process_start_ticks', 'endpoint_gid', 'endpoint_generation', 'worker_generation', 'rmw_identifier')}
-            worker.update(role='topology_' + role, endpoint_role=role, fixture=False, real_ros=True,
+            worker.update(role=alias, endpoint_role=role, fixture=False, real_ros=True,
                 domain_id=181, rmw=config['rmw'], execution_domain_id=181, domain_observation_source='worker_environment',
                 fresh_process=True, separate_context=True, closed=True, returncode=0, cleanup_status='closed', unknowns=[],
                 token_raw_ref=created, start_raw_refs=[start], exit_raw_refs=[exited], cleanup_raw_refs=[cleanup])

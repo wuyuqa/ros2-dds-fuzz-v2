@@ -206,12 +206,34 @@ def test_unsupported_layer_stays_unsupported_beside_a_supported_configuration(tm
         op_request["slot_id"] = "S1.topology.qos.lease"
     plan, config, result = _run(tmp_path, [REQUESTS[1], op_request])
     audit = result["application_audit"]
-    assert audit["status"] == "incomplete", audit
     layer = audit["layers"][1]
-    assert layer["status"] == "unsupported"
-    assert "operator_application_auditor_not_implemented:" + operator in layer["reasons"]
     if operator == "env.delay":
-        assert layer["netem_application_ref"] == "not_applicable_offline_fixture"
+        # This sealed wildcard resolved to an endpoint deadline, not netem.
+        receipt = config["input_layer_receipts"][1]
+        slot, separator, index_text = receipt["slot_id"].partition("#")
+        assert slot == "S1.topology.qos.deadline" and separator == "#"
+        assert index_text.isdecimal() and str(int(index_text)) == index_text
+        endpoint_index = int(index_text)
+        endpoint = receipt["input_after"]["endpoints"][endpoint_index]
+        assert audit["status"] == layer["status"] == "fixture_application_observed", audit
+        assert layer["application_kind"] == "configuration_only"
+        assert layer["configuration_application_observed"] is True
+        assert layer["qos_delta"] == [{
+            "index": endpoint_index, "logical_id": endpoint["logical_id"],
+            "role": endpoint["role"], "field": "deadline_sec",
+            "before": receipt["input_before"]["endpoints"][endpoint_index]["qos"]["deadline_sec"],
+            "value": endpoint["qos"]["deadline_sec"],
+        }]
+        assert not layer["reasons"]
+        assert layer["effect_observation"] == "unknown_deadline_semantic_effect_not_measured"
+        assert layer["effect_observed"] is False
+        assert layer["operator_application"]["effect_observed"] is False
+        assert "netem_application_ref" not in layer
+        assert audit["netem_application"]["status"] == "not_applicable_offline_fixture"
+    else:
+        assert audit["status"] == "incomplete", audit
+        assert layer["status"] == "unsupported"
+        assert "operator_application_auditor_not_implemented:" + operator in layer["reasons"]
     _assert_no_execution_or_hit(audit)
 
 

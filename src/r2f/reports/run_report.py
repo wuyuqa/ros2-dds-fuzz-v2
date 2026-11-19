@@ -54,6 +54,36 @@ SUPPORTED_CAMPAIGN_KINDS = frozenset({"required", "exploratory"})
 BOUNDARY_AUDIT_PENDING = "isolated_boundary_qualification_pending"
 
 
+def topology_nohit_continuation(config, result, row, qualified):
+    """Separate non-success terminal audit; strict qualification stays failed.
+
+    Do not filter errors or promote a row to judged. In particular, every
+    independent boundary/source/raw/worker/cleanup failure is still terminal
+    for the campaign, even if an input_terminal label was supplied.
+    """
+    if "input_terminal" not in row:
+        return False
+    from r2f.campaign.runtime_adapter import topology_nohit_terminal
+    expected = topology_nohit_terminal(config, result, row)
+    if (row["input_terminal"] != expected or row.get("oracle_verdict") != "not_applicable"
+            or row.get("oracle") != {"rule_id": row.get("rule_id"), "rule_role": "primary",
+                "verdict": "not_applicable", "reason_codes": ["topology_mutation_nohit"],
+                "forbidden_residuals": [], "closure": {}}
+            or not isinstance(row.get("diagnostic_oracle"), dict)
+            or any(row.get(k) is not False for k in ("candidate_eligible", "feedback_eligible", "seal_eligible"))
+            or qualified.get("real_ros_execution") is not False
+            or qualified.get("real_runtime_attempt") is not True
+            or qualified.get("qualification_errors") != ["real_judged_execution_missing"]):
+        raise ValueError("topology_nohit_terminal_not_independently_valid")
+    isolated = isinstance(config.get("execution_boundary"), dict) and config["execution_boundary"].get("enabled") is True
+    if isolated and (qualified.get("boundary_audit") or {}).get("valid") is not True:
+        raise ValueError("topology_nohit_terminal_boundary_audit_invalid")
+    source = config["source_manifest"]
+    if canonical_hash(source_manifest(Path(source["source_repo"]))) != canonical_hash(source):
+        raise ValueError("topology_nohit_terminal_current_source_mismatch")
+    return True
+
+
 def execution_boundary_qualification(runtime_boundary=None, *, config=None, result=None,
                                      row=None, formal_runtime=False, output_root=None):
     """Combine caller selection and complete execution evidence after runtime.
@@ -99,7 +129,14 @@ def execution_boundary_qualification(runtime_boundary=None, *, config=None, resu
                 errors.append("boundary_current_source_mismatch")
         except (OSError, ValueError, KeyError, TypeError) as exc:
             errors.append("boundary_current_source_unavailable:" + type(exc).__name__)
-    return {"status": "qualified" if not errors else "invalid",
+    terminal = False
+    if "input_terminal" in row:
+        try:
+            terminal = topology_nohit_continuation(config, result, row, qualified)
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            errors.append("topology_nohit_terminal_invalid:" + str(exc))
+    return {"status": "terminal_unqualified" if terminal else ("qualified" if not errors else "invalid"),
+            "continuation_eligible": terminal,
             "reason_code": "boundary_execution_qualified" if not errors else errors[0],
             "errors": errors, "eligible": not errors,
             "boundary_audit": qualified.get("boundary_audit"),
@@ -776,6 +813,12 @@ def _topology_generation_provenance(root, row, report):
                     status="rejected", actual=False, execution=None)
     if canonical_hash(search) != canonical_hash(expected):
         raise ValueError("topology_rejection_input_search_mismatch")
+    # Submission/plan history is stronger evidence of an attempted case than
+    # missing/deleted runtime artifacts or a forged rejected task label. Keep
+    # this specific laundering denial ahead of rejection-only status checks.
+    if (row.get("attribution") == "harness_input_generation"
+            and [e["action"] for e in history] != ["select", "generation_rejected", "finish"]):
+        raise ValueError("topology_rejection_has_submission_or_plan_history")
     selections = [s for s in state["scheduler"]["selections"] if s.get("task_id") == task["task_id"]]
     if (len(selections) != 1 or cell != f"{row['run_id']}.{selections[0]['sequence']:04d}.rejected"
             or task.get("status") != "rejected" or task.get("actual") is not False
@@ -900,7 +943,8 @@ def _topology_artifact_qualification(root, row, report):
         recalculated = ingest_execution(original, config, result, capsule, services=services)
         for key in ("execution_stage", "actual_run", "abort_reason", "typed_facts", "oracle", "oracle_verdict",
                     "rule_id", "mutation_receipt", "precondition_receipts", "observation_receipts",
-                    "raw_path", "raw_sha256", "runtime_status", "runtime_reason", "runtime_execution_metadata"):
+                    "raw_path", "raw_sha256", "runtime_status", "runtime_reason", "runtime_execution_metadata",
+                    "input_terminal", "diagnostic_oracle"):
             if canonical_hash(row.get(key)) != canonical_hash(recalculated.get(key)):
                 raise ValueError("topology_recomputed_ingest_differs:" + key)
         formal = report.get("formal_runtime", report.get("runtime_formal")) is True
@@ -912,10 +956,15 @@ def _topology_artifact_qualification(root, row, report):
                 or canonical_hash(source_manifest(Path(source["source_repo"]))) != canonical_hash(source)):
             qualified["qualification_errors"].append("topology_current_source_mismatch")
             qualified["real_ros_execution"] = False
+        if "input_terminal" in row:
+            # Compare the complete regenerated terminal; never accept a label.
+            topology_nohit_continuation(config, result, row, qualified)
+            qualified["continuation_eligible"] = True
     if not qualified["real_ros_execution"]:
         if any(row.get(key) is True for key in ("candidate_eligible", "feedback_eligible", "seal_eligible")):
             raise ValueError("topology_unqualified_execution_claims_eligibility")
-        if row.get("execution_stage") == "judged" or row.get("actual_run") is True:
+        if ((row.get("execution_stage") == "judged" or row.get("actual_run") is True)
+                and qualified.get("continuation_eligible") is not True):
             raise ValueError("topology_execution_not_qualified:" + ",".join(qualified["qualification_errors"]))
     return qualified
 
@@ -980,7 +1029,7 @@ def _verify_exploratory_row(root, row, report, errors):
                 _verify_topology_model_terminal(root, row, report)
             return True
         qualification = boundary_qualification_for_row(root, row, report)
-        if qualification["status"] not in {"not_applicable", "qualified"}:
+        if qualification["status"] not in {"not_applicable", "qualified", "terminal_unqualified"}:
             raise ValueError(qualification["reason_code"])
         if topology:
             _topology_artifact_qualification(root, row, report)
@@ -1132,7 +1181,7 @@ def _audit_exploratory_ledger(root, report, rows, errors, details):
     eligible_rows, exclusions = [], []
     from r2f.modules.s1.topology_targets import TOPOLOGY_TARGET
     for row in rows:
-        if boundary_qualification_for_row(root, row, report)["status"] not in {"not_applicable", "qualified"}:
+        if boundary_qualification_for_row(root, row, report)["status"] not in {"not_applicable", "qualified", "terminal_unqualified"}:
             continue
         if row.get("target_id") == TOPOLOGY_TARGET:
             try:

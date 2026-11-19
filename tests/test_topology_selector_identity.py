@@ -63,7 +63,7 @@ def test_different_concrete_depth_not_merged(parent, operator):
 
 def test_domain_is_topology_only_root_and_derived_old_corpus_rejected(parent):
     assert CONTENT_IDENTITY_SCHEMA == 'r2f.corpus-content/v2'
-    assert TOPOLOGY_CONTENT_IDENTITY_SCHEMA == 'r2f.corpus-content/topology-v3'
+    assert TOPOLOGY_CONTENT_IDENTITY_SCHEMA == 'r2f.corpus-content/topology-v4'
     root = {k: deepcopy(parent[k]) for k in ('target_id', 'target_revision', 'rmw', 'contract_hash', 'final_config')}
     assert content_identity(root) == canonical_hash({'schema': TOPOLOGY_CONTENT_IDENTITY_SCHEMA, 'identity': root})
     old = canonical_hash({'schema': CONTENT_IDENTITY_SCHEMA, 'identity': root})
@@ -74,6 +74,15 @@ def test_domain_is_topology_only_root_and_derived_old_corpus_rejected(parent):
     data = c.to_dict(); data['entries'][0]['content_sha256'] = old
     with pytest.raises(ValueError, match='content hash mismatch'):
         Corpus.from_dict(data)
+    old_v3 = canonical_hash({'schema': 'r2f.corpus-content/topology-v3', 'identity': root})
+    assert old_v3 != content_identity(root)
+    with pytest.raises(ValueError, match='content hash mismatch'):
+        Corpus().add_seed(dict(root, content_sha256=old_v3))
+    data_v3 = c.to_dict(); data_v3['entries'][0]['content_sha256'] = old_v3
+    saved_v3 = deepcopy(data_v3)
+    with pytest.raises(ValueError, match='content hash mismatch'):
+        Corpus.from_dict(data_v3)
+    assert data_v3 == saved_v3
     for record in (parent, generated(parent, 'min')):
         assert content_sha256(record) == record['content_sha256']
 

@@ -297,3 +297,52 @@ def test_isolated_injected_wrapper_rejected_before_reserve_carrier_or_invoke(tmp
     carrier.assert_not_called(); wrapper.assert_not_called(); source.assert_not_called()
     assert not output.exists()
     assert original.read_bytes() == before
+
+
+@pytest.mark.parametrize('damage', [
+    'foreign_logical_id', 'endpoint_role', 'metadata_alias',
+    'raw_worker_alias', 'raw_topology_alias', 'high_alias', 'wrong_ordinal',
+])
+def test_declared_worker_binding_rejects_role_and_logical_id_forgery(nested, damage):
+    """Exercise the real strict matcher, without mocking any lineage gate."""
+    f = nested
+    for original in f.workers:
+        worker = deepcopy(original)
+        token = deepcopy(f.raw[worker['token_raw_ref']['event_index']])
+        assert replay._topology_worker_role_matches(f.config, worker, token)
+        if damage == 'foreign_logical_id':
+            worker['logical_id'] = token['logical_id'] = 'foreign_synthetic'
+        elif damage == 'endpoint_role':
+            worker['endpoint_role'] = 'reader' if worker['endpoint_role'] == 'writer' else 'writer'
+        elif damage == 'metadata_alias':
+            worker['role'] = 'topology_' + worker['endpoint_role']
+        elif damage == 'raw_worker_alias':
+            token['worker_role'] = 'topology_' + worker['endpoint_role']
+        elif damage == 'raw_topology_alias':
+            token['topology_worker_role'] = 'topology_' + worker['endpoint_role']
+        else:
+            alias = worker['endpoint_role'] + ('99' if damage == 'high_alias' else '4')
+            if alias == worker['role']:
+                alias = worker['endpoint_role'] + '2'
+            worker['role'] = token['role'] = token['worker_role'] = alias
+        assert not replay._topology_worker_role_matches(f.config, worker, token), damage
+        child = deepcopy(f.child)
+        child['events'][worker['token_raw_ref']['event_index']] = token
+        index = f.workers.index(original)
+        child['execution_metadata']['workers'][index] = worker
+        assert 'topology_worker_lineage_invalid:worker_role_mismatch' in (
+            replay._topology_worker_errors(f.config, child)), damage
+
+
+@pytest.mark.parametrize('field', ['worker_role', 'topology_worker_role', 'role'])
+def test_rehashed_raw_alias_conflict_still_fails_lineage_qualification(nested, field):
+    f = nested
+    token = f.raw[f.workers[0]['token_raw_ref']['event_index']]
+    token[field] = 'writer99'
+    f.sync()  # Recompute refs/hashes: rejection must be semantic, not stale bytes.
+    result = qualify(f)
+    assert result['boundary_audit']['valid'], result
+    assert 'topology_worker_lineage_invalid:worker_role_mismatch' in result['qualification_errors']
+    assert 'offline_fixture_cannot_establish_real_ros' in result['qualification_errors']
+    assert f.child['evidence_origin'] == 'fixture' and f.child['real_execution'] is False
+    assert not result['real_ros_execution'] and not result['real_runtime_attempt']

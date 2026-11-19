@@ -327,6 +327,237 @@ def _projection_anomaly(facts):
     return sorted(rows, key=canonical_hash)
 
 
+
+TOPOLOGY_SIGNATURE_SCHEMA = "r2f.conformance-signature/topology-v1"
+_TOPOLOGY_TARGET = "discovery.endpoint_topology.fuzz_v1"
+_TOPOLOGY_FACTS = "r2f.s1-topology-facts/v1"
+_TOPOLOGY_RULE = "s1.topology.program_consistency.v1"
+
+
+def _topology_conformance_signature(metadata, facts, rule):
+    """A normalised outcome, not admission: qualification denials stay closed.
+
+    Only the registered topology rule and concrete typed pair proofs are
+    understood here. Caller-supplied anomaly_signature is never a fallback.
+    Instance GIDs/process IDs/raw paths are checked but excluded from equality.
+    """
+    import json
+    from .candidate import (TOPOLOGY_IDENTITY_SCHEMA, _validate_observation_identity,
+                            _validate_topology_admission, topology_observation_identity)
+    try:
+        oracle = metadata.get("oracle", {})
+        verdict = metadata.get("oracle_verdict")
+        if (metadata.get("target_id") != _TOPOLOGY_TARGET or facts.get("schema") != _TOPOLOGY_FACTS
+                or rule != _TOPOLOGY_RULE or oracle.get("rule_id") != rule
+                or oracle.get("verdict") != verdict or verdict not in {"pass", "fail"}
+                or metadata.get("input_identity_schema") != INPUT_SCHEMA_V2
+                or metadata.get("execution_stage") != "judged" or metadata.get("actual_run") is not True
+                or metadata.get("arm") == "negative" or metadata.get("control_kind")
+                or metadata.get("tool_error") or metadata.get("runtime_status") == "tool_error"
+                or metadata.get("observer_complete") is False or metadata.get("observer_dropped") is True
+                or facts.get("fixture") is not False or facts.get("control_excluded") is not False
+                or facts.get("tool_error") is not False or facts.get("evidence_error")
+                or facts.get("unknown_reasons_sample_identity") or facts.get("unresolved_historical_obligations")
+                or facts.get("diagnostic_valid") is not True or oracle.get("diagnostic_only") is not False
+                or any(facts.get(k) is not True for k in (
+                    "execution_evidence", "environment_healthy", "process_healthy",
+                    "source_provenance_qualified", "endpoint_identity_complete", "observation_complete"))):
+            return None
+        integer(metadata.get("target_revision"), "topology signature target_revision")
+        sha256_digest(metadata.get("effective_input_sha256"), "topology signature input")
+        manifest = metadata.get("target", {})
+        if manifest and (manifest.get("target_id") != _TOPOLOGY_TARGET
+                         or manifest.get("target_revision") != metadata["target_revision"]
+                         or manifest.get("rule_contract", {}).get("primary_rule") != rule):
+            return None
+        evidence = dict(metadata)
+        evidence.setdefault("endpoint_identity", topology_observation_identity(metadata))
+        _validate_observation_identity(evidence)
+        if verdict == "fail":
+            _validate_topology_admission(evidence)
+            # Ineffective mutations/tool observations cannot acquire a fail
+            # signature. Full execution and independent review remain upstream.
+            if metadata.get("arm") == "mutated":
+                receipt = metadata.get("mutation_receipt", {})
+                if any(receipt.get(k) is not True for k in
+                       ("carrier_admitted", "configured", "applied", "hit", "effect_observed")):
+                    return None
+        with open(metadata["raw_path"], encoding="utf-8") as stream:
+            events = [json.loads(line) for line in stream if line.strip()]
+        if any(ev.get("fixture") is True for ev in events):
+            return None
+
+        def event(ref):
+            if (not isinstance(ref, dict) or ref.get("path") != metadata["raw_path"]
+                    or ref.get("sha256") != metadata["raw_sha256"]
+                    or type(ref.get("event_index")) is not int
+                    or not 0 <= ref["event_index"] < len(events)):
+                raise ValueError("topology signature proof reference invalid")
+            return events[ref["event_index"]]
+
+        tokens = {(e["logical_id"], e["generation"]): e for e in facts["endpoint_lineage"]}
+
+        def witness(pair, sample):
+            for role in ("writer", "reader"):
+                if any(sample.get(k) != pair.get(k) for k in (role, role + "_generation")):
+                    raise ValueError("topology witness crosses pair generation")
+            seq = sample.get("sequence")
+            if type(seq) is not int or seq < 0:
+                raise ValueError("topology witness sequence invalid")
+            send, receive = event(sample.get("send_ref")), event(sample.get("receive_ref"))
+            for role, ev, kind in (("writer", send, "send"), ("reader", receive, "receive")):
+                token = tokens[(pair[role], pair[role + "_generation"])]
+                if (ev.get("event") != kind or ev.get("logical_id") != token["logical_id"]
+                        or ev.get("generation") != token["generation"]
+                        or ev.get("endpoint_generation") != token["endpoint_generation"]
+                        or ev.get("send_sequence") != seq):
+                    raise ValueError("topology witness differs from raw endpoint generation")
+            if (receive.get("payload_writer_id") != pair["writer"]
+                    or receive.get("payload_writer_generation") != pair["writer_generation"]
+                    or receive.get("payload_run_id") != metadata["run_id"]
+                    or receive.get("payload_endpoint_gid") != tokens[(pair["writer"], pair["writer_generation"])]["endpoint_gid"]
+                    or not send.get("payload_sha256") or send.get("payload_sha256") != receive.get("payload_sha256")):
+                raise ValueError("topology sentinel payload identity mismatch")
+            return seq, send, receive
+
+        declarations = {e["logical_id"]: e for e in metadata["final_input"]["topology_program"]["endpoints"]}
+        anomalies, residuals = [], set()
+        claimed = oracle.get("forbidden_residuals")
+        if not isinstance(claimed, list) or any(not isinstance(v, str) for v in claimed):
+            return None
+        if set(claimed) - {"topology.pair_graph_mismatch", "topology.closed_delivery_gap"}:
+            return None
+        for pair in facts["pairs"]:
+            subjects = {role: {"logical_id": pair[role], "generation": pair[role + "_generation"]}
+                        for role in ("writer", "reader")}
+            if any(not isinstance(declarations[pair[role]].get(k), str)
+                   or not declarations[pair[role]][k].strip()
+                   for role in ("writer", "reader") for k in ("topic", "type_name")):
+                return None
+            if any(not isinstance(declarations[pair[role]].get("qos"), dict) for role in ("writer", "reader")):
+                return None
+            obligation = {role: {key: snapshot(declarations[pair[role]].get(key))
+                                for key in ("topic", "type_name", "qos")}
+                          for role in ("writer", "reader")}
+            proofs = pair.get("proofs", {})
+            compatibility = proofs.get("compatibility", {})
+            match = proofs.get("observed_match", {})
+            samples = pair.get("communication_witnesses", [])
+            if not isinstance(samples, list):
+                return None
+            attributed = [witness(pair, sample) for sample in samples]
+            def direct_peer_match():
+                if (match.get("status") != "observed" or match.get("value") != pair.get("observed_match")
+                        or match.get("detail", {}).get("proof_kind") != "direct_per_peer_api"):
+                    return False
+                directions = set()
+                for ref in match.get("refs", []):
+                    ev = event(ref)
+                    if ev.get("event") != "match_snapshot":
+                        continue
+                    for local, peer in (("writer", "reader"), ("reader", "writer")):
+                        token = tokens[(pair[local], pair[local + "_generation"])]
+                        peer_gid = tokens[(pair[peer], pair[peer + "_generation"])]["endpoint_gid"]
+                        if (ev.get("logical_id") == token["logical_id"] and ev.get("generation") == token["generation"]
+                                and ev.get("endpoint_generation") == token["endpoint_generation"]
+                                and peer_gid in (ev.get("matched_peer_gids") or [])):
+                            directions.add(local)
+                required = {"bidirectional": {"writer", "reader"}, "writer_only": {"writer"},
+                            "reader_only": {"reader"}}.get(pair.get("observed_match"))
+                return required is not None and required <= directions
+
+            graph_mismatch = (pair.get("compatibility") == "incompatible"
+                and compatibility.get("status") == "observed" and compatibility.get("value") == "incompatible"
+                and (bool(attributed) or direct_peer_match()))
+            if graph_mismatch:
+                residual = "topology.pair_graph_mismatch"
+                residuals.add(residual)
+                anomalies.append(dict(subjects, residual=residual, obligation=obligation,
+                                      compatibility="incompatible", observed_match=pair.get("observed_match"),
+                                      communication_observed=bool(attributed)))
+            if pair.get("delivery_closure") != "closed_with_gap":
+                continue
+            component = proofs.get("delivery_closure", {})
+            detail = component.get("detail", {})
+            if (component.get("status") != "observed" or component.get("value") != "closed_with_gap"
+                    or not component.get("refs")
+                    or any(pair.get(k) is not True for k in
+                           ("reliable_history_contract", "filter_free", "delivery_window_identity_complete"))):
+                return None
+            expected, missing = detail.get("expected"), detail.get("missing")
+            if (not isinstance(expected, list) or not expected or not isinstance(missing, list) or not missing
+                    or any(type(n) is not int or n < 0 for n in expected + missing)
+                    or len(set(expected)) != len(expected) or expected != sorted(expected)
+                    or len(set(missing)) != len(missing)):
+                return None
+            if any(ref not in component["refs"] for ref in (detail.get("open_ref"), detail.get("close_ref"))):
+                return None
+            opened, closed = event(detail.get("open_ref")), event(detail.get("close_ref"))
+            if (opened.get("event") != "topology_delivery_window_open"
+                    or closed.get("event") != "topology_delivery_window_closed"
+                    or opened["event_index"] >= closed["event_index"] or closed.get("window_complete") is not True):
+                return None
+            if closed.get("open_ref") != opened["event_index"]:
+                return None
+            for role in ("writer", "reader"):
+                if any(ev.get(k) != pair.get(k) for ev in (opened, closed)
+                       for k in (role, role + "_generation")):
+                    return None
+            if (closed.get("expected_sequences") != expected
+                    or closed.get("missing_sequences") != sorted(missing)
+                    or closed.get("received_sequences") != detail.get("received")):
+                return None
+            inside = events[opened["event_index"] + 1:closed["event_index"]]
+            sends = [ev for ev in inside if ev.get("event") == "send"
+                     and ev.get("logical_id") == pair["writer"] and ev.get("generation") == pair["writer_generation"]]
+            token = tokens[(pair["writer"], pair["writer_generation"])]
+            if any(ev.get("endpoint_generation") != token["endpoint_generation"] for ev in sends):
+                return None
+            sent = [ev.get("send_sequence") for ev in sends]
+            if sent != expected or len(set(sent)) != len(sent):
+                return None
+            received = [seq for seq, send, receive in attributed
+                        if opened["event_index"] < send["event_index"] < closed["event_index"]
+                        and opened["event_index"] < receive["event_index"] < closed["event_index"]]
+            raw_pair_receives = {ev["event_index"] for ev in inside if ev.get("event") == "receive"
+                and ev.get("logical_id") == pair["reader"] and ev.get("generation") == pair["reader_generation"]
+                and ev.get("payload_writer_id") == pair["writer"]
+                and ev.get("payload_writer_generation") == pair["writer_generation"]}
+            witnessed_receives = {receive["event_index"] for seq, send, receive in attributed
+                if opened["event_index"] < receive["event_index"] < closed["event_index"]}
+            if raw_pair_receives != witnessed_receives:
+                return None
+            sentinel = detail.get("sentinel_sequence")
+            if (type(sentinel) is not int or sentinel != max(expected) or sentinel not in received
+                    or closed.get("sentinel_sequence") != sentinel
+                    or set(received) - set(expected) or len(set(received)) != len(received)
+                    or sorted(set(expected) - set(received)) != sorted(missing)
+                    or detail.get("received") != sorted(received)
+                    or any(n >= sentinel for n in missing)):
+                return None
+            sentinel_samples = [(send, receive) for seq, send, receive in attributed if seq == sentinel]
+            if (len(sentinel_samples) != 1
+                    or closed.get("sentinel_send_ref") != sentinel_samples[0][0]["event_index"]
+                    or closed.get("sentinel_receive_ref") != sentinel_samples[0][1]["event_index"]):
+                return None
+            # A same-writer later sequence, never an unrelated pair/global sort.
+            residual = "topology.closed_delivery_gap"
+            residuals.add(residual)
+            anomalies.append(dict(subjects, residual=residual, obligation=obligation,
+                                  expected=expected, missing=sorted(missing), received=sorted(received),
+                                  sentinel_sequence=sentinel, reliable_history_contract=True, filter_free=True))
+        if verdict == "fail" and (not anomalies or residuals != set(claimed)):
+            return None
+        if verdict == "pass" and (anomalies or claimed):
+            return None
+        return {"schema": TOPOLOGY_SIGNATURE_SCHEMA, "endpoint_identity_schema": TOPOLOGY_IDENTITY_SCHEMA,
+                "rule_id": rule, "target_id": _TOPOLOGY_TARGET, "target_revision": metadata["target_revision"],
+                "effective_input_sha256": metadata["effective_input_sha256"], "oracle_verdict": verdict,
+                "typed_anomaly_signature": sorted(anomalies, key=canonical_hash)}
+    except (ValueError, KeyError, TypeError, OSError, IndexError, AttributeError):
+        return None
+
+
 def conformance_signature(metadata):
     """Return a typed, stable normal-conformance outcome signature, or None.
 
@@ -346,6 +577,9 @@ def conformance_signature(metadata):
     rule = metadata.get("rule_id") or target.get("rule_contract", {}).get("primary_rule")
     if not isinstance(rule, str) or not rule:
         return None
+    # Exact topology routing precedes the legacy caller-supplied signature path.
+    if metadata.get("target_id") == _TOPOLOGY_TARGET or facts.get("schema") == _TOPOLOGY_FACTS:
+        return _topology_conformance_signature(metadata, facts, rule)
     explicit = metadata.get("typed_anomaly_signature", facts.get("anomaly_signature"))
     if explicit is not None:
         if not isinstance(explicit, (dict, list)) or not explicit:
@@ -571,7 +805,7 @@ class ReplayCapsule:
         return result
 
 
-def rerun_conformance(capsule, runner, *, domain, plan_aware=False):
+def rerun_conformance(capsule, runner, *, domain, plan_aware=False, comparison_view=None):
     """runner(scenario, domain) runs the normal scene and returns execution metadata.
 
     The compiled scenario's final_input/input_layer_receipts/source_manifest fields
@@ -579,6 +813,8 @@ def rerun_conformance(capsule, runner, *, domain, plan_aware=False):
     V2 requires plan_aware=True: the callback must preserve the saved plan and
     return an explicit actual submitted input/hash binding. This does not qualify
     an injected callback as real ROS; campaign qualification is a separate gate.
+    comparison_view, when provided, independently revalidates comparison copies
+    for original/fresh evidence. It never replaces the saved execution/history.
     """
     try:
         validate_replay_input(capsule.input)
@@ -669,8 +905,22 @@ def rerun_conformance(capsule, runner, *, domain, plan_aware=False):
                                       failure_reason="" if completed else "execution was not judged",
                                       execution_metadata=metadata, comparison_basis="execution_success_only",
                                       comparison_matches_original=False)
-    original_signature = conformance_signature(original)
-    replay_signature = conformance_signature(metadata)
+    # Comparison views are ephemeral, independently validated projections. The
+    # first execution and append-only history remain exactly as recorded above.
+    before_view, after_view = snapshot(original), snapshot(metadata)
+    if comparison_view is not None:
+        try:
+            before_view = comparison_view(snapshot(original), original=True)
+            after_view = comparison_view(snapshot(metadata), original=False)
+            if not isinstance(before_view, dict) or not isinstance(after_view, dict):
+                raise ValueError("comparison views must be execution objects")
+        except (ValueError, KeyError, TypeError, OSError, AttributeError) as exc:
+            return capsule.record_attempt("fail_artifact", domain=domain,
+                failure_reason="comparison view invalid: " + str(exc),
+                execution_metadata=metadata, comparison_basis="original_execution_signature",
+                comparison_matches_original=False)
+    original_signature = conformance_signature(before_view)
+    replay_signature = conformance_signature(after_view)
     consistent = (original_signature is not None and replay_signature is not None
                   and canonical_hash(original_signature) == canonical_hash(replay_signature))
     original_identity = {key: original.get(key) for key in (

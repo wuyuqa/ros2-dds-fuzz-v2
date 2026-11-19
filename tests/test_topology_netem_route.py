@@ -333,18 +333,58 @@ def test_fixture_never_claims_a_window():
 
 def test_application_audit_attaches_a_separate_netem_object(tmp_path):
     plan, config = config_for("env.delay")
+    # This seeded request resolves to endpoint deadline configuration, not netem.
+    receipt = config["input_layer_receipts"][0]
+    assert receipt["operator_id"] == "env.delay"
+    assert receipt["slot_id"] == "S1.topology.qos.deadline#1"
+    assert "environment_mutation" not in config
     result = run_pair(config, tmp_path, topology_backend=OfflineTopologyBackend())
     audit_out = result["application_audit"]
     netem = audit_out["netem_application"]
     assert netem["schema"] == "r2f.topology-netem-application/v1"
     assert netem["status"] == "not_applicable_offline_fixture"
-    # The named operator layer keeps a stable unsupported family and points at
-    # the separate window audit instead of implying a netem application.
+    assert netem["reasons"] == ["offline_fixture_cannot_own_a_real_netem_window"]
+    assert netem["declared"] is None and netem["declared_sha256"] is None
+    assert netem["window_installed"] is False
+    assert netem["matched_packets"] == netem["identity_bound_counters"] == 0
+    assert "endpoint_qos_deadline_is_not_a_netem_delay_window" in netem["limitations"]
     layer = audit_out["layers"][0]
-    assert layer["status"] == "unsupported"
-    assert layer["netem_application_ref"] == "not_applicable_offline_fixture"
-    assert "netem_application_audited_separately_not_via_this_input_slot" in layer["reasons"]
-    assert audit_out["mutation_receipt"]["hit"] is False
+    operator = layer["operator_application"]
+    assert audit_out["status"] == layer["status"] == operator["status"] == "fixture_application_observed"
+    assert layer["application_kind"] == "configuration_only"
+    assert layer["effect_scope"] == "endpoint_deadline_configuration_only_not_deadline_semantics_or_netem"
+    assert layer["configuration_application_observed"] is True
+    assert layer["configuration_intervention_proven"] is True
+    assert operator["qos_delta"] == [{"before": "infinite", "field": "deadline_sec",
+                                      "index": 1, "logical_id": "r0", "role": "reader", "value": 0.001}]
+    assert len(operator["timing_delta"]) == 1
+    readback = operator["timing_delta"][0]
+    assert {key: readback[key] for key in ("field", "logical_id", "role", "before", "value",
+                                         "observed", "observed_source")} == {
+        "field": "deadline_sec", "logical_id": "r0", "role": "reader", "before": "infinite",
+        "value": 0.001, "observed": 1000000, "observed_source": "offline_fixture"}
+    assert layer["effect_observation"] == "unknown_deadline_semantic_effect_not_measured"
+    # Keep the reference/reason contract explicit: a deadline configuration layer
+    # must not masquerade as the separate unsupported network-window input slot.
+    assert "netem_application_ref" not in layer
+    assert "netem_application_audited_separately_not_via_this_input_slot" not in layer["reasons"]
+    assert layer["reasons"] == operator["reasons"] == []
+    assert result["fixture"] is True and result["real_execution"] is False
+    assert audit_out["fixture"] is True and netem["fixture"] is True
+    for record in (layer, operator):
+        for flag in ("hit", "effect_observed", "execution_evidence", "candidate_eligible"):
+            assert record[flag] is False
+    for record in (audit_out, netem):
+        assert record["execution_evidence"] is False
+    assert audit_out["candidate_eligible"] is False
+    assert result["candidate_eligible"] is False
+    assert result["sealed"] is False and result["mature"] is False
+    for record in netem["operators"].values():
+        for flag in ("hit", "s1_mutation_hit", "execution_evidence", "candidate_eligible"):
+            assert record[flag] is False
+    for record in (audit_out, result):
+        assert record["mutation_receipt"]
+        assert all(value is False for value in record["mutation_receipt"].values())
 
 
 def test_route_binding_carries_the_declared_mutation_only_when_present(tmp_path):

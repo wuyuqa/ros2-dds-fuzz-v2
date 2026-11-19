@@ -17,7 +17,7 @@ import os
 from datetime import datetime, timezone
 from pathlib import Path
 
-from r2f.core.candidate import CandidateLifecycle
+from r2f.core.candidate import CandidateLifecycle, topology_observation_identity
 from r2f.core.evidence import canonical_hash
 from r2f.core.oracle import TriageResult
 
@@ -219,8 +219,10 @@ def _exploratory_evidence(row):
     return dict(row, timestamp=row.get("timestamp") or datetime.now(timezone.utc).isoformat(),
                 candidate_source="instrumentation" if instrumented else "blackbox",
                 evidence_tier="instrumented" if instrumented else "blackbox",
-                endpoint_identity={key: (row.get("typed_facts") or {}).get(key)
-                                   for key in ("writer", "reader")})
+                endpoint_identity=(topology_observation_identity(row)
+                    if (row.get("typed_facts") or {}).get("schema") == "r2f.s1-topology-facts/v1"
+                    else {key: (row.get("typed_facts") or {}).get(key)
+                          for key in ("writer", "reader")}))
 
 
 def _review_errors(review, candidate_id):
