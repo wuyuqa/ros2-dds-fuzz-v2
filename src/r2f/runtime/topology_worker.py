@@ -1121,6 +1121,9 @@ class _EndpointProcess:
             except (KeyError, ValueError):
                 pass
             self.selector.close()
+            # Keep the retired process/history for audit, but future backend
+            # pumps must not select on its successfully closed epoll object.
+            self.selector = None
         for handle in (self.process.stdin, self.process.stdout, self.stderr):
             try:
                 handle.close()
