@@ -149,7 +149,7 @@ def _policy_from_graph(events, role, gid):
 
 def _policy_view(policy, source, event, role):
     if policy is None:
-        return {"role": role, "source": None, "fields": {}, "complete": False,
+        return {"role": role, "source": None, "fields": {}, "values": {}, "complete": False,
                 "missing_fields": list(_KNOWN_QOS_FIELDS),
                 "unavailable_fields": list(_UNAVAILABLE_QOS_FIELDS)}
     fields = {}
@@ -484,6 +484,8 @@ def g01_edge_observation(events, config=None, *, writer_role="writer",
         "relation": relation,
         "incomplete_reasons": sorted(set(reasons)),
         "identity_correlated": identity_correlated,
+        "pair_identity_correlated": not reasons and graph["status"] == "exact_pair"
+                                    and match["status"] == "observed",
         "aggregate_used": False,
         "execution_evidence": False,
         "oracle_verdict": None,
@@ -550,7 +552,7 @@ def guard_facts_from_edge(edge, window, *, submitted=None):
         "observed": None,
     }
     match = edge.get("match", {})
-    if match.get("status") == "observed" and edge.get("identity_correlated"):
+    if match.get("status") == "observed" and edge.get("pair_identity_correlated", edge.get("identity_correlated")):
         at_ns = match.get("at_ns")
         if type(at_ns) is int:
             facts["match"] = {
@@ -807,5 +809,191 @@ def edge_summary(observation):
 __all__ = [
     "SCHEMA", "OBSERVER_ID", "g01_edge_observation", "observe_w01_delivery",
     "guard_facts_from_edge", "window_from_events", "relation_observer_capability",
-    "edge_summary",
+    "edge_summary", "g01_configuration_readback", "g01_runtime_observation",
 ]
+
+
+def g01_configuration_readback(events, config):
+    """Verify only API configuration intervention; never a match/effect claim."""
+    _require_event_indexes(events)
+    _validate_run(events, config.get("run_id"), config.get("domain_id"))
+    if any(row.get("run_id") != config.get("run_id")
+           or row.get("domain_id") != config.get("domain_id") for row in events):
+        raise RelationSurfaceError("g01_run_or_domain_identity_missing")
+    creations = _endpoint_creations(events)
+    tokens = {}
+    for role in ("writer", "reader"):
+        rows = creations.get(role, [])
+        if len(rows) != 1:
+            raise RelationSurfaceError("g01_unique_creation_required:" + role)
+        token = tokens[role] = rows[0]
+        if (not isinstance(token.get("endpoint_gid"), str) or not token["endpoint_gid"]
+                or not isinstance(token.get("endpoint_generation"), str)
+                or not token["endpoint_generation"] or type(token.get("pid")) is not int
+                or token["pid"] <= 0
+                or token.get("run_id") != config.get("run_id")
+                or token.get("domain_id") != config.get("domain_id")
+                or token.get("rmw_identifier") != (config.get("rmws") or {}).get(
+                    role, config.get("rmw", "rmw_cyclonedds_cpp"))
+                or token.get("topic") != config.get("topic")
+                or token.get("message_type") != "std_msgs/msg/String"
+                or type(token.get("created_monotonic_ns")) is not int
+                or not token["created_monotonic_ns"] <= token["monotonic_ns"]):
+            raise RelationSurfaceError("g01_creation_identity_invalid:" + role)
+        bindings = [e for e in events if e.get("event") == "qos_binding_observed"
+                    and e.get("role") == role]
+        if len(bindings) != 1:
+            raise RelationSurfaceError("g01_unique_qos_readback_required:" + role)
+        binding = bindings[0]
+        observed = binding.get("observed_self")
+        api = "get_" + ("publishers" if role == "writer" else "subscriptions") + "_info_by_topic"
+        if (binding.get("observed_self_gid") != token["endpoint_gid"]
+                or binding.get("observation_api") != api
+                or not isinstance(observed, dict)
+                or any(observed.get(k) != v for k, v in config[role + "_qos"].items())
+                or not token["monotonic_ns"] <= binding.get("monotonic_ns", -1)):
+            raise RelationSurfaceError("g01_qos_readback_mismatch:" + role)
+        # WorkerPool authenticates these on the pipe. Replays must retain
+        # the same identity fields; a same-role foreign process cannot pass.
+        for row in events:
+            if row.get("role") != role or row.get("event") not in {
+                    "qos_binding_observed", "match_snapshot", "graph_snapshot",
+                    "command_done", "send", "receive"}:
+                continue
+            if any(row.get(k) != token.get(k) for k in
+                   ("pid", "endpoint_generation", "rmw_identifier", "run_id", "domain_id")):
+                raise RelationSurfaceError("g01_worker_identity_mismatch:" + role)
+    if (tokens["writer"]["pid"] == tokens["reader"]["pid"]
+            or tokens["writer"]["endpoint_gid"] == tokens["reader"]["endpoint_gid"]):
+        raise RelationSurfaceError("g01_pair_identity_not_independent")
+    return tokens
+
+
+def g01_runtime_observation(events, config):
+    """Strict raw-to-guard seam for the public 1W1R runtime.
+
+    The legacy edge helper also serves partial/offline diagnostics. This seam
+    requires transport identities, real API readback, command requests and a
+    bounded graph before *and* after delivery. It returns no verdict and never
+    treats a finite zero count as proof of prohibited-event absence.
+    """
+    result = {"schema": SCHEMA, "kind": "g01_runtime_observation",
+              "facts": None, "oracle_input": False, "reasons": [],
+              "relation_effect_observed": False, "execution_evidence": False,
+              "candidate_eligible": False}
+    reasons = result["reasons"]
+    labels = {"reliable": "R", "best_effort": "B"}
+    pair = "".join(labels.get(config.get(role + "_qos", {}).get("reliability"), "?")
+                   for role in ("writer", "reader"))
+    result["reliability_prediction"] = {
+        "pair": pair, "compatible": pair not in G01_INCOMPATIBLE_PAIRS if "?" not in pair else None,
+        "basis": "submitted_reliability_only_not_match_prediction",
+        "does_not_establish_topic_type_or_other_rxo_compatibility": True}
+    result["observed_relation"] = None
+    result["identity_limitations"] = []
+    try:
+        _require_event_indexes(events)
+        _validate_run(events, config.get("run_id"), config.get("domain_id"))
+        window_rows = {kind: [e for e in events if e.get("event") == kind
+                             and e.get("window") == "pair_compatibility_window"]
+                       for kind in ("window_open", "window_close")}
+        if any(len(rows) != 1 for rows in window_rows.values()):
+            raise RelationSurfaceError("g01_unique_complete_window_required")
+        window = window_from_events(events, "pair_compatibility_window")
+        if window is None:
+            raise RelationSurfaceError("g01_invalid_window")
+        start, end = window["start_ns"], window["end_ns"]
+        tokens = g01_configuration_readback(events, config)
+        if any(not start <= t["created_monotonic_ns"] <= t["monotonic_ns"] < end
+               for t in tokens.values()):
+            raise RelationSurfaceError("g01_creation_outside_window")
+        sends = [e for e in events if e.get("event") == "send"]
+        receives = [e for e in events if e.get("event") == "receive"]
+        if any(not start < e.get("monotonic_ns", -1) < end for e in sends + receives):
+            raise RelationSurfaceError("g01_delivery_outside_window")
+        for row in sends:
+            if (row.get("role") != "writer" or row.get("writer_gid") != tokens["writer"]["endpoint_gid"]
+                    or row.get("phase") != "pair_probe"):
+                raise RelationSurfaceError("g01_send_identity_invalid")
+        for row in receives:
+            if (row.get("role") != "reader" or row.get("reader_gid") != tokens["reader"]["endpoint_gid"]
+                    or row.get("phase") != "pair_probe"
+                    or row.get("publisher_gid") is None and row.get("publisher_gid_status") != "unavailable_api"):
+                raise RelationSurfaceError("g01_receive_identity_invalid")
+        # Only request -> fresh sample -> graph -> ACK qualifies. At least one
+        # complete pair snapshot precedes sends and one follows all delivery.
+        before, after = {}, {}
+        for role, token in tokens.items():
+            proofs = _command_bound_snapshot(events, role, token["endpoint_gid"],
+                                              max(t["created_monotonic_ns"] for t in tokens.values()))
+            valid = []
+            for proof in proofs:
+                requests = [e for e in events if e.get("event") == "worker_command_requested"
+                            and e.get("role") == role and e.get("command_id") == proof["command_id"]]
+                if len(requests) != 1:
+                    raise RelationSurfaceError("g01_snapshot_request_missing_or_ambiguous:" + role)
+                request, match, graph, ack = requests[0], proof["match"], proof["graph"], proof["ack"]
+                if (request.get("command") != "snapshot"
+                        or request.get("origin") != "controller_pipe"
+                        or any(request.get(k) != token.get(k) for k in ("pid", "endpoint_generation"))
+                        or not start < request.get("requested_monotonic_ns", -1) <= request["monotonic_ns"] <= proof["sampled_ns"]
+                        or not request["event_index"] < match["event_index"]
+                        or not ack["monotonic_ns"] < end
+                        or match.get("count_api") != ("get_subscription_count" if role == "writer"
+                                                       else "get_publisher_count")
+                        or type(match.get("matched_count")) is not int
+                        or match["matched_count"] not in (0, 1)
+                        or _graph_isolation(graph, tokens["writer"]["endpoint_gid"],
+                                            tokens["reader"]["endpoint_gid"])[0] != "exact_pair"):
+                    raise RelationSurfaceError("g01_snapshot_request_or_pair_invalid:" + role)
+                for table, endpoint_role in (("publishers", "writer"), ("subscriptions", "reader")):
+                    entries = graph.get(table, [])
+                    if len(entries) != 1 or entries[0].get("topic_type") != "std_msgs/msg/String":
+                        raise RelationSurfaceError("g01_graph_type_or_cardinality_invalid:" + role)
+                    qos = entries[0].get("qos")
+                    if not isinstance(qos, dict) or any(qos.get(k) != v for k, v in config[endpoint_role + "_qos"].items()):
+                        raise RelationSurfaceError("g01_graph_qos_mismatch:" + endpoint_role)
+                valid.append(proof)
+            requested = [e for e in events if e.get("event") == "worker_command_requested"
+                         and e.get("role") == role and e.get("command") == "snapshot"]
+            if len(requested) != len(valid):
+                raise RelationSurfaceError("g01_snapshot_command_incomplete:" + role)
+            first_send = min((e["monotonic_ns"] for e in sends), default=end)
+            last_delivery = max((e["monotonic_ns"] for e in sends + receives), default=start)
+            prior = [p for p in valid if p["ack"]["monotonic_ns"] < first_send]
+            posterior = [p for p in valid if p["sampled_ns"] > last_delivery]
+            if not prior or not posterior:
+                raise RelationSurfaceError("g01_fresh_graph_boundaries_missing:" + role)
+            before[role], after[role] = prior[-1], posterior[-1]
+        if any(before[r]["match"]["matched_count"] != after[r]["match"]["matched_count"]
+               for r in tokens):
+            raise RelationSurfaceError("g01_match_changed_across_delivery_window")
+        observation = g01_edge_observation(events, config)
+        result["observation"] = observation
+        if not observation.get("edges"):
+            raise RelationSurfaceError("g01_edge_missing")
+        edge = observation["edges"][0]
+        result["observed_relation"] = {"match": edge["match"], "delivery": edge["delivery"],
+                                       "policies": edge["observed_policies"]}
+        if any(e.get("publisher_gid") is None for e in receives):
+            result["identity_limitations"].append("publisher_gid_unavailable_api_endpoint_correlated_not_direct_sample_gid")
+        if edge["incomplete_reasons"]:
+            reasons.extend(edge["incomplete_reasons"])
+            return result
+        delivery = edge["delivery"]
+        if any(seq not in delivery["sent_sequences"] for seq in delivery["received_sequences"]):
+            raise RelationSurfaceError("g01_uncorrelated_received_sequence")
+        converted = guard_facts_from_edge(edge, window)
+        result.update(facts=converted["facts"], oracle_input=converted["oracle_input"])
+        if converted["reason"]:
+            reasons.append(converted["reason"])
+        result["relation_effect_observed"] = (converted["oracle_input"] and edge["match"]["status"] == "observed")
+        result["graph_boundaries"] = {
+            role: {"before_ack": _row_ref(before[role]["ack"]),
+                   "after_ack": _row_ref(after[role]["ack"])} for role in tokens}
+        result["delivery_obligation"] = "not_evaluated_by_compatibility_guard"
+        result["finite_absence_is_not_proof"] = True
+    except (RelationSurfaceError, KeyError, TypeError, ValueError) as exc:
+        reasons.append(str(exc))
+        result.update(facts=None, oracle_input=False, relation_effect_observed=False)
+    return result

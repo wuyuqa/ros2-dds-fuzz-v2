@@ -19,6 +19,34 @@ RECOVERY_FIELDS = frozenset({
     'publish_burst_in_window', 'publish_burst_count',
     'publish_burst_interval_sec', 'environment_mutation', 'netem_covers_delivery',
 })
+G01_TARGET = "discovery.match_compatibility.fuzz_v1"
+
+
+def is_g01_profile(profile):
+    return profile.get("target_ids") == [G01_TARGET]
+
+
+def validate_g01_profile(profile):
+    """Exact-target activation, not a relaxation of the F2 windows opt-in."""
+    if not is_g01_profile(profile):
+        return False
+    if profile.get("runtime_capability") is not None or profile.get("surfaces") != ["G01"]:
+        raise ValueError("g01_requires_exact_target_and_surface_without_capability")
+    # Explicit G01 profile copies may opt in; this is not live admission.
+    # Other F2/default profiles retain their existing disabled-only contract.
+    if type(profile.get("enabled")) is not bool or profile.get("required_catalog_included") is not False:
+        raise ValueError("g01_requires_explicit_boolean_exploratory_profile")
+    if type(profile.get("chain_length", 1)) is not int or profile.get("chain_length", 1) != 1:
+        raise ValueError("g01_requires_chain_length_1")
+    if set(profile.get("sampling_kinds", [])) - {"representative"}:
+        raise ValueError("g01_only_pair_representatives_supported")
+    if RECOVERY_FIELDS & set(profile) or PROJECTION_FIELDS & set(profile):
+        raise ValueError("g01_additional_runtime_controls_not_enabled")
+    if "search" in profile and profile["search"].get("samples_per_class") != 4:
+        raise ValueError("g01_bfs_requires_four_explicit_pair_slots")
+    return True
+
+
 F2_WINDOWS_CAPABILITY = 'f2_windows_v1'
 F2_WINDOWS_TARGET = 'discovery.interruption_recovery.fuzz_windows_v1'
 F2_ANCHOR_POLICY = 'f2_anchor_not_before_v1'
@@ -91,6 +119,7 @@ def validate_profile_fields(profile):
     if unknown:
         raise ValueError('unsupported exploratory profile field:' + ','.join(sorted(unknown)))
     validate_f2_profile(profile)
+    validate_g01_profile(profile)
     for key in PROFILE_CONTROL_FIELDS & set(profile):
         if profile[key] is None:
             raise ValueError(key + ' must not be null; omit an unused control')

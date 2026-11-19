@@ -784,6 +784,163 @@ def _delivery_no_sends_basis(writer, reader, program, events, chains):
             "candidate_eligible": False, "mutation_hit": False, "semantic_effect": False}
 
 
+def _delivery_recreated_no_sends_basis(writer, reader, program, events, chains):
+    """v2 current-generation absence, with independently retained old obligations.
+
+    Engineering design under main dispatch: v1's generation-one fence remains.
+    This is an inventory claim before cleanup; the consumer must also verify
+    actual same-generation exits and runtime-end after the final boundary.
+    """
+    fields = ("logical_id", "generation", "endpoint_gid", "pid", "process_start_ticks", "endpoint_generation")
+    try:
+        if type(writer.get("generation")) is not int or writer["generation"] < 2:
+            return None
+        seals = [e for e in events if e.get("event") == "topology_send_inventory_end"]
+        if len(seals) != 1:
+            return None
+        seal = seals[0]; end = seal["event_index"]; prefix = events[:end]
+        digest = hashlib.sha256(json.dumps(prefix, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        if (seal.get("schema") != "r2f.topology-send-inventory/v1" or seal.get("inventory_count") != end
+                or seal.get("inventory_sha256") != digest
+                or any(e.get("event_index") != i or e.get("run_id") != seal["run_id"]
+                       or type(e.get("monotonic_ns")) is not int for i, e in enumerate(events))):
+            return None
+        begins = [e for e in prefix if e.get("event") == "topology_action_begin"]
+        done = [e for e in prefix if e.get("event") == "topology_action_done"]
+        if len(begins) != len(program["actions"]) or len(done) != len(begins):
+            return None
+        spans = []
+        for i, (action, begin, finish) in enumerate(zip(program["actions"], begins, done)):
+            if (begin.get("action") != action or finish.get("action") != action
+                    or begin.get("action_index") != i or finish.get("action_index") != i
+                    or not begin["event_index"] < finish["event_index"] < end
+                    or begin["monotonic_ns"] > finish["monotonic_ns"]
+                    or (i and done[i-1]["event_index"] >= begin["event_index"])
+                    or finish.get("receipt", {}).get("satisfied") is not True):
+                return None
+            spans.append((action, begin, finish))
+        if seal.get("action_done_refs") != [e["event_index"] for e in done]:
+            return None
+        if any(e.get("event") in {"endpoint_created", "endpoint_destroyed", "topology_endpoint_destroyed"}
+               and e.get("logical_id") in {writer["logical_id"], reader["logical_id"]}
+               for e in events[end+1:]):
+            return None
+        tokens, histories = [], {}
+        for handle, role in ((writer, "writer"), (reader, "reader")):
+            history = [e for e in prefix if e.get("logical_id") == handle["logical_id"]
+                       and e.get("event") in {"endpoint_created", "endpoint_destroyed", "topology_endpoint_destroyed"}]
+            live = None; generation = 0; gids = set(); workers = set(); nonces = set()
+            previous_time = -1
+            for e in history:
+                if e["monotonic_ns"] < previous_time:
+                    return None
+                previous_time = e["monotonic_ns"]
+                if e["event"] == "endpoint_created":
+                    if (live is not None or type(e.get("generation")) is not int or e["generation"] != generation+1
+                            or any(e.get(k) is None for k in fields)
+                            or worker_role_kind(e.get("role")) != role or not e.get("topic") or not e.get("message_type")
+                            or e["endpoint_gid"] in gids or (e["pid"], e["process_start_ticks"]) in workers
+                            or e["endpoint_generation"] in nonces):
+                        return None
+                    valid_action = lambda a, op=("create" if generation == 0 else "recreate"), gen=generation+1: a.get("op") == op and a.get("generation") == gen
+                    gids.add(e["endpoint_gid"]); workers.add((e["pid"], e["process_start_ticks"])); nonces.add(e["endpoint_generation"])
+                    live = e; generation += 1
+                else:
+                    if live is None or e.get("cleanup_status") != "closed" or any(e.get(k) != live[k] for k in fields):
+                        return None
+                    exits = [x for x in prefix if x.get("event") == "topology_worker_exit"
+                             and x.get("logical_id") == live["logical_id"] and x.get("generation") == generation]
+                    if (len(exits) != 1 or exits[0].get("returncode") != 0
+                            or any(exits[0].get(k) != live[k] for k in fields)
+                            or len([a for a,b,f in spans if a.get("endpoint_id") == live["logical_id"]
+                                    and (a.get("op"), a.get("generation")) in {("destroy", generation), ("recreate", generation+1)}
+                                    and b["event_index"] < exits[0]["event_index"] < f["event_index"]
+                                    and b["monotonic_ns"] <= exits[0]["monotonic_ns"] <= f["monotonic_ns"]]) != 1):
+                        return None
+                    valid_action = lambda a: (a.get("op"), a.get("generation")) in {("destroy", generation), ("recreate", generation+1)}
+                    live = None
+                if len([a for a,b,f in spans if a.get("endpoint_id") == handle["logical_id"] and valid_action(a)
+                        and b["event_index"] < e["event_index"] < f["event_index"]
+                        and b["monotonic_ns"] <= e["monotonic_ns"] <= f["monotonic_ns"]]) != 1:
+                    return None
+            if live is None or any(live[k] != handle.get(k) for k in fields):
+                return None
+            chain = chains[handle["logical_id"]]
+            if _delivery_snapshot_chain(live, chain[0].get("command_id"), events, after_index=end+1) != chain:
+                return None
+            histories[handle["logical_id"]] = [e["event_index"] for e in history]
+            tokens.append(live)
+        w, r = tokens
+        creations = [e for e in events if e.get("event") == "endpoint_created"]
+        sends = [e for e in events if e.get("event") == "send"]
+        for send in sends:
+            known = [e for e in creations if e.get("logical_id") == send.get("logical_id") and e.get("generation") == send.get("generation")]
+            if (len(known) != 1 or any(send.get(k) != known[0].get(k) for k in fields if k != "endpoint_gid")
+                    or send.get("writer_gid") != known[0]["endpoint_gid"] or send.get("publish_returned") is not True
+                    or send["event_index"] >= end or not isinstance(send.get("payload_sha256"), str)
+                    or len([s for s in sends if s.get("payload_sha256") == send["payload_sha256"]]) != 1):
+                return None
+            if send.get("logical_id") == w["logical_id"] and (send.get("generation") >= w["generation"] or send["event_index"] >= w["event_index"]):
+                return None
+        for receive in (e for e in events if e.get("event") == "receive"):
+            matches = [x for x in sends if x.get("payload_sha256") == receive.get("payload_sha256")
+                       and x.get("logical_id") == receive.get("payload_writer_id")
+                       and x.get("generation") == receive.get("payload_writer_generation")
+                       and x.get("send_sequence") == receive.get("send_sequence")
+                       and x.get("run_id") == receive.get("payload_run_id")]
+            if len(matches) != 1:
+                return None
+        for e in events:
+            if e.get("event") in {"runtime_abort", "worker_error", "worker_command_error", "topology_backend_blocked"}:
+                return None
+            a = e.get("action") if isinstance(e.get("action"), dict) else {}
+            if (a.get("endpoint_id") == w["logical_id"] and a.get("op") == "publish_batch"
+                    and (a.get("generation") == w["generation"] or e["event_index"] > w["event_index"])):
+                return None
+            if e.get("logical_id") == w["logical_id"] and (e.get("command") in {"publish", "publish_batch"} or e.get("event") in {"publish", "publish_batch", "publish_batch_done"}):
+                if type(e.get("generation")) is not int or e["generation"] >= w["generation"] or e["event_index"] > w["event_index"]:
+                    return None
+            if e.get("writer") == w["logical_id"] and e.get("event", "").startswith("topology_delivery_window"):
+                if type(e.get("writer_generation")) is not int or e["writer_generation"] >= w["generation"]:
+                    return None
+        closed = []
+        opens = [e for e in events if e.get("event") == "topology_delivery_window_open"]
+        for opened in opens:
+            closes = [e for e in events if e.get("event") == "topology_delivery_window_closed" and e.get("open_ref") == opened["event_index"]]
+            if len(closes) != 1:
+                return None
+            close = closes[0]
+            evidence = _delivery_window_evidence(opened, events, before_index=close["event_index"])
+            if (not close.get("window_complete") or not evidence["window_complete"] or evidence["closure_status"] not in {"closed", "no_obligation"}
+                    or any(close.get(k) != v for k,v in evidence.items())):
+                return None
+            closed.append((opened, close, evidence))
+        # Every older writer send still needs a closed, same-reader-generation
+        # obligation (or raw NONE window) for each reader alive at that send.
+        for send in (e for e in sends if e.get("logical_id") == w["logical_id"]):
+            active = {}
+            for e in events[:send["event_index"]]:
+                if e.get("event") == "endpoint_created" and worker_role_kind(e.get("role")) == "reader": active[e["logical_id"]] = e["generation"]
+                elif e.get("event") in {"endpoint_destroyed", "topology_endpoint_destroyed"}: active.pop(e.get("logical_id"), None)
+            for eid, gen in active.items():
+                if not any(o["writer"] == w["logical_id"] and o["writer_generation"] == send["generation"]
+                           and o["reader"] == eid and o["reader_generation"] == gen
+                           and o["event_index"] < send["event_index"] < c["event_index"]
+                           and (send["event_index"] in proof["send_refs"] or proof["closure_status"] == "no_obligation") for o,c,proof in closed):
+                    return None
+        return {"schema": "r2f.topology-delivery-no-sends/v2", "closure_status": "not_applicable_no_sends",
+                "scope": "current_writer_generation_after_verified_retirement", "inventory_end_ref": end,
+                "inventory_count": end, "inventory_sha256": digest,
+                "writer_identity": {k:w[k] for k in fields}, "reader_identity": {k:r[k] for k in fields},
+                "writer_creation_ref": w["event_index"], "reader_creation_ref": r["event_index"],
+                "generation_history_refs": histories, "prior_window_close_refs": [c["event_index"] for _,c,_ in closed],
+                "snapshot_refs": {t["logical_id"]:[e["event_index"] for e in chains[t["logical_id"]]] for t in tokens},
+                "expected_sequences": [], "received_sequences": [], "missing_sequences": [],
+                "candidate_eligible": False, "mutation_hit": False, "semantic_effect": False}
+    except (KeyError, TypeError, ValueError, IndexError, TopologyBackendError):
+        return None
+
+
 def _delivery_no_obligation_basis(opened, events):
     """Fresh observed identity/type or complete direct NONE, never QoS intent.
 
@@ -1555,10 +1712,18 @@ def run_topology(program, config, output_dir, *, backend=None):
                 continue
             if endpoint_id is not None and endpoint_id not in (opened["writer"], opened["reader"]) and topic != opened.get("topic"):
                 continue
-            if reason is not None:
+            # Freeze already observed delivery closure before lifecycle side
+            # effects retire a token or change the same-topic inventory. NONE /
+            # no-obligation is snapshot-scoped, not a delivered sentinel: keep
+            # its conservative inventory interruption even if valid right now.
+            evidence = _delivery_window_evidence(opened, events)
+            delivered_before_change = (reason == "endpoint_lifecycle_changed"
+                and evidence["window_complete"]
+                and evidence["closure_status"] in {"closed", "closed_with_gap"})
+            if reason is not None and not delivered_before_change:
                 emit("topology_delivery_window_interrupted", open_ref=opened["event_index"],
                      reason=reason, fixture=not backend.real_ros, candidate_eligible=False)
-            evidence = _delivery_window_evidence(opened, events)
+                evidence = _delivery_window_evidence(opened, events)
             close = emit("topology_delivery_window_closed",
                          **{k: opened[k] for k in _PAIR_KEY},
                          open_ref=opened["event_index"], **evidence,
@@ -1729,6 +1894,9 @@ def run_topology(program, config, output_dir, *, backend=None):
             if not matching:
                 basis = (_delivery_no_sends_basis(live[w]["handle"], live[r]["handle"], effective_program, events, chains)
                          if phase == "after_program" and lifecycle_ok and observed else None)
+                if basis is None and phase == "after_program" and lifecycle_ok and observed:
+                    basis = _delivery_recreated_no_sends_basis(
+                        live[w]["handle"], live[r]["handle"], effective_program, events, chains)
                 if basis is not None:
                     receipt = emit("topology_delivery_no_sends", writer=w, reader=r,
                                    writer_generation=live[w]["generation"], reader_generation=live[r]["generation"],
@@ -2001,9 +2169,9 @@ def run_topology(program, config, output_dir, *, backend=None):
                     if st["alive"] and st["handle"] is not None:
                         # recreate replaces a live endpoint; destroy is a real step.
                         try:
-                            cleanup = backend.destroy_endpoint(st["handle"])
                             close_delivery_windows("endpoint_lifecycle_changed", endpoint_id=eid,
                                                    topic=endpoint_specs[eid]["topic"])
+                            cleanup = backend.destroy_endpoint(st["handle"])
                         except TopologyBackendError as exc:
                             record_guard(action, "predecessor_destroy_failed",
                                          type(exc).__name__, kind="tool", before=before)
@@ -2027,9 +2195,9 @@ def run_topology(program, config, output_dir, *, backend=None):
                                      details=exc.details, before=before)
                         continue
                     try:
-                        handle = backend.create_endpoint(endpoint_specs[eid], gen, worker_roles[eid])
                         close_delivery_windows("endpoint_lifecycle_changed", endpoint_id=eid,
                                                topic=endpoint_specs[eid]["topic"])
+                        handle = backend.create_endpoint(endpoint_specs[eid], gen, worker_roles[eid])
                     except TopologyUnsupported as exc:
                         record_guard(action, exc.code, str(exc), kind="capability",
                                      details=exc.details, before=before)
@@ -2071,9 +2239,9 @@ def run_topology(program, config, output_dir, *, backend=None):
                                      "destroy requires current live generation", before=before)
                         continue
                     try:
-                        cleanup = backend.destroy_endpoint(st["handle"])
                         close_delivery_windows("endpoint_lifecycle_changed", endpoint_id=eid,
                                                topic=endpoint_specs[eid]["topic"])
+                        cleanup = backend.destroy_endpoint(st["handle"])
                     except TopologyBackendError as exc:
                         record_guard(action, "endpoint_destroy_error", type(exc).__name__,
                                      kind="tool", before=before)
@@ -2471,11 +2639,14 @@ def run_topology(program, config, output_dir, *, backend=None):
                 writer = events[claim["writer_creation_ref"]]
                 reader = events[claim["reader_creation_ref"]]
                 chains = {eid: [events[i] for i in refs] for eid, refs in claim["snapshot_refs"].items()}
-                basis = _delivery_no_sends_basis(writer, reader, effective_program, events, chains)
+                regenerated = claim.get("schema") == "r2f.topology-delivery-no-sends/v2"
+                validator = _delivery_recreated_no_sends_basis if regenerated else _delivery_no_sends_basis
+                basis = validator(writer, reader, effective_program, events, chains)
                 valid = cleanup_complete and basis is not None and all(claim.get(k) == v for k, v in basis.items())
                 for token in (writer, reader):
                     exits = [e for e in events if e.get("event") == "topology_worker_exit"
-                             and e.get("logical_id") == token["logical_id"]]
+                             and e.get("logical_id") == token["logical_id"]
+                             and (not regenerated or e.get("generation") == token["generation"])]
                     valid = valid and len(exits) == 1 and exits[0].get("returncode") == 0 and all(
                         exits[0].get(k) == token[k] for k in
                         ("generation", "endpoint_gid", "pid", "process_start_ticks", "endpoint_generation"))

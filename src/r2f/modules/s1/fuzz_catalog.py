@@ -172,6 +172,10 @@ class RuleSpec:
 # Runtime binding ids that already exist in the checked-out runtime/identity
 # code.  A binding claim here is still not execution evidence.
 RUNTIME_BINDINGS = {
+    "pair.offered_requested_reliability": {
+        "runtime_field": "writer_qos.reliability,reader_qos.reliability",
+        "wired_in": ("runtime.ros2_pair.normalize_config",), "phase": "endpoint_create",
+    },
     "late_joiner.reader_delay_sec": {
         "runtime_field": "reader_delay_sec",
         "wired_in": ("campaign.identity.semantic_input", "runtime.ros2_pair.normalize_config"),
@@ -1252,5 +1256,22 @@ def f2_live_contract():
         rules=[rule_to_core(RULES[rid], RULE_EFFECT_ID[rid]) for rid in rule_ids],
         effects=[effect_to_core(eid) for eid in effect_ids],
     )
+    contract.validate()
+    return contract
+
+
+def g01_live_contract():
+    """Exact revision1 pair route; M08 remains outside default/F1 registration."""
+    from r2f.core.mutation_plan import MutationSurface, ExplorationContract
+    data = f2_generation_surface("G01").to_dict()
+    data.update(runtime_binding="pair.offered_requested_reliability")
+    surface = MutationSurface.from_dict(data)
+    rule_ids = set(surface.rule_ids)
+    effect_ids = {surface.effect_id} | {RULE_EFFECT_ID[rid] for rid in rule_ids}
+    fact_ids = set(surface.fact_ids) | {fid for rid in rule_ids for fid in RULES[rid].required_fact_ids}
+    contract = ExplorationContract(
+        surfaces=[surface], facts=[fact_to_core(FACT_SPECS[fid]) for fid in sorted(fact_ids)],
+        rules=[rule_to_core(RULES[rid], RULE_EFFECT_ID[rid]) for rid in sorted(rule_ids)],
+        effects=[effect_to_core(eid) for eid in sorted(effect_ids)])
     contract.validate()
     return contract

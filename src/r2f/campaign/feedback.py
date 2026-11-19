@@ -6,9 +6,10 @@ Replaying the same ordered log with the same RNG seed reproduces selection.
 """
 from __future__ import annotations
 
-from collections import Counter, defaultdict
+from collections import Counter
 from copy import deepcopy
 from dataclasses import dataclass, field
+import re
 
 from r2f.core.evidence import canonical_hash
 from r2f.core.observation_status import observation_complete, tool_error
@@ -106,3 +107,75 @@ class FeedbackLog:
         for event in events:
             log.events.append(deepcopy(event))
         return log
+
+    @classmethod
+    def from_dict(cls, data):
+        """Strict artifact restore, including edge derivation from provenance.
+
+        Hashes detect corruption, not authenticity. This checks the canonical
+        projection contract but does not open raw files or certify execution.
+        The legacy ``from_events`` copy helper intentionally remains unchanged.
+        """
+        if not isinstance(data, dict) or data.get("schema") != SCHEMA:
+            raise ValueError("unsupported feedback schema")
+        events = data.get("events")
+        if not isinstance(events, list):
+            raise ValueError("feedback events must be a list")
+        for event in events:
+            if not isinstance(event, dict):
+                raise ValueError("feedback event must be a dict")
+            for key in ("event_sha256", "content_sha256"):
+                if not isinstance(event.get(key), str) or not re.fullmatch(r"[0-9a-f]{64}", event[key]):
+                    raise ValueError("invalid feedback " + key)
+            if canonical_hash({k: v for k, v in event.items() if k != "event_sha256"}) != event["event_sha256"]:
+                raise ValueError("feedback event hash mismatch")
+            if any(type(event.get(k)) is not bool for k in ("executed", "coverage", "complete", "tool_error")):
+                raise ValueError("invalid feedback flags")
+            if event["coverage"] != event["complete"] or (event["complete"] and (
+                    not event["executed"] or event["tool_error"])):
+                raise ValueError("feedback coverage requires complete executed observation")
+            surface = event.get("surface_class")
+            if surface is not None and (not isinstance(surface, list) or len(surface) not in (2, 3)
+                    or any(not isinstance(x, str) or not x for x in surface)):
+                raise ValueError("invalid feedback surface class")
+            edge = event.get("edge_id")
+            if edge is not None:
+                provenance = event.get("edge_provenance")
+                if (not event["coverage"] or not isinstance(edge, str)
+                        or not re.fullmatch(r"[0-9a-f]{64}", edge)
+                        or not isinstance(provenance, dict)
+                        or provenance.get("schema") != "r2f.s1-feedback-edge-provenance/v1"
+                        or not isinstance(provenance.get("observation"), dict)):
+                    raise ValueError("feedback edge provenance required")
+                observation = provenance["observation"]
+                if (edge_id(observation) != edge or surface is None
+                        or tuple(surface[:2]) != surface_class(observation)):
+                    raise ValueError("feedback edge provenance mismatch")
+            elif event.get("edge_provenance") is not None:
+                raise ValueError("edge provenance without an edge")
+        log = cls.from_events(events)
+        if data != log.to_dict():
+            raise ValueError("feedback identity or summary mismatch")
+        return log
+
+    @classmethod
+    def from_partitions(cls, partitions, *, compatibility):
+        """Restore compatible run-local artifacts as one canonical log.
+
+        Each member supplies run_id, feedback.to_dict() and compatibility from
+        its authoritative manifest/contract. No scheduler is changed implicitly.
+        """
+        from .feedback_aggregate import FeedbackAggregate
+        aggregate = FeedbackAggregate(compatibility)
+        for partition in partitions:
+            aggregate.import_run(partition["run_id"], partition["feedback"],
+                                 compatibility=partition["compatibility"])
+        return aggregate.feedback_log()
+
+    @classmethod
+    def merge_partition_file(cls, path, *, compatibility, run_id, feedback):
+        """Persist terminal feedback without replacing any live scheduler log."""
+        from .feedback_aggregate import merge_feedback_file
+        aggregate, receipt = merge_feedback_file(path, compatibility=compatibility,
+                                                 run_id=run_id, feedback=feedback)
+        return aggregate.feedback_log(), receipt

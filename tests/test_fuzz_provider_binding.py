@@ -183,7 +183,7 @@ class ExploratoryTargets(unittest.TestCase):
     def setUp(self):
         self.targets = exploratory_target_declarations()
 
-    def test_five_targets_revision_zero_and_required_untouched(self):
+    def test_only_g01_revision_one_and_required_untouched(self):
         self.assertEqual(tuple(self.targets), catalog.F2_SURFACE_IDS and
                          ("discovery.late_endpoint.fuzz_v1", "discovery.late_join_delivery.fuzz_v1",
                           "discovery.interruption_recovery.fuzz_v1",
@@ -191,7 +191,7 @@ class ExploratoryTargets(unittest.TestCase):
                           "discovery.match_compatibility.fuzz_v1"))
         for target_id, target in self.targets.items():
             self.assertEqual(target.target_id, target_id)
-            self.assertEqual(target.target_revision, 0)
+            self.assertEqual(target.target_revision, 1 if target_id == "discovery.match_compatibility.fuzz_v1" else 0)
             self.assertIsInstance(target.exploration_contract, ExplorationContract)
         # Required declarations are produced by a separate function and are
         # unaffected by building exploratory ones.
@@ -212,7 +212,7 @@ class ExploratoryTargets(unittest.TestCase):
                     self.assertIn(surface.effect_id, catalog.EFFECTS)
                     self.assertIn(surface.runtime_binding, catalog.RUNTIME_BINDINGS)
 
-    def test_f1_targets_declare_routable_surfaces_and_f2_is_pending(self):
+    def test_f1_contracts_unchanged_and_exact_g01_revision1_has_live_projection(self):
         for target_id, target in self.targets.items():
             activation = target.observation_contract["activation"]
             pending = target.observation_contract["pending_surface_ids"]
@@ -222,8 +222,14 @@ class ExploratoryTargets(unittest.TestCase):
                 self.assertTrue(target.observation_contract["reuses"] in EXECUTION_ORDER)
             else:
                 self.assertEqual(target_id, "discovery.match_compatibility.fuzz_v1")
-                self.assertEqual(pending, ["G01"])
-                self.assertEqual(target.exploration_contract.surfaces, [])
+                self.assertEqual(pending, [])
+                self.assertEqual(set(target.exploration_contract.surface_by_id), {"G01"})
+                surface = target.exploration_contract.surface_by_id["G01"]
+                self.assertTrue(surface.executable)
+                self.assertEqual(surface.mutator_ids, ["M08"])
+                # The authored generation template remains non-executable.
+                self.assertFalse(catalog.f2_generation_surface("G01").executable)
+                self.assertEqual(target.target_revision, 1)
 
     def test_runtime_backend_reuse_is_explicit(self):
         self.assertIsNone(EXPLORATORY_RUNTIME_TARGET["discovery.match_compatibility.fuzz_v1"])
@@ -407,7 +413,7 @@ class PlanRefusals(unittest.TestCase):
             self.provider.prepare(scenario)
         self.assertIn("contract_hash", str(caught.exception))
 
-    def test_f2_target_has_no_live_backend_and_says_so(self):
+    def test_g01_requires_its_own_plan_and_retains_observation_guards(self):
         scenario = _scenario(self.targets["discovery.match_compatibility.fuzz_v1"])
         with self.assertRaises(ExploratoryInputError) as caught:
             self.provider.prepare(scenario)
@@ -417,8 +423,24 @@ class PlanRefusals(unittest.TestCase):
         scenario = _scenario(self.targets["discovery.match_compatibility.fuzz_v1"], plan)
         with self.assertRaises(ExploratoryInputError) as caught:
             self.provider.prepare(scenario)
-        self.assertIn("no live routable surface", str(caught.exception))
-        self.assertIn("G01", str(caught.exception))
+        self.assertIn("contract_hash", str(caught.exception))
+        from r2f.core.mutators import mutate_f2
+        target = self.targets["discovery.match_compatibility.fuzz_v1"]
+        contract = target.exploration_contract
+        base = {"topic": "/g01", "message_type": "std_msgs/msg/String",
+                "qos": {}, "writer_qos": {"reliability": "best_effort"},
+                "reader_qos": {"reliability": "reliable"}, "pair_relation": "BR"}
+        proposal = mutate_f2(base, contract.surface_by_id["G01"], make_rng(7),
+                             context={"pair_relation": "RR"}, mutator_id="M08")
+        plan = compose(base, [proposal], contract, rng_seed=7)
+        prepared = self.provider.prepare(_scenario(target, plan))
+        self.assertEqual(prepared["final_input"], plan.final_config)
+        self.assertEqual(prepared["plan_status"], "valid")
+        self.assertEqual(contract.surface_by_id["G01"].sut_guards,
+                         {"identity_backed_match_or_delivery_only": "unknown"})
+        # Preparation has no match/delivery witness or SUT verdict.
+        self.assertNotIn("oracle", prepared)
+        self.assertNotIn("hit", prepared)
 
     def test_unknown_surface_and_rule_references_are_named(self):
         with self.assertRaises(catalog.CatalogError) as caught:

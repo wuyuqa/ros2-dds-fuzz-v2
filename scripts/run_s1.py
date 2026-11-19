@@ -37,6 +37,8 @@ def main(argv=None):
                         help="explicit cumulative exploratory selection cap (default: profile budget)")
     parser.add_argument("--resume-from", type=Path,
                         help="saved checkpoint.json or its output directory; old evidence stays read-only")
+    parser.add_argument("--feedback-aggregate", type=Path,
+                        help="optional terminal cross-run feedback accounting; frozen single-target/rule scope only; never changes BFS eligibility")
     args = vars(parser.parse_args(argv))
     if args.pop("list_targets"):
         print(json.dumps({"schema_version": "r2f.s1-target-catalog/v1",
@@ -52,6 +54,9 @@ def main(argv=None):
     cycle_id = args.pop("cycle_id")
     resume_path = args.pop("resume_from")
     scheduler_policy = args.pop("scheduler_policy")
+    feedback_aggregate = args.pop("feedback_aggregate")
+    if feedback_aggregate is not None and not profile_path:
+        parser.error("--feedback-aggregate is only valid with --exploratory-profile")
     if scheduler_policy is not None and not profile_path:
         parser.error("--scheduler-policy is only valid with --exploratory-profile")
     if resume_path and not profile_path:
@@ -113,13 +118,15 @@ def main(argv=None):
             scheduler=scheduler, profile=profile, execute=args["execute"],
             runtime=runtime, continuation=continuation, checkpoint_hook=checkpoint_hook,
             run_id=args["run_id"], max_inputs=args["max_inputs"], domain_id=args["domain_id"],
-            runtime_boundary=runtime_boundary)
+            runtime_boundary=runtime_boundary, feedback_aggregate=feedback_aggregate)
         output = {"run_id": result["run_id"], "cycle_path": str(Path(args["output_dir"]).resolve() / "cycle.json"),
                   "execution_stage": result["rows"][0].get("execution_stage") if result["rows"] else None,
                   "runtime_boundary": result.get("runtime_boundary", runtime_boundary),
                   "runtime_formal": result.get("runtime_formal", False)}
         if "search_summary" in result:
             output["search_summary"] = result["search_summary"]
+        if "feedback_aggregate" in result:
+            output["feedback_aggregate"] = result["feedback_aggregate"]
         print(json.dumps(output, indent=2))
         return 0 if not args["execute"] or any(r.get("actual_run") for r in result["rows"]) else 1
     args.pop("max_inputs")

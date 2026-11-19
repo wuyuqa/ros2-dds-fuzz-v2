@@ -161,8 +161,10 @@ def _replay_config(capsule, replay_id, domain, source):
     spec = ({"backend": "topology_pair", "carrier": "ros2_endpoint", "mutation_kind": "endpoint_program"}
             if topology and target.observation_contract.get("runtime_capability") == TOPOLOGY_CAPABILITY
             else EXPLORATORY_TARGETS.get(scenario.target_id))
-    if (spec is None or spec['backend'] not in
-            {'endpoint_pair', 'discovery_namespace', 'projection_pair', 'topology_pair'}):
+    backends = {'endpoint_pair', 'discovery_namespace', 'projection_pair', 'topology_pair'}
+    if scenario.target_id == 'discovery.match_compatibility.fuzz_v1' and scenario.target_revision == 1:
+        backends.add('relation_pair')
+    if spec is None or spec['backend'] not in backends:
         raise _Failure('fail_environment', 'unsupported_runtime_backend',
                        'registered target has no admitted replay runtime backend', 'preflight')
     if (scenario.carrier, scenario.mutation_kind) != (spec['carrier'], spec['mutation_kind']):

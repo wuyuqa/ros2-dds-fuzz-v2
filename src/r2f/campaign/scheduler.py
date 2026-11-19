@@ -288,6 +288,11 @@ class ExploratoryScheduler:
         parent = entry.get("final_config")
         if surface is None or not isinstance(parent, dict):
             return []
+        if (entry.get("target_id") == "discovery.match_compatibility.fuzz_v1"
+                and entry.get("target_revision") == 1
+                and entry.get("surface_id") == "G01" and entry.get("mutator_id") == "M08"
+                and surface.executable and surface.mutator_ids == ["M08"]):
+            return ["representative"]
         try:
             kinds = _wide_kinds(surface, parent)
             if has_routes(entry):

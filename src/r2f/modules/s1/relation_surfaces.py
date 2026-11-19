@@ -945,6 +945,7 @@ def relation_surface_core_projection():
     return {
         "schema": SCHEMA,
         "status": "adapter_ready_pending_main_wiring",
+        "runtime_wiring_status": "raw_seam_wired_campaign_adapter_pending",
         "replacement_points": copy.deepcopy(REPLACEMENT_POINTS),
         "surfaces": {
             "G01": {
@@ -958,7 +959,11 @@ def relation_surface_core_projection():
                 "incompatible_pairs": sorted(G01_INCOMPATIBLE_PAIRS),
                 "per_edge_required": True,
                 "aggregate_match_count_is_not_evidence": True,
-                "runtime_binding": "relation_observer.edges_from_events",
+                "runtime_binding": "relation_observer.g01_runtime_observation",
+                "reliability_compatibility_is_not_match": True,
+                "finite_unmatched_is_sut_failure": False,
+                "best_effort_reliable_delivery_obligation": False,
+                "configuration_hit_is_not_relation_effect": True,
                 "activation": "F2-adapter",
             },
             "W01": {

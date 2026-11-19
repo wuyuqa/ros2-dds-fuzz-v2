@@ -103,9 +103,10 @@ class _Cycle:
 
 
 class RouteTableContracts(unittest.TestCase):
-    def test_routes_cover_exactly_the_four_declared_f1_targets(self):
-        self.assertEqual(_F1_CYCLE_TARGETS, {LATE, LATE_JOIN, RECOVERY, PROJECTION})
-        self.assertNotIn(COMPAT, _F1_CYCLE_TARGETS)
+    def test_routes_cover_four_legacy_targets_plus_exact_g01(self):
+        self.assertEqual(_F1_CYCLE_TARGETS, {LATE, LATE_JOIN, RECOVERY, PROJECTION, COMPAT})
+        self.assertEqual(_EXPLORATORY_ROUTES[COMPAT]["backend"], "relation_pair")
+        self.assertEqual(_EXPLORATORY_ROUTES[COMPAT]["target_revision"], 1)
         self.assertEqual(_EXPLORATORY_ROUTES[LATE]["carrier"], "ros2_endpoint")
         self.assertEqual(_EXPLORATORY_ROUTES[LATE_JOIN]["carrier"], "ros2_endpoint")
         self.assertEqual(_EXPLORATORY_ROUTES[RECOVERY]["carrier"], "wire_proxy")
@@ -374,10 +375,17 @@ class UnknownAndLatePaths(unittest.TestCase):
         for key in ("generated", "unique_inputs", "attempted", "actual", "unique_actual"):
             self.assertEqual(result["budget"][key], 0, key)
 
-    def test_match_compatibility_is_not_routed(self):
+    def test_match_compatibility_is_exactly_routed_not_globally_promoted(self):
         entry_contract = _contract(COMPAT)
-        self.assertEqual(entry_contract.surfaces, [])
-        self.assertNotIn(COMPAT, _F1_CYCLE_TARGETS)
+        self.assertEqual(set(entry_contract.surface_by_id), {"G01"})
+        self.assertIn(COMPAT, _F1_CYCLE_TARGETS)
+        self.assertFalse(fuzz_catalog.f2_generation_surface("G01").executable)
+        with self.assertRaises(fuzz_catalog.UnsupportedCapabilityError):
+            fuzz_catalog.surface_to_core(fuzz_catalog.SURFACES["G01"])
+        from r2f.core.mutators import MUTATORS
+        self.assertNotIn("M08", MUTATORS)
+        for target_id in (LATE, LATE_JOIN, RECOVERY, PROJECTION):
+            self.assertNotIn("G01", _contract(target_id).surface_by_id)
 
     def test_late_endpoint_path_is_unchanged(self):
         cycle = _Cycle(self, LATE, "P01")

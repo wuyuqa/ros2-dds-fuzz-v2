@@ -285,6 +285,13 @@ def _plan_capabilities(contract, *, target_id=None, carrier=None, mutation_kind=
     route = exploratory_runtime_capabilities().get(target_id, {})
     if not isinstance(route, dict):
         route = {}
+    if (target_id == "discovery.match_compatibility.fuzz_v1"
+            and carrier == "ros2_endpoint" and mutation_kind == "endpoint_qos_variation"
+            and route.get("backend") == "relation_pair"
+            and set(contract.surface_by_id) == {"G01"}):
+        caps.update(activation=("F2",), mutators=("M08",),
+                    surface_kinds=("compatibility",),
+                    runtime_bindings=("pair.offered_requested_reliability",))
     maximum = route.get("max_runtime_windows")
     route_surfaces = route.get("surfaces")
     if (target_id == F2_WINDOWS_TARGET and carrier == "wire_proxy"
@@ -336,7 +343,9 @@ def validate_exploratory_plan(plan, contract, *, target_id=None, carrier=None,
     result = validate_plan(plan, capabilities=caps, contract=contract)
     if f2_route and result.status in {"valid", "needs_observation"}:
         _validate_f2_windows_input(plan, contract, maximum=caps["max_runtime_windows"])
-    if result.status != "valid" and not (f2_route and result.status == "needs_observation"):
+    g01_route = (target_id == "discovery.match_compatibility.fuzz_v1"
+                 and caps.get("mutators") == ("M08",))
+    if result.status != "valid" and not ((f2_route or g01_route) and result.status == "needs_observation"):
         raise ExploratoryInputError(
             f"plan is not live-routable ({result.status}): " + "; ".join(result.reasons))
     return result

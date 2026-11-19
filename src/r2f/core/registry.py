@@ -3,7 +3,7 @@
 from collections.abc import Mapping
 from types import MappingProxyType
 
-from ._json import nonempty
+from ._json import nonempty, snapshot
 from .semantic_target import SemanticTarget
 from .interfaces import ExecutionServices
 
@@ -13,6 +13,7 @@ class Registry:
         self._modules = {}
         self._targets = {}
         self._services = {}
+        self._target_modules = {}
 
     @property
     def modules(self):
@@ -55,6 +56,7 @@ class Registry:
         self._modules[identifier] = module
         self._targets.update(prepared)
         self._services.update(services)
+        self._target_modules.update({key: identifier for key in prepared})
         return module
 
     def get_target(self, target_id):
@@ -69,3 +71,20 @@ class Registry:
         if target_id not in self._services:
             raise ValueError("target has no execution services: " + target_id)
         return self._services[target_id]
+
+    def get_rule_lineage(self, target_id, rule_id):
+        """Dispatch provenance to the registered owner; never search other modules.
+
+        A detached metadata result grants no execution or qualification. Modules
+        without a lineage resolver fail closed without changing their registration.
+        """
+        nonempty(rule_id, "rule_id")
+        owner = self._modules[self._target_modules[target_id]]
+        resolver = getattr(owner, "resolve_rule_lineage", None)
+        if not callable(resolver):
+            raise ValueError("target owner has no rule lineage resolver: " + target_id)
+        result = resolver(target_id, rule_id)
+        if not isinstance(result, dict) or result.get("target_id") != target_id \
+                or result.get("rule_id") != rule_id:
+            raise ValueError("rule lineage resolver returned missing or mismatched scope")
+        return snapshot(result)

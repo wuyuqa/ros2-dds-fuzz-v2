@@ -1,0 +1,307 @@
+{
+  "contract_sha256": "7eb1d80a6f6308a12f64e020d850676ae596809a769f649375b83f3265efa1f7",
+  "decision_source": "results/main-review/s1-user-review-20261119/main/g01-extra-scope-decision.json",
+  "manifest": {
+    "control_contract": {},
+    "evidence_policy": {},
+    "expected_effect_set": {},
+    "exploration_contract": {
+      "contract_version": 1,
+      "effects": [
+        {
+          "allowed_observations": [
+            "incompatible_pair_not_matched",
+            "compatible_pair_matched"
+          ],
+          "effect_id": "s1.discovery.compatibility_guard",
+          "forbidden_residuals": [
+            "prohibited_match_observed",
+            "prohibited_delivery_observed"
+          ],
+          "schema": "r2f.effect-spec/v1",
+          "version": 1,
+          "window": "pair_compatibility_window"
+        }
+      ],
+      "facts": [
+        {
+          "freshness": "per_window",
+          "id": "delivery.receive_sequence.v1",
+          "identity_binding": "reader and writer identity plus generation",
+          "missing_policy": "unknown",
+          "producer_id": "runtime.ros2_pair",
+          "schema": "r2f.fact-spec/v1",
+          "scope": "window",
+          "sources": [
+            "receive_tokens",
+            "raw_events"
+          ],
+          "unit": "count",
+          "value_type": "int",
+          "version": 1
+        },
+        {
+          "freshness": "per_window",
+          "id": "delivery.send_sequence.v1",
+          "identity_binding": "writer identity plus generation",
+          "missing_policy": "unknown",
+          "producer_id": "runtime.ros2_pair",
+          "schema": "r2f.fact-spec/v1",
+          "scope": "window",
+          "sources": [
+            "publish_tokens",
+            "raw_events"
+          ],
+          "unit": "count",
+          "value_type": "int",
+          "version": 1
+        },
+        {
+          "freshness": "per_snapshot",
+          "id": "discovery.pair_match.v1",
+          "identity_binding": "writer/reader id plus generation",
+          "missing_policy": "unknown",
+          "producer_id": "campaign.runtime_adapter",
+          "schema": "r2f.fact-spec/v1",
+          "scope": "pair",
+          "sources": [
+            "match_snapshot",
+            "graph_snapshot"
+          ],
+          "unit": "none",
+          "value_type": "pair_relation",
+          "version": 1
+        },
+        {
+          "freshness": "per_observation",
+          "id": "endpoint.observed_qos.v1",
+          "identity_binding": "endpoint id plus generation",
+          "missing_policy": "unknown",
+          "producer_id": "runtime.worker",
+          "schema": "r2f.fact-spec/v1",
+          "scope": "endpoint",
+          "sources": [
+            "ros_graph",
+            "passive_rtps_wire"
+          ],
+          "unit": "mixed",
+          "value_type": "str",
+          "version": 1
+        },
+        {
+          "freshness": "per_input",
+          "id": "endpoint.submitted_qos.v1",
+          "identity_binding": "submitted endpoint role and value",
+          "missing_policy": "unknown",
+          "producer_id": "campaign.identity.semantic_input",
+          "schema": "r2f.fact-spec/v1",
+          "scope": "endpoint",
+          "sources": [
+            "campaign.identity",
+            "input_capsule"
+          ],
+          "unit": "mixed",
+          "value_type": "str",
+          "version": 1
+        },
+        {
+          "freshness": "per_window",
+          "id": "observation.completeness.v1",
+          "identity_binding": "observer and window ids",
+          "missing_policy": "unknown",
+          "producer_id": "campaign.runtime_adapter",
+          "schema": "r2f.fact-spec/v1",
+          "scope": "window",
+          "sources": [
+            "observer_health",
+            "log_closure",
+            "raw_events"
+          ],
+          "unit": "none",
+          "value_type": "bool",
+          "version": 1
+        }
+      ],
+      "rules": [
+        {
+          "allowed_effects": [
+            "s1.discovery.compatibility_guard"
+          ],
+          "applies_when": {
+            "incompatible": [
+              "BR"
+            ],
+            "pair_relation": "offered_requested_reliability"
+          },
+          "evaluator_id": "modules.s1.oracles.evaluate_match_compatibility_guard",
+          "forbidden_residuals": [
+            "prohibited_match_observed",
+            "prohibited_delivery_observed"
+          ],
+          "id": "s1.discovery.compatibility_guard.v1",
+          "limitations": "creation success is never itself a violation; compatible finite-window no-match is unknown",
+          "primary_or_supporting": "primary",
+          "required_fact_ids": [
+            "endpoint.submitted_qos.v1",
+            "endpoint.observed_qos.v1",
+            "discovery.pair_match.v1",
+            "delivery.send_sequence.v1",
+            "delivery.receive_sequence.v1",
+            "observation.completeness.v1"
+          ],
+          "responsibility_layer": "s1",
+          "schema": "r2f.rule-spec/v1",
+          "spec_refs": [
+            "docs/s1-fuzz-expansion-implementation-plan-2026-11-16.md#5.3"
+          ],
+          "version": 1
+        }
+      ],
+      "schema": "r2f.exploration-contract/v1",
+      "surfaces": [
+        {
+          "activation": "F2",
+          "allowed_with": [],
+          "boundary_classes": [
+            "relation_false",
+            "relation_true"
+          ],
+          "carrier_id": "ros2_endpoint",
+          "conflicts_with": [],
+          "domain": {
+            "incompatible_pairs": [
+              "BR"
+            ],
+            "pairs": [
+              "RR",
+              "RB",
+              "BB",
+              "BR"
+            ]
+          },
+          "effect_id": "s1.discovery.compatibility_guard",
+          "fact_ids": [
+            "endpoint.submitted_qos.v1",
+            "endpoint.observed_qos.v1",
+            "discovery.pair_match.v1",
+            "delivery.send_sequence.v1",
+            "delivery.receive_sequence.v1",
+            "observation.completeness.v1"
+          ],
+          "input_paths": [
+            "writer_qos.reliability",
+            "reader_qos.reliability"
+          ],
+          "missing_policy": "unknown",
+          "mutator_ids": [
+            "M08"
+          ],
+          "order_after": [],
+          "rule_ids": [
+            "s1.discovery.compatibility_guard.v1"
+          ],
+          "runtime_binding": "pair.offered_requested_reliability",
+          "runtime_phase": "endpoint_create",
+          "schema": "r2f.mutation-surface/v1",
+          "source_refs": [
+            "docs/s1-fuzz-expansion-implementation-plan-2026-11-16.md#3.1 (engineering sampling budget, not a DDS normative bound)"
+          ],
+          "special_values": [],
+          "surface_id": "G01",
+          "surface_kind": "compatibility",
+          "sut_guards": {
+            "identity_backed_match_or_delivery_only": "unknown"
+          },
+          "tool_requires": {
+            "independent_role_qos": {
+              "required": true
+            },
+            "public_ros2_api": {
+              "required": true
+            }
+          },
+          "unit": "policy_pair",
+          "unsupported_policy": "reject",
+          "value_relations": [
+            "BR_is_incompatible_not_an_invalid_api_value"
+          ],
+          "value_type": "pair_relation",
+          "version": 1
+        }
+      ]
+    },
+    "intent_and_scope": "Revision1 offered/requested reliability pair route over public per-role QoS. M08 input activation is not live qualification; finite no-match is unknown, and best-effort carries no reliable-delivery obligation.",
+    "mutation_slots": [
+      {
+        "carrier": "ros2_endpoint",
+        "mutation_kind": "endpoint_qos_variation",
+        "parameters": {}
+      }
+    ],
+    "observation_contract": {
+      "activation": "F2",
+      "evidence": "no exploratory run is implied by this declaration",
+      "input_binding": "pair.offered_requested_reliability",
+      "pending_surface_ids": [],
+      "raw_recomputation": "g01_runtime_observation",
+      "receipt_kind": "pair_compatibility_window",
+      "reuse_kind": "runtime_adapter_and_observation_schema",
+      "reuses": null,
+      "schema": "s1.exploratory.v1",
+      "sources": [
+        "per_role_actual_qos",
+        "fresh_bidirectional_match_and_graph",
+        "window_bound_identity_send_receive"
+      ],
+      "surfaces": [
+        "G01"
+      ]
+    },
+    "rmw_applicability": [
+      "rmw_cyclonedds_cpp",
+      "rmw_fastrtps_cpp"
+    ],
+    "rule_contract": {
+      "compatibility_rule": "s1.discovery.compatibility_guard.v1",
+      "shared_with_required": null
+    },
+    "state_preconditions": [
+      {
+        "condition_id": "environment_ok",
+        "expected": true,
+        "fact": "environment_ok",
+        "operator": "eq"
+      },
+      {
+        "condition_id": "locks_held",
+        "expected": true,
+        "fact": "locks_held",
+        "operator": "eq"
+      }
+    ],
+    "state_steps": [
+      {
+        "action": "admit_environment",
+        "parameters": {},
+        "requires": [
+          {
+            "condition_id": "environment_ok",
+            "expected": true,
+            "fact": "environment_ok",
+            "operator": "eq"
+          },
+          {
+            "condition_id": "locks_held",
+            "expected": true,
+            "fact": "locks_held",
+            "operator": "eq"
+          }
+        ],
+        "step_id": "admit_environment"
+      }
+    ],
+    "target_id": "discovery.match_compatibility.fuzz_v1",
+    "target_revision": 1
+  },
+  "manifest_sha256": "508f099b04f5557cd5396ed05b46cfa8e1e24f8de4f7d46a8e023b94f1efbc75"
+}

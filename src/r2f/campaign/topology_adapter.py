@@ -618,6 +618,108 @@ def _no_obligation_send_covered(audit, pairs, send):
     return True
 
 
+def _recreated_history_windows(audit, pairs, projection, deliveries):
+    """Keep verified old windows separate from the current unsent generation.
+
+    This deliberately does NOT loosen the legacy live-generation NONE fence.
+    Only a freshly reconstructed v2 retirement inventory certifies this path;
+    every historical close is then re-read at its own old-generation boundary.
+    """
+    from .topology_state_projection import _Projection
+    projector = _Projection(audit.program, audit.path, audit.sha, audit.events,
+                            {"input_ref": audit.ref(audit.binding)})
+    boundary = audit.resolve(projection["receipt"]["after"]["boundary_ref"])
+    windows, certified = {}, set()
+    for pair in pairs:
+        w, r = pair["writer"], pair["reader"]
+        proof = pair["proofs"]["delivery_closure"]
+        if (w in certified or pair.get("writer_generation", 0) < 2
+                or pair.get("delivery_applicability") != "not_applicable_no_sends"
+                or pair.get("delivery_window_identity_complete") is not True
+                or proof.get("status") != "observed"
+                or proof.get("detail", {}).get("no_sends_schema") != "r2f.topology-delivery-no-sends/v2"):
+            continue
+        try:
+            value, _, detail = projector.recreated_no_sends(
+                audit.tokens[(w, pair["writer_generation"])],
+                audit.tokens[(r, pair["reader_generation"])], boundary)
+            _require(value == "no_obligation", "recreated_history_inventory_unknown")
+            pending = {}
+            for ref in detail["prior_window_close_refs"]:
+                close = audit.resolve(ref)
+                if close.get("writer") != w:
+                    continue
+                wg, rg = close["writer_generation"], close["reader_generation"]
+                _require(wg < pair["writer_generation"], "recreated_history_not_prior_generation")
+                value, rows, old_detail = projector.delivery(
+                    audit.tokens[(w, wg)], audit.tokens[(close["reader"], rg)], {}, close)
+                _require(value in {"closed", "no_obligation"} and not old_detail.get("missing"),
+                         "recreated_history_unclosed_obligation")
+                row = {"writer": w, "reader": close["reader"], "writer_generation": wg,
+                       "reader_generation": rg, "delivery_closure": value,
+                       "proofs": {"delivery_closure": {"status": "observed", "value": value,
+                           "detail": old_detail, "refs": [audit.ref(e) for e in rows]}},
+                       "generation_inventory_ref": detail["no_sends_ref"]}
+                row.update(_delivery_window(audit, row, deliveries))
+                _require(row.get("delivery_window_identity_complete") is True
+                         and row["delivery_closure"] in {"closed", "no_obligation"},
+                         "recreated_history_window_identity_incomplete")
+                pending[close["open_ref"]] = row
+            windows.update(pending)
+            certified.add(w)
+        except (ValueError, KeyError, TypeError, IndexError):
+            # A missing receipt/old ACK/retirement or unresolved old window
+            # leaves the historical send unresolved, never borrows g2 NONE.
+            continue
+    return list(windows.values())
+
+
+def _recreated_history_send_coverage(audit, windows, send):
+    """One old send requires its OWN complete window for every then-live reader."""
+    live = {}
+    for event in audit.events[:send["event_index"]]:
+        eid = event.get("logical_id")
+        if event["event"] == "endpoint_created" and audit.specs[eid]["role"] == "reader":
+            live[eid] = event["generation"]
+        elif event["event"] in {"endpoint_destroyed", "topology_endpoint_destroyed"}:
+            live.pop(eid, None)
+    if not live:
+        return None
+    rows = []
+    for row in windows:
+        if (row["writer"] != send.get("logical_id") or row["writer_generation"] != send.get("generation")
+                or live.get(row["reader"]) != row["reader_generation"]):
+            continue
+        proof = row["proofs"]["delivery_closure"]
+        detail = proof["detail"]
+        opened, close = (audit.resolve(detail[k]) for k in ("open_ref", "close_ref"))
+        if not (opened["event_index"] < send["event_index"] < close["event_index"]
+                and opened["monotonic_ns"] <= send["monotonic_ns"] <= close["monotonic_ns"]):
+            continue
+        if row["delivery_closure"] == "closed" and audit.ref(send) not in proof["refs"]:
+            continue
+        rows.append({"reader": row["reader"], "reader_generation": row["reader_generation"],
+                     "writer_generation": row["writer_generation"], "open_ref": audit.ref(opened),
+                     "close_ref": audit.ref(close), "closure": row["delivery_closure"],
+                     "generation_inventory_ref": row["generation_inventory_ref"]})
+    if len(rows) != len(live) or {r["reader"]: r["reader_generation"] for r in rows} != live:
+        return None
+    covered = {r["open_ref"]["event_index"] for r in rows}
+    for opened in audit.events[:send["event_index"]]:
+        if (opened["event"] != "topology_delivery_window_open"
+                or opened.get("writer") != send.get("logical_id")
+                or opened.get("writer_generation") != send.get("generation")):
+            continue
+        closes = [e for e in audit.events if e["event"] == "topology_delivery_window_closed"
+                  and e.get("open_ref") == opened["event_index"]]
+        if len(closes) != 1 or (closes[0]["event_index"] > send["event_index"]
+                                and opened["event_index"] not in covered):
+            return None
+    return {"send_ref": audit.ref(send), "writer": send["logical_id"],
+            "writer_generation": send["generation"], "reader_windows": rows,
+            "scope": "complete_historical_windows_not_current_generation_delivery"}
+
+
 def facts_from_events(events, runtime, config):
     """Produce typed facts from persisted raw. All missing evidence is explicit."""
     facts = {"schema": SCHEMA, "producer_id": TOPOLOGY_FACT_PRODUCER, "target_id": TOPOLOGY_TARGET,
@@ -660,11 +762,16 @@ def facts_from_events(events, runtime, config):
         facts["unknown_reasons_sample_identity"] = list(facts["unknown_reasons"])
         facts["pairs"] = _pair_facts(a, projection, facts["deliveries"])
         empty_windows = _historical_no_obligation_windows(a, facts["pairs"], projection)
+        historical = _recreated_history_windows(a, facts["pairs"], projection, facts["deliveries"])
+        facts["historical_send_coverage"] = [coverage for send in sends
+            if (coverage := _recreated_history_send_coverage(a, historical, send)) is not None]
+        covered_history = {c["send_ref"]["event_index"] for c in facts["historical_send_coverage"]}
         facts["unresolved_historical_obligations"] = [a.ref(s) for s in sends if not any(
             p["writer"] == s.get("logical_id") and p.get("writer_generation") == s.get("generation")
             and p.get("delivery_closure") in {"closed", "closed_with_gap", "open"}
             and a.ref(s) in p.get("proofs", {}).get("delivery_closure", {}).get("refs", [])
-            for p in facts["pairs"]) and not _no_obligation_send_covered(a, empty_windows, s)]
+            for p in facts["pairs"]) and not _no_obligation_send_covered(a, empty_windows, s)
+            and s["event_index"] not in covered_history]
         facts["application_audit"] = _application(a)
         facts["source_provenance_qualified"] = _source_qualification(a)
         facts["execution_evidence"] = not a.fixture

@@ -1,0 +1,101 @@
+{
+  "schema_version": "r2f.s1-fuzz-profile/v1",
+  "profile_id": "s1-fuzz-g01-pair-revision1",
+  "campaign_kind": "exploratory",
+  "enabled": false,
+  "seed_catalog_status": "authored_t02",
+  "description": "Exact G01 revision1 M08 pair enumeration; disabled offline profile, no live qualification.",
+  "required_catalog_included": false,
+  "target_ids": [
+    "discovery.match_compatibility.fuzz_v1"
+  ],
+  "surfaces": [
+    "G01"
+  ],
+  "seed_specs": [
+    {
+      "seed_id": "G01",
+      "target_id": "discovery.match_compatibility.fuzz_v1",
+      "boundary_class": "relation_true",
+      "executable": true,
+      "mutation_routes": [
+        {
+          "surface_id": "G01",
+          "boundary_class": "relation_true",
+          "mutator_id": "M08"
+        }
+      ]
+    }
+  ],
+  "declared_seed_specs_union": [
+    {
+      "seed_id": "G01",
+      "target_id": "discovery.match_compatibility.fuzz_v1",
+      "boundary_class": "relation_true",
+      "executable": true,
+      "mutation_routes": [
+        {
+          "surface_id": "G01",
+          "boundary_class": "relation_true",
+          "mutator_id": "M08"
+        }
+      ]
+    }
+  ],
+  "cycles": [
+    {
+      "cycle_id": "g01-pair",
+      "target_id": "discovery.match_compatibility.fuzz_v1",
+      "surfaces": [
+        "G01"
+      ],
+      "runner_slice": "endpoint_pair_slice",
+      "seed_specs": [
+        {
+          "seed_id": "G01",
+          "target_id": "discovery.match_compatibility.fuzz_v1",
+          "boundary_class": "relation_true",
+          "executable": true,
+          "mutation_routes": [
+            {
+              "surface_id": "G01",
+              "boundary_class": "relation_true",
+              "mutator_id": "M08"
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "composition": {
+    "mutation_routes_schema": "r2f.mutation-routes/v1",
+    "mode": "baseline_then_declared_route",
+    "status": "offline_planning_only"
+  },
+  "rmws": [
+    "rmw_cyclonedds_cpp"
+  ],
+  "budget": {
+    "max_inputs": 16,
+    "warmup_inputs": 0,
+    "max_seconds": 120
+  },
+  "corpus": {
+    "capacity": 256,
+    "bucket_limit": 3
+  },
+  "sampling_kinds": [
+    "representative"
+  ],
+  "chain_length": 1,
+  "execution_boundary": "offline-only; no ROS/campaign/live authorization",
+  "search": {
+    "schema": "r2f.input-search-config/v1",
+    "mode": "input_search_bfs",
+    "max_depth": 2,
+    "max_nodes": 8,
+    "samples_per_class": 4,
+    "max_tasks": 64
+  },
+  "scheduler_policy": "bfs"
+}

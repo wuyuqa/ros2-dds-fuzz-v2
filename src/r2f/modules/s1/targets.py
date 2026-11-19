@@ -191,8 +191,9 @@ _EXPLORATORY_SCOPE = {
     "discovery.match_compatibility.fuzz_v1": (
         (), ("s1.discovery.compatibility_guard.v1",), "endpoint_qos_variation",
         "ros2_endpoint", "F2",
-        "Offered/requested reliability relation guard. Capability pending: the "
-        "per-role QoS runtime binding is not wired, so no live input is claimed."),
+        "Revision1 offered/requested reliability pair route over public per-role QoS. "
+        "M08 input activation is not live qualification; finite no-match is unknown, "
+        "and best-effort carries no reliable-delivery obligation."),
 }
 
 
@@ -214,7 +215,11 @@ def exploratory_target_declarations(*, runtime_capability=None):
     targets = {}
     for target_id in EXPLORATORY_TARGET_ORDER:
         surface_ids, extra_rules, kind, carrier, activation, scope = _EXPLORATORY_SCOPE[target_id]
-        if activation == "F1":
+        if target_id == "discovery.match_compatibility.fuzz_v1":
+            contract = fuzz_catalog.g01_live_contract()
+            pending_surfaces = []
+            declared_surfaces = ("G01",)
+        elif activation == "F1":
             contract = fuzz_catalog.exploration_contract(surface_ids, extra_rule_ids=extra_rules)
             pending_surfaces = []
             declared_surfaces = tuple(surface_ids)
@@ -230,7 +235,7 @@ def exploratory_target_declarations(*, runtime_capability=None):
         runtime_target = EXPLORATORY_RUNTIME_TARGET[target_id]
         data = {
             "target_id": target_id,
-            "target_revision": 0,
+            "target_revision": 1 if target_id == "discovery.match_compatibility.fuzz_v1" else 0,
             "intent_and_scope": scope,
             "state_preconditions": [
                 {"condition_id": name, "fact": name, "expected": True}
@@ -262,6 +267,13 @@ def exploratory_target_declarations(*, runtime_capability=None):
             "control_contract": {},
             "exploration_contract": contract,
         }
+        if target_id == "discovery.match_compatibility.fuzz_v1":
+            data["observation_contract"].update(
+                receipt_kind="pair_compatibility_window",
+                raw_recomputation="g01_runtime_observation",
+                sources=["per_role_actual_qos", "fresh_bidirectional_match_and_graph",
+                         "window_bound_identity_send_receive"],
+                input_binding="pair.offered_requested_reliability")
         # Reuse the reviewed required contract fields where the semantics are
         # the same instead of restating (and drifting from) them.
         if runtime_target is not None:

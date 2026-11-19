@@ -79,10 +79,14 @@ class BindingDeclarationTests(unittest.TestCase):
         self.assertEqual(EXPLORATORY_TARGETS[F2_WINDOWS_TARGET]['runtime_capability'],
                          F2_WINDOWS_CAPABILITY)
         caps = exploratory_runtime_capabilities()
-        self.assertFalse(caps['discovery.match_compatibility.fuzz_v1']['implemented'])
+        self.assertTrue(caps['discovery.match_compatibility.fuzz_v1']['implemented'])
+        self.assertTrue(caps['discovery.match_compatibility.fuzz_v1']['runtime_implemented'])
+        self.assertTrue(caps['discovery.match_compatibility.fuzz_v1']['runner_executable'])
+        self.assertEqual(caps['discovery.match_compatibility.fuzz_v1']['target_revision'], 1)
+        self.assertFalse(caps['discovery.match_compatibility.fuzz_v1']['live_qualified'])
         self.assertFalse(caps['discovery.match_compatibility.fuzz_v1']['admitted'])
         self.assertEqual(caps['discovery.match_compatibility.fuzz_v1']['backend'],
-                         'unsupported_relation_observation')
+                         'relation_pair')
         for target in ('discovery.late_endpoint.fuzz_v1',
                        'builtin.discovery_projection_reconciliation.fuzz_v1',
                        'discovery.interruption_recovery.fuzz_v1'):
@@ -180,24 +184,40 @@ class BindingDeclarationTests(unittest.TestCase):
             with self.subTest(overrides=overrides), self.assertRaises(ValueError):
                 normalize_config(config)
 
-    def test_g01_is_unsupported_without_relation_observer(self):
-        with tempfile.TemporaryDirectory() as temp:
-            result = run_pair(base(target_id='discovery.match_compatibility.fuzz_v1',
-                                   carrier='ros2_endpoint',
-                                   mutation_kind='endpoint_qos_variation',
-                                   fuzz_surfaces=['G01'],
-                                   submitted_parameters={'writer_qos.reliability': 'best_effort',
-                                                         'reader_qos.reliability': 'reliable'},
-                                   writer_qos={'reliability': 'best_effort', 'durability': 'volatile',
-                                               'depth': 32},
-                                   reader_qos={'reliability': 'reliable', 'durability': 'volatile',
-                                               'depth': 32}),
-                              Path(temp) / 'state')
-        self.assertEqual(result['capability_status'], 'unsupported_capability')
-        self.assertIn('pair_relation_observation_not_implemented', result['reason'])
+    def test_g01_missing_observation_cannot_claim_execution_or_effect(self):
+        from r2f.runtime.domains import IsolationError
+        from r2f.runtime.relation_observer import g01_runtime_observation
+        from r2f.modules.s1.oracles import evaluate_match_compatibility_guard
+
+        config = base(target_id='discovery.match_compatibility.fuzz_v1',
+                      carrier='ros2_endpoint', mutation_kind='endpoint_qos_variation',
+                      fuzz_surfaces=['G01'],
+                      submitted_parameters={'writer_qos.reliability': 'best_effort',
+                                            'reader_qos.reliability': 'reliable'},
+                      writer_qos={'reliability': 'best_effort', 'durability': 'volatile', 'depth': 32},
+                      reader_qos={'reliability': 'reliable', 'durability': 'volatile', 'depth': 32})
+        with tempfile.TemporaryDirectory() as temp, \
+                patch('r2f.runtime.ros2_pair.acquire_pair_environment',
+                      side_effect=IsolationError('offline_missing_observation')), \
+                patch('r2f.runtime.ros2_pair.WorkerPool') as pool:
+            result = run_pair(config, Path(temp) / 'state')
+        pool.assert_not_called()
+        self.assertEqual(result['reason'], 'offline_missing_observation')
         self.assertFalse(result['real_execution'])
+        self.assertIsNone(result['execution'])
         self.assertFalse(result['mutation_receipt']['hit'])
         self.assertFalse(result['mutation_receipt']['applied'])
+        refused = g01_runtime_observation([], normalize_config(config))
+        self.assertFalse(refused['oracle_input'])
+        self.assertFalse(refused['relation_effect_observed'])
+        # The new backend must positively consume complete observations, but
+        # a BR zero count in a finite fixture window is still NOT a pass/effect.
+        from test_g01_relation_runtime_wiring import G01RuntimeWiring
+        observed, _ = G01RuntimeWiring().run_offline('BR', matched=0)
+        self.assertTrue(observed['relation_observation']['oracle_input'])
+        self.assertTrue(observed['mutation_receipt']['hit'])
+        self.assertFalse(observed['mutation_receipt']['effect_observed'])
+        self.assertEqual(evaluate_match_compatibility_guard(observed['facts'])['verdict'], 'unknown')
 
     def test_control_arm_does_not_require_fuzz_surfaces(self):
         class OfflineLease:

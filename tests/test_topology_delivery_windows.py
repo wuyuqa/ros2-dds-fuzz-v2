@@ -285,7 +285,7 @@ def test_no_send_and_no_reader_never_fabricate_completed_windows(tmp_path):
 def test_reader_generation_replacement_does_not_borrow_old_sentinel(tmp_path):
     program = _program()
     program["actions"].insert(-1, _action("replace_reader", "recreate", "r0", 2))
-    _, events, projection, boundary = _run(tmp_path, program)
+    _, events, projection, boundary = _run(tmp_path, program, backend=WindowFixture(omit={2}))
     close = _closed(events)
     assert close["reader_generation"] == 1 and not close["window_complete"]
     assert "endpoint_lifecycle_changed" in close["reasons"]
@@ -427,7 +427,7 @@ def test_new_generation_delivery_cannot_erase_old_interrupted_window(tmp_path):
         _action("replace_reader", "recreate", "r0", 2),
         _action("second_generation_data", "publish_batch", "w0", 1,
                 count=2, start_sequence=3, interval_sec=0.0)]
-    _, events, projection, boundary = _run(tmp_path, program)
+    _, events, projection, boundary = _run(tmp_path, program, backend=WindowFixture(omit={2}))
     closes = [e for e in events if e["event"] == "topology_delivery_window_closed"]
     assert [(e["reader_generation"], e["window_complete"]) for e in closes] == [(1, False), (2, True)]
     assert not boundary["window_complete"]

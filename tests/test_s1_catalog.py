@@ -1,4 +1,7 @@
 """Unified S1 metadata over unchanged SemanticTarget declarations; offline only."""
+import json
+from pathlib import Path
+
 from copy import deepcopy
 from unittest.mock import Mock
 
@@ -30,6 +33,12 @@ FROZEN_MANIFESTS = {
     "builtin.discovery_projection_reconciliation.fuzz_v1": "0288795a666bb50d30cdf07a789ec60f7a9a3fde9f1643f15ea0c3607221a183",
     "discovery.match_compatibility.fuzz_v1": "1a884ef74dbfc8e15ca4ddb60ac121ba6dd4b81c43f7581b988426d942e68b2e",
 }
+# G01 alone was explicitly promoted by main on 2026-11-19. Keep the v0
+# digest above as history, not as a current execution-compatible identity.
+G01_TARGET = "discovery.match_compatibility.fuzz_v1"
+G01_REVISION1 = json.loads(
+    (Path(__file__).parent / "fixtures" / "g01_revision1_manifest.json").read_text()
+)
 REQUIRED_MODULE_SHA256 = "947757406e7a23662b576b5cf5ab615773f36a83ccdff9a1e19579fe569e4eb6"
 OPT_INS = {F2_WINDOWS_TARGET: F2_WINDOWS_CAPABILITY, TOPOLOGY_TARGET: TOPOLOGY_CAPABILITY}
 
@@ -79,7 +88,7 @@ def test_catalog_metadata_is_read_only_and_does_not_build_semantic_targets(monke
 
 
 @pytest.mark.parametrize("capability", [None, F2_WINDOWS_CAPABILITY, TOPOLOGY_CAPABILITY])
-def test_all_nine_old_manifests_and_required_module_bytes_are_frozen(capability):
+def test_eight_legacy_manifests_and_explicit_g01_revision1_are_pinned(capability):
     required = S1Module()
     fuzz = S1ExploratoryModule(runtime_capability=capability)
     assert canonical_hash(required.to_dict()) == REQUIRED_MODULE_SHA256
@@ -88,8 +97,15 @@ def test_all_nine_old_manifests_and_required_module_bytes_are_frozen(capability)
     for identifier, expected_digest in FROZEN_MANIFESTS.items():
         target = (required.targets if identifier in EXECUTION_ORDER else fuzz.targets)[identifier]
         assert type(target) is SemanticTarget
-        assert target.target_revision == 0
-        assert canonical_hash(target.to_dict()) == expected_digest
+        if identifier == G01_TARGET:
+            assert target.target_revision == 1
+            assert target.to_dict() == G01_REVISION1["manifest"]
+            assert canonical_hash(target.to_dict()) == G01_REVISION1["manifest_sha256"] == (
+                "508f099b04f5557cd5396ed05b46cfa8e1e24f8de4f7d46a8e023b94f1efbc75")
+            assert G01_REVISION1["manifest_sha256"] != expected_digest
+        else:
+            assert target.target_revision == 0
+            assert canonical_hash(target.to_dict()) == expected_digest
         assert catalog.resolve_target(identifier, exploratory=identifier not in EXECUTION_ORDER,
                                       runtime_capability=capability).to_dict() == target.to_dict()
     assert required.to_dict().keys() == {"id", "targets", "execution_order", "dispositions"}

@@ -21,6 +21,13 @@ class S1Module:
         self.dispositions = deepcopy(DISPOSITIONS)
         self.services = service_bindings(self.targets)
 
+    def resolve_rule_lineage(self, target_id, rule_id):
+        """Resolve only this module's registered view, without manifest edits."""
+        if target_id not in self.targets:
+            raise KeyError(target_id)
+        from .catalog import resolve_rule_lineage
+        return resolve_rule_lineage(target_id, rule_id)
+
     def to_dict(self):
         return {"id": self.id, "targets": {key: value.to_dict() for key, value in self.targets.items()},
                 "execution_order": list(self.execution_order), "dispositions": deepcopy(self.dispositions)}
@@ -47,6 +54,13 @@ class S1ExploratoryModule:
     @property
     def execution_order(self):
         return tuple(self.targets)
+
+    def resolve_rule_lineage(self, target_id, rule_id):
+        """Resolve only this module's registered view, without manifest edits."""
+        if target_id not in self.targets:
+            raise KeyError(target_id)
+        from .catalog import resolve_rule_lineage
+        return resolve_rule_lineage(target_id, rule_id)
 
     def to_dict(self):
         return {"id": self.id,

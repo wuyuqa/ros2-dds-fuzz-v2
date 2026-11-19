@@ -142,6 +142,18 @@ def test_regeneration_cannot_erase_preexisting_sends(tmp_path, which):
     change["depends_on"] = [first["action_id"]]
     p["actions"].insert(p["actions"].index(first)+1, change)
     r, c = produce(tmp_path, program=p)
+    if which == "writer":
+        # Completed g1 sentinel is retained, not borrowed as a g2 publish.
+        facts, oracle = consume(r, c)
+        assert r["runtime_status"] == "completed"
+        assert facts["unresolved_historical_obligations"] == []
+        assert facts["historical_send_coverage"]
+        assert oracle["verdict"] == "pass"
+        assert not any(e["event"] == "send" and e.get("generation") == 2 for e in r["events"])
+        # Now make the ORIGINAL old tail genuinely incomplete, preserving all
+        # original conservative assertions rather than blanket-flipping verdicts.
+        seqs = range(first["params"]["start_sequence"], first["params"]["start_sequence"] + first["params"]["count"])
+        r, c = produce(tmp_path / "old-tail-missing", program=p, backend=ObservedWindow(omit=tuple(seqs)))
     assert r["runtime_status"] == "completed_with_unknown"
     assert not any(e["event"] == "topology_delivery_no_sends" for e in r["events"])
     assert consume(r, c)[1]["verdict"] == "unknown"
@@ -152,6 +164,17 @@ def test_unsent_rebuilt_generation_is_conservatively_unknown(tmp_path, which):
     p = program_without_publish()
     p["actions"].append(model._action("rebuild-without-send", "recreate", "w0" if which == "writer" else "r0", 2))
     r, c = produce(tmp_path, program=p)
+    if which == "writer":
+        facts, oracle = consume(r, c)
+        assert r["runtime_status"] == "completed" and oracle["verdict"] == "pass"
+        assert facts["unresolved_historical_obligations"] == []
+        assert not any(e["event"] in {"send", "topology_delivery_window_open"} for e in r["events"])
+        assert any(e["event"] == "topology_delivery_no_sends"
+                   and e.get("schema") == "r2f.topology-delivery-no-sends/v2" for e in r["events"])
+        from test_topology_recreated_history_accounting import HistoryBackend
+        r, c = produce(tmp_path / "missing-ack", program=p, backend=HistoryBackend(fault="missing_ack"))
+    # Reader-only regeneration still lacks a v2 writer proof; absent ACKs also
+    # retain the original UNKNOWN/no-receipt contract for the writer branch.
     assert r["runtime_status"] == "completed_with_unknown"
     assert not any(e["event"] == "topology_delivery_no_sends" for e in r["events"])
     assert consume(r, c)[1]["verdict"] == "unknown"

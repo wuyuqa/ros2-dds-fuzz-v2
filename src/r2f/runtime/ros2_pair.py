@@ -286,7 +286,7 @@ EXPLORATORY_TARGETS = {
         'runtime_capability': 'pair_relation_guard',
         'carrier': 'ros2_endpoint',
         'mutation_kind': 'endpoint_qos_variation',
-        'backend': 'unsupported_relation_observation',
+        'backend': 'relation_pair',
         'surfaces': ('G01',),
     },
 }
@@ -550,7 +550,12 @@ def require_binding_preserved(expected, config):
 
 
 def exploratory_runtime_capabilities():
-    return {target_id: {'implemented': spec['backend'] != 'unsupported_relation_observation',
+    return {target_id: {'implemented': (spec['backend'] not in ('unsupported_relation_observation', 'relation_pair')
+                                        or target_id == 'discovery.match_compatibility.fuzz_v1'),
+                        **({'runtime_implemented': True, 'runner_executable': True,
+                            'target_revision': 1, 'live_qualified': False,
+                            'activation_status': 'revision1_route_declared_executable_live_unverified'}
+                           if target_id == 'discovery.match_compatibility.fuzz_v1' else {}),
                         'backend': spec['backend'],
                         'carrier': spec['carrier'],
                         'mutation_kind': spec['mutation_kind'],
@@ -1002,6 +1007,109 @@ def verify_pair_lease(lease, config, output_dir):
     return lease.receipts
 
 
+def _observe_g01_pair(c, result, pool, emit, step, publish, observe):
+    """Collect G01 inside run_pair's existing lease/source/cleanup lifetime."""
+    events, receipt = result['events'], result['mutation_receipt']
+    active = c['arm'] == 'mutated'
+    def environment_ready():
+        return (any(e['event'] == 'environment_preflight' and e.get('ok') is True for e in events)
+                and any(e['event'] == 'isolation_locks_acquired' and e.get('locks') for e in events))
+    step('admit_environment', environment_ready, lambda: None, c['startup_timeout_sec'],
+         ['environment_ok', 'locks_held'])
+    env_step = result['precondition_receipts'][-1]
+    env_refs = [{'step_id': env_step['step_id'],
+                 'raw_before_index': next(e['event_index'] for e in events
+                     if e['event'] == 'state_step_before' and e['step_id'] == env_step['step_id']),
+                 'raw_after_index': next(e['event_index'] for e in events
+                     if e['event'] == 'state_step_after' and e['step_id'] == env_step['step_id'])}]
+    receipt.update(submitted=active, carrier_admitted=active, configured=active)
+    emit('mutation_begin' if active else 'control_begin',
+         mutation_kind=c['mutation_kind'], mutation_receipt=dict(receipt),
+         preconditions_snapshot={'environment_ok': result['environment'].get('ok') is True,
+                                 'locks_held': True, 'endpoints_created': False},
+         precondition_receipt_refs=env_refs)
+    emit('window_open', window='pair_compatibility_window')
+    tokens = {}
+    for role in ('writer', 'reader'):
+        def created(role=role):
+            return any(e['event'] == 'endpoint_created' and e.get('role') == role for e in events)
+        step(role + '_created', created, lambda role=role: pool.start(role),
+             c['startup_timeout_sec'], ['environment_ok', 'locks_held'], observation=True)
+        token = next(e for e in events if e['event'] == 'endpoint_created' and e.get('role') == role)
+        require_role_rmw(c, role, token)
+        if not token.get('endpoint_gid') or not token.get('endpoint_generation'):
+            raise RuntimeError('g01_endpoint_identity_missing:' + role)
+        tokens[role] = token
+        observe('capture_worker', role, token['pid'], token)
+        binding = wait_for_qos_binding(events, pool, role, token['endpoint_gid'],
+                                       c['startup_timeout_sec'], emit=emit, exactly_one=True)
+        actual = binding['observed_self']
+        if (not isinstance(actual, dict)
+                or any(actual.get(k) != v for k, v in c[role + '_qos'].items())):
+            raise RuntimeError('g01_actual_qos_readback_mismatch:' + role)
+    if tokens['writer']['pid'] == tokens['reader']['pid']:
+        raise RuntimeError('g01_endpoint_processes_not_independent')
+    result['effective_rmws'] = effective_rmws_receipt(c, tokens)
+    emit('qos_binding_verified', observation_api='per_role_public_graph_readback',
+         endpoints={role: token['endpoint_gid'] for role, token in tokens.items()})
+    from .relation_observer import g01_configuration_readback
+    g01_configuration_readback(events, c)
+    receipt.update(applied=active, hit=active)
+    emit('configuration_intervention_observed',
+         hit_kind='public_api_configuration_intervention',
+         role_readback_refs={role: next(e['event_index'] for e in events
+             if e['event'] == 'qos_binding_observed' and e.get('role') == role) for role in tokens},
+         mutation_receipt=dict(receipt), relation_effect_observed=False)
+    # A finite wait is observation, not a promise that even RR must match.
+    # Query both roles even for BR; a prohibited match must not be suppressed
+    # simply because the submitted policy says it should not exist.
+    deadline = time.monotonic() + c['match_timeout_sec']
+    while True:
+        proof = query_acknowledged_graphs(pool, events, c['startup_timeout_sec'], emit)
+        exact = all(
+            {e.get('endpoint_gid') for e in proof[r]['graph']['publishers']} == {tokens['writer']['endpoint_gid']}
+            and {e.get('endpoint_gid') for e in proof[r]['graph']['subscriptions']} == {tokens['reader']['endpoint_gid']}
+            and proof[r]['snapshot'].get('endpoint_gid') == tokens[r]['endpoint_gid']
+            and proof[r]['snapshot'].get('matched_count') == 1 for r in tokens)
+        if exact or time.monotonic() >= deadline:
+            break
+        until = min(deadline, time.monotonic() + 0.05)
+        pool.wait(lambda: time.monotonic() >= until, 1, 'g01_observation_interval')
+    emit('pair_probe_begin', matched_snapshot_observed=exact,
+         reliable_delivery_obligation=False,
+         note='compatibility guard only; no BE reliable-delivery obligation')
+    for sequence in range(c['post_match_count']):
+        publish(sequence, 'pair_probe')
+        until = time.monotonic() + c['publish_interval_sec']
+        pool.wait(lambda: time.monotonic() >= until, c['publish_interval_sec'] + 1, 'pair_probe_interval')
+    def received_all():
+        return set(range(c['post_match_count'])) <= {
+            e.get('send_sequence') for e in events if e['event'] == 'receive' and e.get('phase') == 'pair_probe'}
+    try:
+        pool.wait(received_all, c['delivery_timeout_sec'], 'g01_probe_observation_deadline')
+        probe_timed_out = False
+    except TimeoutError:
+        probe_timed_out = True
+    query_acknowledged_graphs(pool, events, c['startup_timeout_sec'], emit)
+    emit('window_close', window='pair_compatibility_window', deadline_expired=probe_timed_out,
+         timeout_is_sut_failure=False)
+    from .relation_observer import g01_runtime_observation
+    relation = g01_runtime_observation(events, c)
+    result['relation_observation'] = relation
+    result['relation_guard_facts'] = relation['facts']
+    effect = active and relation['relation_effect_observed']
+    receipt.update(effect_observed=effect)
+    emit('mutation_effect' if effect else 'relation_observation_complete',
+         effect_id='public_api_pair_match' if effect else None,
+         hit_kind='public_api_configuration_intervention',
+         mutation_receipt=dict(receipt), oracle_input=relation['oracle_input'],
+         reasons=relation['reasons'], absence_is_not_proof=True)
+    if not relation['oracle_input']:
+        emit('discovery_observation_unknown',
+             classification='relation_evidence_incomplete_not_sut_violation',
+             reasons=relation['reasons'])
+
+
 def run_pair(config: dict, output_dir: Path, *, topology_backend=None) -> dict:
     # Explicit opt-in extension, deliberately outside EXPLORATORY_TARGETS.
     from .topology_route import topology_route_requested, run_topology_route
@@ -1053,12 +1161,6 @@ def run_pair(config: dict, output_dir: Path, *, topology_backend=None) -> dict:
             result['reason'] = admission_error
             result['capability_status'] = 'unsupported_capability'
             return result
-        if spec['backend'] == 'unsupported_relation_observation':
-            # G01 needs an independent relation observer that this runtime does
-            # not provide. Never fabricate match/delivery for a config-only pair.
-            result['reason'] = 'blocked:unsupported_capability:pair_relation_observation_not_implemented'
-            result['capability_status'] = 'unsupported_capability'
-            return result
         if spec['backend'] == 'projection_pair':
             from .namespace_pair import run_discovery_pair
             # Dispatch only; the target id stays the exploratory id.
@@ -1070,7 +1172,11 @@ def run_pair(config: dict, output_dir: Path, *, topology_backend=None) -> dict:
     elif c['target_id'] not in ('discovery.late_endpoint', 'discovery.late_join_delivery'):
         result['reason'] = 'blocked:target_not_supported'
         return result
-    if c['carrier'] != 'ros2_endpoint' or c['mutation_kind'] != 'late_joiner':
+    relation_pair = c['target_id'] == 'discovery.match_compatibility.fuzz_v1'
+    if relation_pair and (c['arm'] == 'negative' or c.get('fault_id')):
+        result['reason'] = 'blocked:g01_negative_control_contract_not_implemented'
+        return result
+    if c['carrier'] != 'ros2_endpoint' or (not relation_pair and c['mutation_kind'] != 'late_joiner'):
         result['reason'] = 'blocked:endpoint_carrier_not_expressible'
         return result
     if c['target_id'] in EXPLORATORY_TARGETS and c.get('runtime_windows'):
@@ -1196,177 +1302,180 @@ def run_pair(config: dict, output_dir: Path, *, topology_backend=None) -> dict:
             pool_class = RoleRmwWorkerPool if role_rmw_differs_from_config(c) else WorkerPool
             pool = pool_class(c, observation.base_env, output_dir, emit,
                               role_environments=role_env)
-        emit('window_open', window='before_reader_match')
-        step('writer_created', lambda: has('endpoint_created', 'writer'), lambda: pool.start('writer'),
-             c['startup_timeout_sec'], ['environment_ok', 'locks_held'])
-        writer_token = next(e for e in events if e['event'] == 'endpoint_created' and e['role'] == 'writer')
-        require_role_rmw(c, 'writer', writer_token)
-        if not writer_token.get('endpoint_gid'):
-            raise RuntimeError('writer_identity_or_rmw_incomplete')
-        observed_rmws = {'writer': writer_token}
-        result['effective_rmws'] = effective_rmws_receipt(c, observed_rmws)
-        emit('effective_rmws_observed', role='writer',
-             expected=role_rmw(c, 'writer'),
-             observed=writer_token.get('rmw_identifier'),
-             receipt=result['effective_rmws'])
-        observe('capture_worker', 'writer', writer_token['pid'], writer_token)
-        step('writer_prejoin_published', lambda: sum(e['event'] == 'send' and e.get('phase') == 'prejoin' for e in events) == c['pre_match_count'],
-             lambda: [publish(i, 'prejoin') for i in range(c['pre_match_count'])], c['startup_timeout_sec'], ['writer_created'])
-        preconditions_ok = len(receipts) == 2 and all(r['satisfied'] for r in receipts)
-        if not preconditions_ok:
-            raise RuntimeError('mutation_preconditions_not_reached')
-        references = [{'step_id': r['step_id'],
-                       'raw_before_index': next(e['event_index'] for e in events if e['event'] == 'state_step_before' and e['step_id'] == r['step_id']),
-                       'raw_after_index': next(e['event_index'] for e in events if e['event'] == 'state_step_after' and e['step_id'] == r['step_id'])} for r in receipts]
-        snapshot = {'writer_created': True, 'writer_prejoin_published': True, 'reader_created': False,
-                    'writer_gid': writer_token['endpoint_gid'],
-                    'prejoin_publish_sequences': [e['send_sequence'] for e in events if e['event'] == 'send' and e.get('phase') == 'prejoin']}
-        receipt['submitted'] = active_mutation
-        receipt['carrier_admitted'] = active_mutation
-        receipt['configured'] = active_mutation
-        emit('mutation_begin' if active_mutation else 'control_begin',
-             mutation_kind=c['mutation_kind'], preconditions_snapshot=snapshot,
-             precondition_receipt_refs=references, mutation_receipt=dict(receipt))
-        # transparent and baseline execute the same input, including the delay.
-        delay = c['reader_delay_sec'] if active_mutation else c['baseline_reader_delay_sec']
-        delay_deadline = time.monotonic() + delay
-        pool.wait(lambda: time.monotonic() >= delay_deadline, delay + 1, 'reader_creation_delay')
-        step('reader_created', lambda: has('endpoint_created', 'reader'), lambda: pool.start('reader'),
-             c['startup_timeout_sec'], ['writer_created', 'writer_prejoin_published'], observation=True)
-        reader_token = next(e for e in events if e['event'] == 'endpoint_created' and e['role'] == 'reader')
-        require_role_rmw(c, 'reader', reader_token)
-        if not reader_token.get('endpoint_gid') or reader_token['pid'] == writer_token['pid']:
-            raise RuntimeError('reader_identity_or_process_isolation_incomplete')
-        observed_rmws['reader'] = reader_token
-        result['effective_rmws'] = effective_rmws_receipt(c, observed_rmws)
-        emit('effective_rmws_observed', role='reader',
-             expected=role_rmw(c, 'reader'),
-             observed=reader_token.get('rmw_identifier'),
-             receipt=result['effective_rmws'])
-        observe('capture_worker', 'reader', reader_token['pid'], reader_token)
-        actual_delay = reader_token['created_monotonic_ns'] - writer_token['created_monotonic_ns']
-        if actual_delay <= 0:
-            raise RuntimeError('reader_not_created_after_writer')
-        emit('reader_created_after_writer', writer_gid=writer_token['endpoint_gid'], reader_gid=reader_token['endpoint_gid'],
-             delay_ns=actual_delay, configured_delay_sec=delay)
-        if exploratory:
-            requested_by_role = {role: c[role + '_qos'] for role in ('writer', 'reader')}
-            submitted_qos = c.get('submitted_parameters', {})
-            for role, token in (('writer', writer_token), ('reader', reader_token)):
-                if token.get('qos') != requested_by_role[role]:
-                    raise RuntimeError('endpoint_reported_qos_differs_from_config:' + role)
-                # The worker emits qos_binding_observed on its own creation path;
-                # that line can still be unread in the pipe when pool.start()
-                # returns.  Wait for it (bounded) instead of reading a stale
-                # event list.  GID binding and non-empty observation stay strict.
-                wait_for_qos_binding(events, pool, role, token['endpoint_gid'],
-                                     c['startup_timeout_sec'], emit=emit,
-                                     exactly_one=False)
-            observed = {
-                'P01': {'configured_delay_sec': delay, 'observed_delay_ns': actual_delay,
-                        'basis': 'reader_created_monotonic_minus_writer_created_monotonic'},
-                'W01': {'depth': c['qos']['depth'],
-                        'pre_match_count': c['pre_match_count'],
-                        'post_match_count': c['post_match_count'],
-                        'basis': 'config_and_actual_publish_counts'},
-                'W02': {'publish_interval_sec': c['publish_interval_sec'],
-                        'basis': 'actual_inter_publish_monotonic_delta'},
-            }
-            selected = {sid: observed[sid] for sid in c.get('fuzz_surfaces', []) if sid in observed}
-            binding_event_index = len(events)
-            emit('exploratory_binding_observed', observed=selected,
-                 requested_qos=requested_by_role,
-                 submitted_qos=submitted_qos,
-                 observation_basis='public_api_endpoint_and_creation_events')
-            emit('qos_binding_verified', endpoints=requested_by_role,
-                 observation_api='get_publishers_info_by_topic/get_subscriptions_info_by_topic',
-                 binding_event_ref=binding_event_index)
-        if active_mutation:
-            # A submitted mutation is not automatically a hit.  P01's zero
-            # delay is a legitimate boundary input but has no observable timing
-            # effect; record it as no_effect instead of fabricating hit=True.
-            timing_hit = (c.get('mutation_kind') != 'late_joiner'
-                          or bool(c.get('fuzz_surfaces'))
-                          and (delay > 0.0 and actual_delay > 0))
-            receipt.update(applied=True, hit=timing_hit, effect_observed=timing_hit)
-            emit('mutation_effect' if timing_hit else 'mutation_no_effect',
-                 effect_id='reader_created_after_writer', mutation_receipt=dict(receipt),
-                 configured_delay_sec=delay, observed_delay_ns=actual_delay,
-                 reason=None if timing_hit else 'zero_delay_has_no_observable_timing_effect')
-        elif c['arm'] == 'transparent':
-            emit('transparency_control', declaration={'mutation_kind': c['mutation_kind'], 'parameters': c['mutation_parameters']},
-                 applied_input_equal_to_baseline=True, effective_reader_delay_sec=delay, mutation_hit=False)
-        fresh_matches = {}
-        def observe_fresh_matches():
-            fresh_matches.update(wait_for_fresh_match(
-                pool, events, reader_token['created_monotonic_ns'], c['match_timeout_sec'], emit))
-        step('endpoints_matched', lambda: set(fresh_matches) == {'writer', 'reader'},
-             observe_fresh_matches, c['match_timeout_sec'], ['reader_created', 'writer_created'], observation=True)
-        # Check only the newly requested, fully acknowledged graph projections.
-        graph_proof = {}
-        def graph_expected():
-            for role in ('writer', 'reader'):
-                if role not in graph_proof:
-                    return False
-                snapshot = graph_proof[role]['graph']
-                if {p['endpoint_gid'] for p in snapshot['publishers']} != {writer_token['endpoint_gid']}:
-                    return False
-                if {p['endpoint_gid'] for p in snapshot['subscriptions']} != {reader_token['endpoint_gid']}:
-                    return False
-            return True
-        def observe_graph():
-            graph_proof.update(query_acknowledged_graphs(pool, events, c['match_timeout_sec'], emit, capture_graph))
-        step('graph_identity_verified', graph_expected, observe_graph, c['match_timeout_sec'], ['endpoints_matched'], observation=True)
-        emit('window_close', window='before_reader_match')
-        expected = list(range(c['pre_match_count'], c['pre_match_count'] + c['post_match_count']))
-        omitted = expected[len(expected) // 2] if c['fault_id'] else None
-        emit('delivery_contract', expected_sequences=expected, sentinel_sequence=expected[-1],
-             fault_id=c['fault_id'], contract_includes_harness_omission=True,
-             prejoin_in_delivery_contract=False, qos=c['qos'])
-        emit('window_open', window='post_match_delivery', expected_sequences=expected)
-        for sequence in expected:
-            publish(sequence, 'post_match', omit=sequence == omitted)
-            pause_deadline = time.monotonic() + c['publish_interval_sec']
-            pool.wait(lambda: time.monotonic() >= pause_deadline, c['publish_interval_sec'] + 1, 'publish_interval')
-        # A fault omission is intentional absence before publish, not SUT data loss.
-        def delivered():
-            received = {e['send_sequence'] for e in events if e['event'] == 'receive' and e.get('phase') == 'post_match'}
-            return set(expected) - ({omitted} if omitted is not None else set()) <= received
-        try:
-            pool.wait(delivered, c['delivery_timeout_sec'], 'delivery_deadline')
-            delivery_timed_out = False
-        except TimeoutError:
-            delivery_timed_out = True
-        if exploratory:
-            sends = [e for e in events if e['event'] == 'send' and e.get('phase') == 'post_match']
-            deltas = [b['monotonic_ns'] - a['monotonic_ns'] for a, b in zip(sends, sends[1:])]
-            actual_interval = (sum(deltas) / len(deltas) / 10**9) if deltas else None
-            tolerance = max(0.002, c['publish_interval_sec'] * 0.5)
-            # W02 is a requested pacing lower bound, not a throughput claim.
-            # The controller waits for publish ACK before the next interval, so
-            # the observed inter-send gap is >= configured; a gap below the
-            # configured lower bound is the actual binding violation.
-            interval_bound = (actual_interval is not None
-                              and actual_interval >= c['publish_interval_sec'] - tolerance)
-            if 'W02' in c.get('fuzz_surfaces', []) and not interval_bound:
-                raise RuntimeError('publish_interval_binding_not_observed')
-            emit('timing_binding_observed', configured_publish_interval_sec=c['publish_interval_sec'],
-                 observed_mean_publish_interval_sec=actual_interval,
-                 samples=len(sends), tolerance_sec=tolerance,
-                 send_schedule_refs=[e['event_index'] for e in sends])
-        emit('window_close', window='post_match_delivery', deadline_expired=delivery_timed_out,
-             intended_missing_includes_omission=True)
-        query_acknowledged_graphs(pool, events, c['startup_timeout_sec'], emit, capture_graph)
-        identity_facts = summarize_events(events)
-        emit('identity_observation', identity_basis=identity_facts['identity_basis'], graph_boundary_check=True,
-             publisher_gid_status=identity_facts['publisher_gid_status'],
-             graph_stable_across_window=identity_facts['graph_stable_across_window'],
-             endpoint_identity_correlated=identity_facts['endpoint_identity_correlated'],
-             limitations=identity_facts['identity_limitations'])
-        if c['fault_id']:
-            emit('fault_control_receipt', fault_id=c['fault_id'], omitted_sequence=omitted,
-                 applied=has('harness_omission', 'writer', send_sequence=omitted),
-                 responsibility_layer='harness', candidate_eligible=False)
+        if relation_pair:
+            _observe_g01_pair(c, result, pool, emit, step, publish, observe)
+        else:
+            emit('window_open', window='before_reader_match')
+            step('writer_created', lambda: has('endpoint_created', 'writer'), lambda: pool.start('writer'),
+                 c['startup_timeout_sec'], ['environment_ok', 'locks_held'])
+            writer_token = next(e for e in events if e['event'] == 'endpoint_created' and e['role'] == 'writer')
+            require_role_rmw(c, 'writer', writer_token)
+            if not writer_token.get('endpoint_gid'):
+                raise RuntimeError('writer_identity_or_rmw_incomplete')
+            observed_rmws = {'writer': writer_token}
+            result['effective_rmws'] = effective_rmws_receipt(c, observed_rmws)
+            emit('effective_rmws_observed', role='writer',
+                 expected=role_rmw(c, 'writer'),
+                 observed=writer_token.get('rmw_identifier'),
+                 receipt=result['effective_rmws'])
+            observe('capture_worker', 'writer', writer_token['pid'], writer_token)
+            step('writer_prejoin_published', lambda: sum(e['event'] == 'send' and e.get('phase') == 'prejoin' for e in events) == c['pre_match_count'],
+                 lambda: [publish(i, 'prejoin') for i in range(c['pre_match_count'])], c['startup_timeout_sec'], ['writer_created'])
+            preconditions_ok = len(receipts) == 2 and all(r['satisfied'] for r in receipts)
+            if not preconditions_ok:
+                raise RuntimeError('mutation_preconditions_not_reached')
+            references = [{'step_id': r['step_id'],
+                           'raw_before_index': next(e['event_index'] for e in events if e['event'] == 'state_step_before' and e['step_id'] == r['step_id']),
+                           'raw_after_index': next(e['event_index'] for e in events if e['event'] == 'state_step_after' and e['step_id'] == r['step_id'])} for r in receipts]
+            snapshot = {'writer_created': True, 'writer_prejoin_published': True, 'reader_created': False,
+                        'writer_gid': writer_token['endpoint_gid'],
+                        'prejoin_publish_sequences': [e['send_sequence'] for e in events if e['event'] == 'send' and e.get('phase') == 'prejoin']}
+            receipt['submitted'] = active_mutation
+            receipt['carrier_admitted'] = active_mutation
+            receipt['configured'] = active_mutation
+            emit('mutation_begin' if active_mutation else 'control_begin',
+                 mutation_kind=c['mutation_kind'], preconditions_snapshot=snapshot,
+                 precondition_receipt_refs=references, mutation_receipt=dict(receipt))
+            # transparent and baseline execute the same input, including the delay.
+            delay = c['reader_delay_sec'] if active_mutation else c['baseline_reader_delay_sec']
+            delay_deadline = time.monotonic() + delay
+            pool.wait(lambda: time.monotonic() >= delay_deadline, delay + 1, 'reader_creation_delay')
+            step('reader_created', lambda: has('endpoint_created', 'reader'), lambda: pool.start('reader'),
+                 c['startup_timeout_sec'], ['writer_created', 'writer_prejoin_published'], observation=True)
+            reader_token = next(e for e in events if e['event'] == 'endpoint_created' and e['role'] == 'reader')
+            require_role_rmw(c, 'reader', reader_token)
+            if not reader_token.get('endpoint_gid') or reader_token['pid'] == writer_token['pid']:
+                raise RuntimeError('reader_identity_or_process_isolation_incomplete')
+            observed_rmws['reader'] = reader_token
+            result['effective_rmws'] = effective_rmws_receipt(c, observed_rmws)
+            emit('effective_rmws_observed', role='reader',
+                 expected=role_rmw(c, 'reader'),
+                 observed=reader_token.get('rmw_identifier'),
+                 receipt=result['effective_rmws'])
+            observe('capture_worker', 'reader', reader_token['pid'], reader_token)
+            actual_delay = reader_token['created_monotonic_ns'] - writer_token['created_monotonic_ns']
+            if actual_delay <= 0:
+                raise RuntimeError('reader_not_created_after_writer')
+            emit('reader_created_after_writer', writer_gid=writer_token['endpoint_gid'], reader_gid=reader_token['endpoint_gid'],
+                 delay_ns=actual_delay, configured_delay_sec=delay)
+            if exploratory:
+                requested_by_role = {role: c[role + '_qos'] for role in ('writer', 'reader')}
+                submitted_qos = c.get('submitted_parameters', {})
+                for role, token in (('writer', writer_token), ('reader', reader_token)):
+                    if token.get('qos') != requested_by_role[role]:
+                        raise RuntimeError('endpoint_reported_qos_differs_from_config:' + role)
+                    # The worker emits qos_binding_observed on its own creation path;
+                    # that line can still be unread in the pipe when pool.start()
+                    # returns.  Wait for it (bounded) instead of reading a stale
+                    # event list.  GID binding and non-empty observation stay strict.
+                    wait_for_qos_binding(events, pool, role, token['endpoint_gid'],
+                                         c['startup_timeout_sec'], emit=emit,
+                                         exactly_one=False)
+                observed = {
+                    'P01': {'configured_delay_sec': delay, 'observed_delay_ns': actual_delay,
+                            'basis': 'reader_created_monotonic_minus_writer_created_monotonic'},
+                    'W01': {'depth': c['qos']['depth'],
+                            'pre_match_count': c['pre_match_count'],
+                            'post_match_count': c['post_match_count'],
+                            'basis': 'config_and_actual_publish_counts'},
+                    'W02': {'publish_interval_sec': c['publish_interval_sec'],
+                            'basis': 'actual_inter_publish_monotonic_delta'},
+                }
+                selected = {sid: observed[sid] for sid in c.get('fuzz_surfaces', []) if sid in observed}
+                binding_event_index = len(events)
+                emit('exploratory_binding_observed', observed=selected,
+                     requested_qos=requested_by_role,
+                     submitted_qos=submitted_qos,
+                     observation_basis='public_api_endpoint_and_creation_events')
+                emit('qos_binding_verified', endpoints=requested_by_role,
+                     observation_api='get_publishers_info_by_topic/get_subscriptions_info_by_topic',
+                     binding_event_ref=binding_event_index)
+            if active_mutation:
+                # A submitted mutation is not automatically a hit.  P01's zero
+                # delay is a legitimate boundary input but has no observable timing
+                # effect; record it as no_effect instead of fabricating hit=True.
+                timing_hit = (c.get('mutation_kind') != 'late_joiner'
+                              or bool(c.get('fuzz_surfaces'))
+                              and (delay > 0.0 and actual_delay > 0))
+                receipt.update(applied=True, hit=timing_hit, effect_observed=timing_hit)
+                emit('mutation_effect' if timing_hit else 'mutation_no_effect',
+                     effect_id='reader_created_after_writer', mutation_receipt=dict(receipt),
+                     configured_delay_sec=delay, observed_delay_ns=actual_delay,
+                     reason=None if timing_hit else 'zero_delay_has_no_observable_timing_effect')
+            elif c['arm'] == 'transparent':
+                emit('transparency_control', declaration={'mutation_kind': c['mutation_kind'], 'parameters': c['mutation_parameters']},
+                     applied_input_equal_to_baseline=True, effective_reader_delay_sec=delay, mutation_hit=False)
+            fresh_matches = {}
+            def observe_fresh_matches():
+                fresh_matches.update(wait_for_fresh_match(
+                    pool, events, reader_token['created_monotonic_ns'], c['match_timeout_sec'], emit))
+            step('endpoints_matched', lambda: set(fresh_matches) == {'writer', 'reader'},
+                 observe_fresh_matches, c['match_timeout_sec'], ['reader_created', 'writer_created'], observation=True)
+            # Check only the newly requested, fully acknowledged graph projections.
+            graph_proof = {}
+            def graph_expected():
+                for role in ('writer', 'reader'):
+                    if role not in graph_proof:
+                        return False
+                    snapshot = graph_proof[role]['graph']
+                    if {p['endpoint_gid'] for p in snapshot['publishers']} != {writer_token['endpoint_gid']}:
+                        return False
+                    if {p['endpoint_gid'] for p in snapshot['subscriptions']} != {reader_token['endpoint_gid']}:
+                        return False
+                return True
+            def observe_graph():
+                graph_proof.update(query_acknowledged_graphs(pool, events, c['match_timeout_sec'], emit, capture_graph))
+            step('graph_identity_verified', graph_expected, observe_graph, c['match_timeout_sec'], ['endpoints_matched'], observation=True)
+            emit('window_close', window='before_reader_match')
+            expected = list(range(c['pre_match_count'], c['pre_match_count'] + c['post_match_count']))
+            omitted = expected[len(expected) // 2] if c['fault_id'] else None
+            emit('delivery_contract', expected_sequences=expected, sentinel_sequence=expected[-1],
+                 fault_id=c['fault_id'], contract_includes_harness_omission=True,
+                 prejoin_in_delivery_contract=False, qos=c['qos'])
+            emit('window_open', window='post_match_delivery', expected_sequences=expected)
+            for sequence in expected:
+                publish(sequence, 'post_match', omit=sequence == omitted)
+                pause_deadline = time.monotonic() + c['publish_interval_sec']
+                pool.wait(lambda: time.monotonic() >= pause_deadline, c['publish_interval_sec'] + 1, 'publish_interval')
+            # A fault omission is intentional absence before publish, not SUT data loss.
+            def delivered():
+                received = {e['send_sequence'] for e in events if e['event'] == 'receive' and e.get('phase') == 'post_match'}
+                return set(expected) - ({omitted} if omitted is not None else set()) <= received
+            try:
+                pool.wait(delivered, c['delivery_timeout_sec'], 'delivery_deadline')
+                delivery_timed_out = False
+            except TimeoutError:
+                delivery_timed_out = True
+            if exploratory:
+                sends = [e for e in events if e['event'] == 'send' and e.get('phase') == 'post_match']
+                deltas = [b['monotonic_ns'] - a['monotonic_ns'] for a, b in zip(sends, sends[1:])]
+                actual_interval = (sum(deltas) / len(deltas) / 10**9) if deltas else None
+                tolerance = max(0.002, c['publish_interval_sec'] * 0.5)
+                # W02 is a requested pacing lower bound, not a throughput claim.
+                # The controller waits for publish ACK before the next interval, so
+                # the observed inter-send gap is >= configured; a gap below the
+                # configured lower bound is the actual binding violation.
+                interval_bound = (actual_interval is not None
+                                  and actual_interval >= c['publish_interval_sec'] - tolerance)
+                if 'W02' in c.get('fuzz_surfaces', []) and not interval_bound:
+                    raise RuntimeError('publish_interval_binding_not_observed')
+                emit('timing_binding_observed', configured_publish_interval_sec=c['publish_interval_sec'],
+                     observed_mean_publish_interval_sec=actual_interval,
+                     samples=len(sends), tolerance_sec=tolerance,
+                     send_schedule_refs=[e['event_index'] for e in sends])
+            emit('window_close', window='post_match_delivery', deadline_expired=delivery_timed_out,
+                 intended_missing_includes_omission=True)
+            query_acknowledged_graphs(pool, events, c['startup_timeout_sec'], emit, capture_graph)
+            identity_facts = summarize_events(events)
+            emit('identity_observation', identity_basis=identity_facts['identity_basis'], graph_boundary_check=True,
+                 publisher_gid_status=identity_facts['publisher_gid_status'],
+                 graph_stable_across_window=identity_facts['graph_stable_across_window'],
+                 endpoint_identity_correlated=identity_facts['endpoint_identity_correlated'],
+                 limitations=identity_facts['identity_limitations'])
+            if c['fault_id']:
+                emit('fault_control_receipt', fault_id=c['fault_id'], omitted_sequence=omitted,
+                     applied=has('harness_omission', 'writer', send_sequence=omitted),
+                     responsibility_layer='harness', candidate_eligible=False)
         after_source = execution_chain_identity()
         if not same_source(before_source, after_source):
             raise RuntimeError('source_identity_changed_during_execution')
@@ -1394,7 +1503,14 @@ def run_pair(config: dict, output_dir: Path, *, topology_backend=None) -> dict:
                           status='failed' if result['real_execution'] else 'blocked',
                           reason='source_identity_changed_during_execution')
             emit('runtime_abort', reason=result['reason'])
-        result['facts'] = summarize_events(events)
+        if relation_pair:
+            from .relation_observer import g01_runtime_observation
+            relation = g01_runtime_observation(events, c)
+            result['relation_observation'] = relation
+            result['relation_guard_facts'] = relation['facts']
+            result['facts'] = relation['facts'] or {}
+        else:
+            result['facts'] = summarize_events(events)
         observed = observed_rmws_from_events(events)
         if observed:
             result['effective_rmws'] = effective_rmws_receipt(c, observed)

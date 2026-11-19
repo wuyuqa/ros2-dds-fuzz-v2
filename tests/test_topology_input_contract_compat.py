@@ -1,5 +1,9 @@
 """Pinned pre-I2 hashes and exhaustive old catalog subset hash compatibility."""
 import itertools
+import json
+from copy import deepcopy
+from pathlib import Path
+from types import SimpleNamespace
 from dataclasses import replace
 
 import pytest
@@ -57,6 +61,48 @@ LEGACY = {'registry': '3ad538230ba02309b3accbf26958c47acd9e461120bb0328b31bb72f0
                'f2_live': '4963654505779aba389bf46cd0d4c0f61dfea4697a011e1b6beea9fb13605303'}}
 
 
+# Only this target changed: all LEGACY bytes above remain the v0 history.
+G01_TARGET = "discovery.match_compatibility.fuzz_v1"
+G01_REVISION1 = json.loads(
+    (Path(__file__).parent / "fixtures" / "g01_revision1_manifest.json").read_text()
+)
+
+
+def historical_g01_manifest():
+    """Retain the exact generation-only v0 manifest, never upgrade it in replay."""
+    manifest = deepcopy(G01_REVISION1["manifest"])
+    manifest["target_revision"] = 0
+    manifest["intent_and_scope"] = (
+        "Offered/requested reliability relation guard. Capability pending: the "
+        "per-role QoS runtime binding is not wired, so no live input is claimed.")
+    manifest["exploration_contract"] = fuzz_catalog.exploration_contract(
+        (), extra_rule_ids=("s1.discovery.compatibility_guard.v1",)).to_dict()
+    observation = manifest["observation_contract"]
+    observation["pending_surface_ids"] = ["G01"]
+    for key in ("receipt_kind", "raw_recomputation", "sources", "input_binding"):
+        del observation[key]
+    return manifest
+
+
+def test_historical_g01_revision0_manifest_and_contract_remain_pinned():
+    manifest = historical_g01_manifest()
+    assert canonical_hash(manifest) == LEGACY["exploratory"][G01_TARGET]["target"]
+    assert ExplorationContract.from_dict(manifest["exploration_contract"]).contract_hash() == (
+        LEGACY["exploratory"][G01_TARGET]["contract"])
+    assert canonical_hash(manifest) != G01_REVISION1["manifest_sha256"]
+
+
+def test_historical_g01_capsule_manifest_cannot_resolve_as_revision1():
+    # Exercise only the production exact-manifest preflight; no execution or
+    # capsule qualification is implied by this minimal input-envelope fixture.
+    from r2f.campaign.replay import _Failure, _registered_target
+    manifest = historical_g01_manifest()
+    capsule = SimpleNamespace(input={"target_id": G01_TARGET, "target": manifest,
+                                     "scenario": {"target": deepcopy(manifest)}})
+    with pytest.raises(_Failure, match="target/revision differs"):
+        _registered_target(capsule)
+
+
 def test_default_specs_and_signature_are_byte_for_byte_unchanged():
     assert {k: v.to_dict() for k, v in mutators.MUTATOR_SPECS.items()} == LEGACY["specs"]
     assert mutators.mutator_registry_signature() == LEGACY["registry"]
@@ -71,10 +117,21 @@ def test_all_four_required_target_hashes_unchanged(target_id, digest):
 
 
 @pytest.mark.parametrize("target_id,expected", list(LEGACY["exploratory"].items()))
-def test_every_old_exploratory_target_and_contract_unchanged(target_id, expected):
+def test_exploratory_identity_pins_except_explicit_g01_revision1(target_id, expected):
     target = targets.exploratory_target_declarations(runtime_capability=targets.F2_WINDOWS_CAPABILITY)[target_id]
-    assert canonical_hash(target.to_dict()) == expected["target"]
-    assert target.exploration_contract.contract_hash() == expected["contract"]
+    if target_id == G01_TARGET:
+        assert target.target_revision == 1
+        assert target.to_dict() == G01_REVISION1["manifest"]
+        assert canonical_hash(target.to_dict()) == G01_REVISION1["manifest_sha256"] == (
+            "508f099b04f5557cd5396ed05b46cfa8e1e24f8de4f7d46a8e023b94f1efbc75")
+        assert target.exploration_contract.contract_hash() == G01_REVISION1["contract_sha256"] == (
+            "7eb1d80a6f6308a12f64e020d850676ae596809a769f649375b83f3265efa1f7")
+        assert G01_REVISION1["manifest_sha256"] != expected["target"]
+        assert G01_REVISION1["contract_sha256"] != expected["contract"]
+    else:
+        assert target.target_revision == 0
+        assert canonical_hash(target.to_dict()) == expected["target"]
+        assert target.exploration_contract.contract_hash() == expected["contract"]
 
 
 @pytest.mark.parametrize("name,digest", list(LEGACY["contracts"].items()))

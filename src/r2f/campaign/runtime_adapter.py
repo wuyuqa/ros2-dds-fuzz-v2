@@ -119,8 +119,139 @@ def fresh_match_proof(events, tokens, opening, *, anchor_ns=None):
     return max(completed), proof
 
 
+G01_TARGET = "discovery.match_compatibility.fuzz_v1"
+
+
+def _g01_admission(events, runtime, config):
+    """Reconstruct the existing environment step, never the late-reader steps."""
+    import hashlib
+
+    env = _one(events, "environment_preflight")
+    lock_event = _one(events, "isolation_locks_acquired")
+    locks = lock_event.get("locks")
+    if env.get("ok") is not True or not isinstance(locks, list) or len(locks) != 3:
+        raise ValueError("g01_environment_or_three_leases_missing")
+    state_dir = str(Path(runtime["raw_path"]).resolve().parent)
+    expected_names = {"domain-" + str(config["domain_id"]) + ".lock",
+                      "campaign-" + hashlib.sha256(config["campaign_id"].encode()).hexdigest() + ".lock",
+                      "state-" + hashlib.sha256(state_dir.encode()).hexdigest() + ".lock"}
+    if {Path(lock.get("path", "")).name for lock in locks} != expected_names:
+        raise ValueError("g01_lease_scope_mismatch")
+    for lock in locks:
+        owner = lock.get("owner", {})
+        if (lock.get("acquired") is not True or owner.get("pid") != lock_event.get("pid")
+                or owner.get("campaign_id") != config["campaign_id"]
+                or owner.get("domain_id") != config["domain_id"] or owner.get("state_dir") != state_dir):
+            raise ValueError("g01_lease_owner_mismatch")
+    before = _one(events, "state_step_before", step_id="admit_environment")
+    after = _one(events, "state_step_after", step_id="admit_environment")
+    if (not max(env["monotonic_ns"], lock_event["monotonic_ns"]) < before["monotonic_ns"] < after["monotonic_ns"]
+            or not max(env["event_index"], lock_event["event_index"]) < before["event_index"] < after["event_index"]
+            or before.get("before", {}).get("satisfied") is not True
+            or before.get("receipt_kind") != "precondition" or after.get("receipt_kind") != "precondition"
+            or before.get("requires") != ["environment_ok", "locks_held"]
+            or after.get("requires") != before["requires"]
+            or after.get("satisfied") is not True or after.get("after", {}).get("satisfied") is not True):
+        raise ValueError("g01_environment_step_chronology_invalid")
+    begin = _one(events, "mutation_begin" if config["arm"] == "mutated" else "control_begin")
+    refs = [{"step_id": "admit_environment", "raw_before_index": before["event_index"],
+             "raw_after_index": after["event_index"]}]
+    snapshot = begin.get("preconditions_snapshot", {})
+    if (not after["monotonic_ns"] < begin["monotonic_ns"]
+            or not after["event_index"] < begin["event_index"]
+            or begin.get("precondition_receipt_refs") != refs
+            or snapshot.get("environment_ok") is not True or snapshot.get("locks_held") is not True
+            or snapshot.get("endpoints_created") is not False
+            or begin.get("mutation_kind") != "endpoint_qos_variation"):
+        raise ValueError("g01_mutation_begin_admission_invalid")
+    for role in ("writer", "reader"):
+        token = _one(events, "endpoint_created", role=role)
+        if (not begin["monotonic_ns"] < token["created_monotonic_ns"] <= token["monotonic_ns"]
+                or not begin["event_index"] < token["event_index"]):
+            raise ValueError("g01_endpoint_created_before_configuration_begin:" + role)
+    return before, after, begin
+
+
+def _g01_facts(events, runtime, config):
+    """Only raw event fields feed G01; returned runtime facts are ignored."""
+    from r2f.runtime.relation_observer import g01_configuration_readback, g01_runtime_observation
+
+    observation = g01_runtime_observation(events, config)
+    facts = dict(observation["facts"] or {})
+    facts.update(schema_version=1, environment_healthy=False, process_healthy=False,
+                 preconditions_reached=False, endpoint_identity_complete=False,
+                 observed_effects=[], configuration_intervention_verified=False,
+                 relation_effect_observed=False, g01_observation=observation,
+                 candidate_eligible=False)
+    try:
+        tokens = g01_configuration_readback(events, config)
+        facts["configuration_intervention_verified"] = True
+        _g01_admission(events, runtime, config)
+        facts.update(environment_healthy=True, preconditions_reached=True)
+        # Exit return codes are process-controller raw, not a summary counter.
+        for role, token in tokens.items():
+            started = _one(events, "process_started", role=role)
+            stopped = _one(events, "worker_shutdown", role=role)
+            exited = _one(events, "process_exit", role=role)
+            if (started.get("pid") != token["pid"] or stopped.get("pid") != token["pid"]
+                    or exited.get("pid") != token["pid"] or exited.get("returncode") != 0
+                    or stopped.get("endpoint_generation") != token["endpoint_generation"]
+                    or stopped.get("rmw_identifier") != token["rmw_identifier"]
+                    or not started["event_index"] < token["event_index"] < stopped["event_index"] < exited["event_index"]
+                    or not started["monotonic_ns"] <= token["created_monotonic_ns"] <= stopped["monotonic_ns"] <= exited["monotonic_ns"]):
+                raise ValueError("g01_worker_lifecycle_identity_invalid:" + role)
+        if any(e.get("event") in {"worker_error", "worker_unexpected_exit", "runtime_abort"} for e in events):
+            raise ValueError("g01_worker_or_runtime_error")
+        ending = _one(events, "runtime_end")
+        if (ending.get("runtime_status") != "completed" or ending.get("real_execution") is not True
+                or ending.get("reason") is not None):
+            raise ValueError("g01_runtime_not_completed")
+        facts["process_healthy"] = True
+        facts["endpoint_identity_complete"] = observation["oracle_input"] is True
+        facts["relation_effect_observed"] = observation["relation_effect_observed"] is True
+        if facts["relation_effect_observed"]:
+            facts["observed_effects"] = ["public_api_pair_match"]
+        if not observation["oracle_input"]:
+            facts["observation_unknown_reasons"] = observation["reasons"]
+    except (KeyError, ValueError, TypeError) as exc:
+        facts["evidence_error"] = str(exc)
+        # A relation-looking fragment without its health/admission proof is a
+        # diagnostic, never a SUT fail admitted through the primary guard.
+        facts.update(match=None, delivery=None, observed=None)
+        if isinstance(facts.get("window"), dict):
+            facts["window"] = dict(facts["window"], complete=False)
+    return facts
+
+
+def _g01_receipts(scenario, runtime, events, config):
+    before, after, _ = _g01_admission(events, runtime, config)
+    if (len(scenario.state_steps) != 1 or scenario.state_steps[0].step_id != "admit_environment"
+            or scenario.state_steps[0].action != "admit_environment"):
+        raise ValueError("g01_target_environment_step_contract_mismatch")
+    step = scenario.state_steps[0]
+    expected = [c.condition_id for c in step.requires]
+    actuals = runtime.get("precondition_receipts", [])
+    if len(actuals) != 1:
+        raise ValueError("g01_runtime_precondition_count_invalid")
+    actual = actuals[0]
+    if (actual.get("step_id") != step.step_id or actual.get("requires") != expected
+            or actual.get("satisfied") is not True or before.get("requires") != expected
+            or actual.get("before") != before.get("before") or actual.get("after") != after.get("after")):
+        raise ValueError("g01_runtime_environment_receipt_differs_from_raw")
+    state = {"environment_ok": True, "locks_held": True}
+    checks = {c.condition_id: c.evaluate(state) for c in step.requires}
+    if not all(checks.values()):
+        raise ValueError("g01_environment_requires_not_reached")
+    proof = {"runtime_step_id": step.step_id, "raw_before_index": before["event_index"],
+             "raw_after_index": after["event_index"], "runtime_receipt": actual}
+    return [StepReceipt(step.step_id, step.action, dict(state), dict(state, admit_environment=True),
+                        checks, "executed", _iso(before["time_ns"]), _iso(after["time_ns"]), proof).to_dict()]
+
+
 def facts_from_events(events, runtime, config):
     """Only raw tokens produce primary facts; summaries cannot substitute."""
+    if config.get("target_id") == G01_TARGET:
+        return _g01_facts(events, runtime, config)
     if config.get("target_id") == "discovery.endpoint_topology.fuzz_v1":
         from .topology_adapter import facts_from_events as topology_facts
         return topology_facts(events, runtime, config)
@@ -217,6 +348,10 @@ def facts_from_events(events, runtime, config):
 
 def canonical_receipts(scenario, runtime, events, *, config=None):
     """Exact 1:1 runtime step mapping; raw before/after events are mandatory."""
+    if scenario.target_id == G01_TARGET:
+        if not isinstance(config, dict) or config.get("target_id") != G01_TARGET:
+            raise ValueError("g01_receipts_require_exact_runtime_config")
+        return _g01_receipts(scenario, runtime, events, config)
     if scenario.target_id == "discovery.endpoint_topology.fuzz_v1":
         from .topology_adapter import canonical_receipts as topology_receipts
         return topology_receipts(scenario, runtime, events, config=config)
@@ -287,6 +422,10 @@ def _produce_facts(services, evidence):
 def _primary_rule_id(scenario):
     """Return only the declared rule identity; never infer one from a verdict."""
     contract = scenario.target.rule_contract
+    if scenario.target_id == G01_TARGET:
+        from r2f.modules.s1.oracles import COMPATIBILITY_RULE_ID
+        rule_id = contract.get("compatibility_rule") if isinstance(contract, Mapping) else None
+        return rule_id if rule_id == COMPATIBILITY_RULE_ID else None
     rule_id = contract.get("primary_rule") if isinstance(contract, Mapping) else None
     return rule_id if isinstance(rule_id, str) and rule_id.strip() else None
 
@@ -410,6 +549,25 @@ def ingest_execution(scenario, config, runtime, capsule, *, services=None):
         else:
             services = resolve_services(scenario.target_id)
     def attach_candidate_assessment(row):
+        if scenario.target_id == G01_TARGET:
+            # No fixture/old/unfrozen source can authorize candidate admission.
+            source = capsule.input.get("source_manifest", {})
+            metadata = runtime.get("execution_metadata") or runtime.get("execution") or {}
+            source_ok = False
+            if (source.get("source_frozen") is True and metadata.get("source") == source
+                    and metadata.get("source_after") == source):
+                try:
+                    from .identity import source_manifest
+                    source_ok = source_manifest(Path(source["source_repo"])) == source
+                except (ValueError, KeyError, OSError):
+                    pass
+            qualified = (source_ok and scenario.arm == "mutated"
+                         and row.get("execution_stage") == "judged"
+                         and row.get("oracle_verdict") == "fail"
+                         and not row.get("ingestion_error")
+                         and row.get("typed_facts", {}).get("relation_effect_observed") is True)
+            row.update(candidate_eligible=qualified, g01_source_qualified=source_ok,
+                       feedback_eligible=False, seal_eligible=False)
         if scenario.target_id == "discovery.endpoint_topology.fuzz_v1":
             from .topology_candidate_assessment import ingest_assessment
             return ingest_assessment(scenario, config, capsule, row)
@@ -489,13 +647,21 @@ def ingest_execution(scenario, config, runtime, capsule, *, services=None):
         record.advance(ExecutionStage.EXPRESSIBLE, adapter_accepted=True)
         record.advance(ExecutionStage.PLANNED)
         receipts = canonical_receipts(scenario, runtime, events, config=config)
+        if scenario.target_id == G01_TARGET:
+            configuration = facts.get("configuration_intervention_verified") is True
+            effect = facts.get("relation_effect_observed") is True and scenario.arm == "mutated"
+            if ((receipt.applied or receipt.hit) and not configuration
+                    or receipt.effect_observed is not effect):
+                raise ValueError("g01_mutation_receipt_not_backed_by_raw_intervention_or_relation")
         record.advance(ExecutionStage.PRECONDITION_EXECUTED, precondition_receipts=receipts)
         record.advance(ExecutionStage.REACHED)
         neutral = None
         fault_control = None
         if scenario.arm in ("baseline", "transparent"):
             digest = canonical_hash(capsule.input["effective_input"]["final_input"])
-            neutral = {"kind": "no_op", "reason": "actual reader delay, endpoint QoS, delivery counts and raw primary observations verified against submitted input", "before_input_sha256": digest, "after_input_sha256": digest}
+            neutral = {"kind": "no_op", "reason": ("actual per-role QoS and raw identity-backed relation observations verified against submitted input"
+                       if scenario.target_id == G01_TARGET else "actual reader delay, endpoint QoS, delivery counts and raw primary observations verified against submitted input"),
+                       "before_input_sha256": digest, "after_input_sha256": digest}
         elif scenario.arm == "negative":
             actual_fault = _one(events, "fault_control_receipt")
             fault_control = {key: actual_fault.get(key) for key in (
@@ -564,6 +730,17 @@ def ingest_execution(scenario, config, runtime, capsule, *, services=None):
                            environment=runtime.get("environment", {}))
                 return attach_candidate_assessment(row)
             record.advance(ExecutionStage.MUTATION_APPLIED, mutation_receipt=receipt.to_dict())
+        if scenario.target_id == G01_TARGET and facts.get("relation_effect_observed") is not True:
+            row = dict(record.to_dict(), **audit)
+            row.update(domain_id=config["domain_id"], typed_facts=facts, oracle=oracle,
+                       oracle_verdict=oracle["verdict"], rule_id=oracle["rule_id"],
+                       raw_path=runtime.get("raw_path"), raw_sha256=runtime.get("raw_sha256"),
+                       runtime_execution_metadata=runtime.get("execution_metadata") or runtime.get("execution"),
+                       observation_receipts=runtime.get("observation_receipts", []),
+                       environment=runtime.get("environment", {}),
+                       observation_status="unknown_no_relation_effect_proof",
+                       observation_unknown_reasons=facts.get("observation_unknown_reasons", oracle["reason_codes"]))
+            return attach_candidate_assessment(row)
         if facts.get("evidence_error"):
             raise ValueError(facts["evidence_error"])
         if not all(facts.get(key) is True for key in ("environment_healthy", "process_healthy", "preconditions_reached", "endpoint_identity_complete")):

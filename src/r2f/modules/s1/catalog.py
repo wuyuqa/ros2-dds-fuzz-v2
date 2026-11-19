@@ -77,3 +77,17 @@ def resolve_target(target_id, *, exploratory=False, runtime_capability=None):
     """
     return catalog_declarations(exploratory=exploratory,
                                 runtime_capability=runtime_capability)[target_id]
+
+
+def resolve_rule_lineage(target_id, rule_id):
+    """Read-only sidecar lookup; membership comes from the exact existing manifest.
+
+    The catalog can describe an opt-in identity. Registry callers must first
+    have registered that identity with the owning module/capability.
+    """
+    entry = resolve_catalog_entry(target_id)
+    target = resolve_target(target_id, exploratory=entry["usage"] == "fuzz",
+                            runtime_capability=entry["runtime_capability"])
+    from .rule_lineage import resolve
+    return resolve(target, rule_id, scope={key: entry[key] for key in
+        ("usage", "family_id", "conformance_baseline_id", "runtime_capability")})

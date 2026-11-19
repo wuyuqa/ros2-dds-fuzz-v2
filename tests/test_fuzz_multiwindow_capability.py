@@ -323,7 +323,11 @@ class MultiwindowProvider(unittest.TestCase):
             with self.subTest(sid=sid), self.assertRaises(fuzz_catalog.UnsupportedCapabilityError):
                 fuzz_catalog.surface_to_core(fuzz_catalog.SURFACES[sid])
         compatibility = self.provider.contract_for('discovery.match_compatibility.fuzz_v1')
-        self.assertEqual(compatibility.surfaces, [])
+        # Only the separately selected G01 revision1 target gains M08.
+        self.assertEqual(set(compatibility.surface_by_id), {'G01'})
+        self.assertEqual(compatibility.surface_by_id['G01'].mutator_ids, ['M08'])
+        self.assertTrue(compatibility.surface_by_id['G01'].executable)
+        self.assertEqual(self.targets['discovery.match_compatibility.fuzz_v1'].target_revision, 1)
 
     def test_runtime_advertises_only_recovery_route_and_never_live_admission(self):
         capabilities = exploratory_runtime_capabilities()

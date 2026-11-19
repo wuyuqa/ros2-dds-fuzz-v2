@@ -898,7 +898,8 @@ def corpus_from_profile(profile, seeds=None, *, cycle_id=None, target_id=None):
 
     F1 remains the default. Only the explicit f2_windows_v1 profile/new
     target may authorize new E02/M07 or E03/M06 entries from pending templates;
-    it never edits their authored provenance or admits G01/other F2 surfaces.
+    Exact G01 target selection separately authorizes its revision1 M08 binding.
+    Neither path edits authored generation-template provenance or widens F1 surfaces.
     """
     from r2f.modules.s1 import fuzz_catalog
     from r2f.modules.s1.targets import (
@@ -908,7 +909,7 @@ def corpus_from_profile(profile, seeds=None, *, cycle_id=None, target_id=None):
     from r2f.core.mutators import MUTATORS
     from r2f.campaign.exploratory_input import (
         F2_SURFACE_MUTATORS, F2_WINDOWS_CAPABILITY, apply_profile_controls,
-        validate_profile_fields, validate_f2_profile,
+        validate_profile_fields, validate_f2_profile, is_g01_profile,
     )
 
     profile = _load_profile_document(profile)
@@ -921,6 +922,7 @@ def corpus_from_profile(profile, seeds=None, *, cycle_id=None, target_id=None):
     try:
         validate_profile_fields(profile)
         f2_windows = validate_f2_profile(profile)
+        g01 = is_g01_profile(profile)
     except ValueError as exc:
         raise CorpusProfileError(str(exc)) from exc
     if profile.get("schema_version") != _PROFILE_SCHEMA:
@@ -933,7 +935,7 @@ def corpus_from_profile(profile, seeds=None, *, cycle_id=None, target_id=None):
         raise CorpusProfileError("profile profile_id is required")
     if profile.get("seed_catalog_status") != "authored_t02":
         raise CorpusProfileError("profile seed_catalog_status must be authored_t02")
-    if profile.get("enabled") is not False:
+    if profile.get("enabled") is not False and not (g01 and profile.get("enabled") is True):
         raise CorpusProfileError("profile must stay enabled=false; enabling is a separate owner decision")
 
     all_targets = _profile_strings(profile, "target_ids")
@@ -978,6 +980,8 @@ def corpus_from_profile(profile, seeds=None, *, cycle_id=None, target_id=None):
         if f2_windows:
             if surface_id not in F2_SURFACE_MUTATORS or not fuzz_catalog.f2_live_surface(surface_id).executable:
                 raise CorpusProfileError(f"profile surface {surface_id} has no explicit F2 live binding")
+            continue
+        if g01 and surface_id == "G01":
             continue
         if surface_id in fuzz_catalog.F2_SURFACE_IDS:
             raise CorpusProfileError(
@@ -1104,7 +1108,7 @@ def corpus_from_profile(profile, seeds=None, *, cycle_id=None, target_id=None):
         seed = seed_map[seed_id]
         fuzz_catalog.validate_seed(seed)
         capability = seed.get("capability", {})
-        if f2_windows:
+        if f2_windows or g01:
             if capability.get("status") != "capability_pending" or capability.get("f1_routable") is not False:
                 raise CorpusProfileError(f"seed {seed_id}: F2 template provenance must remain pending")
         elif capability.get("status") != "authored" or capability.get("f1_routable") is not True:
@@ -1117,12 +1121,13 @@ def corpus_from_profile(profile, seeds=None, *, cycle_id=None, target_id=None):
             raise CorpusProfileError(f"seed {seed_id} must reference at least one valid template surface")
         surface_id = spec["mutation_routes"][0]["surface_id"] if routed else refs[0]
         boundary_class = spec["mutation_routes"][0]["boundary_class"] if routed else spec["boundary_class"]
-        if not f2_windows and surface_id not in fuzz_catalog.F1_SURFACE_IDS:
+        if not (f2_windows or g01) and surface_id not in fuzz_catalog.F1_SURFACE_IDS:
             raise CorpusProfileError(f"seed {seed_id} references non-F1 surface {surface_id}")
         if surface_id not in surfaces:
             raise CorpusProfileError(
                 f"seed {seed_id} surface {surface_id} is not declared in the selected cycle")
-        surface = (fuzz_catalog.f2_live_surface(surface_id) if f2_windows
+        surface = (fuzz_catalog.g01_live_contract().surface_by_id["G01"] if g01 else
+                   fuzz_catalog.f2_live_surface(surface_id) if f2_windows
                    else fuzz_catalog.SURFACES[surface_id])
         if not surface.executable:
             raise CorpusProfileError(f"seed {seed_id} surface {surface_id} is not executable")
@@ -1142,7 +1147,8 @@ def corpus_from_profile(profile, seeds=None, *, cycle_id=None, target_id=None):
         if surface_id not in contract.surface_by_id:
             raise CorpusProfileError(
                 f"target {target_id} does not declare surface {surface_id}")
-        runtime_target = (F2_WINDOWS_RUNTIME_TARGET if f2_windows
+        runtime_target = ("discovery.match_compatibility" if g01 else
+                          F2_WINDOWS_RUNTIME_TARGET if f2_windows
                           else EXPLORATORY_RUNTIME_TARGET.get(target_id))
         if runtime_target is None:
             raise CorpusProfileError(
@@ -1151,7 +1157,7 @@ def corpus_from_profile(profile, seeds=None, *, cycle_id=None, target_id=None):
             raise CorpusProfileError(
                 f"seed {seed_id} target_family {seed.get('target_family')} "
                 f"does not match {target_id} runtime family {runtime_target}")
-        if target.observation_contract.get("activation") != ("F2" if f2_windows else "F1"):
+        if target.observation_contract.get("activation") != ("F2" if f2_windows or g01 else "F1"):
             raise CorpusProfileError(f"target {target_id} activation differs from explicit profile")
 
         # Select from the target's *projected* contract surface, not the raw
@@ -1159,7 +1165,8 @@ def corpus_from_profile(profile, seeds=None, *, cycle_id=None, target_id=None):
         # keeps only M03 in the late-join contract).  Picking the catalog's
         # first mutator would hand the runner an undeclared mutator id.
         projected = contract.surface_by_id[surface_id]
-        implemented = ([F2_SURFACE_MUTATORS[surface_id]] if f2_windows
+        implemented = (["M08"] if g01 else
+                       [F2_SURFACE_MUTATORS[surface_id]] if f2_windows
                        and F2_SURFACE_MUTATORS[surface_id] in projected.mutator_ids else
                        [mid for mid in projected.mutator_ids if mid in MUTATORS])
         if f2_windows and (projected.to_dict() != surface.to_dict()
