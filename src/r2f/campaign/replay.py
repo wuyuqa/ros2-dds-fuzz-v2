@@ -424,6 +424,14 @@ def _topology_comparison_view(capsule, execution, *, config, result, origin, out
     return view
 
 
+def _checkpoint_request_for_capsule(capsule_path, action_id):
+    # Pin origin layout to the capsule's case, never a saved row's root/path.
+    from .topology_episode_rebuild import checkpoint_request
+    case = Path(capsule_path).resolve().parent
+    return checkpoint_request(case / 'runtime_config.json',
+                              case / 'runtime' / 'runtime_result.json', action_id)
+
+
 def _original_topology_context(capsule_path):
     """Pinned original runner layout; saved row/raw paths cannot select roots."""
     case = Path(capsule_path).resolve().parent
@@ -973,7 +981,7 @@ def _qualification(origin, config, result, row, *, output_root=None):
 
 
 def replay_cell(capsule_path, *, output_dir, domain_id, runtime=None,
-                runtime_boundary='host') -> dict:
+                runtime_boundary='host', episode_checkpoint=None) -> dict:
     """Replay an unchanged capsule into a fresh evidence directory and domain.
 
     output_dir must be empty and outside the original run. Source must match the
@@ -992,6 +1000,10 @@ def replay_cell(capsule_path, *, output_dir, domain_id, runtime=None,
     request = {'schema': SCHEMA, 'replay_id': replay_id, 'capsule_path': str(capsule_path),
                'domain_id': domain_id, 'execution_origin': origin,
                'runtime_boundary': runtime_boundary, 'timestamp': utc_now()}
+    if episode_checkpoint is not None:
+        if not isinstance(episode_checkpoint, str) or not episode_checkpoint.strip():
+            raise ValueError('episode_checkpoint must be a nonempty action id')
+        request['episode_checkpoint'] = episode_checkpoint
     _write(output / 'request.json', request)
     report = dict(request, report_path=str(output / 'replay_report.json'),
                   formal_runtime=formal,
@@ -1047,6 +1059,21 @@ def replay_cell(capsule_path, *, output_dir, domain_id, runtime=None,
                 config = _runtime_execution_config(
                     _replay_config(capsule, replay_id, domain, before), execute=True,
                     runtime=runtime, runtime_boundary=runtime_boundary)
+                if episode_checkpoint is not None:
+                    if capsule.input['target_id'] != _TOPOLOGY_TARGET:
+                        raise ValueError('episode_checkpoint requires topology episode target')
+                    config['episode_rebuild'] = _checkpoint_request_for_capsule(capsule_path, episode_checkpoint)
+                    from .topology_episode_rebuild import load_checkpoint
+                    loaded = load_checkpoint(config['episode_rebuild'], config['topology_program'], config)
+                    dependencies = [config['episode_rebuild'][key]['path']
+                                    for key in ('origin_config', 'origin_runtime', 'progress')]
+                    dependencies += [r['observation']['prefix']['path'] for r in loaded['progress']['receipts']]
+                    dependencies += [loaded['origin_raw']['path']]
+                    dependencies += [e['initial_prefix']['path'] for e in loaded['origin_events']
+                                     if e.get('event') == 'topology_episode_begin']
+                    for path in dependencies:
+                        if not any(ref['path'] == str(path) for ref in report['original_artifacts']):
+                            report['original_artifacts'].append(_reference(path))
                 context['config'] = config
                 if capsule.input['target_id'] == _TOPOLOGY_TARGET:
                     report['observation_replay'] = _observation_replay_declaration(capsule, config)
@@ -1209,6 +1236,8 @@ def audit_replay(report_path) -> dict:
         if files != set(report['artifacts']):
             errors.append('artifact manifest does not cover exactly the persisted files')
         request = _json(root / 'request.json')
+        if report.get('episode_checkpoint') != request.get('episode_checkpoint'):
+            errors.append('request/report identity mismatch:episode_checkpoint')
         for key in ('replay_id', 'domain_id', 'execution_origin'):
             if report.get(key) != request.get(key):
                 errors.append('request/report identity mismatch:' + key)
@@ -1363,6 +1392,11 @@ def _check_audit_config(root, original, report, errors):
         _replay_config(original, report['replay_id'], report['domain_id'], original.input['source_manifest']),
         execute=True, runtime=runtime_for_boundary(boundary) if formal else None,
         runtime_boundary=boundary)
+    if report.get('episode_checkpoint') is not None:
+        expected['episode_rebuild'] = _checkpoint_request_for_capsule(
+            report['capsule_path'], report['episode_checkpoint'])
+        from .topology_episode_rebuild import load_checkpoint
+        load_checkpoint(expected['episode_rebuild'], expected['topology_program'], expected)
     if canonical_hash(config) != canonical_hash(expected):
         errors.append('replay config differs from deterministic capsule reconstruction')
     if (report.get('observation_replay') is not None

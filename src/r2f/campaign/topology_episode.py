@@ -250,9 +250,21 @@ def audit_topology_episode(program, runtime, config):
             reset_verified=len(resets) == len(program['episode'].get('reset_action_ids', [])) and all(resets),
             stop_reason=execution['stop_reason'], action_count=len(receipts),
             episode_input_sha256=episode.input_identity(), record_sha256=loaded['record_sha256'])
+        from .topology_episode_rebuild import audit_rebuild
+        rebuilt = audit_rebuild(program, runtime, config, execution)
+        if rebuilt is not None:
+            result['checkpoint_reconstruction'] = rebuilt
+            if result['completed']:
+                require(rebuilt['validated'], 'episode_rebuild_not_validated')
+                if result['execution_evidence']:
+                    require(rebuilt['execution_evidence'] is True, 'episode_rebuild_nonreal_origin')
         if result['completed'] and result['checkpoint_observations_complete'] and result['reset_verified']:
             result['status'] = 'observed'
     except (OSError, ValueError, TypeError, KeyError, IndexError, UnicodeError) as exc:
-        result['status'] = 'invalid'
+        # A late dependency/reconstruction failure must revoke provisional
+        # qualification, while retaining the diagnostic step history.
+        result.update(status='invalid', structural_valid=False, completed=False,
+                      execution_evidence=False, checkpoint_observations_complete=False,
+                      reset_verified=False, candidate_eligible=False)
         result['reasons'].append(str(exc))
     return result

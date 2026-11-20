@@ -689,6 +689,103 @@ class EpisodeStore:
         return {"path": str(path.resolve()), "record_sha256": record["record_sha256"],
                 "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
 
+    def load_progress(self, episode, sequence):
+        """Read and authenticate one committed action prefix, without a terminal.
+
+        This recovers JSON observation history, not a DDS memory snapshot or a
+        successful replay. ``checkpoint=False`` remains loadable; callers must
+        independently authorize reconstruction and verify its runtime evidence.
+        """
+        if not isinstance(episode, Episode):
+            raise EpisodeStoreError("progress_episode_required")
+        if type(sequence) is not int or not 0 <= sequence < len(episode.actions):
+            raise EpisodeStoreError("progress_sequence_out_of_range")
+
+        def require(ok, reason):
+            if not ok:
+                raise EpisodeStoreError("progress_" + reason)
+
+        def object_pairs(pairs):
+            result = {}
+            for key, value in pairs:
+                require(key not in result, "duplicate_json_key:" + key)
+                result[key] = value
+            return result
+
+        def constant(value):
+            raise EpisodeStoreError("progress_nonfinite_json:" + value)
+
+        try:
+            # Revalidate mutable caller objects, including safe path and the
+            # per-action content hashes, rather than trusting cached identities.
+            Episode.from_dict(episode.to_dict())
+            path = self.root / "checkpoints" / episode.episode_id / f"{sequence:04d}.json"
+            data = snapshot(json.loads(path.read_text(), object_pairs_hook=object_pairs,
+                                       parse_constant=constant))
+            fields = {"schema", "episode_id", "input_sha256", "state_schema", "action_count",
+                      "checkpoint", "receipts", "restoration_supported", "record_sha256"}
+            require(isinstance(data, dict) and set(data) == fields, "record_fields_invalid")
+            require(data["schema"] == "r2f.s1-episode-progress/v1", "schema_mismatch")
+            _sha(data["record_sha256"], "progress_record_sha256")
+            require(data["record_sha256"] == canonical_hash(
+                {k: v for k, v in data.items() if k != "record_sha256"}), "record_hash_mismatch")
+            require(data["episode_id"] == episode.episode_id, "episode_id_mismatch")
+            require(data["input_sha256"] == episode.input_identity(), "input_identity_mismatch")
+            require(data["state_schema"] == episode.state_schema, "state_schema_mismatch")
+            require(type(data["action_count"]) is int and data["action_count"] == sequence + 1,
+                    "action_count_mismatch")
+            require(type(data["checkpoint"]) is bool, "checkpoint_not_bool")
+            require(data["restoration_supported"] is False, "restoration_not_false")
+            receipts = data["receipts"]
+            require(isinstance(receipts, list) and len(receipts) == sequence + 1,
+                    "receipt_count_mismatch")
+            receipt_fields = {"schema", "sequence", "action_id", "action", "input_sha256",
+                "parameters", "before_state", "before_state_id", "after_state", "after_state_id",
+                "guard", "execution_stage", "status", "error", "observed_effect", "expected_effect",
+                "oracle_verdict", "rule_id", "reason_code", "responsibility_layer", "tool_error",
+                "parent_history", "timing"}
+            current = snapshot(episode.initial_state)
+            for action, receipt in zip(episode.actions[:sequence + 1], receipts):
+                label = "receipt:" + str(action.sequence) + ":"
+                require(isinstance(receipt, dict) and receipt_fields <= set(receipt)
+                        and not set(receipt) - receipt_fields - {"observation"}, label + "fields_invalid")
+                require(receipt["schema"] == "r2f.s1-episode-action-receipt/v1", label + "schema_mismatch")
+                require(type(receipt["sequence"]) is int and receipt["sequence"] == action.sequence
+                        and receipt["action_id"] == action.action_id and receipt["action"] == action.action
+                        and receipt["input_sha256"] == action.input_sha256,
+                        label + "action_binding_mismatch")
+                require(isinstance(receipt["parameters"], dict)
+                        and canonical_hash(receipt["parameters"]) == canonical_hash(action.parameters),
+                        label + "parameters_mismatch")
+                require(receipt["expected_effect"] == action.expected_effect, label + "expected_effect_mismatch")
+                require(_stage(receipt["execution_stage"]) == receipt["execution_stage"], label + "stage_invalid")
+                verdict = receipt["oracle_verdict"]
+                require(verdict is None or isinstance(verdict, str), label + "verdict_invalid")
+                _verdict(verdict)
+                require(isinstance(receipt["rule_id"], str)
+                        and (verdict not in {"pass", "fail"} or bool(receipt["rule_id"])),
+                        label + "rule_id_missing")
+                require(isinstance(receipt["status"], str) and bool(receipt["status"]), label + "status_invalid")
+                require(type(receipt["tool_error"]) is bool, label + "tool_error_not_bool")
+                before = validate_state(receipt["before_state"], schema=episode.state_schema)
+                require(receipt["before_state_id"] == state_id(before, schema=episode.state_schema),
+                        label + "before_state_id_mismatch")
+                require(canonical_hash(before) == canonical_hash(current), label + "state_chain_mismatch")
+                after = receipt["after_state"]
+                if after is None:
+                    require(receipt["after_state_id"] is None, label + "null_after_state_id_mismatch")
+                else:
+                    after = validate_state(after, schema=episode.state_schema)
+                    require(receipt["after_state_id"] == state_id(after, schema=episode.state_schema),
+                            label + "after_state_id_mismatch")
+                    current = after
+            return snapshot(data)
+        except EpisodeStoreError:
+            raise
+        except (OSError, ValueError, TypeError, KeyError, IndexError, AttributeError,
+                RecursionError, OverflowError) as exc:
+            raise EpisodeStoreError("progress_invalid:" + type(exc).__name__ + ":" + str(exc)) from exc
+
     def load(self, episode_id):
         path = self._path(episode_id)
         try:

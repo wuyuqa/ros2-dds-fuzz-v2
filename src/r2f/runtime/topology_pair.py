@@ -2311,6 +2311,20 @@ def run_topology(program, config, output_dir, *, backend=None):
         result["reason"] = "blocked:mutated_program_not_bound"
         return result
 
+    episode_rebuild = None
+    if "episode_rebuild" in cfg:
+        try:
+            from r2f.campaign.topology_episode_rebuild import load_checkpoint
+            if "episode" not in effective_program:
+                raise ValueError("episode_rebuild:episode_required")
+            episode_rebuild = load_checkpoint(cfg["episode_rebuild"], effective_program, cfg)
+            if backend.real_ros and episode_rebuild["execution_evidence"] is not True:
+                raise ValueError("episode_rebuild:real_runtime_requires_real_checkpoint_origin")
+        except (OSError, ValueError, TypeError, KeyError, IndexError) as exc:
+            result.update(reason="blocked:invalid_episode_checkpoint:" + str(exc),
+                          runtime_status="blocked", status="blocked")
+            return result
+
     raw_path = output_dir / "raw.jsonl"
     try:
         raw = raw_path.open("x", buffering=1)
@@ -3486,6 +3500,12 @@ def run_topology(program, config, output_dir, *, backend=None):
             emit("topology_episode_begin", episode_id=episode.episode_id,
                  input_sha256=episode.input_identity(), initial_prefix=initial_prefix,
                  restoration_supported=False, candidate_eligible=False)
+            if episode_rebuild is not None:
+                emit("topology_episode_rebuild_begin", request=cfg["episode_rebuild"],
+                     origin_raw=episode_rebuild["origin_raw"],
+                     checkpoint_action_id=cfg["episode_rebuild"]["checkpoint_action_id"],
+                     mode="public_api_prefix_rebuild_then_suffix", DDS_memory_restored=False,
+                     hidden_state_equivalence_claimed=False, candidate_eligible=False)
             previous_boundary = initial_after["event_index"]
             checkpoints = set(effective_program["episode"]["checkpoint_action_ids"])
             resets = set(effective_program["episode"].get("reset_action_ids", []))
@@ -3535,6 +3555,16 @@ def run_topology(program, config, output_dir, *, backend=None):
                      restoration_supported=False, candidate_eligible=False)
                 raw.flush()
                 os.fsync(raw.fileno())
+                if (episode_rebuild is not None
+                        and receipt["sequence"] == episode_rebuild["request"]["sequence"]):
+                    from r2f.campaign.topology_episode_rebuild import validate_reconstructed_checkpoint
+                    validation = validate_reconstructed_checkpoint(episode_rebuild, receipt, events)
+                    emit("topology_episode_rebuild_validated", validation=validation,
+                         checkpoint_commit_ref=len(events)-1, candidate_eligible=False)
+                    # The semantic match and fresh-incarnation proof must be
+                    # durable BEFORE run_episode can start any suffix action.
+                    raw.flush()
+                    os.fsync(raw.fileno())
 
             execution = run_episode(episode, perform=perform_episode_action,
                 clock=time.monotonic, on_receipt=commit_episode_action)
