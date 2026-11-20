@@ -53,7 +53,7 @@ attestation/source freeze. Synthetic fixtures always remain ineligible.
 """
 from r2f.runtime.endpoint_incarnation import endpoint_identity_at
 from r2f.runtime.publish_occurrence import producer_occurrence_witness
-from r2f.campaign.topology_sample_attribution import native_delivery_identity
+from r2f.campaign.topology_sample_attribution import declares_native_publish, native_delivery_identity
 from copy import deepcopy
 import hashlib
 import json
@@ -70,6 +70,23 @@ from r2f.instrumentation.fastdds_peer.receipt import validate_observation
 
 SCHEMA = "r2f.s1-topology-state-projection/v1"
 _BOUNDARIES = {"topology_state_boundary", "state_step_before", "state_step_after", "topology_pair_observation"}
+
+
+def declares_fastdds_peer(row):
+    """Select the strong FastDDS contract without authenticating its receipt.
+
+    Cyclone public API observations share the historical carrier field. Only
+    their known schema/source pair is exempt; malformed or unknown declarations
+    must never gain the legacy public/count/isolation fallback.
+    """
+    observation = row.get("native_peer_observation")
+    cyclone_public = (isinstance(observation, dict)
+                      and observation.get("schema") == "r2f.cyclone-matched-peer-observation/v1"
+                      and row.get("peer_proof_source") == "dds_matched_endpoint_api")
+    return (row.get("event") == "native_peer_provider_selected"
+            or row.get("peer_proof_source") == "fastdds_native_stateful_peer_snapshot"
+            or row.get("observation_mode") == "instrumentation"
+            or "native_peer_observation" in row and not cyclone_public)
 
 
 def _text(value):
@@ -364,10 +381,8 @@ class _Projection:
                           if e.get("event") == "native_peer_provider_selected"
                           and all(token.get(k) is not None and e.get(k) == token[k]
                                   for k in ("pid", "process_start_ticks", "endpoint_generation"))]
-            native_declared = (source == "fastdds_native_stateful_peer_snapshot"
-                               or row.get("observation_mode") == "instrumentation"
+            native_declared = (declares_fastdds_peer(row)
                                or token.get("observation_mode") == "instrumentation"
-                               or isinstance(row.get("native_peer_observation"), dict)
                                or bool(selections))
             if native_declared and source != "fastdds_native_stateful_peer_snapshot":
                 raise ValueError("native_peer_proof_source_mislabeled")
@@ -375,6 +390,26 @@ class _Projection:
                         and isinstance(row.get("matched_peer_gids"), list))
             if native_declared and not complete:
                 raise ValueError("native_peer_membership_incomplete")
+            if not native_declared and "native_peer_observation" in row:
+                # The known Cyclone schema only dispatches the public contract;
+                # it cannot authenticate a complete capture or permit isolation
+                # to rescue a contradictory/incomplete public API receipt.
+                observation = row["native_peer_observation"]
+                if (observation.get("complete") is not True or not complete
+                        or observation.get("local_gid") != row.get("endpoint_gid")
+                        or observation.get("role_kind") != self.roles[token["logical_id"]]
+                        or not _integer(observation.get("domain_id"))
+                        or observation["domain_id"] != row.get("domain_id")
+                        or observation["domain_id"] != token.get("domain_id")
+                        or row.get("rmw_identifier") != "rmw_cyclonedds_cpp"
+                        or token.get("rmw_identifier") != "rmw_cyclonedds_cpp"
+                        or observation.get("matched_peer_gids") != row["matched_peer_gids"]):
+                    raise ValueError("cyclone_peer_observation_incomplete_or_inconsistent")
+                started, ended = (observation.get("started_monotonic_ns"),
+                                  observation.get("ended_monotonic_ns"))
+                if (not _integer(started, 1) or not _integer(ended, 1)
+                        or not chain[0]["monotonic_ns"] <= started <= ended <= row["monotonic_ns"]):
+                    raise ValueError("cyclone_peer_observation_chronology_invalid")
             if source in {"dds_matched_endpoint_api", "fastdds_native_stateful_peer_snapshot"} and complete:
                 gids = [_gid(gid) for gid in row["matched_peer_gids"]]
                 if None in gids or len(gids) != len(set(gids)) or row["matched_count"] != len(gids):
@@ -600,8 +635,7 @@ class _Projection:
         events = self.prefix(boundary)
         declared = any(e.get("logical_id") == send.get("logical_id")
                        and e.get("generation") == send.get("generation")
-                       and (e["event"] in {"publish_call_begin", "rmw_publish_trace", "publish_call_end"}
-                            or e["event"] == "send" and "publish_occurrence_receipt" in e)
+                       and declares_native_publish(e)
                        for e in events)
         if not declared:
             return []

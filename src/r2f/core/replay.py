@@ -470,15 +470,14 @@ def _topology_conformance_signature(metadata, facts, rule):
             if len({sample["receive_ref"]["event_index"] for sample in native_samples}) != len(native_samples):
                 return None
             native_peer_kinds = {"direct_native_per_peer", "direct_mixed_per_peer"}
+            from r2f.campaign.topology_state_projection import declares_fastdds_peer
             raw_native_peer = any(
                 ev.get("logical_id") in (pair["writer"], pair["reader"])
                 and ev.get("generation") == pair["writer_generation" if ev.get("logical_id") == pair["writer"]
                                                  else "reader_generation"]
                 and (ev.get("event") == "native_peer_provider_selected"
                      or ev.get("event") == "endpoint_created" and ev.get("observation_mode") == "instrumentation"
-                     or ev.get("event") == "match_snapshot" and (
-                         ev.get("peer_proof_source") == "fastdds_native_stateful_peer_snapshot"
-                         or "native_peer_observation" in ev or ev.get("observation_mode") == "instrumentation"))
+                     or ev.get("event") == "match_snapshot" and declares_fastdds_peer(ev))
                 for ev in events)
             native_peer = raw_native_peer or match.get("detail", {}).get("proof_kind") in native_peer_kinds
 

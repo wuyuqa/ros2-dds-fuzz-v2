@@ -14,7 +14,6 @@ from typing import Callable, TypedDict
 from r2f.runtime.publish_occurrence import publish_occurrence_witness
 from r2f.runtime.topology_worker import worker_role_kind
 
-_SCOPE_EVENTS = frozenset({'publish_call_begin', 'rmw_publish_trace', 'publish_call_end'})
 _IDENTITY_REFS = ('creation_ref', 'transition_ref', 'ack_ref', 'valid_after_ref')
 
 
@@ -46,15 +45,24 @@ def _require(condition, reason):
         raise ValueError('native_delivery_identity:' + reason)
 
 
-def _declares_native(row):
-    # Presence, not status/schema/hash, is the dispatch condition. In particular,
-    # an unsupported RMW claiming this contract must fail it, not downgrade.
-    return (row.get('event') in _SCOPE_EVENTS or
-            row.get('event') == 'send' and 'publish_occurrence_receipt' in row)
+def declares_native_publish(row):
+    """Select the FastDDS occurrence contract, not generic public API scopes.
+
+    Trace/receipt presence selects strict validation even if malformed or on an
+    unsupported RMW. Begin/end are emitted for ordinary Cyclone publishes too;
+    only their explicit FastDDS/instrumentation declaration selects UST proof.
+    This function dispatches contracts; it does not authenticate any sample.
+    """
+    kind = row.get('event')
+    return (kind == 'rmw_publish_trace'
+            or kind == 'send' and 'publish_occurrence_receipt' in row
+            or kind in {'publish_call_begin', 'publish_call_end'}
+            and (row.get('rmw_identifier') == 'rmw_fastrtps_cpp'
+                 or row.get('observation_mode') == 'instrumentation'))
 
 
 def _writer_for_native(event, events):
-    declarations = [row for row in events if _declares_native(row)]
+    declarations = [row for row in events if declares_native_publish(row)]
     if not declarations:
         return None
     publisher = event.get('publisher_gid')
