@@ -72,3 +72,42 @@ def test_new_effective_schema_never_waives_missing_or_mismatched_receipts(tmp_pa
     record=audit(plan,config,runtime)
     assert record['reasons'],record
     assert not record['configuration_application_observed'] and not record['hit']
+
+
+def test_formal_gate_consumes_actual_schema_not_only_legacy_source_tag(tmp_path):
+    # Mock only the existing formal branch, NEVER evidence of real execution.
+    from test_topology_operator_route_integration import _mocked_formal_audit
+    plan, config, runtime = raw_default_case(tmp_path)
+    route = _mocked_formal_audit(plan, config, runtime)
+    assert route['execution_evidence'] is True, route['reasons']
+    assert route['status'] == 'application_observed'
+    assert route['mutation_receipt']['planned']
+    assert route['mutation_receipt']['submitted']
+    assert route['mutation_receipt']['carrier_admitted']
+    # param.boundary retains its existing legacy receipt contract; this does
+    # not attest timed lease lifecycle or turn default resolution into one.
+    assert route['layers'][0]['effect_scope'] == 'endpoint_public_configuration_only_not_timed_lifecycle'
+
+
+@pytest.mark.parametrize('damage', ['missing', 'pid', 'qos', 'request', 'comparison',
+                                    'source_tag_only', 'identity_api', 'topic', 'type'])
+def test_actual_schema_formal_gate_never_accepts_tag_or_request_echo(tmp_path, damage):
+    from test_topology_operator_route_integration import _mocked_formal_audit
+    plan, config, runtime = raw_default_case(tmp_path)
+    def corrupt(events):
+        token = next(e for e in events if e['event'] == 'endpoint_created')
+        if damage == 'missing': token.pop('actual_endpoint_qos')
+        elif damage == 'pid': token['actual_endpoint_qos']['pid'] += 1
+        elif damage == 'qos': token['actual_endpoint_qos']['qos']['depth'] += 1
+        elif damage == 'request': token['requested_qos']['depth'] += 1
+        elif damage == 'comparison': token['qos_request_comparison']['status'] = 'mismatch'
+        elif damage == 'source_tag_only': token['configuration_source'] = 'public_graph_endpoint_reflection'
+        elif damage == 'identity_api': token['identity_source'] = 'config_echo'
+        elif damage == 'topic': token['topic'] = '/foreign'
+        else: token['message_type'] = 'other'
+        return events
+    _rewrite_raw(runtime, corrupt)
+    route = _mocked_formal_audit(plan, config, runtime)
+    assert route['execution_evidence'] is False, route
+    assert 'raw_formal_execution_qualification_incomplete' in route['reasons']
+    assert not any(route['mutation_receipt'].values())

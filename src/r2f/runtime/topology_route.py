@@ -523,6 +523,37 @@ def audit_topology_netem(binding, events, *, path, digest, real, fixture, observ
     return audit
 
 
+def _worker_configuration_proven(created, program):
+    """Recognize exact legacy reflection or validate the new actual-QoS raw.
+
+    The schema tag alone is never an observation. New receipts must bind the
+    public readback to this worker and the sealed program's create request.
+    """
+    source = created.get("configuration_source")
+    if source == "public_graph_endpoint_reflection":
+        return "actual_endpoint_qos" not in created
+    if source != "public_endpoint_actual_qos":
+        return False
+    from .qos_binding import validate_created_qos
+    from .topology_worker import endpoint_expressibility
+    try:
+        specs = [e for e in program["endpoints"]
+                 if e.get("logical_id") == created.get("logical_id")]
+        if len(specs) != 1:
+            return False
+        spec = specs[0]
+        api = ("get_publishers_info_by_topic" if spec["role"] == "writer"
+               else "get_subscriptions_info_by_topic")
+        if (created.get("identity_source") != api or created.get("topic") != spec["topic"]
+                or created.get("message_type") != spec["type_name"]):
+            return False
+        requested = endpoint_expressibility(spec, {"rmw": created.get("rmw_identifier")})["public_qos"]
+        validate_created_qos(created, requested)
+        return True
+    except (ValueError, TypeError, KeyError, RuntimeError):
+        return False
+
+
 def audit_topology_application(plan, input_layer_receipts, runtime):
     """Audit per-layer input→application, retaining unsupported/unknown gaps.
 
@@ -579,7 +610,7 @@ def audit_topology_application(plan, input_layer_receipts, runtime):
         workers = _execution_workers(events, path)
         worker_provenance = bool(created_workers) and all(
             e.get("backend") == ROS_BACKEND and e.get("real_ros") is True
-            and e.get("configuration_source") == "public_graph_endpoint_reflection"
+            and _worker_configuration_proven(e, program)
             and type(e.get("observed_domain_id")) is int and e.get("observed_domain_id") == e.get("domain_id")
             and e.get("rmw_identifier") in {"rmw_cyclonedds_cpp", "rmw_fastrtps_cpp"}
             and all(e.get(k) is not None for k in ("pid", "process_start_ticks", "endpoint_generation", "endpoint_gid"))
