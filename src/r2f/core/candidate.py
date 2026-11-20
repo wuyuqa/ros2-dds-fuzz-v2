@@ -131,7 +131,27 @@ def _validate_topology_identity(row, identity):
         event = reference(endpoint.get("creation_ref"))
         if event.get("event") != "endpoint_created" or any(
                 event.get(name) != endpoint.get(name) for name in
-                ("logical_id", "generation", "endpoint_gid", "endpoint_generation", "pid", "process_start_ticks")):
+                ("logical_id", "generation", "endpoint_generation", "pid", "process_start_ticks")):
+            raise ValueError("topology lineage differs from raw creation identity")
+        # A lineage summary names the final authenticated DDS incarnation, not
+        # necessarily the creation GID. Keep the immutable process/origin check
+        # above, then independently reopen the complete API/graph/transition/ACK
+        # chain. Neither a changed GID alone nor omitted metadata permits a
+        # legacy creation-only interpretation of an actual raw transition.
+        incarnation_declared = any(name in endpoint for name in
+                                   ("incarnation_ordinal", "identity_transition_ref"))
+        raw_transition = any(e.get("event") == "endpoint_identity_transition"
+                             and e.get("logical_id") == logical_id
+                             and e.get("generation") == generation for e in events)
+        if incarnation_declared or raw_transition:
+            from r2f.runtime.endpoint_incarnation import endpoint_identity_at
+            current = endpoint_identity_at(events, event)
+            if (type(endpoint.get("incarnation_ordinal")) is not int
+                    or "identity_transition_ref" not in endpoint
+                    or any(canonical_hash(endpoint.get(name)) != canonical_hash(current.get(name))
+                           for name in ("endpoint_gid", "incarnation_ordinal", "identity_transition_ref"))):
+                raise ValueError("topology lineage differs from authenticated current incarnation")
+        elif event.get("endpoint_gid") != endpoint.get("endpoint_gid"):
             raise ValueError("topology lineage differs from raw creation identity")
         if not re.fullmatch(roles[logical_id] + r"[0-9]*", str(event.get("role", ""))):
             raise ValueError("topology endpoint role differs from raw creation")
