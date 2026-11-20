@@ -1700,7 +1700,13 @@ def concurrent_writers_program():
         "publish_batch", a["endpoint_id"], 1,
         {"count": 1, "start_sequence": 64, "interval_sec": 0.0,
          "payload": "later-same-writer-sentinel"}) for a in publishes]
-    program["actions"] = creates + [barrier] + publishes + sentinels + [
+    # Publish return and snapshot ACK are not DDS delivery completion. Await
+    # the existing identity-bound delivery contract before closing the capture.
+    delivered = topology_model._action("delivered_after_group", "barrier", params={
+        "condition": "delivery", "timeout_sec": 5.0,
+        "endpoint_ids": [e["logical_id"] for e in program["endpoints"]]})
+    delivered["depends_on"] = [a["action_id"] for a in sentinels]
+    program["actions"] = creates + [barrier] + publishes + sentinels + [delivered,
         topology_model._action("final", "snapshot", params={"label": "after-L02"})]
     if topology_model.validate_program(program)["status"] != "valid":
         raise ValueError("concurrent writer seed violated the topology contract")

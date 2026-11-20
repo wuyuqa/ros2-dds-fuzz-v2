@@ -72,3 +72,20 @@ def test_canonical_cli_plans_concurrency_and_sentinels_without_execution(tmp_pat
     assert any(a['action_id'].startswith('snapshot_added') for a in final['actions'])
     capsule = json.loads(Path(row['replay_path']).read_text())
     assert capsule['execution'] is None
+
+
+def test_authored_concurrency_awaits_identity_bound_delivery_after_both_sentinels():
+    """A snapshot ACK must not close an undrained asynchronous reader window."""
+    program = v2.concurrent_writers_program()
+    actions = program['actions']
+    sentinels = [a for a in actions if a['action_id'].startswith('later_sentinel_')]
+    waits = [a for a in actions if a['op'] == 'barrier'
+             and a['params'].get('condition') == 'delivery']
+    assert len(waits) == 1
+    wait = waits[0]
+    assert set(wait['params']['endpoint_ids']) == {e['logical_id'] for e in program['endpoints']}
+    assert set(wait['depends_on']) == {a['action_id'] for a in sentinels}
+    assert 0 < wait['params']['timeout_sec'] <= 10
+    assert all(actions.index(a) < actions.index(wait) for a in sentinels)
+    assert actions.index(wait) < next(i for i, a in enumerate(actions) if a['action_id'] == 'final')
+    assert topology_model.validate_program(program)['status'] == 'valid'
