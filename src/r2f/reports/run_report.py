@@ -707,7 +707,7 @@ def _verify_topology_generation_rejection(root, row, report):
         raise ValueError("topology_rejection_model_provenance_mismatch")
 
 
-def _topology_generation_provenance(root, row, report):
+def _topology_generation_provenance(root, row, report, *, prepared_duplicate=False):
     """Shared source/profile/task/parent proof, never execution qualification."""
     from r2f.campaign.checkpoint import _identity, SCHEMA
     from r2f.campaign.search_frontier import search_settings, derived_record
@@ -820,7 +820,8 @@ def _topology_generation_provenance(root, row, report):
             and [e["action"] for e in history] != ["select", "generation_rejected", "finish"]):
         raise ValueError("topology_rejection_has_submission_or_plan_history")
     selections = [s for s in state["scheduler"]["selections"] if s.get("task_id") == task["task_id"]]
-    if (len(selections) != 1 or cell != f"{row['run_id']}.{selections[0]['sequence']:04d}.rejected"
+    suffix = parent["surface_id"] if prepared_duplicate else "rejected"
+    if (len(selections) != 1 or cell != f"{row['run_id']}.{selections[0]['sequence']:04d}.{suffix}"
             or task.get("status") != "rejected" or task.get("actual") is not False
             or task.get("execution") is not None or task.get("reason") != row["reason_code"]):
         raise ValueError("topology_rejection_model_provenance_mismatch")
@@ -892,6 +893,57 @@ def _verify_topology_model_terminal(root, row, report):
             or history[2].get("execution") is not None or history[2].get("reason") != reason):
         raise ValueError("topology_model_terminal_regeneration_mismatch")
 
+
+
+def _verify_topology_prepared_duplicate(root, row, report):
+    """A prepared duplicate is neither an unprepared guard nor an execution."""
+    from r2f.campaign.checkpoint import _identity, _validate_state
+    from r2f.campaign.topology_search import generate
+    from r2f.campaign.search_frontier import derived_record
+    from r2f.core.replay import ReplayCapsule
+    case = Path(root) / 'cases' / row['cell_id']
+    if (case.is_symlink() or not case.is_dir() or {p.name for p in case.iterdir()} != {
+            'row.json', 'mutation_plan.json', 'runtime_config.json', 'capsule.json'}):
+        raise ValueError('topology_prepared_duplicate_has_execution_artifacts')
+    if (row.get('generation_status') != 'rejected' or row.get('reason_code') != 'model_duplicate_content'
+            or row.get('blocked_reason') != 'model_duplicate_content'
+            or row.get('execution_stage') != 'planned' or row.get('actual_run') is not False
+            or row.get('oracle_verdict') != 'not_applicable' or row.get('arm') != 'mutated'
+            or row.get('control_kind') is not None
+            or any(row.get(k) is not False for k in ('candidate_eligible', 'feedback_eligible', 'seal_eligible'))
+            or row.get('mutation_receipt') != dict.fromkeys((
+                'planned', 'submitted', 'carrier_admitted', 'configured', 'applied', 'hit', 'effect_observed'), False)
+            or any(row.get(k) is not None for k in ('raw_path', 'raw_sha256', 'typed_facts', 'oracle',
+                'runtime_execution_metadata', 'execution_metadata', 'execution', 'input_terminal'))):
+        raise ValueError('topology_prepared_duplicate_execution_claim_invalid')
+    saved = json.loads(_path(root, str(case / 'row.json')).read_text())
+    if canonical_hash(saved) != canonical_hash(row):
+        raise ValueError('topology_prepared_duplicate_saved_row_mismatch')
+    checkpoint = json.loads(_path(root, 'checkpoint.json').read_text())
+    identity, seeds, registry = _identity(report['profile'], checkpoint['identity']['cycle_id'],
+                                         report['source_manifest'])
+    _validate_state(checkpoint['state'], identity, seeds, registry)
+    task, parent, history, desc = _topology_generation_provenance(root, row, report, prepared_duplicate=True)
+    if ([e['action'] for e in history] != ['select', 'plan', 'finish']
+            or task.get('generation_outcome') != 'duplicate_content'):
+        raise ValueError('topology_prepared_duplicate_model_history_invalid')
+    plan = generate(parent, task, desc)
+    record = derived_record(parent, plan)
+    if (canonical_hash(task.get('generated_record')) != canonical_hash(record)
+            or canonical_hash(row.get('mutation_plan')) != canonical_hash(plan.to_dict())
+            or row.get('mutation_plan_sha256') != canonical_hash(plan.to_dict())
+            or row.get('content_sha256') != record['content_sha256']
+            or row.get('parent_content_sha256') != parent['content_sha256']):
+        raise ValueError('topology_prepared_duplicate_model_regeneration_mismatch')
+    config = json.loads(_path(root, str(case / 'runtime_config.json')).read_text())
+    capsule = ReplayCapsule.from_dict(json.loads(_path(root, str(case / 'capsule.json')).read_text()))
+    if (capsule.execution is not None or capsule.execution_history
+            or config.get('source_manifest') != report['source_manifest']
+            or row.get('source_manifest', report['source_manifest']) != report['source_manifest']):
+        raise ValueError('topology_prepared_duplicate_capsule_source_or_execution_invalid')
+    qualification = _topology_artifact_qualification(root, row, report)
+    if qualification.get('real_ros_execution') is not False:
+        raise ValueError('topology_prepared_duplicate_cannot_be_execution')
 
 
 def _topology_artifact_qualification(root, row, report):
@@ -1023,7 +1075,9 @@ def _verify_exploratory_row(root, row, report, errors):
         from r2f.modules.s1.topology_targets import TOPOLOGY_TARGET
         topology = row["target_id"] == TOPOLOGY_TARGET
         if topology and row.get("generation_status") == "rejected":
-            if row.get("mutation_plan") is None:
+            if row.get("reason_code") == "model_duplicate_content":
+                _verify_topology_prepared_duplicate(root, row, report)
+            elif row.get("mutation_plan") is None:
                 _verify_topology_generation_rejection(root, row, report)
             else:
                 _verify_topology_model_terminal(root, row, report)
@@ -1290,8 +1344,9 @@ def _audit_exploratory_ledger(root, report, rows, errors, details):
     eligible_rows, exclusions = [], []
     from r2f.modules.s1.topology_targets import TOPOLOGY_TARGET
     for row in rows:
-        if boundary_qualification_for_row(root, row, report)["status"] not in {"not_applicable", "qualified", "terminal_unqualified"}:
-            continue
+        if (row.get("target_id") == TOPOLOGY_TARGET and row.get("generation_status") == "rejected"
+                and row.get("actual_run") is False and row.get("execution_stage") == "planned"):
+            continue  # Already independently certified by the strict row verifier.
         if row.get("target_id") == TOPOLOGY_TARGET:
             try:
                 qualified = _topology_artifact_qualification(root, row, report)
@@ -1303,10 +1358,12 @@ def _audit_exploratory_ledger(root, report, rows, errors, details):
                                    "raw_sha256": row.get("raw_sha256"),
                                    "qualification_errors": qualified["qualification_errors"]})
                 continue
+        if boundary_qualification_for_row(root, row, report)["status"] not in {"not_applicable", "qualified", "terminal_unqualified"}:
+            continue
         _f1_adapter_artifact_qualification(root, row, report)
         eligible_rows.append(row)
     expected = exploratory_candidate_ledger(eligible_rows, reviews=report.get("review_records") or [])
-    if exclusions and ledger.get("execution_exclusions") != exclusions:
+    if ledger.get("execution_exclusions", []) != exclusions:
         errors.append("topology_ledger_execution_exclusions_mismatch")
     if Counter(c.get("candidate_id") for c in ledger.get("candidates", [])) != Counter(
             c.get("candidate_id") for c in expected["candidates"]):

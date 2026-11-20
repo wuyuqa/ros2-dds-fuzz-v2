@@ -117,6 +117,8 @@ def four_rows(model_report, tmp_path, monkeypatch):
     report['candidate_ledger_path'] = str(ledger_path)
     report['candidate_ledger_sha256'] = canonical_hash(ledger)
     report['budget'].update(attempted=2, executed=2, actual=2, unique_actual=2)
+    # Fresh synthetic segment: its local counters must match its cumulative budget.
+    report['cycle_budget'].update(attempted=2, executed=2, actual=2)
     report['last_state']['executed'] = 2
     report['report_sha256'] = audit.exploratory_report_digest(report)
     write(root / 'report.json', report)

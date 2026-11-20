@@ -1295,10 +1295,17 @@ def _persist_topology_exploratory_report(output_dir, cycle, registry):
                            "target_sha256": canonical_hash(target.to_dict())},
               "required_catalog_sha256": required_catalog_hash(), "rows": cycle["rows"],
               "budget": cycle["budget"], "last_state": cycle["last_state"], "abort": cycle["abort"],
+              **{key: deepcopy(cycle[key]) for key in ("cycle_budget", "resume_origin", "row_sequences")
+                 if key in cycle},
               "runtime_boundary": cycle["runtime_boundary"], "runtime_formal": cycle["runtime_formal"],
               "control_references": [], "review_records": []}
     eligible, exclusions = [], []
     for row in cycle["rows"]:
+        if (row.get("generation_status") == "rejected" and row.get("actual_run") is False
+                and row.get("execution_stage") == "planned"):
+            # Generation is audited separately, never an execution exclusion or
+            # natural-candidate input. The standalone row verifier reopens it.
+            continue
         try:
             qualified = _topology_artifact_qualification(output_dir, row, report)
         except (OSError, ValueError, TypeError, KeyError) as exc:
@@ -2487,7 +2494,15 @@ def _generate_case(sequence, entry, target, contract, surface, parent, mutator_i
         if outcome in {"compile_time_no_change", "duplicate_content", "guard_terminal"}:
             reason = "model_" + outcome
             row.update(generation_status="rejected", reason_code=reason,
-                       blocked_reason=reason, candidate_eligible=False)
+                       blocked_reason=reason, candidate_eligible=False,
+                       feedback_eligible=False, seal_eligible=False,
+                       oracle_verdict="not_applicable")
+            if topology and outcome == "duplicate_content":
+                # Input dedupe never submits a carrier. This terminal is
+                # separately regenerated/reopened by the standalone consumer.
+                row["boundary_qualification"] = {
+                    "status": "not_applicable", "eligible": False,
+                    "reason_code": "model_duplicate_content_no_execution", "errors": []}
             _atomic_json(row_path, row)
             return row
     if not execute:
