@@ -182,7 +182,7 @@ def _direct_peer_membership(token, peer, snapshot, events, *, before_index=None)
     request = chain[0]
     if match.get("peer_proof_source") == "fastdds_native_stateful_peer_snapshot":
         from r2f.instrumentation.fastdds_peer.receipt import validate_observation
-        reason = validate_observation(match.get("native_peer_observation"), match, token, events, request)
+        reason = validate_observation(chain[1].get("native_peer_observation"), chain[1], token, events, request)
         if reason is not None:
             return None, reason
     elif native_declared:

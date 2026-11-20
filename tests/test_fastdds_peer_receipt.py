@@ -160,3 +160,20 @@ def test_jointly_forged_raw_provider_identity_rejected_by_manifest(damage):
     else:
         selected['provider_binary']['path'] = mapped['path'] = '/forged/libr2f_fastdds_peer.so'
     assert not proof(rows, opened, close)['window_complete']
+
+
+def test_controller_semantic_snapshot_uses_raw_event_envelope_not_missing_index():
+    from r2f.runtime.topology_pair import _direct_peer_membership
+    rows, opened, close = instrumented_window()
+    token, peer = rows[:2]
+    indices = opened['snapshot_refs'][token['logical_id']]
+    chain = [rows[i] for i in indices]
+    # Real _EndpointProcess returns worker JSON, while the controller's sink
+    # adds event_index only in raw. Contract fixtures used full raw envelopes.
+    match = {k:v for k,v in chain[1].items() if k not in ('event_index','raw_event_ref')}
+    graph = {k:v for k,v in chain[2].items() if k not in ('event_index','raw_event_ref')}
+    snapshot = dict(complete=True, command_id=chain[0]['command_id'],
+                    match_snapshot=match,graph_snapshot=graph)
+    value, reason = _direct_peer_membership(token,peer,snapshot,rows,
+                                           before_index=close['event_index'])
+    assert value is True, reason
