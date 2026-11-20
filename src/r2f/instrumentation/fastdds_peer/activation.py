@@ -27,7 +27,11 @@ def manifest_for_reference(reference):
             or not isinstance(reference.get('manifest_sha256'), str)
             or re.fullmatch(r'[0-9a-f]{64}', reference['manifest_sha256']) is None):
         raise ProbeError('explicit_fastdds_peer_instrumentation_reference_required')
-    return validate_manifest(reference['manifest_path'], reference['manifest_sha256'])
+    manifest = validate_manifest(reference['manifest_path'], reference['manifest_sha256'])
+    if manifest.get('filter_trace') is not None:
+        from r2f.instrumentation.fastdds_filter_trace.activation import selected_manifest
+        selected_manifest(manifest)
+    return manifest
 
 
 def reference_from_config(config):
@@ -61,6 +65,9 @@ def environment_for_reference(base_env, reference):
     env['LD_LIBRARY_PATH'] = os.pathsep.join([libdir, *[
         item for item in env.get('LD_LIBRARY_PATH', '').split(os.pathsep)
         if item and item != libdir]])
+    if manifest.get('filter_trace') is not None:
+        from r2f.instrumentation.fastdds_filter_trace.activation import selected_manifest
+        env['LD_PRELOAD'] = selected_manifest(manifest)['binary']['path']
     return env
 
 

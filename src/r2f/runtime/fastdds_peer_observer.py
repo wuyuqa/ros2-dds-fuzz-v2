@@ -129,10 +129,10 @@ class _Bindings:
     """Retain DSOs/functions only, NEVER an endpoint/rmw/native object pointer."""
     def __init__(self, reference):
         self.reference = _reference(reference)
-        if os.environ.get('LD_PRELOAD') or os.environ.get('LD_AUDIT'):
-            raise PeerObservationUnavailable('instrumentation_untracked_loader_hook')
-        self.abi = verify_abi()
         self.manifest = manifest_for_reference(self.reference)
+        from r2f.instrumentation.fastdds_filter_trace.activation import verify_loader_selection
+        verify_loader_selection(self.manifest)
+        self.abi = verify_abi()
         self._check_manifest_abi(self.manifest)
         # The existing RMW must already use this vendor. Do not rescue an
         # incorrectly launched worker by loading a second vendor here.

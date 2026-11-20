@@ -995,6 +995,20 @@ class _LivelinessPeerSampler:
         return value
 
 
+def _drain_filter_decisions(observer, emit, *, final=False):
+    """Forward actual native returns unchanged; overflow is a tool failure."""
+    records, stats = observer.drain()
+    for receipt in records:
+        emit("native_content_filter_decision", receipt=receipt, candidate_eligible=False)
+    if records or final or stats["dropped"] or stats["resolve_status"] == 2:
+        emit("native_filter_trace_health", manifest_reference=observer.reference,
+             stats=stats, final=final, capture_complete=stats["dropped"] == 0,
+             candidate_eligible=False)
+    if stats["dropped"] or stats["resolve_status"] == 2:
+        raise TopologyBackendError("native_filter_trace_overflow_or_resolver_failure")
+    return stats
+
+
 def _worker_main(argv):
     """Child entry point: one endpoint generation, strict JSONL on stdout."""
     if len(argv) != 3:
@@ -1059,11 +1073,14 @@ def _worker_main(argv):
     executor.add_node(node)
     local_gid = None
     native_peer_observer = None
+    filter_decision_observer = None
     incarnation_ordinal = 0
     receive_sequence = 0
     endpoint_generation = node_token
 
     def emit(event, **fields):
+        if event == "command_done" and filter_decision_observer is not None:
+            _drain_filter_decisions(filter_decision_observer, emit)
         value = {
             "event": event, "time_ns": time.time_ns(), "monotonic_ns": time.monotonic_ns(),
             "monotonic_clock_identity": _monotonic_clock_identity(),
@@ -1088,6 +1105,18 @@ def _worker_main(argv):
              vendor_binary=selected["binaries"]["vendor"],
              provider_source_sha256=selected["provider_source_sha256"],
              provider_abi=selected["patch"]["abi"], candidate_eligible=False)
+        if selected.get("filter_trace") is not None:
+            from r2f.instrumentation.fastdds_filter_trace.observer import FilterDecisionObserver
+            filter_decision_observer = FilterDecisionObserver(selected)
+            emit("native_filter_trace_provider_selected",
+                 manifest_reference=filter_decision_observer.reference,
+                 peer_manifest_reference=instrumentation,
+                 binary=filter_decision_observer.manifest["binary"],
+                 vendor_binary=selected["binaries"]["vendor"],
+                 provider_mapping=filter_decision_observer.mapping,
+                 hook_source_sha256=filter_decision_observer.manifest["hook_source_sha256"],
+                 abi=filter_decision_observer.manifest["abi"],
+                 capture_scope="actual_evaluate_calls_only", candidate_eligible=False)
 
     def gid_bytes(value):
         return bytes(value).hex() if value is not None else None
@@ -1236,6 +1265,8 @@ def _worker_main(argv):
         last_graph_ns = 0
         while True:
             executor.spin_once(timeout_sec=0.01)
+            if filter_decision_observer is not None:
+                _drain_filter_decisions(filter_decision_observer, emit)
             now = time.monotonic_ns()
             count = (endpoint.get_subscription_count() if kind == "writer"
                      else endpoint.get_publisher_count())
@@ -1403,6 +1434,11 @@ def _worker_main(argv):
     finally:
         primary_error = sys.exc_info()[1]
         close_error = None
+        if filter_decision_observer is not None:
+            try:
+                _drain_filter_decisions(filter_decision_observer, emit, final=True)
+            except BaseException as exc:
+                close_error = exc
         if publish_observer is not None:
             try:
                 emit("publish_observer_closed", **publish_observer.close())
