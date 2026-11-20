@@ -96,6 +96,11 @@ def evaluate_topology(scenario, facts):
     if facts.get("endpoint_identity_complete") is not True:
         result["reason_codes"] = ["topology_endpoint_identity_incomplete"]
         return _assessed_result(scenario, facts, result)
+    # Supporting diagnostics only: no ordering residual is declared in the
+    # frozen target rule. Do not fold this observation into its verdict/facts.
+    result["ordering_observations"] = [pair["ordering_observation"]
+        for pair in facts.get("pairs", []) if "ordering_observation" in pair]
+    result["ordering_oracle_coverage"] = "not_declared_by_target_rule"
     graph_values, delivery_values, reasons, residuals = [], [], [], []
     for pair in facts.get("pairs", []):
         detail = {"writer": pair["writer"], "reader": pair["reader"],

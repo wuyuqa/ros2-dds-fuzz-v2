@@ -304,6 +304,18 @@ def _action_proof(action, events):
         if not any(e.get("event") == "topology_pair_observation" for e in segment):
             return [], "snapshot_raw_observation_missing"
     elif op == "publish_batch":
+        group = action.get("params", {}).get("concurrency_group")
+        if group is not None:
+            from .topology_concurrency import audit_concurrency
+            program = {"actions": [e["action"] for e in events if e.get("event") == "topology_action_begin" and isinstance(e.get("action"), dict)]}
+            # The raw begin event binds the immutable effective program.
+            if not isinstance(program, dict):
+                return [], "concurrent_program_binding_missing"
+            try:
+                audit_concurrency(events, program["actions"], group)
+            except ValueError as exc:
+                return [], str(exc)
+            segment = [e for e in events if e.get("phase") == action["action_id"]]
         sends = [e for e in segment if e.get("event") == "send" and e.get("logical_id") == eid and e.get("generation") == gen]
         p = action["params"]
         expected = list(range(p["start_sequence"], p["start_sequence"] + p["count"]))

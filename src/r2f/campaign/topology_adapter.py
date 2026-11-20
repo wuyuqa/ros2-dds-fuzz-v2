@@ -26,6 +26,7 @@ from .topology_state_projection import project_topology_state
 SCHEMA = "r2f.s1-topology-facts/v1"
 _WORKER_EVENTS = {"endpoint_created", "endpoint_create_begin", "worker_ready", "send", "receive",
                   "match_snapshot", "graph_snapshot", "command_done", "worker_shutdown",
+                  "concurrent_publish_ready", "concurrent_publish_started", "concurrent_publish_finished",
                   "worker_command_requested", "topology_snapshot_requested", "liveliness_asserted"}
 _TOOL_EVENTS = {"worker_error", "worker_command_error", "worker_unexpected_exit", "runtime_abort",
                 "owned_worker_cleanup_signal", "topology_tool_error"}
@@ -329,7 +330,15 @@ class _Audit:
             begin = _one(self.events, "topology_action_begin", action_id=aid)
             done = _one(self.events, "topology_action_done", action_id=aid)
             self.action_before(action, begin)
-            _chain(previous, begin, done)
+            group = action.get("params", {}).get("concurrency_group")
+            prev_group = (self.program["actions"][i - 1].get("params", {}).get("concurrency_group") if i else None)
+            if group is not None and group == prev_group:
+                from r2f.runtime.topology_concurrency import audit_concurrency
+                audit_concurrency(self.events, self.program["actions"], group)
+                _chain(begin, done)
+                _chain(previous, done)
+            else:
+                _chain(previous, begin, done)
             _require(begin.get("action") == action and done.get("action") == action
                      and begin.get("action_index") == i and done.get("action_index") == i,
                      "action_program_binding_mismatch")
@@ -364,6 +373,10 @@ class _Audit:
                              and e.get("generation") == action["generation"] for e in inside), "action_destroy_raw_missing")
             elif op == "publish_batch":
                 params = action["params"]
+                if params.get("concurrency_group") is not None:
+                    from r2f.runtime.topology_concurrency import audit_concurrency
+                    audit_concurrency(self.events, self.program["actions"], params["concurrency_group"])
+                    inside = [e for e in self.events if e.get("phase") == aid]
                 sends = [e for e in inside if e["event"] == "send" and e.get("logical_id") == action["endpoint_id"]
                          and e.get("generation") == action["generation"]]
                 _require([e.get("send_sequence") for e in sends] == list(range(params["start_sequence"], params["start_sequence"] + params["count"])),
@@ -429,25 +442,50 @@ class _Audit:
 
 
 def _source_qualification(audit, *, before=None):
-    """Artifact claims alone never confer source-frozen provenance."""
+    """Reopen source and independently bind every producer phase to raw order.
+
+    Admission uses only its own prefix. Final qualification additionally needs
+    each action's pre-API check (including both concurrently begun writers),
+    action completion, and cleanup; source-equal bookends alone are not proof.
+    """
     source = audit.config.get("source_manifest")
     if audit.fixture or not isinstance(source, dict) or source.get("source_frozen") is not True:
         return False
     try:
         from .identity import source_manifest
+        _require(source == source_manifest(Path(source["source_repo"])), "source_changed")
         checks = [e for e in audit.events if e["event"] == "topology_source_checked"]
         if before is not None:
-            prefix = [e for e in checks if e["event_index"] < before["event_index"]
+            checks = [e for e in checks if e["event_index"] < before["event_index"]
                       and e["monotonic_ns"] < before["monotonic_ns"]]
-            return (source == source_manifest(Path(source["source_repo"])) and bool(prefix)
-                    and any(e.get("phase") == "after_preflight" for e in prefix)
-                    and all(e.get("source") == source for e in prefix))
+        _require(bool(checks) and all(e.get("source") == source for e in checks), "source_checks_mismatch")
+
+        def phase(name):
+            return _one(checks, "topology_source_checked", phase=name)
+
+        preflight, ready, presteps = (phase(name) for name in
+            ("before_preflight", "after_preflight", "before_presteps"))
+        _chain(preflight, ready, presteps)
+        if before is not None:
+            _chain(presteps, before)
+            return True
+
         actions = [e for e in audit.events if e["event"] == "topology_action_begin"]
-        return (source == source_manifest(Path(source["source_repo"])) and len(checks) >= 2
-                and all(e.get("source") == source for e in checks)
-                and checks[-1].get("phase") == "after_cleanup"
-                and (not actions or checks[0]["event_index"] < actions[0]["event_index"]
-                     and checks[-1]["event_index"] > actions[-1]["event_index"]))
+        action_ids = [e.get("action_id") for e in actions]
+        _require(all(_text(aid) for aid in action_ids)
+                 and len(set(action_ids)) == len(action_ids), "source_action_identity")
+        after_actions, after_cleanup = phase("after_actions"), phase("after_cleanup")
+        expected_phases = {"before_preflight", "after_preflight", "before_presteps",
+                           "after_actions", "after_cleanup"} | {"before_action:" + aid for aid in action_ids}
+        _require(len(checks) == len(expected_phases)
+                 and {e.get("phase") for e in checks} == expected_phases, "source_phase_set")
+        for begin in actions:
+            gate = phase("before_action:" + begin["action_id"])
+            done = _one(audit.events, "topology_action_done", action_id=begin["action_id"])
+            _chain(presteps, gate, begin, done, after_actions)
+        cleanup = _one(audit.events, "topology_cleanup")
+        _chain(presteps, after_actions, cleanup, after_cleanup)
+        return True
     except (KeyError, OSError, ValueError, TypeError):
         return False
 
@@ -506,9 +544,98 @@ def _pair_facts(audit, projection, deliveries):
                               all(audit.specs[eid].get("filter") is None for eid in (w, r)))
         row["writer_generation"] = side["identity"].get(w, {}).get("generation")
         row["reader_generation"] = side["identity"].get(r, {}).get("generation")
+        row["ordering_observation"] = {
+            "schema": "r2f.topology-per-writer-order-observation/v1", "status": "unknown",
+            "reason_codes": ["validated_pair_window_unavailable"],
+            "writer": w, "reader": r, "writer_generation": row["writer_generation"],
+            "reader_generation": row["reader_generation"],
+            "writer_gid": audit.tokens.get((w, row["writer_generation"]), {}).get("endpoint_gid"),
+            "reader_gid": audit.tokens.get((r, row["reader_generation"]), {}).get("endpoint_gid"),
+            "oracle_coverage": "not_declared_by_target_rule", "candidate_eligible": False,
+            "cross_writer_order_required": False, "rule_verdict": None}
         row.update(_delivery_window(audit, row, deliveries))
         rows.append(row)
     return rows
+
+
+def _ordering_observation(audit, pair, opened, close):
+    """Supporting observation, independently rebuilt from the audited raw file.
+
+    This is reader callback/capture order, not wire order or a cross-writer
+    total order. The target's existing rule declares no ordering residual:
+    even an observed inversion cannot confer rule/candidate eligibility.
+    """
+    w, r = pair["writer"], pair["reader"]
+    wg, rg = pair["writer_generation"], pair["reader_generation"]
+    result = {
+        "schema": "r2f.topology-per-writer-order-observation/v1",
+        "scope": "per_writer_reader_generation_window",
+        "writer": w, "reader": r, "writer_generation": wg, "reader_generation": rg,
+        "writer_gid": audit.tokens.get((w, wg), {}).get("endpoint_gid"),
+        "reader_gid": audit.tokens.get((r, rg), {}).get("endpoint_gid"),
+        "open_ref": audit.ref(opened), "close_ref": audit.ref(close),
+        "status": "unknown", "reason_codes": [], "send_order": [], "receive_order": [],
+        "send_refs": [], "receive_refs": [], "witnesses": [], "inversions": [],
+        "identity_bases": [], "cross_writer_order_required": False,
+        "oracle_coverage": "not_declared_by_target_rule", "candidate_eligible": False,
+        "rule_verdict": None,
+    }
+    def unknown(reason):
+        result["reason_codes"].append(reason)
+        return result
+
+    lo, hi = opened["event_index"], close["event_index"]
+    inside = [e for e in audit.events if lo < e["event_index"] < hi]
+    result["raw_reader_receive_refs"] = [audit.ref(e) for e in inside
+        if e["event"] == "receive" and e.get("logical_id") == r and e.get("generation") == rg]
+    sends = [e for e in inside if e["event"] == "send"
+             and e.get("logical_id") == w and e.get("generation") == wg]
+    result["send_order"] = [e.get("send_sequence") for e in sends]
+    result["send_refs"] = [audit.ref(e) for e in sends]
+    # Do not use producer/helper summary or even the supplied deliveries list.
+    all_sends = [e for e in audit.events if e["event"] == "send"]
+    try:
+        for event in inside:
+            if (event["event"] != "receive" or event.get("logical_id") != r
+                    or event.get("generation") != rg):
+                continue
+            witness = audit.delivery_identity(event, all_sends)
+            if witness["writer"] != w or witness["writer_generation"] != wg:
+                continue  # Valid other-writer/generation delivery, not this stream.
+            result["witnesses"].append(witness)
+    except (ValueError, KeyError, TypeError) as exc:
+        return unknown("raw_sample_identity_unknown:" + str(exc))
+    result["receive_order"] = [d["sequence"] for d in result["witnesses"]]
+    result["receive_refs"] = [d["receive_ref"] for d in result["witnesses"]]
+    result["identity_bases"] = sorted({d["basis"] for d in result["witnesses"]})
+    expected, received = result["send_order"], result["receive_order"]
+    if not expected or any(type(seq) is not int for seq in expected):
+        return unknown("no_orderable_send_inventory")
+    if len(expected) != len(set(expected)) or len(received) != len(set(received)):
+        return unknown("duplicate_or_retransmission_ambiguity")
+    if any(d["send_ref"] not in result["send_refs"] for d in result["witnesses"]):
+        return unknown("receive_send_outside_generation_window")
+    if any(e.get("publish_returned") is not True for e in sends):
+        return unknown("publish_completion_unproven")
+    if pair.get("reliable_history_contract") is not True or pair.get("filter_free") is not True:
+        return unknown("reliable_unfiltered_contract_unproven")
+    sentinel = close.get("sentinel_sequence")
+    # A finite timer/close marker alone is not a delivery closure. Require the
+    # later same-writer send to be observed last; never judge a missing tail.
+    if (close.get("window_complete") is not True or sentinel != expected[-1]
+            or not received or received[-1] != sentinel):
+        return unknown("later_same_generation_sentinel_not_closed")
+    result["sentinel_send_ref"] = result["send_refs"][-1]
+    result["sentinel_receive_ref"] = result["receive_refs"][-1]
+    ranks = {seq: i for i, seq in enumerate(expected)}
+    for left, right in zip(result["witnesses"], result["witnesses"][1:]):
+        if ranks[left["sequence"]] > ranks[right["sequence"]]:
+            result["inversions"].append({"earlier_receive_ref": left["receive_ref"],
+                                         "later_receive_ref": right["receive_ref"],
+                                         "sequences": [left["sequence"], right["sequence"]]})
+    result["status"] = "inversion_observed" if result["inversions"] else "in_order_observed"
+    result["reason_codes"] = ["ordering_observation_only_no_declared_rule"]
+    return result
 
 
 def _delivery_window(audit, pair, deliveries):
@@ -562,6 +689,9 @@ def _delivery_window(audit, pair, deliveries):
     witnesses = [d for d in deliveries if d["writer"] == w and d["reader"] == r
                  and d["writer_generation"] == wg and d["reader_generation"] == rg
                  and opened["event_index"] < d["receive_ref"]["event_index"] < close["event_index"]]
+    # The projector already proved this window's identities and fresh match
+    # chronology. Preserve ordering separately before the legacy set/gap gate.
+    pair["ordering_observation"] = _ordering_observation(audit, pair, opened, close)
     all_attributed = {d["receive_ref"]["event_index"] for d in deliveries}
     if any(e["event_index"] not in all_attributed for e in samples):
         return {"delivery_window_identity_complete": False, "delivery_closure": "unknown"}
@@ -827,6 +957,13 @@ def facts_from_events(events, runtime, config):
         facts["endpoint_lineage"] = a.identity()
         facts["endpoint_identity_complete"] = True
         facts["action_receipts"] = a.actions()
+        groups = sorted({x["params"]["concurrency_group"] for x in a.program["actions"]
+                         if x.get("params", {}).get("concurrency_group") is not None})
+        if groups:
+            from r2f.runtime.topology_concurrency import audit_concurrency
+            facts["concurrency_observations"] = [audit_concurrency(a.events, a.program["actions"], g) for g in groups]
+            for observation in facts["concurrency_observations"]:
+                observation["raw_evidence"] = [a.ref(a.events[i]) for i in observation["raw_refs"]]
         facts["diagnostic_valid"] = True
         boundaries = [e for e in a.events if e["event"] == "topology_state_boundary"]
         _require(len(boundaries) >= 2, "topology_state_boundaries_missing")

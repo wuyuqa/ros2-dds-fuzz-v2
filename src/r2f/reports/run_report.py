@@ -1,5 +1,7 @@
 """Independent, hash-checked offline acceptance of persisted campaign evidence."""
 from collections import Counter
+from copy import deepcopy
+import hashlib
 import json
 from pathlib import Path
 
@@ -1054,7 +1056,85 @@ def _f1_adapter_artifact_qualification(root, row, report):
     return qualified
 
 
-def _verify_exploratory_row(root, row, report, errors):
+class _TopologyQualificationReuse:
+    """One exploratory audit, successful topology proofs only.
+
+    This deliberately snapshots the entire *case*, not a hand-maintained list
+    of raw/worker/boundary filenames. Successful canonical qualification pins
+    their file reads under that case; source reads are checked separately via
+    the original double-content/HEAD source_manifest gate. No process-global
+    cache, runtime summary trust, or mtime-based validity is involved.
+    """
+
+    def __init__(self, root):
+        self.root = Path(root).resolve()
+        self.entries = {}
+
+    def _snapshot(self, case):
+        if case.is_symlink() or case.resolve(strict=True) != case or not case.is_dir():
+            raise ValueError("topology_reuse_case_not_canonical")
+        contents = {}
+        for path in sorted(case.rglob("*")):
+            # Symlinks/special files are not an enumerable dependency closure.
+            # First use falls back to the original full public audit.
+            if path.is_symlink():
+                raise ValueError("topology_reuse_symlink")
+            if path.is_dir():
+                contents[str(path.relative_to(case))] = None
+            elif path.is_file() and path.resolve(strict=True).is_relative_to(case):
+                contents[str(path.relative_to(case))] = hashlib.sha256(path.read_bytes()).hexdigest()
+            else:
+                raise ValueError("topology_reuse_special_file")
+        return contents
+
+    def _check(self, entry):
+        case, contents, source, _, row, report, identity = entry
+        if (canonical_hash(report), canonical_hash(row)) != identity:
+            raise ValueError("topology_reuse_input_changed")
+        if self._snapshot(case) != contents:
+            raise ValueError("topology_reuse_artifact_changed:" + str(case))
+        if canonical_hash(source_manifest(Path(source["source_repo"]))) != canonical_hash(source):
+            raise ValueError("topology_reuse_source_changed")
+
+    def qualify(self, root, row, report):
+        # Rejected/planned/unknown/terminal cases retain their complete path.
+        if row.get("actual_run") is not True or row.get("execution_stage") != "judged":
+            return _topology_artifact_qualification(root, row, report)
+        root = Path(root).resolve()
+        cell = row.get("cell_id")
+        source = report.get("source_manifest")
+        if (root != self.root or not isinstance(cell, str) or cell in {"", ".", ".."}
+                or Path(cell).name != cell or "\\" in cell
+                or not isinstance(source, dict) or not source.get("source_repo")):
+            return _topology_artifact_qualification(root, row, report)
+        # Bind the entire caller-owned input, including formal/boundary mode,
+        # rows, manifest identities and receipt declarations, not just cell_id.
+        key = (canonical_hash(report), canonical_hash(row))
+        if key in self.entries:
+            entry = self.entries[key]
+            self._check(entry)
+            return deepcopy(entry[3])
+        case = root / "cases" / cell
+        try:
+            contents = self._snapshot(case)
+        except (OSError, ValueError, RuntimeError):
+            return _topology_artifact_qualification(root, row, report)
+        result = _topology_artifact_qualification(root, row, report)
+        # Never cache unknowns, exceptions, no-hit terminals or failed proofs.
+        if result.get("real_ros_execution") is True and result.get("qualification_errors") == []:
+            entry = (case, contents, deepcopy(source), deepcopy(result), row, report, key)
+            self._check(entry)  # Detect changes during the initial computation.
+            self.entries[key] = entry
+        return result
+
+    def finish(self):
+        # A ledger/coverage consumer may run after the last reuse. Recheck at
+        # audit exit as well, even if no subsequent lookup would see a change.
+        for entry in self.entries.values():
+            self._check(entry)
+
+
+def _verify_exploratory_row(root, row, report, errors, *, qualification_reuse=None):
     cell = row.get("cell_id", "<missing>")
     try:
         for key in ("cell_id", "run_id", "target_id", "profile_id", "rmw"):
@@ -1093,7 +1173,10 @@ def _verify_exploratory_row(root, row, report, errors):
         if qualification["status"] not in {"not_applicable", "qualified", "terminal_unqualified"}:
             raise ValueError(qualification["reason_code"])
         if topology:
-            _topology_artifact_qualification(root, row, report)
+            if qualification_reuse is None:
+                _topology_artifact_qualification(root, row, report)
+            else:
+                qualification_reuse.qualify(root, row, report)
         _f1_adapter_artifact_qualification(root, row, report)
         plan = row.get("mutation_plan")
         if plan is not None:
@@ -1335,7 +1418,7 @@ def _audit_exploratory_controls(report, rows, errors):
         errors.append("control_execution_count_not_deduplicated")
 
 
-def _audit_exploratory_ledger(root, report, rows, errors, details):
+def _audit_exploratory_ledger(root, report, rows, errors, details, *, qualification_reuse=None):
     from r2f.reports.candidate_report import exploratory_candidate_ledger, audit_projection
     ledger_path = _path(root, report.get("candidate_ledger_path"))
     ledger = json.loads(ledger_path.read_text())
@@ -1349,7 +1432,8 @@ def _audit_exploratory_ledger(root, report, rows, errors, details):
             continue  # Already independently certified by the strict row verifier.
         if row.get("target_id") == TOPOLOGY_TARGET:
             try:
-                qualified = _topology_artifact_qualification(root, row, report)
+                qualified = (_topology_artifact_qualification(root, row, report)
+                             if qualification_reuse is None else qualification_reuse.qualify(root, row, report))
             except (OSError, ValueError, KeyError, TypeError) as exc:
                 qualified = {"real_ros_execution": False, "qualification_errors": [str(exc)]}
             if not qualified["real_ros_execution"]:
@@ -1473,12 +1557,15 @@ def audit_exploratory_report(report_path, *, report=None):
                     errors.append("exploratory_row_target_not_in_profile:" + str(row.get("cell_id")))
                 if row.get("rmw") not in allowed_rmws:
                     errors.append("exploratory_row_rmw_not_in_profile:" + str(row.get("cell_id")))
-        valid = [r for r in rows if _verify_exploratory_row(root, r, report, errors)]
+        qualification_reuse = _TopologyQualificationReuse(root)
+        valid = [r for r in rows if _verify_exploratory_row(
+            root, r, report, errors, qualification_reuse=qualification_reuse)]
         details["rows_verified"] = len(valid)
         details["rows_total"] = len(rows)
         _audit_exploratory_budget(report, rows, errors, root=root)
         _audit_exploratory_controls(report, rows, errors)
-        _audit_exploratory_ledger(root, report, rows, errors, details)
+        _audit_exploratory_ledger(root, report, rows, errors, details,
+                                  qualification_reuse=qualification_reuse)
         coverage = []
         for row in valid:
             if row.get("execution_stage") != "judged" or row.get("actual_run") is not True:
@@ -1495,7 +1582,7 @@ def audit_exploratory_report(report_path, *, report=None):
             from r2f.modules.s1.topology_targets import TOPOLOGY_TARGET
             if row.get("target_id") == TOPOLOGY_TARGET:
                 try:
-                    recomputed = _topology_artifact_qualification(root, row, report)
+                    recomputed = qualification_reuse.qualify(root, row, report)
                 except (OSError, ValueError, TypeError, KeyError) as exc:
                     recomputed = {"real_ros_execution": False, "qualification_errors": [str(exc)]}
                 details.setdefault("topology_qualifications", {})[row.get("cell_id", "<missing>")] = recomputed
@@ -1519,6 +1606,7 @@ def audit_exploratory_report(report_path, *, report=None):
             and r.get("arm") != "negative" and not r.get("control_kind"))
         all_pass = bool(observed) and all(r.get("oracle_verdict") in {"pass", "not_applicable"} for r in observed)
         details["all_oracles_pass"] = all_pass
+        qualification_reuse.finish()
         details["evidence_valid"] = not errors
         return {"sealed": False, "seal": EXPLORATORY_SEAL, "audit_kind": "exploratory",
                 "evidence_valid": not errors, "all_oracles_pass": all_pass,

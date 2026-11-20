@@ -52,7 +52,7 @@ _ENV_KEYS = {"backend_available", "transport_ready", "discovery_enabled",
 _ACTION_PARAMS = {
     "create": (set(), set()), "destroy": (set(), set()),
     "recreate": (set(), set()), "assert_liveliness": (set(), set()),
-    "publish_batch": ({"count", "start_sequence"}, {"interval_sec", "payload", "repeat_data_from"}),
+    "publish_batch": ({"count", "start_sequence"}, {"interval_sec", "payload", "repeat_data_from", "concurrency_group"}),
     "update_filter": ({"expression", "parameters"}, set()),
     "snapshot": (set(), {"label", "timeout_sec"}),
     "barrier": ({"condition", "timeout_sec"}, {"endpoint_ids"}),
@@ -267,6 +267,29 @@ def _shape(program):
             if (not isinstance(targets, list) or any(not isinstance(t, str) or t not in ids for t in targets)
                     or (all(isinstance(t, str) for t in targets) and len(set(targets)) != len(targets))):
                 _error(errors, f"{path}.params.endpoint_ids", "reference", "unique known endpoint ids required")
+    groups = {}
+    for i, action in enumerate(actions):
+        if not isinstance(action, dict) or not isinstance(action.get("params"), dict):
+            continue
+        group = action["params"].get("concurrency_group")
+        if "concurrency_group" in action["params"]:
+            if not _text(group, limit=128):
+                _error(errors, "program.actions", "concurrency_group", "bounded nonempty group required")
+            elif action.get("op") == "publish_batch":
+                groups.setdefault(group, []).append((i, action))
+    for group, members in groups.items():
+        indices = [i for i, _ in members]
+        writers = [a.get("endpoint_id") for _, a in members]
+        preceding = {a.get("action_id") for a in actions[:indices[0]]
+                     if isinstance(a, dict) and isinstance(a.get("action_id"), str)}
+        if (len(members) != 2 or indices != list(range(indices[0], indices[0] + len(members)))
+                or any(not isinstance(w, str) for w in writers)
+                or len({w for w in writers if isinstance(w, str)}) != len(writers)
+                or any(not isinstance(a.get("depends_on", []), list)
+                       or any(not isinstance(dep, str) or dep not in preceding for dep in a.get("depends_on", []))
+                       for _, a in members)
+                or any("repeat_data_from" in a["params"] for _, a in members)):
+            _error(errors, "program.actions", "concurrency_group", "requires contiguous two distinct writers, no intra-group dependency or repeated data")
     if samples > budget["max_total_samples"]:
         _error(errors, "program.actions", "budget", "total publications exceed sample budget")
     return errors, budget

@@ -515,7 +515,10 @@ def pair_delivery_fact(pair, events, *, active_writers_on_topic=None, real_ros=F
         for item in (reason, single_reason):
             if item is not None and item not in attribution_reasons:
                 attribution_reasons.append(item)
-    rows = direct + correlated + single
+    # Attribution categories are not arrival order. Retain the capture order
+    # (including duplicates), never sort samples by their sequence number.
+    attributed = {id(e) for e in direct + correlated + single}
+    rows = [e for e in events if id(e) in attributed]
     received = [event.get("send_sequence") for event in rows]
     missing = [sequence for sequence in expected if sequence not in received]
     duplicates = sorted({sequence for sequence in received if received.count(sequence) > 1})
@@ -530,7 +533,12 @@ def pair_delivery_fact(pair, events, *, active_writers_on_topic=None, real_ros=F
         "missing_sequences": missing,
         "duplicate_sequences": duplicates,
         "receive_order": received,
-        "in_order": received == sorted(received),
+        "send_order_refs": [e.get("event_index") for e in sends],
+        "receive_order_refs": [e.get("event_index") for e in rows],
+        "ordering_scope": "raw_capture_only_not_closed_window_verdict",
+        "in_order": (None if duplicates or unknown or len(expected) != len(set(expected))
+                     else all(expected.index(a) < expected.index(b)
+                              for a, b in zip(received, received[1:]))),
         "cross_writer_order_required": False,
         "identity_basis": ("message_info_gid" if direct and not unknown
                            else "endpoint_correlated_payload" if correlated and not unknown
@@ -2513,19 +2521,26 @@ def run_topology(program, config, output_dir, *, backend=None):
             netem_ctx = {"active": True, "carrier": carrier, "spec": deepcopy(netem_decl["spec"]),
                          "install_index": install_event["event_index"],
                          "counters": [], "counter_failures": []}
+        concurrent_begun = {}
+        concurrent_results = {}
+        failed_concurrent_groups = set()
         for action_index, action in enumerate(effective_program["actions"]):
-            check_topology_source("before_action:" + action["action_id"])
+            if action["action_id"] not in concurrent_begun:
+                check_topology_source("before_action:" + action["action_id"])
             action_id = action["action_id"]
             action_state = state.get(action.get("endpoint_id"))
             action_before = ({key: action_state[key] for key in
                               ("generation", "alive", "next_sequence")}
                              if action_state is not None else
                              {"alive": sorted(e for e, st in state.items() if st["alive"])})
-            emit("topology_action_begin", action_id=action_id, action_index=action_index,
-                 action=deepcopy(action), before=deepcopy(action_before))
-            emit("state_step_before", step_id="action:" + action_id, action=deepcopy(action),
-                 before=deepcopy(action_before), after=None, requires=[], satisfied=None,
-                 fixture=not backend.real_ros)
+            if action_id in concurrent_begun:
+                action_before = deepcopy(concurrent_begun[action_id])
+            if action_id not in concurrent_begun:
+                emit("topology_action_begin", action_id=action_id, action_index=action_index,
+                     action=deepcopy(action), before=deepcopy(action_before))
+                emit("state_step_before", step_id="action:" + action_id, action=deepcopy(action),
+                     before=deepcopy(action_before), after=None, requires=[], satisfied=None,
+                     fixture=not backend.real_ros)
             try:
                 aid, op = action["action_id"], action["op"]
                 eid, gen = action["endpoint_id"], action["generation"]
@@ -2670,6 +2685,13 @@ def run_topology(program, config, output_dir, *, backend=None):
                                   execution_evidence=False)
                     continue
                 if op == "publish_batch":
+                    if params.get("concurrency_group") in failed_concurrent_groups:
+                        record_action(action, action_before, {k: state[eid][k] for k in ("generation", "alive", "next_sequence")},
+                                      disposition="tool_error", satisfied=False,
+                                      requires=[{"id": "concurrent_group_completed", "status": "unsatisfied"}],
+                                      reason="concurrent_group_failed", side_effects="unknown_consult_raw_group",
+                                      execution_evidence=False)
+                        continue
                     st = state[eid]
                     if not (st["alive"] and st["generation"] == gen and
                             endpoint_specs[eid]["role"] == "writer"):
@@ -2714,12 +2736,84 @@ def run_topology(program, config, output_dir, *, backend=None):
                         # Matching unknown/incompatible is not a tool rejection:
                         # snapshots gate only command/identity integrity, while
                         # the close keeps an unestablished obligation incomplete.
-                        prepare_delivery_windows(st["handle"], aid, sequences)
+                        group = params.get("concurrency_group")
+                        if group in failed_concurrent_groups:
+                            raise TopologyBackendError("concurrent_group_previously_failed")
+                        if group is not None and aid not in concurrent_results:
+                            members = [a for a in effective_program["actions"] if a.get("params", {}).get("concurrency_group") == group]
+                            requests = []
+                            for member in members:
+                                ms = state[member["endpoint_id"]]
+                                mp = member["params"]
+                                completed = {e.get("action_id") for e in events if e.get("event") == "topology_action_done"
+                                             and e.get("receipt", {}).get("satisfied") is True}
+                                if any(dep not in completed for dep in member.get("depends_on", [])):
+                                    raise TopologyBackendError("concurrent_dependency_not_satisfied")
+                                if (not ms["alive"] or ms["generation"] != member["generation"]
+                                        or endpoint_specs[member["endpoint_id"]]["role"] != "writer"
+                                        or mp["start_sequence"] < ms["next_sequence"]):
+                                    raise TopologyBackendError("concurrent_writer_guard")
+                                seqs = list(range(mp["start_sequence"], mp["start_sequence"] + mp["count"]))
+                                requests.append({"handle": ms["handle"], "sequences": seqs,
+                                    "interval_sec": mp.get("interval_sec", 0.0), "phase": member["action_id"],
+                                    "payload": mp.get("payload")})
+                            if not hasattr(backend, "publish_concurrent"):
+                                raise TopologyUnsupported("concurrent_backend_unavailable", "fixture/legacy backend has no concurrent API")
+                            # Every member begins before any worker release, never backfill
+                            # a second action's start after its API calls have run.
+                            for member in members[1:]:
+                                # Gate this member before its actual begin/API calls,
+                                # not when the serial bookkeeping loop resumes later.
+                                check_topology_source("before_action:" + member["action_id"])
+                                ms = state[member["endpoint_id"]]
+                                mb = {k: ms[k] for k in ("generation", "alive", "next_sequence")}
+                                mi = next(i for i, a in enumerate(effective_program["actions"]) if a["action_id"] == member["action_id"])
+                                emit("topology_action_begin", action_id=member["action_id"], action_index=mi,
+                                     action=deepcopy(member), before=deepcopy(mb))
+                                emit("state_step_before", step_id="action:" + member["action_id"], action=deepcopy(member),
+                                     before=deepcopy(mb), after=None, requires=[], satisfied=None, fixture=not backend.real_ros)
+                                concurrent_begun[member["action_id"]] = deepcopy(mb)
+                            for request in requests:
+                                prepare_delivery_windows(request["handle"], request["phase"], request["sequences"])
+                            try:
+                                concurrent_results.update(backend.publish_concurrent(group, requests))
+                                from .topology_concurrency import audit_concurrency
+                                observation = audit_concurrency(events, effective_program["actions"], group)
+                                emit("topology_concurrency_observation", **observation)
+                            except Exception as exc:
+                                failed_concurrent_groups.add(group)
+                                for request in requests:
+                                    handle = request["handle"]
+                                    interrupt_writer_windows(handle["logical_id"], "concurrent_group_failed")
+                                    if handle.get("alive"):
+                                        try:
+                                            backend.destroy_endpoint(handle)
+                                        except Exception as cleanup_error:
+                                            emit("topology_tool_error", reason="concurrent_group_cleanup_failed",
+                                                 concurrency_group=group, logical_id=handle["logical_id"],
+                                                 error_type=type(cleanup_error).__name__)
+                                    member_state = state[handle["logical_id"]]
+                                    member_state["alive"] = handle.get("alive", True)
+                                    # Preserve actual returned publishes even when completion
+                                    # is missing; these remain raw observations, not a success ACK.
+                                    sent = [e["send_sequence"] for e in events if e.get("event") == "send"
+                                            and e.get("phase") == request["phase"]
+                                            and e.get("logical_id") == handle["logical_id"]
+                                            and e.get("generation") == handle["generation"]
+                                            and e.get("writer_gid") == handle["endpoint_gid"]
+                                            and e.get("publish_returned") is True]
+                                    if sent:
+                                        member_state["next_sequence"] = max(member_state["next_sequence"], max(sent) + 1)
+                                emit("topology_tool_error", reason="concurrent_group_failed", concurrency_group=group,
+                                     error_type=type(exc).__name__, error=str(exc))
+                                raise TopologyBackendError("concurrent_group_failed:" + str(exc)) from exc
+                        if group is None:
+                            prepare_delivery_windows(st["handle"], aid, sequences)
                         kwargs = {"payload": payload}
                         if repeat_source is not None:
                             kwargs["repeat_string_data"] = repeat_data
-                        publish = backend.publish_batch(
-                            st["handle"], sequences, float(interval), aid, **kwargs)
+                        publish = (concurrent_results.pop(aid) if group is not None else backend.publish_batch(
+                            st["handle"], sequences, float(interval), aid, **kwargs))
                         if repeat_source is not None:
                             emit("topology_repeat_data_binding", source_send_ref=repeat_source["event_index"],
                                  writer=eid, writer_generation=gen, writer_gid=st["handle"].get("endpoint_gid"),
@@ -2738,8 +2832,15 @@ def run_topology(program, config, output_dir, *, backend=None):
                         continue
                     except TopologyBackendError as exc:
                         interrupt_writer_windows(eid, "publish_batch_tool_error")
-                        record_guard(action, "publish_batch_error", type(exc).__name__,
-                                     kind="tool", before=before)
+                        if params.get("concurrency_group") is not None:
+                            record_action(action, before, {k: state[eid][k] for k in ("generation", "alive", "next_sequence")},
+                                          disposition="tool_error", satisfied=False,
+                                          requires=[{"id": "concurrent_group_completed", "status": "unsatisfied"}],
+                                          reason=str(exc), side_effects="unknown_consult_raw_group",
+                                          execution_evidence=False)
+                        else:
+                            record_guard(action, "publish_batch_error", type(exc).__name__,
+                                         kind="tool", before=before)
                         continue
                     st["next_sequence"] = max(st["next_sequence"], start + count)
                     after = {**before, "next_sequence": st["next_sequence"],

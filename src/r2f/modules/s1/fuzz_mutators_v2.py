@@ -1673,12 +1673,47 @@ def _complex_action_program():
     return program
 
 
-def corpus_v2(*, include_catalog=True, seed=0):
+CONCURRENT_WRITERS_SEED = "topology.concurrent_writers"
+
+
+def concurrent_writers_program():
+    """Authored bounded 2W1R input, not evidence of overlapping DDS calls.
+
+    Explicit matched barrier, sufficient reliable history, and a later sentinel
+    from each writer make identity-bound ordering observations possible. The
+    runtime, not this input, must prove individual publish API overlap.
+    """
+    program = topology_model.generate_program(7, writers=2, readers=1)
+    for endpoint in program["endpoints"]:
+        endpoint["qos"].update(reliability="reliable", history="keep_last", depth=128)
+    creates = [a for a in program["actions"] if a["op"] == "create"]
+    publishes = [a for a in program["actions"] if a["op"] == "publish_batch"]
+    barrier = topology_model._action("matched_before_group", "barrier", params={
+        "condition": "matched", "timeout_sec": 5.0,
+        "endpoint_ids": [e["logical_id"] for e in program["endpoints"]]})
+    for action in publishes:
+        action["params"].update(count=64, start_sequence=0, interval_sec=0.0,
+            payload="L02-public-api-" + "x" * 512,
+            concurrency_group="L02-writers-1")
+        action["depends_on"] = [barrier["action_id"]]
+    sentinels = [topology_model._action("later_sentinel_" + a["endpoint_id"],
+        "publish_batch", a["endpoint_id"], 1,
+        {"count": 1, "start_sequence": 64, "interval_sec": 0.0,
+         "payload": "later-same-writer-sentinel"}) for a in publishes]
+    program["actions"] = creates + [barrier] + publishes + sentinels + [
+        topology_model._action("final", "snapshot", params={"label": "after-L02"})]
+    if topology_model.validate_program(program)["status"] != "valid":
+        raise ValueError("concurrent writer seed violated the topology contract")
+    return program
+
+
+def corpus_v2(*, include_catalog=True, seed=0, include_concurrent=False):
     """Offline seed corpus: legal, boundary, environment and guard seeds.
 
     The manifest separates ``authored`` entries from ``pending`` runtime
     capabilities and ``unsupported`` modelling gaps.  Nothing here is a real
-    run, a mutation hit, or a candidate.
+    run, a mutation hit, or a candidate. ``include_concurrent`` is explicit
+    opt-in; omitted preserves every legacy corpus and ingestion identity.
     """
     entries, manifest = [], []
     for kind in ("empty_roles", "writer_only", "reader_only", "multi_endpoint"):
@@ -1699,6 +1734,15 @@ def corpus_v2(*, include_catalog=True, seed=0):
                      "status": "authored", "kind": "complex_actions",
                      "expected_disposition": "expect_pass",
                      "content_sha256": entry["content_sha256"]})
+
+    if include_concurrent:
+        entry = _seed_entry("S1.topology", CONCURRENT_WRITERS_SEED,
+            concurrent_writers_program(), "concurrent_writer_calls_with_sentinels",
+            "expect_pass", "authored deterministic 2W1R public API concurrency program")
+        entries.append(entry)
+        manifest.append({"seed_id": entry["seed_id"], "surface_id": "S1.topology",
+            "status": "authored", "kind": "concurrent_writers",
+            "expected_disposition": "expect_pass", "content_sha256": entry["content_sha256"]})
 
     # Environment / guard seeds are built through topology_model's own
     # deliberate guard mutations; they remain inputs, not execution attempts.

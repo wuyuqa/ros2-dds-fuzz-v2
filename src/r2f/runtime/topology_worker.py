@@ -1052,6 +1052,7 @@ def _worker_main(argv):
                 endpoint, rmw_identifier, config["domain_id"], local_gid)
         emit("graph_snapshot", **initial_graph)
 
+        pending_publish = None
         stdin_buffer = b""
         queue = []
         last_count = None
@@ -1080,6 +1081,35 @@ def _worker_main(argv):
                 continue
             command = json.loads(queue.pop(0))
             command_id = command.get("command_id")
+            if command["command"] == "prepare_concurrent_publish":
+                seqs = command.get("sequences")
+                delay = command.get("interval_sec")
+                if (pending_publish is not None or kind != "writer"
+                        or not isinstance(command.get("concurrency_group"), str) or not command["concurrency_group"]
+                        or not isinstance(seqs, list) or not 1 <= len(seqs) <= 1024
+                        or any(type(n) is not int or n < 0 for n in seqs)
+                        or len(set(seqs)) != len(seqs)
+                        or type(delay) not in (int, float) or not math.isfinite(delay) or not 0 <= delay <= MAX_INTERVAL_SEC
+                        or command.get("repeat_string_data") is not None
+                        or (command.get("payload") is not None and
+                            (not isinstance(command["payload"], str) or len(command["payload"]) > 1024))):
+                    emit("worker_command_error", command_id=command_id, error="concurrent_prepare_invalid")
+                    continue
+                pending_publish = command
+                emit("concurrent_publish_ready", command_id=command_id,
+                     concurrency_group=command["concurrency_group"], endpoint_gid=local_gid)
+                continue
+            if command["command"] == "release_concurrent_publish":
+                if (pending_publish is None or command.get("prepared_command_id") != pending_publish["command_id"]
+                        or command.get("concurrency_group") != pending_publish["concurrency_group"]):
+                    emit("worker_command_error", command_id=command_id, error="concurrent_release_invalid")
+                    continue
+                command = pending_publish
+                pending_publish = None
+                command_id = command["command_id"]
+                command["command"] = "publish_batch"
+                emit("concurrent_publish_started", command_id=command_id,
+                     concurrency_group=command["concurrency_group"], endpoint_gid=local_gid)
             if command["command"] in ("stop", "destroy"):
                 emit("worker_stopping", command_id=command_id)
                 break
@@ -1169,6 +1199,9 @@ def _worker_main(argv):
                         end = time.monotonic() + float(interval)
                         while time.monotonic() < end:
                             executor.spin_once(timeout_sec=min(0.01, max(0.0, end - time.monotonic())))
+                if command.get("concurrency_group") is not None:
+                    emit("concurrent_publish_finished", command_id=command_id,
+                         concurrency_group=command["concurrency_group"], endpoint_gid=local_gid)
                 emit("command_done", command_id=command_id, burst_count=len(sequences))
             elif command["command"] == "assert_liveliness" and kind == "writer":
                 endpoint.assert_liveliness()
@@ -1272,6 +1305,8 @@ class _EndpointProcess:
             if not isinstance(event, dict) or "event" not in event:
                 raise ValueError("bad event")
             kind = event.pop("event")
+            if kind.startswith("concurrent_publish_") and event.get("pgid") != self.process.pid:
+                raise ValueError("concurrent pgid mismatch")
             if event.get("pid") not in (None, self.process.pid):
                 raise ValueError("pid mismatch")
             event["pid"] = self.process.pid
@@ -1310,6 +1345,12 @@ class _EndpointProcess:
         self.command_serial += 1
         command_id = self.command_serial
         payload = {"command": command, "command_id": command_id, **fields}
+        if command in {"prepare_concurrent_publish", "release_concurrent_publish"}:
+            created = next((e for e in reversed(self.events) if e.get("event") == "endpoint_created"), {})
+            self.emit("concurrent_publish_requested" if command == "prepare_concurrent_publish" else "concurrent_publish_release",
+                      concurrency_group=fields["concurrency_group"],
+                      command_id=command_id if command == "prepare_concurrent_publish" else fields["prepared_command_id"],
+                      **{k: created.get(k) for k in ("logical_id", "generation", "endpoint_gid", "pid", "pgid", "process_start_ticks", "endpoint_generation")})
         if command == "snapshot":
             created = next((e for e in reversed(self.events) if e.get("event") == "endpoint_created"), {})
             self.emit("topology_snapshot_requested", command="snapshot", command_id=command_id,
@@ -2030,6 +2071,84 @@ class RosTopologyBackend:
             raise TopologyBackendError("dynamic_filter_receipt_missing_or_duplicate")
         return {"command_id": command_id, "filter_receipt": deepcopy(rows[0].get("filter_receipt")),
                 "worker_event": deepcopy(rows[0])}
+
+    def publish_concurrent(self, group, requests):
+        """Two authenticated workers; submit all, ready all, release all, bounded join.
+
+        No timing evidence is synthesized. Caller owns normal delivery windows.
+        On any failure retire the whole group before returning control.
+        """
+        if len(requests) != 2 or len({r["handle"]["logical_id"] for r in requests}) != 2:
+            raise TopologyBackendError("concurrency_requires_two_writers")
+        if self.closed:
+            raise TopologyBackendError("backend_closed")
+        timeout = float(self.config.get("publish_timeout_sec", 10.0))
+        if not math.isfinite(timeout) or not 0 < timeout <= 120:
+            raise TopologyBackendError("concurrent_timeout_out_of_bounds")
+        deadline = time.monotonic() + timeout
+        pending = []
+        def wait_all(event):
+            while not all(p.has(event, command_id=cid) for _, p, cid in pending):
+                if time.monotonic() >= deadline:
+                    raise TopologyBackendTimeout("concurrent_publish_timeout:" + event)
+                for _, process, _ in pending:
+                    process.pump(min(0.01, max(0, deadline - time.monotonic())))
+                    if process.process.poll() is not None:
+                        raise TopologyBackendError("concurrent_worker_exit")
+                    if any(e.get("event") in {"worker_error", "worker_command_error"} for e in process.events):
+                        raise TopologyBackendError("concurrent_worker_error")
+        try:
+            for request in requests:
+                process = request["handle"]["process"]
+                cid = process.command("prepare_concurrent_publish", concurrency_group=group,
+                    sequences=request["sequences"], interval_sec=request["interval_sec"],
+                    phase=request["phase"], payload=request.get("payload"))
+                pending.append((request, process, cid))
+            wait_all("concurrent_publish_ready")
+            # Authenticate every ready *before* release, not only after execution.
+            for request, process, cid in pending:
+                ready = [e for e in process.events if e.get("event") == "concurrent_publish_ready" and e.get("command_id") == cid]
+                created = [e for e in process.events if e.get("event") == "endpoint_created"]
+                keys = ("logical_id", "generation", "endpoint_gid", "pid", "pgid", "process_start_ticks", "endpoint_generation",
+                        "run_id", "domain_id", "monotonic_clock_identity")
+                if (len(ready) != 1 or len(created) != 1
+                        or any(created[0].get(k) is None or ready[0].get(k) != created[0][k] for k in keys)
+                        or ready[0].get("concurrency_group") != group
+                        or type(ready[0].get("monotonic_ns")) is not int
+                        or ready[0]["monotonic_ns"] < created[0]["monotonic_ns"]):
+                    raise TopologyBackendError("concurrent_ready_authentication_failed")
+            ready_clocks = [next(e["monotonic_clock_identity"] for e in process.events
+                                 if e.get("event") == "concurrent_publish_ready" and e.get("command_id") == cid)
+                            for _, process, cid in pending]
+            if ready_clocks[0] != ready_clocks[1]:
+                raise TopologyBackendError("concurrent_ready_clock_mismatch")
+            # Flush every release before awaiting any completion.
+            for request, process, cid in pending:
+                process.command("release_concurrent_publish", concurrency_group=group, prepared_command_id=cid)
+            wait_all("command_done")
+            results = {}
+            for request, process, cid in pending:
+                sends = [e for e in process.events if e.get("event") == "send" and e.get("command_id") == cid]
+                if [e.get("send_sequence") for e in sends] != request["sequences"]:
+                    raise TopologyBackendError("concurrent_publish_send_set_mismatch")
+                results[request["phase"]] = {
+                    "command_id": cid, "sent_sequences": request["sequences"],
+                    "start_ns": min(e["publish_begin_ns"] for e in sends),
+                    "end_ns": max(e["publish_return_ns"] for e in sends),
+                    "controller_ack_count": 1, "per_sample_ack": False,
+                    "payload_binding": "declared_payload_embedded" if request.get("payload") is not None else "canonical_metadata_only",
+                    "backend": self.backend_name}
+            return results
+        except BaseException:
+            # Include the worker whose submit failed; one failed cleanup must
+            # not prevent attempting cleanup of its peer or mask root cause.
+            for request in requests:
+                try:
+                    self.destroy_endpoint(request["handle"])
+                except Exception as cleanup_error:
+                    self._emit("topology_tool_error", reason="concurrent_cleanup_error", concurrency_group=group,
+                               logical_id=request["handle"]["logical_id"], error_type=type(cleanup_error).__name__)
+            raise
 
     def publish_batch(self, handle, sequences, interval_sec, phase, payload=None, repeat_string_data=None):
         if self.closed:
