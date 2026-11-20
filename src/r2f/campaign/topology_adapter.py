@@ -707,7 +707,9 @@ def _recreated_history_windows(audit, pairs, projection, deliveries):
     for pair in pairs:
         w, r = pair["writer"], pair["reader"]
         proof = pair["proofs"]["delivery_closure"]
-        if (w in certified or pair.get("writer_generation", 0) < 2
+        # A declared endpoint may never have been created (generation=None).
+        # Only an observed integer generation >=2 can certify recreated history.
+        if (w in certified or not _integer(pair.get("writer_generation"), 2)
                 or pair.get("delivery_applicability") != "not_applicable_no_sends"
                 or pair.get("delivery_window_identity_complete") is not True
                 or proof.get("status") != "observed"
