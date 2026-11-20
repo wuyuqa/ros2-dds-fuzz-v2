@@ -1600,6 +1600,34 @@ def run_exploratory_cycle(output_dir, *, corpus, feedback, scheduler, profile, r
                 resume_uncertainty = "pending_case_owner_cannot_be_verified"
     cycle_ids = {entry.get("cycle_id") for entry in corpus.entries.values() if entry.get("cycle_id")}
     cycle_id = continuation.get("cycle_id") or (next(iter(cycle_ids)) if len(cycle_ids) == 1 else None)
+    resume_origin = None
+    if continuation.get("resumed_from") is not None:
+        # Keep a self-contained, immutable origin; never depend on an old run's
+        # mutable pathname when auditing this continuation later.
+        from .checkpoint import SCHEMA as checkpoint_schema, _identity, _validate_state
+        reference = continuation["resumed_from"]
+        origin = json.loads(Path(reference["path"]).read_text())
+        identity, seeds, origin_registry = _identity(profile, cycle_id, source)
+        if (origin.get("schema") != checkpoint_schema
+                or origin.get("checkpoint_sha256") != reference.get("checkpoint_sha256")
+                or origin.get("checkpoint_sha256") != canonical_hash({
+                    k: v for k, v in origin.items() if k != "checkpoint_sha256"})
+                or origin.get("identity") != identity):
+            raise ExploratoryCycleError("resume origin checkpoint identity mismatch")
+        _validate_state(origin["state"], identity, seeds, origin_registry)
+        expected_continuation = deepcopy(continuation)
+        expected_continuation.pop("resumed_from")
+        for key, value in (("corpus", corpus.to_dict()), ("feedback", feedback.to_dict()),
+                           ("scheduler", scheduler.to_dict()),
+                           ("continuation", expected_continuation)):
+            saved_value = deepcopy(origin["state"][key])
+            if key == "continuation":
+                saved_value.pop("resumed_from", None)
+            if saved_value != value:
+                raise ExploratoryCycleError("resume origin state mismatch:" + key)
+        _atomic_json(output_dir / "resume-origin-checkpoint.json", origin)
+        resume_origin = {"path": "resume-origin-checkpoint.json",
+                         "checkpoint_sha256": origin["checkpoint_sha256"]}
 
     def update_elapsed():
         budget["elapsed_sec"] = elapsed_before + max(0.0, time.monotonic() - started)
@@ -1948,9 +1976,9 @@ def run_exploratory_cycle(output_dir, *, corpus, feedback, scheduler, profile, r
     if stop_reason is None and budget["selected"] >= max_inputs:
         stop_reason = "max_inputs_reached"
     update_elapsed()
+    checkpoint("final")
     cycle_budget = {key: budget[key] - initial_counts[key] for key in counters}
     cycle_budget["elapsed_sec"] = budget["elapsed_sec"] - elapsed_before
-    checkpoint("final")
     result = {
         "schema_version": EXPLORATORY_CYCLE_SCHEMA,
         "campaign_kind": "exploratory",
@@ -1964,6 +1992,7 @@ def run_exploratory_cycle(output_dir, *, corpus, feedback, scheduler, profile, r
         "rejected": rejected,
         "budget": budget,
         "cycle_budget": cycle_budget,
+        "resume_origin": resume_origin,
         "row_sequences": row_sequences,
         "continuation": {"cycle_id": cycle_id, "budget": deepcopy(budget),
                          "seen_input_hashes": sorted(seen), "seen_actual_hashes": sorted(seen_actual),

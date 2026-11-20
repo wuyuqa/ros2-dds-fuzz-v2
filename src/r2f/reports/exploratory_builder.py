@@ -25,6 +25,102 @@ def _read(path):
     return value
 
 
+def _qualify_g01_rejection(root, row, cycle):
+    """Regenerate a pure proposal rejection before bypassing execution gates."""
+    from r2f.campaign.checkpoint import _identity, _validate_corpus_binding
+    from r2f.campaign.corpus import Corpus
+    from r2f.campaign.scheduler import validated_feedback
+    from r2f.campaign.scheduler import ExploratoryScheduler
+    from r2f.campaign.search_frontier import InputSearchFrontier, derived_record
+    from r2f.campaign.runner import _build_case_plan, _derive_rng_seed, _NoEffectiveInputRejection
+    from r2f.reports.run_report import _path
+    case = root / 'cases' / row['cell_id']
+    if {p.name for p in case.iterdir()} != {'row.json', 'mutation_plan.json'}:
+        raise ValueError('f1_rejected_proposal_has_runtime_artifacts')
+    original = _read(_path(root, str(case / 'row.json')))
+    producer = deepcopy(row)
+    if 'generation_binding' in producer:
+        producer['binding'] = producer.pop('generation_binding')
+    _same(original, producer, 'f1_persisted_rejected_row_mismatch')
+    if (row.get('actual_run') is not False or row.get('execution_stage') != 'planned'
+            or row.get('oracle_verdict') != 'not_applicable'
+            or row.get('reason_code') != 'no_effective_input'
+            or row.get('generation_status') != 'rejected'
+            or row.get('input_layer_receipts') != []
+            or row.get('candidate_eligible') is not False or row.get('feedback_eligible') is not False
+            or any(row.get(k) is not None for k in (
+                'raw_path', 'raw_sha256', 'runtime_result_path', 'replay_path', 'runtime_config_path',
+                'mutation_receipt', 'runtime_execution_metadata', 'effective_input', 'effective_input_sha256'))
+            or any(row.get(k) is True for k in ('workspace_executed', 'hit', 'effect_observed', 'seal_eligible'))):
+        raise ValueError('f1_rejected_proposal_claims_execution')
+    plan = _read(_path(root, str(case / 'mutation_plan.json')))
+    _same(plan, row.get('rejected_mutation_plan'), 'f1_rejected_plan_mismatch')
+    from r2f.core.mutation_plan import MutationPlan
+    if MutationPlan.from_dict(plan).plan_hash() != row.get('rejected_mutation_plan_sha256'):
+        raise ValueError('f1_rejected_plan_hash_mismatch')
+    profile = cycle['profile']
+    identities = {c.get('cycle_id') for c in profile.get('cycles', [])
+                  if c.get('target_id') == row['target_id']}
+    if len(identities) != 1:
+        raise ValueError('f1_rejection_cycle_ambiguous')
+    identity, seeds, registry = _identity(profile, identities.pop(), cycle['source_manifest'])
+    scheduler_path = _path(root, 'selection_log.json')
+    saved = _read(scheduler_path)
+    parents = None
+    frontier = None
+    if saved.get('policy') == 'bfs':
+        frontier = InputSearchFrontier.from_dict(saved.get('frontier'))
+        frontier.validate_model(profile=profile, seeds=seeds, registry=registry)
+        parents = {k: deepcopy(v['entry']) for k, v in frontier.nodes.items()}
+    corpus = Corpus.from_dict(_read(_path(root, 'corpus.json')), model_parents=parents)
+    _validate_corpus_binding(corpus, identity, seeds, registry)
+    feedback = validated_feedback(_read(_path(root, 'feedback.json'))['events'])
+    scheduler = ExploratoryScheduler.from_dict(saved, corpus, feedback, model_parents=parents)
+    try:
+        sequence = int(row['cell_id'].removeprefix(cycle['run_id'] + '.').split('.')[0])
+        selection = scheduler.selection_log[sequence]
+    except (ValueError, IndexError) as exc:
+        raise ValueError('f1_rejection_selection_missing') from exc
+    if row['cell_id'] != f"{cycle['run_id']}.{sequence:04d}.rejected":
+        raise ValueError('f1_rejection_cell_sequence_mismatch')
+    if frontier is not None:
+        task = frontier.task(selection['task_id'])
+        if task['status'] != 'rejected' or task.get('actual') is not False or task.get('execution') is not None:
+            raise ValueError('f1_rejection_task_not_terminal')
+        entry = frontier.entry(selection)
+        search = row.get('input_search') or {}
+        for key in ('task_id', 'baseline_content_sha256', 'parent_content_sha256',
+                    'mutation_route', 'sampling_kind', 'derivation_depth', 'sample_slot', 'rng_seed'):
+            _same(search.get(key), selection.get(key), 'f1_rejection_search_mismatch:' + key)
+    else:
+        context = scheduler.selection_contexts[sequence]
+        entry = Corpus.from_dict(context['corpus']).entries[selection['content_sha256']]
+    target = registry.get_target(entry['target_id'])
+    contract = target.exploration_contract
+    route = selection.get('mutation_route') or entry.get('mutation_routes', [None])[0]
+    surface = contract.surface_by_id[entry['surface_id']]
+    mutator = route['mutator_id'] if route else surface.mutator_ids[0]
+    rng_seed = _derive_rng_seed(scheduler, selection, entry)
+    try:
+        _build_case_plan(entry, target, contract, surface, entry['final_config'],
+                         mutator, profile, rng_seed, selection)
+    except _NoEffectiveInputRejection as exc:
+        _same(exc.plan.to_dict(), plan, 'f1_rejected_proposal_not_model_generatable')
+        if str(exc) != row.get('no_effective_input_reason'):
+            raise ValueError('f1_rejection_reason_mismatch')
+        _same(derived_record(entry, exc.plan)['content_sha256'], row.get('content_sha256'),
+              'f1_rejection_content_mismatch')
+    else:
+        raise ValueError('f1_proposal_not_a_generation_rejection')
+    for key, expected in (('target_id', target.target_id), ('target_revision', target.target_revision),
+                          ('profile_id', profile['profile_id']), ('rmw', entry['rmw']),
+                          ('parent_content_sha256', entry['content_sha256'])):
+        _same(row.get(key), expected, 'f1_rejection_identity_mismatch:' + key)
+    refs = (case / 'row.json', case / 'mutation_plan.json', scheduler_path,
+            _path(root, 'corpus.json'), _path(root, 'feedback.json'))
+    return {str(p.relative_to(root)): canonical_hash(_read(p)) for p in refs}
+
+
 def qualify_f1_artifacts(root, row, cycle):
     """Reopen sealed input, project persisted config, reingest raw and qualify.
 
@@ -47,8 +143,11 @@ def qualify_f1_artifacts(root, row, cycle):
         if (row.get('generation_status') != 'rejected' or row.get('actual_run') is not False
                 or row.get('execution_stage') != 'planned'):
             raise ValueError('f1_missing_plan_not_generation_rejection')
+        from r2f.campaign.runner import G01_TARGET
+        references = (_qualify_g01_rejection(root, row, cycle)
+                      if row.get('target_id') == G01_TARGET else {})
         return {'binding': deepcopy(row.get('binding')), 'qualification': no_execution,
-                'artifact_references': {}}
+                'artifact_references': references}
     if 'source_manifest' in row:
         _same(row['source_manifest'], cycle.get('source_manifest'), 'f1_report_source_mismatch')
     case = root / 'cases' / cell
@@ -207,6 +306,8 @@ def persist_f1_exploratory_report(output_dir, cycle, registry, *, artifact_root=
                            'target_sha256': canonical_hash(target_model)},
               'required_catalog_sha256': required_catalog_hash(), 'rows': rows,
               'budget': cycle['budget'], 'last_state': cycle['last_state'], 'abort': cycle['abort'],
+              **({key: deepcopy(cycle[key]) for key in ('cycle_budget', 'resume_origin', 'row_sequences')
+                  if key in cycle}),
               'runtime_boundary': cycle['runtime_boundary'], 'runtime_formal': cycle['runtime_formal'],
               'control_references': [], 'review_records': [],
               'proof_provenance': {'artifact_root': str(root), 'cycle_sha256': canonical_hash(cycle),

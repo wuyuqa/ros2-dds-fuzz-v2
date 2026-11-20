@@ -1028,6 +1028,13 @@ def _verify_exploratory_row(root, row, report, errors):
             else:
                 _verify_topology_model_terminal(root, row, report)
             return True
+        from r2f.campaign.runner import G01_TARGET
+        if row['target_id'] == G01_TARGET and row.get('mutation_plan') is None:
+            # This exception is granted by reopened, regenerated artifacts, not
+            # by planned/rejected labels. It confers no execution qualification.
+            if _f1_adapter_artifact_qualification(root, row, report) is None:
+                raise ValueError('f1_generation_rejection_proof_missing')
+            return True
         qualification = boundary_qualification_for_row(root, row, report)
         if qualification["status"] not in {"not_applicable", "qualified", "terminal_unqualified"}:
             raise ValueError(qualification["reason_code"])
@@ -1081,7 +1088,100 @@ def _verify_exploratory_row(root, row, report, errors):
         return False
 
 
-def _audit_exploratory_budget(report, rows, errors):
+def _exploratory_cycle_counters(report, root):
+    """Validate cumulative-minus-origin counters against model-valid snapshots.
+
+    A cycle counter is not evidence by itself. Nonzero inherited counters need
+    an independent origin copy and final checkpoint with an immutable prefix.
+    """
+    import math
+    from r2f.campaign.checkpoint import SCHEMA, _identity, _validate_state
+    keys = ('selected', 'planned', 'generated', 'attempted', 'actual',
+            'executed', 'aborted', 'interrupted')
+    cumulative, cycle = report['budget'], report['cycle_budget']
+    if not isinstance(cycle, dict):
+        raise ValueError('exploratory_cycle_budget_invalid')
+    for values in (cumulative, cycle):
+        for key in keys:
+            if type(values.get(key)) is not int or values[key] < 0:
+                raise ValueError('exploratory_cycle_budget_invalid:' + key)
+        elapsed = values.get('elapsed_sec')
+        if type(elapsed) not in (int, float) or not math.isfinite(elapsed) or elapsed < 0:
+            raise ValueError('exploratory_cycle_elapsed_invalid')
+    inherited = {key: cumulative[key] - cycle[key] for key in keys}
+    if any(value < 0 for value in inherited.values()):
+        raise ValueError('exploratory_cycle_exceeds_cumulative_budget')
+    reference = report.get('resume_origin')
+    if reference is None:
+        if any(inherited.values()) or cycle['elapsed_sec'] != cumulative['elapsed_sec']:
+            raise ValueError('exploratory_resume_origin_missing')
+        return cycle
+    if root is None or not isinstance(reference, dict) or reference.get('path') != 'resume-origin-checkpoint.json':
+        raise ValueError('exploratory_resume_origin_reference_invalid')
+    root = Path(root).resolve()
+
+    def reopen(name):
+        data = json.loads(_path(root, name).read_text())
+        if (data.get('schema') != SCHEMA or data.get('checkpoint_sha256') != canonical_hash({
+                k: v for k, v in data.items() if k != 'checkpoint_sha256'})):
+            raise ValueError('exploratory_resume_checkpoint_hash_invalid')
+        seq, previous = data.get('snapshot_sequence'), data.get('previous_checkpoint_sha256')
+        if (type(seq) is not int or seq < 0 or (seq == 0) != (previous is None)
+                or previous is not None and not _sha_or_none(previous)):
+            raise ValueError('exploratory_resume_checkpoint_chain_invalid')
+        return data
+
+    origin, final = reopen(reference['path']), reopen('checkpoint.json')
+    if reference.get('checkpoint_sha256') != origin['checkpoint_sha256']:
+        raise ValueError('exploratory_resume_origin_hash_mismatch')
+    identity, seeds, registry = _identity(report['profile'], origin['identity']['cycle_id'],
+                                         report['source_manifest'])
+    for data in (origin, final):
+        if data.get('identity') != identity:
+            raise ValueError('exploratory_resume_source_profile_identity_mismatch')
+        _validate_state(data['state'], identity, seeds, registry)
+    before, after = origin['state'], final['state']
+    initial = before['continuation']['budget']
+    if any(initial.get(key, 0) != value for key, value in inherited.items()):
+        raise ValueError('exploratory_resume_inherited_budget_mismatch')
+    if after['continuation']['budget'] != cumulative:
+        raise ValueError('exploratory_resume_final_budget_mismatch')
+    expected_elapsed = cumulative['elapsed_sec'] - initial.get('elapsed_sec', 0.0)
+    if not math.isclose(cycle['elapsed_sec'], expected_elapsed, rel_tol=1e-12, abs_tol=1e-9):
+        raise ValueError('exploratory_resume_elapsed_mismatch')
+    resumed_from = after['continuation'].get('resumed_from') or {}
+    if resumed_from.get('checkpoint_sha256') != origin['checkpoint_sha256']:
+        raise ValueError('exploratory_resume_final_origin_mismatch')
+    for name, old, new in (
+            ('selections', before['scheduler']['selections'], after['scheduler']['selections']),
+            ('contexts', before['scheduler']['selection_contexts'], after['scheduler']['selection_contexts']),
+            ('feedback', before['feedback']['events'], after['feedback']['events'])):
+        if new[:len(old)] != old:
+            raise ValueError('exploratory_resume_prefix_changed:' + name)
+    if before['scheduler'].get('policy') == 'bfs':
+        old = before['scheduler']['frontier']['journal']
+        if after['scheduler']['frontier']['journal'][:len(old)] != old:
+            raise ValueError('exploratory_resume_prefix_changed:frontier')
+    # Bind this segment's rows to final selections; inherited observations must
+    # not inflate local coverage. An unfinished prepared selection may recur.
+    sequences = report.get('row_sequences')
+    rows = report['rows']
+    if not isinstance(sequences, list) or len(sequences) != len(rows):
+        raise ValueError('exploratory_resume_row_sequences_missing')
+    minimum = inherited['selected'] - (before['continuation'].get('pending_selection') is not None)
+    seen = set()
+    for index, (row, receipt) in enumerate(zip(rows, sequences)):
+        sequence = receipt.get('selection_sequence')
+        if (receipt.get('cycle_row_index') != index or receipt.get('cell_id') != row.get('cell_id')
+                or type(sequence) is not int or sequence in seen
+                or not minimum <= sequence < cumulative['selected']
+                or not row['cell_id'].startswith(f"{report['run_id']}.{sequence:04d}.")):
+            raise ValueError('exploratory_resume_row_sequence_mismatch')
+        seen.add(sequence)
+    return cycle
+
+
+def _audit_exploratory_budget(report, rows, errors, *, root=None):
     budget = report.get("budget")
     if not isinstance(budget, dict):
         errors.append("exploratory_budget_missing")
@@ -1095,10 +1195,19 @@ def _audit_exploratory_budget(report, rows, errors):
         counters[key] = 0 if value is None else value
     if not (counters["planned"] >= counters["generated"] >= counters["attempted"] >= counters["executed"]):
         errors.append("exploratory_budget_counters_inconsistent")
+    local = counters
+    if 'cycle_budget' in report:
+        try:
+            local = _exploratory_cycle_counters(report, root)
+        except (OSError, ValueError, TypeError, KeyError) as exc:
+            errors.append('exploratory_cycle_budget_error:' + str(exc))
+            local = counters
+    elif report.get('resume_origin') is not None:
+        errors.append('exploratory_cycle_budget_missing_for_resume')
     actual_executed = sum(1 for r in rows
                           if r.get("execution_stage") == "judged" and r.get("actual_run") is True)
-    if counters["executed"] != actual_executed:
-        errors.append(f"exploratory_budget_executed_mismatch:{counters['executed']}!={actual_executed}")
+    if local["executed"] != actual_executed:
+        errors.append(f"exploratory_budget_executed_mismatch:{local['executed']}!={actual_executed}")
     planned_rows = [r for r in rows if r.get("execution_stage") == "planned"]
     if len(planned_rows) > counters["planned"]:
         errors.append("exploratory_planned_rows_exceed_budget")
@@ -1310,7 +1419,7 @@ def audit_exploratory_report(report_path, *, report=None):
         valid = [r for r in rows if _verify_exploratory_row(root, r, report, errors)]
         details["rows_verified"] = len(valid)
         details["rows_total"] = len(rows)
-        _audit_exploratory_budget(report, rows, errors)
+        _audit_exploratory_budget(report, rows, errors, root=root)
         _audit_exploratory_controls(report, rows, errors)
         _audit_exploratory_ledger(root, report, rows, errors, details)
         coverage = []
@@ -1334,6 +1443,10 @@ def audit_exploratory_report(report_path, *, report=None):
                     recomputed = {"real_ros_execution": False, "qualification_errors": [str(exc)]}
                 details.setdefault("topology_qualifications", {})[row.get("cell_id", "<missing>")] = recomputed
                 row = dict(row, execution_qualification=recomputed)
+            from r2f.campaign.runner import G01_TARGET
+            if row.get('target_id') == G01_TARGET and row.get('mutation_plan') is None:
+                qualified_coverage_rows.append(row)
+                continue  # Already fail-closed audited above; not execution coverage.
             qualification = boundary_qualification_for_row(root, row, report)
             if qualification["status"] != "not_applicable":
                 details.setdefault("boundary_qualifications", {})[row.get("cell_id", "<missing>")] = qualification
