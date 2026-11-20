@@ -962,6 +962,8 @@ def g01_runtime_observation(events, config):
         # Only request -> fresh sample -> graph -> ACK qualifies. At least one
         # complete pair snapshot precedes sends and one follows all delivery.
         before, after = {}, {}
+        convergence = []
+        first_send = min((e["monotonic_ns"] for e in sends), default=end)
         for role, token in tokens.items():
             proofs = _command_bound_snapshot(events, role, token["endpoint_gid"],
                                               max(t["created_monotonic_ns"] for t in tokens.values()))
@@ -981,14 +983,20 @@ def g01_runtime_observation(events, config):
                         or match.get("count_api") != ("get_subscription_count" if role == "writer"
                                                        else "get_publisher_count")
                         or type(match.get("matched_count")) is not int
-                        or match["matched_count"] not in (0, 1)
-                        or _graph_isolation(graph, tokens["writer"]["endpoint_gid"],
-                                            tokens["reader"]["endpoint_gid"])[0] != "exact_pair"):
+                        or match["matched_count"] not in (0, 1)):
                     raise RelationSurfaceError("g01_snapshot_request_or_pair_invalid:" + role)
                 for table, endpoint_role in (("publishers", "writer"), ("subscriptions", "reader")):
                     entries = graph.get(table, [])
-                    if len(entries) != 1 or entries[0].get("topic_type") != "std_msgs/msg/String":
+                    # Discovery is asynchronous. An early poll may not yet see
+                    # the remote endpoint, but never admits a foreign/duplicate
+                    # endpoint or makes that partial graph a pair boundary.
+                    if (table not in graph or not isinstance(entries, list)
+                            or len(entries) > 1 or any(
+                            entry.get("endpoint_gid") != tokens[endpoint_role]["endpoint_gid"]
+                            or entry.get("topic_type") != "std_msgs/msg/String" for entry in entries)):
                         raise RelationSurfaceError("g01_graph_type_or_cardinality_invalid:" + role)
+                    if not entries:
+                        continue
                     qos = entries[0].get("qos")
                     binding = next(e for e in events if e.get("event") == "qos_binding_observed"
                                    and e.get("role") == endpoint_role)
@@ -1001,16 +1009,24 @@ def g01_runtime_observation(events, config):
                             qos.get(k) == v for k, v in config[endpoint_role + "_qos"].items())
                     if not graph_matches:
                         raise RelationSurfaceError("g01_graph_qos_mismatch:" + endpoint_role)
+                proof["exact_pair"] = _graph_isolation(
+                    graph, tokens["writer"]["endpoint_gid"],
+                    tokens["reader"]["endpoint_gid"])[0] == "exact_pair"
+                if not proof["exact_pair"]:
+                    if ack["monotonic_ns"] >= first_send:
+                        raise RelationSurfaceError("g01_incomplete_graph_after_probe_started:" + role)
+                    convergence.append({"role": role, "graph": _row_ref(graph),
+                                        "ack": _row_ref(ack), "pair_boundary_eligible": False})
                 valid.append(proof)
             requested = [e for e in events if e.get("event") == "worker_command_requested"
                          and e.get("role") == role and e.get("command") == "snapshot"]
             if len(requested) != len(valid):
                 raise RelationSurfaceError("g01_snapshot_command_incomplete:" + role)
-            first_send = min((e["monotonic_ns"] for e in sends), default=end)
             last_delivery = max((e["monotonic_ns"] for e in sends + receives), default=start)
             prior = [p for p in valid if p["ack"]["monotonic_ns"] < first_send]
             posterior = [p for p in valid if p["sampled_ns"] > last_delivery]
-            if not prior or not posterior:
+            if (not prior or not posterior or not prior[-1]["exact_pair"]
+                    or not posterior[-1]["exact_pair"]):
                 raise RelationSurfaceError("g01_fresh_graph_boundaries_missing:" + role)
             before[role], after[role] = prior[-1], posterior[-1]
         if any(before[r]["match"]["matched_count"] != after[r]["match"]["matched_count"]
@@ -1039,6 +1055,7 @@ def g01_runtime_observation(events, config):
         result["graph_boundaries"] = {
             role: {"before_ack": _row_ref(before[role]["ack"]),
                    "after_ack": _row_ref(after[role]["ack"])} for role in tokens}
+        result["discovery_convergence_snapshots"] = convergence
         result["delivery_obligation"] = "not_evaluated_by_compatibility_guard"
         result["finite_absence_is_not_proof"] = True
     except (RelationSurfaceError, KeyError, TypeError, ValueError) as exc:

@@ -296,6 +296,74 @@ class G01RuntimeWiring(unittest.TestCase):
         self.assertEqual(result['reason'], 'blocked:g01_negative_control_contract_not_implemented')
         self.assertFalse(result['real_execution'])
 
+    def convergence_events(self):
+        result, c = self.run_offline(actual_receipts=True, graph_depth_zero=True)
+        rows = deepcopy(result['events'])
+        request = next(e for e in rows if e['event'] == 'worker_command_requested'
+                       and e['role'] == 'reader' and e['command'] == 'snapshot')
+        initial = [deepcopy(e) for e in rows if e.get('role') == 'reader'
+                   and e.get('command_id') == request['command_id']]
+        for row in initial:
+            row['command_id'] = 10001
+            if row['event'] == 'match_snapshot':
+                row['matched_count'] = 0
+            elif row['event'] == 'graph_snapshot':
+                row['publishers'] = []
+        rows[rows.index(request):rows.index(request)] = initial
+        for i, row in enumerate(rows):
+            row['event_index'] = i
+        return rows, c
+
+    def test_early_partial_discovery_is_diagnostic_not_a_pair_boundary(self):
+        rows, c = self.convergence_events()
+        original = deepcopy(rows)
+        observed = g01_runtime_observation(rows, c)
+        self.assertTrue(observed['oracle_input'], observed['reasons'])
+        self.assertTrue(observed['relation_effect_observed'])
+        diagnostic = observed['discovery_convergence_snapshots']
+        self.assertEqual(len(diagnostic), 1)
+        self.assertFalse(diagnostic[0]['pair_boundary_eligible'])
+        boundary = observed['graph_boundaries']['reader']['before_ack']
+        self.assertGreater(boundary['event_index'], diagnostic[0]['ack']['event_index'])
+        self.assertEqual(rows, original)
+
+    def test_partial_discovery_does_not_hide_invalid_or_missing_pair_evidence(self):
+        for damage in ('foreign', 'wrong_type', 'wrong_qos', 'duplicate_endpoint',
+                       'wrong_request', 'missing_ack', 'no_complete_before', 'missing_final'):
+            with self.subTest(damage=damage):
+                rows, c = self.convergence_events()
+                graph = next(e for e in rows if e.get('command_id') == 10001
+                             and e['event'] == 'graph_snapshot')
+                if damage == 'foreign':
+                    graph['publishers'] = [dict(endpoint_gid='foreign', topic_type='std_msgs/msg/String')]
+                elif damage == 'wrong_type':
+                    graph['subscriptions'][0]['topic_type'] = 'other'
+                elif damage == 'wrong_qos':
+                    graph['subscriptions'][0]['qos']['reliability'] = 'best_effort'
+                elif damage == 'duplicate_endpoint':
+                    graph['subscriptions'].append(deepcopy(graph['subscriptions'][0]))
+                elif damage == 'wrong_request':
+                    next(e for e in rows if e.get('command_id') == 10001
+                         and e['event'] == 'worker_command_requested')['pid'] = 999
+                elif damage == 'missing_ack':
+                    rows = [e for e in rows if not (e.get('command_id') == 10001
+                            and e['event'] == 'command_done')]
+                elif damage == 'no_complete_before':
+                    first = min(e['monotonic_ns'] for e in rows if e['event'] == 'send')
+                    for e in rows:
+                        if e['event'] == 'graph_snapshot' and e['monotonic_ns'] < first:
+                            e['publishers'] = []
+                else:
+                    graphs = [e for e in rows if e['event'] == 'graph_snapshot'
+                              and e.get('role') == 'reader' and 'command_id' in e]
+                    graphs[-1]['publishers'] = []
+                for i, row in enumerate(rows):
+                    row['event_index'] = i
+                observed = g01_runtime_observation(rows, c)
+                self.assertFalse(observed['oracle_input'], (damage, observed))
+                self.assertFalse(observed['relation_effect_observed'])
+                self.assertIsNone(observed['facts'])
+
     def test_missing_evidence_and_wrong_identities_fail_closed(self):
         result, c = self.run_offline()
         events = result['events']
