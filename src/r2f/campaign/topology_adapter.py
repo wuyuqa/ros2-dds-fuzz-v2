@@ -69,6 +69,72 @@ def _chain(*events):
                  for a, b in zip(events, events[1:])), "raw_chronology_invalid")
 
 
+def _assert_api_event(inside, action, receipt, token, begin, after, done):
+    """Bind the legacy API action to its writer and command, not DDS recovery.
+
+    Current offline fake lacks command IDs/ACKs and therefore cannot qualify.
+    """
+    _require(isinstance(token, dict), "action_assert_writer_token_missing")
+    result = receipt.get("after", {}).get("assert")
+    _require(isinstance(result, dict), "action_assert_result_missing")
+    command_id = result.get("command_id")
+    _require(_integer(command_id, 1), "action_assert_command_id_missing")
+    _require(result.get("api") == "rclpy.publisher.Publisher.assert_liveliness",
+             "action_assert_api_missing_or_unverified")
+    _require(token.get("logical_id") == action.get("endpoint_id")
+             and token.get("generation") == action.get("generation"),
+             "action_assert_writer_identity_mismatch")
+    rows = [e for e in inside if e.get("event") == "liveliness_asserted"]
+    _require(len(rows) == 1, "action_assert_raw_missing_or_ambiguous")
+    row = rows[0]
+    _require(row.get("command_id") == command_id and row.get("api") == result["api"],
+             "action_assert_command_or_api_mismatch")
+    _require(all(row.get(k) is not None and row.get(k) == token.get(k) for k in _LINEAGE)
+             and _text(token.get("endpoint_gid"))
+             and row.get("endpoint_gid") == token["endpoint_gid"],
+             "action_assert_writer_identity_mismatch")
+    acknowledgements = [e for e in inside if e.get("event") == "command_done"
+                        and e.get("command_id") == command_id
+                        and all(e.get(k) is not None and e.get(k) == token.get(k) for k in _LINEAGE)]
+    _require(len(acknowledgements) == 1, "action_assert_command_done_missing_or_ambiguous")
+    ack = acknowledgements[0]
+    # Controller and worker timestamps can only be ordered across processes
+    # when every relevant event identifies the same boot/time namespace.
+    requests = [e for e in inside if e.get("event") == "topology_assert_liveliness_requested"]
+    writes = [e for e in inside if e.get("event") == "topology_assert_liveliness_write_result"]
+    _require(len(requests) == len(writes) == 1, "action_assert_request_or_write_missing_or_ambiguous")
+    request, write = requests[0], writes[0]
+    for event in (request, write):
+        _require(event.get("command") == "assert_liveliness"
+                 and event.get("command_id") == command_id
+                 and all(event.get(k) is not None and event.get(k) == token.get(k) for k in _LINEAGE)
+                 and event.get("endpoint_gid") == token.get("endpoint_gid"),
+                 "action_assert_request_or_write_binding_mismatch")
+    _require(write.get("status") == "flushed" and write.get("error_type") is None
+             and _integer(write.get("bytes_expected"), 1)
+             and type(write.get("bytes_written")) is int
+             and write["bytes_written"] == write["bytes_expected"],
+             "action_assert_command_write_not_successful")
+    chain_events = (token, begin, request, write, row, ack, after, done)
+    clock = row.get("monotonic_clock_identity")
+    _require(isinstance(clock, dict) and _text(clock.get("boot_id"))
+             and _integer(clock.get("device")) and _integer(clock.get("inode"), 1)
+             and all(event.get("monotonic_clock_identity") == clock for event in chain_events),
+             "action_assert_monotonic_clock_identity_missing_or_mismatch")
+    _require(request.get("request_clock_identity") == clock
+             and write.get("result_clock_identity") == clock
+             and _integer(request.get("request_monotonic_ns"), 1)
+             and _integer(write.get("result_monotonic_ns"), 1)
+             and request["request_monotonic_ns"] <= request["monotonic_ns"]
+             and write["result_monotonic_ns"] <= write["monotonic_ns"]
+             and request["request_monotonic_ns"] < row["monotonic_ns"]
+             and request["request_monotonic_ns"] < write["result_monotonic_ns"],
+             "action_assert_request_or_write_clock_invalid")
+    _chain(token, begin, request, row, ack, after, done)
+    _chain(request, write, after)
+    return row
+
+
 def _pointer(value):
     return value.replace("~", "~0").replace("/", "~1")
 
@@ -303,7 +369,10 @@ class _Audit:
             elif op in {"snapshot", "barrier"}:
                 _require(any(e["event"] == "command_done" for e in inside), "action_snapshot_ack_missing")
             elif op == "assert_liveliness":
-                _require(any(e["event"] == "liveliness_asserted" for e in inside), "action_assert_raw_missing")
+                _require(self.specs[action["endpoint_id"]].get("role") == "writer",
+                         "action_assert_requires_writer")
+                token = self.tokens.get((action["endpoint_id"], action["generation"]))
+                _assert_api_event(inside, action, receipt, token, begin, after, done)
             self.action_receipts.append({"action_id": aid, "before": snapshot(receipt["before"]),
                 "after": snapshot(receipt["after"]), "requires": snapshot(receipt["requires"]),
                 "terminal": receipt["disposition"], "raw_begin": self.ref(begin), "raw_after": self.ref(after),
@@ -423,7 +492,12 @@ def _pair_facts(audit, projection, deliveries):
             p.get("reliability") == "reliable" and (p.get("history") == "keep_all"
                 or p.get("history") == "keep_last" and _integer(p.get("depth"), max(1, len(expected))))
             for p in policies.values()))
-        row["filter_free"] = all(audit.specs[eid].get("filter") is None for eid in (w, r))
+        # A dynamic update may alter filtering even when the initial spec was empty.
+        # Without a raw-proven temporal partition, conservatively disable delivery obligations.
+        dynamic_reader = any(a.get("op") == "update_filter" and a.get("endpoint_id") == r
+                             for a in getattr(audit, "program", {}).get("actions", []))
+        row["filter_free"] = (not dynamic_reader and
+                              all(audit.specs[eid].get("filter") is None for eid in (w, r)))
         row["writer_generation"] = side["identity"].get(w, {}).get("generation")
         row["reader_generation"] = side["identity"].get(r, {}).get("generation")
         row.update(_delivery_window(audit, row, deliveries))

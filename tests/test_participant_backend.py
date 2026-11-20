@@ -105,7 +105,7 @@ class LedgerTests(unittest.TestCase):
     def test_activity_refresh_is_basis_named(self):
         self.register()
         value = self.ledger.activity(dict(IDENT), at_ns=2000)
-        self.assertTrue(value['refresh_observed'])
+        self.assertFalse(value['refresh_observed'])
         self.assertEqual(value['refresh_basis'], 'builtin_participant_sample')
         self.assertFalse(value['participant_lease_evidence'] if 'participant_lease_evidence' in value else False)
 
@@ -119,26 +119,58 @@ class LedgerTests(unittest.TestCase):
         state = self.ledger.state()
         self.assertEqual(state['status'], 'registered_no_activity')
 
-    def test_expiry_requires_builtin_disposal_evidence(self):
+    def test_disposal_and_no_writers_are_disappearance_not_expiry(self):
+        for basis, instance_state in (("builtin_instance_disposed", "NOT_ALIVE_DISPOSED"),
+                                      ("builtin_instance_no_writers", "NOT_ALIVE_NO_WRITERS")):
+            ledger = pb.ParticipantLedger(clock=lambda: 3000)
+            ledger.register(dict(IDENT), lease())
+            evidence = [{'guid': GUID_A, 'generation': IDENT['generation'], 'vendor': IDENT['vendor'], 'instance_state': instance_state, 'valid_data': False}]
+            value = ledger.expiry(dict(IDENT), basis=basis, evidence=evidence)
+            self.assertEqual(value['receipt_kind'], 'participant_disappearance')
+            self.assertFalse(value['disappearance_observed'])
+            self.assertFalse(value['expiry_observed'])
+            self.assertEqual(value['cause'], 'unknown')
+            state = ledger.state()
+            self.assertEqual(state['status'], 'disappearance_declared')
+            self.assertIsNone(state['expiry'])
+            self.assertFalse(state['expiry_observed'])
+            self.assertEqual(state['expiry_cause_status'], 'unknown_no_authoritative_cause_evidence')
+
+    def test_disappearance_requires_matching_identity_state_and_invalid_data(self):
         self.register()
-        refused = self.ledger.expiry(dict(IDENT), at_ns=3000)
-        self.assertEqual(refused['reason'], 'expiry_requires_builtin_disposal_evidence')
-        self.assertEqual(refused['layer'], 'evidence')
-        other = [{'guid': GUID_B, 'instance_state': 'NOT_ALIVE_DISPOSED', 'valid_data': False}]
-        self.assertFalse(self.ledger.expiry(dict(IDENT), evidence=other).get('expiry_observed'))
-        real = [{'guid': GUID_A, 'instance_state': 'NOT_ALIVE_DISPOSED', 'valid_data': False}]
-        value = self.ledger.expiry(dict(IDENT), at_ns=3000, evidence=real)
-        self.assertTrue(value['expiry_observed'])
-        self.assertEqual(value['expiry_basis'], 'builtin_sample')
-        self.assertEqual(self.ledger.state()['status'], 'expired_observed')
+        for evidence in (None, [{'guid': GUID_B, 'instance_state': 'NOT_ALIVE_DISPOSED', 'valid_data': False}],
+                         [{'guid': GUID_A, 'instance_state': 'NOT_ALIVE_NO_WRITERS', 'valid_data': False}],
+                         [{'guid': GUID_A, 'instance_state': 'NOT_ALIVE_DISPOSED', 'valid_data': True}]):
+            value = self.ledger.expiry(dict(IDENT), evidence=evidence)
+            self.assertEqual(value['reason'], 'disappearance_requires_matching_builtin_evidence')
+            self.assertFalse(value.get('expiry_observed', False))
+        self.assertEqual(self.ledger.state()['status'], 'registered_no_activity')
+
+    def test_unverified_expiry_cause_never_promotes_caller_assertion(self):
+        self.register()
+        evidence = [{'guid': GUID_A, 'cause': 'lease_expired', 'raw_ref': 'claimed'}]
+        value = self.ledger.expiry(dict(IDENT), basis='vendor_lease_expired', evidence=evidence)
+        self.assertEqual(value['reason'], 'expiry_cause_verifier_unavailable')
+        self.assertFalse(value['expiry_observed'])
+        self.assertEqual(self.ledger.state()['status'], 'registered_no_activity')
+
+    def test_disappearance_then_rediscovery_does_not_imply_expiry(self):
+        self.register()
+        self.ledger.disappearance(dict(IDENT), evidence=[{'guid': GUID_A,
+            'generation': IDENT['generation'], 'vendor': IDENT['vendor'],
+            'instance_state': 'NOT_ALIVE_DISPOSED', 'valid_data': False}], at_ns=1000)
+        self.assertFalse(self.ledger.rediscovery(dict(IDENT), at_ns=1001)['prior_gap_observed'])
+        state = self.ledger.state()
+        self.assertFalse(state['expiry_observed'])
+        self.assertIsNone(state['expiry'])
 
     def test_rediscovery_after_proven_gap(self):
         self.register()
         self.ledger.activity(dict(IDENT), at_ns=2000)
         self.ledger.silence(dict(IDENT), window_ns=1_000_000)
         value = self.ledger.rediscovery(dict(IDENT), at_ns=4000)
-        self.assertTrue(value['prior_gap_observed'])
-        self.assertTrue(value['rediscovery_observed'])
+        self.assertFalse(value['prior_gap_observed'])
+        self.assertFalse(value['rediscovery_observed'])
         self.assertTrue(value['identity_generation_unchanged'])
         fresh = pb.ParticipantLedger()
         fresh.register(dict(IDENT), lease())
@@ -150,7 +182,7 @@ class LedgerTests(unittest.TestCase):
         self.register()
         value = self.ledger.replace_identity(
             {'guid': GUID_B, 'vendor': 'cyclonedds', 'generation': 1})
-        self.assertTrue(value['replacement_observed'])
+        self.assertFalse(value['replacement_observed'])
         self.assertFalse(value['counts_as_refresh'])
         self.assertFalse(value['old_lease_reused'])
         self.assertEqual(value['new_generation'], 1)
@@ -181,7 +213,7 @@ class LedgerTests(unittest.TestCase):
         self.assertEqual(self.ledger.activity(dict(IDENT))['reason'],
                          'participant_not_registered')
         self.register()
-        value = self.ledger.activity({'guid': GUID_B, 'vendor': 'cyclonedds'})
+        value = self.ledger.activity({'guid': GUID_B, 'vendor': 'cyclonedds', 'generation': 0})
         self.assertEqual(value['reason'], 'identity_not_current')
         self.assertEqual(value['layer'], 'identity')
 
@@ -197,9 +229,62 @@ class LedgerTests(unittest.TestCase):
         self.assertEqual(self.ledger.state()['state_basis'], 'registration_only')
         self.ledger.activity(dict(IDENT), at_ns=2000)
         state = self.ledger.state()
-        self.assertEqual(state['status'], 'active_observed')
-        self.assertEqual(state['state_basis'], 'last_activity_sample')
+        self.assertEqual(state['status'], 'activity_declared')
+        self.assertEqual(state['state_basis'], 'caller_declared_activity')
         self.assertFalse(state['expiry_inferred'])
+
+    def test_ordered_declarations_and_no_old_recovery(self):
+        self.register()
+        e = [{'guid': GUID_A, 'vendor': IDENT['vendor'], 'generation': IDENT['generation'],
+              'instance_state': 'NOT_ALIVE_DISPOSED', 'valid_data': False, 'raw_ref': 'unverified'}]
+        first = self.ledger.disappearance(dict(IDENT), at_ns=10, evidence=e)
+        self.assertEqual(first['stage'], 'declared')
+        self.assertFalse(first['disappearance_observed'])
+        self.ledger.rediscovery(dict(IDENT), at_ns=11, evidence=[{'raw_ref': 'unverified'}])
+        self.assertEqual(self.ledger.state()['status'], 'rediscovery_declared')
+        self.ledger.disappearance(dict(IDENT), at_ns=12, evidence=e)
+        state = self.ledger.state()
+        self.assertEqual(state['status'], 'disappearance_declared')
+        self.assertIsNone(state['rediscovery'])
+        self.assertEqual(state['disappearance']['disappearance_ns'], 12)
+        self.assertEqual(self.ledger.rediscovery(dict(IDENT), at_ns=11)['reason'], 'event_time_not_after_previous')
+        self.assertEqual(self.ledger.rediscovery(dict(IDENT), at_ns=-1)['reason'], 'rediscovery_time_invalid')
+        self.assertEqual(self.ledger.state()['status'], 'disappearance_declared')
+
+    def test_identity_and_evidence_fail_closed(self):
+        self.register()
+        for identity in ({'guid': GUID_A, 'vendor': IDENT['vendor']},
+                         dict(IDENT, generation=IDENT['generation'] + 1),
+                         dict(IDENT, vendor='other')):
+            self.assertEqual(self.ledger.activity(identity, at_ns=10)['receipt_kind'], 'participant_guard')
+        for evidence in (None, [{'guid': GUID_A, 'instance_state': 'NOT_ALIVE_DISPOSED', 'valid_data': False}]):
+            self.assertEqual(self.ledger.disappearance(dict(IDENT), at_ns=10, evidence=evidence)['receipt_kind'], 'participant_guard')
+        self.assertEqual(self.ledger.state()['status'], 'registered_no_activity')
+
+    def test_metadata_changes_cannot_reset_chronology_or_projection(self):
+        original = dict(IDENT, domain_id=1, participant_name='old')
+        changed = dict(IDENT, domain_id=2, participant_name='new')
+        self.register(original)
+        evidence = [{'guid': GUID_A, 'vendor': IDENT['vendor'],
+                     'generation': IDENT['generation'],
+                     'instance_state': 'NOT_ALIVE_DISPOSED', 'valid_data': False}]
+        self.ledger.disappearance(original, at_ns=100, evidence=evidence)
+        self.assertEqual(self.ledger.rediscovery(changed, at_ns=99)['reason'],
+                         'event_time_not_after_previous')
+        self.assertEqual(self.ledger.state()['status'], 'disappearance_declared')
+        self.assertTrue(self.ledger.register(changed, lease())['receipt_kind'] == 'participant_registered')
+        self.assertEqual(self.ledger.state()['status'], 'disappearance_declared')
+        self.assertEqual(self.ledger.activity(original, at_ns=100)['reason'],
+                         'event_time_not_after_previous')
+        recovery = self.ledger.rediscovery(changed, at_ns=101)
+        self.assertTrue(recovery['prior_gap_declared'])
+        self.assertFalse(recovery['rediscovery_observed'])
+        self.assertEqual(self.ledger.state()['status'], 'rediscovery_declared')
+        self.ledger.disappearance(original, at_ns=102, evidence=evidence)
+        self.assertEqual(self.ledger.state()['status'], 'disappearance_declared')
+        self.assertIsNone(self.ledger.state()['rediscovery'])
+        self.assertEqual(self.ledger.rediscovery(changed, at_ns=101)['reason'],
+                         'event_time_not_after_previous')
 
     def test_ledger_never_counts_toward_maturity(self):
         self.register()

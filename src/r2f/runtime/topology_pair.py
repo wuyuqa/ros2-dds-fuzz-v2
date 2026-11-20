@@ -29,8 +29,10 @@ from r2f.modules.s1 import topology_model as model
 from .domains import IsolationError
 from .topology_environment_observation import TopologyEnvironmentObservation
 
+from .liveliness_evidence import evaluate_liveliness, evaluate_peer_samples
 from .topology_worker import (
     MAX_INTERVAL_SEC,
+    _monotonic_clock_identity,
     NETEM_ISOLATION_ENV,
     OFFLINE_BACKEND,
     ROS_BACKEND,
@@ -1204,6 +1206,305 @@ def _delivery_window_evidence(opened, events, *, before_index=None):
     return evidence
 
 
+def _repeat_data_observation(binding, events):
+    """Compare sent bytes, without claiming which repeated occurrence delivered."""
+    unknown = {"status": "unknown", "binding_ref": binding.get("event_index"),
+               "filter_effect_observed": None, "candidate_eligible": False,
+               "delivery_attribution": "unknown"}
+    ref = binding.get("source_send_ref")
+    if type(ref) is not int or not 0 <= ref < binding.get("event_index", 0):
+        return {**unknown, "reason": "source_ref_invalid"}
+    source = events[ref]
+    sends = [e for e in events if e.get("event") == "send"
+             and e.get("logical_id") == binding.get("writer")
+             and e.get("generation") == binding.get("writer_generation")
+             and e.get("phase") == binding.get("action_id")
+             and e.get("command_id") == binding.get("command_id")
+             and e.get("send_sequence") == binding.get("occurrence_sequence")]
+    if len(sends) != 1:
+        return {**unknown, "reason": "repeat_send_missing_or_ambiguous"}
+    sent = sends[0]
+    if (source.get("event") != "send" or source.get("publish_returned") is not True
+            or sent.get("publish_returned") is not True
+            or any(source.get(k) != sent.get(k) or source.get(k) is None for k in
+                   ("logical_id", "generation", "writer_gid", "pid", "process_start_ticks", "endpoint_generation", "run_id"))
+            or source.get("writer_gid") != binding.get("writer_gid")
+            or source.get("phase") != binding.get("source_action")
+            or source.get("send_sequence") == sent.get("send_sequence")
+            or source.get("command_id") == sent.get("command_id")
+            or not (source.get("event_index", -1) < sent.get("event_index", -1) < binding["event_index"])
+            or type(source.get("monotonic_ns")) is not int or type(sent.get("monotonic_ns")) is not int
+            or source["monotonic_ns"] > sent["monotonic_ns"]
+            or not isinstance(source.get("string_data"), str)
+            or source.get("string_data") != sent.get("string_data")
+            or source.get("payload_sha256") != sent.get("payload_sha256")
+            or hashlib.sha256(source["string_data"].encode()).hexdigest() != source.get("payload_sha256")):
+        return {**unknown, "reason": "repeat_identity_chronology_or_bytes_invalid"}
+    # The first occurrence can only be witnessed from the capture prefix
+    # before the repeat was sent; later equal-payload receives remain ambiguous.
+    updates = [e for e in events if e.get("event") == "topology_filter_update_result"
+               and source["event_index"] < e.get("event_index", -1) < sent["event_index"]]
+    control_ref = None
+    update_ref = None
+    if len(updates) == 1:
+        update = updates[0]
+        prior = events[:sent["event_index"]]
+        def same_update(e):
+            return all(e.get(k) is not None and e.get(k) == update.get(k)
+                       for k in ("command_id", "logical_id", "generation", "reader_gid"))
+        calls = [e for e in prior if e.get("event") == "content_filter_api_call"
+                 and e.get("api_stage") == "set_begin" and same_update(e)]
+        raw_updates = [e for e in prior if e.get("event") == "content_filter_dynamic_update" and same_update(e)]
+        if len(calls) == len(raw_updates) == 1:
+            call, raw_update = calls[0], raw_updates[0]
+            clock = source.get("monotonic_clock_identity")
+            begin, returned, update_begin = source.get("publish_begin_ns"), source.get("publish_return_ns"), call.get("api_monotonic_ns")
+            clock_ok = (isinstance(clock, dict) and bool(clock.get("boot_id"))
+                        and type(clock.get("device")) is int and type(clock.get("inode")) is int
+                        and call.get("monotonic_clock_identity") == clock
+                        and raw_update.get("monotonic_clock_identity") == clock)
+            creations = [e for e in events if e.get("event") == "endpoint_created"
+                         and e.get("logical_id") == update.get("logical_id")
+                         and e.get("generation") == update.get("generation")]
+            identity_ok = (len(creations) == 1 and creations[0].get("endpoint_gid") == update.get("reader_gid")
+                           and all(call.get(k) is not None and call.get(k) == raw_update.get(k) == creations[0].get(k)
+                                   for k in ("pid", "process_start_ticks", "endpoint_generation", "run_id"))
+                           and creations[0].get("monotonic_clock_identity") == clock)
+            retirements = [e for e in events if e.get("event") in
+                           {"endpoint_destroyed", "topology_endpoint_destroyed", "worker_exit", "topology_worker_exit", "topology_generation_retired"}
+                           and e.get("logical_id") == update.get("logical_id")
+                           and e.get("generation") == update.get("generation")]
+            lifecycle_ok = (identity_ok and type(creations[0].get("monotonic_ns")) is int
+                            and type(raw_update.get("update_started_ns")) is int
+                            and type(raw_update.get("update_finished_ns")) is int
+                            and creations[0]["monotonic_ns"] <= raw_update["update_started_ns"]
+                            and all(e.get("monotonic_clock_identity") == clock
+                                    and type(e.get("monotonic_ns")) is int
+                                    and e["monotonic_ns"] > raw_update["update_finished_ns"]
+                                    for e in retirements))
+            timestamps = (begin, returned, source.get("monotonic_ns"), update_begin,
+                          raw_update.get("update_started_ns"), raw_update.get("update_finished_ns"))
+            if (clock_ok and lifecycle_ok and all(type(x) is int for x in timestamps)
+                    and begin <= returned <= source["monotonic_ns"]
+                    and returned <= raw_update["update_started_ns"] <= update_begin <= raw_update["update_finished_ns"]):
+                candidates = []
+                for receive in prior:
+                    if (receive.get("event") != "receive" or receive.get("payload_sha256") != source["payload_sha256"]
+                            or receive.get("monotonic_clock_identity") != clock
+                            or type(receive.get("monotonic_ns")) is not int
+                            or not begin <= receive["monotonic_ns"] < raw_update["update_started_ns"]):
+                        continue
+                    pair = {"writer": source["logical_id"], "writer_generation": source["generation"],
+                            "writer_gid": source["writer_gid"], "reader": update.get("logical_id"),
+                            "reader_generation": update.get("generation"), "reader_gid": update.get("reader_gid")}
+                    witness, _ = payload_delivery_witness(pair, receive, prior)
+                    if witness is not None and witness.get("send_ref") == ref:
+                        candidates.append(receive["event_index"])
+                if len(candidates) == 1:
+                    control_ref, update_ref = candidates[0], update["event_index"]
+    return {**unknown, "status": "identical_input_sent", "reason": "delivery_occurrence_unresolved",
+            "source_send_ref": ref, "repeat_send_ref": sent["event_index"],
+            "pre_control_receive_ref": control_ref, "between_update_ref": update_ref,
+            "input_equivalence": "complete_String.data", "payload_sha256": source["payload_sha256"]}
+
+
+
+def _dynamic_cft_effect(update, events, *, real_ros):
+    """Compare raw windows; no absent final sample or configuration implies effect.
+
+    Only SQL LIKE with one quoted ASCII parameter and '%' wildcards is
+    interpreted. The result is observational, never a candidate or verdict.
+    """
+    import re
+    unknown = {"status": "unknown", "filter_effect_observed": None,
+               "fixture_contrast_observed": None, "candidate_eligible": False,
+               "update_ref": update.get("event_index")}
+    def fail(reason):
+        return {**unknown, "reason": reason}
+    receipt = update.get("receipt") or {}
+    observed = receipt.get("observed") or {}
+    requested = receipt.get("requested") or {}
+    if (receipt.get("api_status") != "succeeded" or receipt.get("readback_status") != "matched"
+            or receipt.get("applied") is not True or requested.get("enabled") is not True
+            or requested.get("expression") != observed.get("expression")
+            or requested.get("parameters") != observed.get("parameters")):
+        return fail("update_api_or_actual_readback_unavailable")
+    expr, params = observed.get("expression"), observed.get("parameters")
+    if not isinstance(expr, str) or not re.fullmatch(r"\s*data\s+LIKE\s+%0\s*", expr, re.I):
+        return fail("predicate_unsupported")
+    if not isinstance(params, list) or len(params) != 1 or not isinstance(params[0], str):
+        return fail("predicate_parameter_unsupported")
+    literal = params[0]
+    if (len(literal) < 2 or literal[0] != "'" or literal[-1] != "'"
+            or not literal.isascii() or any(c in literal[1:-1] for c in "_'\\")):
+        return fail("predicate_parameter_unsupported")
+    pattern = re.compile("\\A" + ".*".join(re.escape(x) for x in literal[1:-1].split("%")) + "\\Z", re.S)
+    uid = update.get("event_index")
+    workers = [e for e in events if e.get("event") == "content_filter_dynamic_update"
+               and e.get("logical_id") == update.get("logical_id")
+               and e.get("generation") == update.get("generation")
+               and e.get("command_id") == update.get("command_id")]
+    if len(workers) != 1:
+        return fail("worker_update_missing_or_ambiguous")
+    worker = workers[0]
+    if real_ros and (worker.get("fixture") is True or worker.get("backend") == OFFLINE_BACKEND):
+        return fail("fixture_cannot_qualify_real_effect")
+    start, end = worker.get("update_started_ns"), worker.get("update_finished_ns")
+    if (type(start) is not int or type(end) is not int or start > end
+            or worker.get("event_index", uid) >= uid or worker.get("filter_receipt") != receipt
+            or worker.get("reader_gid") != update.get("reader_gid")):
+        return fail("worker_update_chronology_or_receipt_invalid")
+    calls = [e for e in events if e.get("event") == "content_filter_api_call"
+             and e.get("logical_id") == update.get("logical_id")
+             and e.get("command_id") == update.get("command_id")]
+    if (len(calls) != 4 or [e.get("api_stage") for e in calls] !=
+            ["set_begin", "set_success", "get_begin", "get_success"]
+            or any(e.get("generation") != worker.get("generation")
+                   or e.get("reader_gid") != worker.get("reader_gid")
+                   or any(e.get(k) != worker.get(k) for k in
+                          ("pid", "process_start_ticks", "endpoint_generation"))
+                   or type(e.get("api_monotonic_ns")) is not int for e in calls)
+            or not all(start <= e["api_monotonic_ns"] <= end for e in calls)
+            or any(a["api_monotonic_ns"] > b["api_monotonic_ns"]
+                   or a.get("event_index", -1) >= b.get("event_index", -1)
+                   for a, b in zip(calls, calls[1:]))
+            or calls[-1].get("event_index", uid) >= worker["event_index"]
+            or calls[0].get("requested") != requested
+            or calls[-1].get("observed") != observed
+            or (real_ros and any(e.get("fixture") is True for e in calls))):
+        return fail("independent_api_call_evidence_invalid")
+    from .filter_backend import normalize_captured_update_readback
+    captured = normalize_captured_update_readback(calls[-1].get("raw_readback"),
+                                                 fixture=not real_ros)
+    if captured is None or captured != calls[-1].get("observed") or captured != observed:
+        return fail("raw_api_readback_invalid_or_inconsistent")
+    created = [e for e in events if e.get("event") == "endpoint_created"
+               and e.get("logical_id") == update.get("logical_id")
+               and e.get("generation") == update.get("generation")
+               and e.get("endpoint_gid") == update.get("reader_gid")]
+    if len(created) != 1 or any(worker.get(k) is None or worker.get(k) != created[0].get(k)
+            for k in ("pid", "process_start_ticks", "endpoint_generation")):
+        return fail("reader_identity_not_bound")
+    closes = [e for e in events if e.get("event") == "topology_delivery_window_closed"
+              and e.get("reader") == update.get("logical_id")
+              and e.get("reader_generation") == update.get("generation")]
+    pre = [e for e in closes if e.get("event_index", uid) < worker["event_index"]
+           and e.get("monotonic_ns", start + 1) <= start]
+    post = [e for e in closes if e.get("event_index", 0) > uid
+            and type(e.get("open_ref")) is int and 0 <= e["open_ref"] < len(events)
+            and events[e["open_ref"]].get("monotonic_ns", 0) >= end]
+    if not pre or not post:
+        return fail("pre_or_post_raw_window_missing")
+    before, after = pre[-1], post[0]
+    keys = ("writer", "reader", "writer_generation", "reader_generation")
+    if any(before.get(k) != after.get(k) for k in keys):
+        return fail("window_generation_changed")
+    if any(type(x.get("open_ref")) is not int or not 0 <= x["open_ref"] < x["event_index"]
+           for x in (before, after)):
+        return fail("window_open_ref_invalid")
+    openings = [events[x["open_ref"]] for x in (before, after)]
+    if any(openings[0].get(k) != openings[1].get(k) for k in ("writer_gid", "reader_gid")):
+        return fail("window_gid_changed")
+    if openings[1].get("reader_gid") != update.get("reader_gid"):
+        return fail("window_reader_gid_mismatch")
+    if any(e.get("event") == "content_filter_dynamic_update" and e is not worker
+           and e.get("logical_id") == update.get("logical_id")
+           and before["event_index"] < e.get("event_index", -1) < after["event_index"] for e in events):
+        return fail("intervening_update")
+    for close, opened in zip((before, after), openings):
+        proof = _delivery_window_evidence(opened, events, before_index=close["event_index"])
+        if (not proof.get("window_complete") or not close.get("window_complete")
+                or any(proof.get(k) != close.get(k) for k in
+                       ("closure_status", "send_refs", "receive_refs", "missing_sequences", "sentinel_send_ref", "sentinel_receive_ref"))):
+            return fail("window_not_raw_closed")
+    if before.get("missing_sequences") or not after.get("missing_sequences"):
+        return fail("positive_control_or_post_contrast_missing")
+    writer = [e for e in events if e.get("event") == "endpoint_created"
+              and e.get("logical_id") == after.get("writer")
+              and e.get("generation") == after.get("writer_generation")
+              and e.get("endpoint_gid") == openings[1].get("writer_gid")]
+    if len(writer) != 1 or any((e.get("qos") or {}).get("reliability") != "reliable" for e in (writer[0], created[0])):
+        return fail("observed_reliable_qos_unavailable")
+    pair = {**{k: after.get(k) for k in keys},
+            "writer_gid": openings[1].get("writer_gid"), "reader_gid": openings[1].get("reader_gid")}
+    def sample(row):
+        text = row.get("string_data")
+        if not isinstance(text, str) or hashlib.sha256(text.encode()).hexdigest() != row.get("payload_sha256"):
+            return None
+        try:
+            body = json.loads(text)
+        except (ValueError, TypeError):
+            return None
+        if (not isinstance(body, dict) or body.get("send_sequence") != row.get("send_sequence")
+                or body.get("run_id") != row.get("run_id") or body.get("writer_id") != pair["writer"]
+                or body.get("writer_generation") != pair["writer_generation"]
+                or body.get("endpoint_gid") != pair["writer_gid"]
+                or not isinstance(body.get("declared_payload"), str)):
+            return None
+        if body.get("declared_payload_sha256") != hashlib.sha256(body["declared_payload"].encode()).hexdigest():
+            return None
+        return body, bool(pattern.fullmatch(text))
+    def rows(close, key):
+        refs = close.get(key)
+        if not isinstance(refs, list) or any(type(i) is not int or i < 0 or i >= close["event_index"] for i in refs):
+            return []
+        return [events[i] for i in refs]
+    pre_sends, post_sends = rows(before, "send_refs"), rows(after, "send_refs")
+    pre_recvs, post_recvs = rows(before, "receive_refs"), rows(after, "receive_refs")
+    if not pre_sends or not post_sends or not pre_recvs or not post_recvs:
+        return fail("raw_sample_rows_missing")
+    if (any(type(e.get("monotonic_ns")) is not int or e["monotonic_ns"] > start
+            for e in pre_sends + pre_recvs)
+            or any(type(e.get("monotonic_ns")) is not int or e["monotonic_ns"] < end
+                   for e in post_sends + post_recvs)):
+        return fail("sample_outside_update_time_window")
+    all_sends = pre_sends + post_sends
+    decoded = {e["event_index"]: sample(e) for e in all_sends}
+    if any(v is None for v in decoded.values()):
+        return fail("sample_encoding_or_hash_invalid")
+    for receive in pre_recvs + post_recvs:
+        witness, _ = payload_delivery_witness(pair, receive, events)
+        if witness is None or sample(receive) is None:
+            return fail("receive_sample_identity_or_encoding_invalid")
+        send = events[witness["send_ref"]]
+        if receive.get("string_data") != send.get("string_data"):
+            return fail("receive_string_data_mismatch")
+    missing = [e for e in post_sends if e.get("send_sequence") in after["missing_sequences"]]
+    controls = [e for e in pre_sends if not decoded[e["event_index"]][1]
+                and any(r.get("send_sequence") == e.get("send_sequence") for r in pre_recvs)]
+    sentinel = events[after["sentinel_send_ref"]]
+    sentinel_receive = events[after["sentinel_receive_ref"]]
+    if (type(sentinel_receive.get("monotonic_ns")) is not int
+            or any(type(e.get("monotonic_ns")) is not int
+                   or e["monotonic_ns"] > sentinel_receive["monotonic_ns"] for e in missing)):
+        return fail("sentinel_does_not_close_missing_send")
+    if any(not sample(receive)[1] for receive in post_recvs):
+        return fail("post_update_received_rejected_sample")
+    if (not missing or any(decoded[e["event_index"]][1] for e in missing)
+            or not decoded.get(sentinel["event_index"], (None, False))[1]
+            or not any(decoded[c["event_index"]][0]["declared_payload"] == decoded[m["event_index"]][0]["declared_payload"]
+                       for c in controls for m in missing)):
+        return fail("positive_control_predicate_or_sentinel_missing")
+    if any(e.get("event") == "receive" and e.get("logical_id") == pair["reader"]
+           and e.get("generation") == pair["reader_generation"]
+           and e.get("payload_sha256") in {m.get("payload_sha256") for m in missing}
+           and e.get("event_index", 0) > after["event_index"] for e in events):
+        return fail("late_receive_after_window")
+    return {**unknown, "status": "delivery_contrast",
+            "filter_effect_observed": None,
+            "api_call_refs": [e["event_index"] for e in calls],
+            "control_equivalence": "declared_payload_only; complete String.data differs or is unverified",
+            "attribution": "unknown; missing delivery is not proof of filtering",
+            "fixture_contrast_observed": True if not real_ros else None,
+            "reason": None, "pre_window_ref": before["event_index"],
+            "post_window_ref": after["event_index"], "worker_update_ref": worker["event_index"],
+            "positive_control_send_refs": [e["event_index"] for e in controls],
+            "missing_send_refs": [e["event_index"] for e in missing],
+            "sentinel_receive_ref": after["sentinel_receive_ref"],
+            "interpretation": "sample_delivery_contrast_not_a_sut_verdict"}
+
+
+
 def _netem_live_identities(state):
     """Live endpoint identities verified against /proc, never from config.
 
@@ -1395,6 +1696,77 @@ def _cleanup_is_complete(receipt, backend, netem_ctx, *, netem_required=False):
     return True
 
 
+
+def _liveliness_observation_facts(events, *, run_id, real_ros):
+    """Consume the final raw liveliness chain without promoting it to a hit.
+
+    The worker currently does not emit a trusted continuous peer-coverage row,
+    so normal executions remain ``unknown``.  Keeping this consumer in the
+    final facts path is intentional: a future producer must satisfy the same
+    fail-closed contract before any lifecycle effect can be observed.
+    """
+    def unknown(reason, **extra):
+        return {
+            "status": "unknown", "reason": reason, "loss_observed": None,
+            "recovery_observed": None, "effect_observed": None,
+            "execution_evidence": False, "candidate_eligible": False, **extra,
+        }
+
+    asserted = [e for e in events if e.get("event") == "liveliness_asserted"]
+    if not asserted:
+        return []
+    created = [e for e in events if e.get("event") == "endpoint_created"]
+    observations = []
+    for assertion in asserted:
+        writer_rows = [e for e in created
+                       if all(e.get(key) is not None and e.get(key) == assertion.get(key)
+                              for key in ("logical_id", "generation", "endpoint_gid", "pid",
+                                          "process_start_ticks", "endpoint_generation"))
+                       and worker_role_kind(e.get("role")) == "writer"]
+        if len(writer_rows) != 1:
+            observations.append(unknown("writer_endpoint_token_missing_or_ambiguous",
+                                        command_id=assertion.get("command_id"),
+                                        writer_logical_id=assertion.get("logical_id")))
+            continue
+        writer_row = writer_rows[0]
+        if not isinstance(writer_row.get("topic"), str) or not writer_row["topic"]:
+            observations.append(unknown("writer_topic_missing",
+                                        command_id=assertion.get("command_id"),
+                                        writer_logical_id=assertion.get("logical_id")))
+            continue
+        readers = [e for e in created if worker_role_kind(e.get("role")) == "reader"
+                   and e.get("topic") == writer_row["topic"]
+                   and type(e.get("monotonic_ns")) is int
+                   and type(assertion.get("monotonic_ns")) is int
+                   and e["monotonic_ns"] < assertion["monotonic_ns"]]
+        writer = {"role": "writer", **{key: writer_row.get(key) for key in
+                  ("logical_id", "generation", "pid", "process_start_ticks",
+                   "endpoint_generation", "endpoint_gid")}}
+        if not readers:
+            observations.append(unknown("reader_endpoint_token_missing",
+                                        command_id=assertion.get("command_id"),
+                                        writer_logical_id=writer["logical_id"]))
+            continue
+        for reader_row in readers:
+            reader = {"role": "reader", **{key: reader_row.get(key) for key in
+                      ("logical_id", "generation", "pid", "process_start_ticks",
+                       "endpoint_generation", "endpoint_gid")}}
+            try:
+                observation = evaluate_liveliness(
+                    events, writer=writer, reader=reader, run_id=run_id,
+                    fixture=not real_ros,
+                    assertion_command_id=assertion.get("command_id"))
+            except (KeyError, TypeError, ValueError) as exc:
+                observation = unknown("consumer_error:" + type(exc).__name__)
+            observation.update({"command_id": assertion.get("command_id"),
+                                "writer_logical_id": writer["logical_id"],
+                                "reader_logical_id": reader["logical_id"],
+                                "writer_generation": writer["generation"],
+                                "reader_generation": reader["generation"]})
+            observations.append(observation)
+    return observations
+
+
 def run_topology(program, config, output_dir, *, backend=None):
     """Execute one bounded topology program; return runtime facts, never a verdict."""
     output_dir = Path(output_dir).resolve()
@@ -1540,9 +1912,24 @@ def run_topology(program, config, output_dir, *, backend=None):
     result["raw_path"] = str(raw_path)
 
     def emit(event, **fields):
+        # Keep the emitter self-contained: contract tests intentionally execute
+        # this nested function from its AST without the module globals.
+        clock_identity_fn = globals().get("_monotonic_clock_identity")
+        if callable(clock_identity_fn):
+            clock_identity = clock_identity_fn()
+        else:
+            try:
+                with open("/proc/sys/kernel/random/boot_id", encoding="utf-8") as stream:
+                    boot_id = stream.read().strip()
+                time_ns = os.stat("/proc/self/ns/time")
+                clock_identity = ({"boot_id": boot_id, "device": time_ns.st_dev,
+                                   "inode": time_ns.st_ino} if boot_id else None)
+            except OSError:
+                clock_identity = None
         value = {
             "event": event, "time_ns": time.time_ns(), "monotonic_ns": time.monotonic_ns(),
             "role": "topology_controller", "pid": os.getpid(), "pgid": os.getpgrp(),
+            "monotonic_clock_identity": clock_identity,
             "run_id": cfg["run_id"], "domain_id": cfg["domain_id"],
             "backend": backend.backend_name,
         }
@@ -2257,6 +2644,31 @@ def run_topology(program, config, output_dir, *, backend=None):
                                   requires=[{"id": "current_generation_alive", "status": "satisfied"}],
                                   cleanup=cleanup)
                     continue
+                if op == "update_filter":
+                    st = state[eid]
+                    if not (st["alive"] and st["generation"] == gen and endpoint_specs[eid]["role"] == "reader"):
+                        record_guard(action, "reader_generation_alive_guard",
+                                     "update_filter requires a live reader generation", before=before)
+                        continue
+                    try:
+                        # Commit a real pre-update observation before issuing the API call.
+                        backend.pump(0.0)
+                        close_delivery_windows()
+                        update = backend.update_filter(st["handle"], params["expression"], params["parameters"])
+                    except TopologyBackendError as exc:
+                        record_guard(action, "filter_update_transport_error", str(exc), kind="tool", before=before)
+                        continue
+                    receipt = update.get("filter_receipt") or {}
+                    update_event = emit("topology_filter_update_result", action_id=aid, logical_id=eid,
+                               generation=gen, reader_gid=st["handle"].get("endpoint_gid"),
+                               command_id=update.get("command_id"), receipt=receipt,
+                               filter_effect_observed=None, fixture=not backend.real_ros)
+                    record_action(action, before, {**before, "filter_update_raw_ref": update_event["event_index"]},
+                                  disposition="configured" if receipt.get("applied") is True else "unknown",
+                                  satisfied=receipt.get("applied") is True,
+                                  filter_update_receipt=receipt, filter_effect_observed=None,
+                                  execution_evidence=False)
+                    continue
                 if op == "publish_batch":
                     st = state[eid]
                     if not (st["alive"] and st["generation"] == gen and
@@ -2285,13 +2697,34 @@ def run_topology(program, config, output_dir, *, backend=None):
                                      kind="capability",
                                      details={"interval_sec": interval}, before=before)
                         continue
+                    repeat_data = None
+                    repeat_source = None
+                    if params.get("repeat_data_from") is not None:
+                        candidates = [e for e in events if e.get("event") == "send"
+                                      and e.get("phase") == params["repeat_data_from"]
+                                      and e.get("logical_id") == eid and e.get("generation") == gen
+                                      and e.get("writer_gid") == st["handle"].get("endpoint_gid")
+                                      and e.get("publish_returned") is True]
+                        if len(candidates) != 1 or not isinstance(candidates[0].get("string_data"), str):
+                            record_guard(action, "repeat_source_missing_or_ambiguous", "repeat requires one prior raw send from same writer generation", before=before)
+                            continue
+                        repeat_source = candidates[0]
+                        repeat_data = repeat_source["string_data"]
                     try:
                         # Matching unknown/incompatible is not a tool rejection:
                         # snapshots gate only command/identity integrity, while
                         # the close keeps an unestablished obligation incomplete.
                         prepare_delivery_windows(st["handle"], aid, sequences)
+                        kwargs = {"payload": payload}
+                        if repeat_source is not None:
+                            kwargs["repeat_string_data"] = repeat_data
                         publish = backend.publish_batch(
-                            st["handle"], sequences, float(interval), aid, payload=payload)
+                            st["handle"], sequences, float(interval), aid, **kwargs)
+                        if repeat_source is not None:
+                            emit("topology_repeat_data_binding", source_send_ref=repeat_source["event_index"],
+                                 writer=eid, writer_generation=gen, writer_gid=st["handle"].get("endpoint_gid"),
+                                 source_action=params["repeat_data_from"], action_id=aid,
+                                 occurrence_sequence=start, command_id=publish.get("command_id"))
                         close_delivery_windows(endpoint_id=eid, no_obligation_only=True)
                     except TopologyUnsupported as exc:
                         interrupt_writer_windows(eid, "publish_batch_unsupported")
@@ -2466,8 +2899,23 @@ def run_topology(program, config, output_dir, *, backend=None):
                         record_guard(action, "assert_liveliness_error", type(exc).__name__,
                                      kind="tool", before=before)
                         continue
+                    # The legacy action disposition describes the API action,
+                    # not a DDS liveliness state transition.  No independently
+                    # verified, writer-attributed lifecycle producer is wired.
+                    # In particular backend-returned counts or raw-looking refs
+                    # cannot be promoted into a recovery observation here.
+                    lifecycle = {
+                        "status": "unknown",
+                        "loss_observed": None,
+                        "recovery_observed": None,
+                        "effect_observed": None,
+                        "reason": "independent_writer_attributed_lifecycle_evidence_unavailable",
+                        "candidate_eligible": False,
+                    }
                     record_action(action, before, {**before, "assert": value},
                                   disposition="effect_observed", satisfied=True,
+                                  effect_scope="assert_liveliness_api_action_only",
+                                  lifecycle_evidence=lifecycle,
                                   requires=[{"id": "public_writer_manual_by_topic",
                                              "status": "satisfied"}])
                     continue
@@ -2588,6 +3036,34 @@ def run_topology(program, config, output_dir, *, backend=None):
                 if end.get("restored") is not True:
                     result.update(status="aborted", runtime_status="aborted",
                                   reason=result["reason"] or "topology_netem_restore_not_verified")
+        # Consume only committed raw window/worker rows after worker cleanup, so
+        # late callbacks cannot be silently omitted from the comparison.
+        result["repeat_data_observations"] = []
+        for binding in [e for e in events if e.get("event") == "topology_repeat_data_binding"]:
+            observation = _repeat_data_observation(binding, events)
+            result["repeat_data_observations"].append(emit("topology_repeat_data_observation", **observation,
+                                                           fixture=not backend.real_ros))
+        result["dynamic_filter_effects"] = []
+        for update in [e for e in events if e.get("event") == "topology_filter_update_result"]:
+            observation = _dynamic_cft_effect(update, events, real_ros=bool(backend.real_ros))
+            raw_observation = emit("topology_dynamic_filter_effect", **observation,
+                                   fixture=not backend.real_ros, execution_evidence=bool(backend.real_ros))
+            result["dynamic_filter_effects"].append(raw_observation)
+        result["liveliness_peer_samples"] = []
+        for observation in evaluate_peer_samples(
+                events, run_id=cfg["run_id"], fixture=not backend.real_ros):
+            result["liveliness_peer_samples"].append(
+                emit("topology_liveliness_peer_evidence", **observation,
+                     fixture=not backend.real_ros))
+        # This is a final raw-backed consumer, not a lifecycle producer.  It
+        # deliberately remains unknown until a trusted continuous peer
+        # inventory is present; the API call alone never becomes a DDS effect.
+        result["liveliness_evidence"] = []
+        for observation in _liveliness_observation_facts(
+                events, run_id=cfg["run_id"], real_ros=bool(backend.real_ros)):
+            result["liveliness_evidence"].append(
+                emit("topology_liveliness_evidence", **observation,
+                     fixture=not backend.real_ros))
         result["netem"] = ({
             "schema": "r2f.topology-netem-window/v1",
             "implementation": "isolated_netns_tc_netem_discovery_udp",
@@ -2758,6 +3234,10 @@ def run_topology(program, config, output_dir, *, backend=None):
             },
             "pair_facts": result["pair_facts"],
             "delivery_facts": result["delivery_facts"],
+            "dynamic_filter_effects": deepcopy(result.get("dynamic_filter_effects", [])),
+            "repeat_data_observations": deepcopy(result.get("repeat_data_observations", [])),
+            "liveliness_evidence": deepcopy(result.get("liveliness_evidence", [])),
+            "liveliness_peer_samples": deepcopy(result.get("liveliness_peer_samples", [])),
             "guard_rejections": [{"step_id": r["step_id"], "code": r["code"],
                                    "kind": r["kind"],
                                    "no_side_effect": True} for r in result["guard_receipts"]],

@@ -52,7 +52,8 @@ _ENV_KEYS = {"backend_available", "transport_ready", "discovery_enabled",
 _ACTION_PARAMS = {
     "create": (set(), set()), "destroy": (set(), set()),
     "recreate": (set(), set()), "assert_liveliness": (set(), set()),
-    "publish_batch": ({"count", "start_sequence"}, {"interval_sec", "payload"}),
+    "publish_batch": ({"count", "start_sequence"}, {"interval_sec", "payload", "repeat_data_from"}),
+    "update_filter": ({"expression", "parameters"}, set()),
     "snapshot": (set(), {"label", "timeout_sec"}),
     "barrier": ({"condition", "timeout_sec"}, {"endpoint_ids"}),
 }
@@ -246,8 +247,17 @@ def _shape(program):
                 _error(errors, f"{path}.params.start_sequence", "value", "bounded nonnegative integer required")
             if "interval_sec" in p and not _number(p["interval_sec"], 0, budget["max_timeout_sec"]):
                 _error(errors, f"{path}.params.interval_sec", "budget", "bounded nonnegative interval required")
+            if "repeat_data_from" in p and (not _text(p["repeat_data_from"], limit=128)
+                    or p.get("count") != 1 or "payload" in p):
+                _error(errors, f"{path}.params.repeat_data_from", "value", "single sample and prior action id required; payload prohibited")
             if "payload" in p and not _text(p["payload"], empty=True, limit=1024):
                 _error(errors, f"{path}.params.payload", "value", "bounded payload text required")
+        if op == "update_filter":
+            if not _text(p["expression"], empty=True, limit=1024):
+                _error(errors, f"{path}.params.expression", "value", "bounded expression required")
+            if (not isinstance(p["parameters"], list) or len(p["parameters"]) > 16
+                    or any(not _text(v, empty=True) for v in p["parameters"])):
+                _error(errors, f"{path}.params.parameters", "value", "bounded string array required")
         if op == "snapshot" and "label" in p and not _text(p["label"], empty=True, limit=128):
             _error(errors, f"{path}.params.label", "value", "bounded label text required")
         if op == "barrier":
@@ -297,6 +307,8 @@ def _evaluate(program, count=None):
             if f.get("expression"):
                 requires += [_require("filter_support", env.get("filter_support"), kind="environment", rule="filter"),
                              _require("filter_validity", env.get("filter_validity"), kind="environment", rule="filter")]
+        if op == "update_filter":
+            requires += [_require("reader_role", ep["role"] == "reader")]
         if op in ("publish_batch", "assert_liveliness"):
             requires += [_require("writer_role", ep["role"] == "writer")]
         if op == "publish_batch":

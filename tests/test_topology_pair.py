@@ -508,6 +508,49 @@ class CapabilityGuards(Harness):
                        if r["step_id"] == "action:a1")
         self.assertEqual(receipt["disposition"], "effect_observed")
         self.assertTrue(receipt["satisfied"])
+        self.assertEqual(receipt["effect_scope"], "assert_liveliness_api_action_only")
+        lifecycle = receipt["lifecycle_evidence"]
+        self.assertEqual(lifecycle["status"], "unknown")
+        self.assertIsNone(lifecycle["loss_observed"])
+        self.assertIsNone(lifecycle["recovery_observed"])
+        self.assertIsNone(lifecycle["effect_observed"])
+        self.assertFalse(lifecycle["candidate_eligible"])
+        self.assertFalse(receipt["execution_evidence"])
+
+    def test_final_facts_keep_liveliness_consumer_fail_closed(self):
+        prog = program(
+            [endpoint("w0", "writer", qos=qos(liveliness="manual_by_topic")),
+             endpoint("r0", "reader")],
+            [action("c1", "create", "w0", 1),
+             action("c2", "create", "r0", 1),
+             action("a1", "assert_liveliness", "w0", 1)])
+        result = self.run_program(prog)
+        observations = result["facts"]["liveliness_evidence"]
+        self.assertEqual(len(observations), 1)
+        self.assertEqual(observations[0]["status"], "unknown")
+        self.assertFalse(observations[0]["execution_evidence"])
+        self.assertFalse(observations[0]["candidate_eligible"])
+        self.assertTrue(any(row["event"] == "topology_liveliness_evidence"
+                            for row in result["events"]))
+
+    def test_assert_caller_claims_and_aggregate_counts_do_not_prove_recovery(self):
+        class ClaimingBackend(OfflineTopologyBackend):
+            def assert_liveliness(self, handle):
+                value = super().assert_liveliness(handle)
+                return {**value, "loss_observed": True, "recovery_observed": True,
+                        "raw_ref": "caller-supplied", "alive_count": 1,
+                        "not_alive_count_change": -1}
+        prog = program(
+            [endpoint("w0", "writer", qos=qos(liveliness="manual_by_topic"))],
+            [action("c1", "create", "w0", 1),
+             action("a1", "assert_liveliness", "w0", 1)])
+        result = self.run_program(prog, backend=ClaimingBackend())
+        receipt = next(r for r in result["precondition_receipts"]
+                       if r["step_id"] == "action:a1")
+        self.assertEqual(receipt["disposition"], "effect_observed")  # legacy API only
+        self.assertEqual(receipt["lifecycle_evidence"]["status"], "unknown")
+        self.assertIsNone(receipt["lifecycle_evidence"]["recovery_observed"])
+        self.assertFalse(receipt["lifecycle_evidence"]["candidate_eligible"])
 
     def test_danging_endpoint_reference_is_blocked_by_structure_validation(self):
         prog = program(

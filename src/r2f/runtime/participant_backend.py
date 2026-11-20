@@ -10,7 +10,7 @@ participant, endpoint or campaign.  It provides
 * ``validate_participant_config`` / ``normalize_lease`` - strict parameter
   domains for the participant lease surface.
 * ``ParticipantLedger`` - an append-only fact ledger distinguishing
-  participant lease activity, staleness, observed expiry, rediscovery,
+  participant lease activity, staleness, observed disappearance, rediscovery,
   identity replacement and writer liveliness.  Every derived state names its
   basis; absence of activity never becomes an expiry claim.
 
@@ -53,7 +53,10 @@ LEASE_SOURCES = ('vendor_config', 'graph_observation', 'builtin_observation',
                  'default_assumption')
 ACTIVITY_SOURCES = ('builtin_participant_sample', 'discovery_announcement',
                    'endpoint_generation', 'harness_clock')
-EXPIRY_BASES = ('builtin_instance_disposed', 'builtin_instance_no_writers')
+DISAPPEARANCE_BASES = {'builtin_instance_disposed': 'NOT_ALIVE_DISPOSED',
+                       'builtin_instance_no_writers': 'NOT_ALIVE_NO_WRITERS'}
+# No authoritative, raw-backed expiry-cause adapter is wired yet.
+EXPIRY_BASES = ()
 LIVELINESS_KEYS = ('automatic', 'manual_by_participant', 'manual_by_topic')
 GUARD_LAYERS = ('config_type', 'config_value', 'identity', 'precondition',
                'evidence', 'channel_confusion', 'unknown_capability')
@@ -141,12 +144,19 @@ def _identity(value):
     vendor = str(value['vendor'])
     if not vendor or len(vendor) > 64:
         raise LeaseGuardError('identity', 'vendor_invalid')
-    generation = value.get('generation', 0)
+    generation = value.get('generation')
     if isinstance(generation, bool) or not isinstance(generation, int) or generation < 0:
         raise LeaseGuardError('identity', 'generation_must_be_nonnegative_int')
     return {'guid': guid, 'vendor': vendor, 'generation': generation,
             'domain_id': value.get('domain_id'),
             'participant_name': value.get('participant_name')}
+
+
+def _same_identity(left, right):
+    """Compare lifecycle identity; name and domain are caller-declared metadata."""
+    return (isinstance(left, dict) and isinstance(right, dict)
+            and all(left.get(key) == right.get(key)
+                    for key in ('guid', 'vendor', 'generation')))
 
 
 def validate_participant_config(config):
@@ -205,6 +215,8 @@ class ParticipantLedger:
     ``events`` are the raw inputs; ``state`` is derived only from recorded
     events and always carries ``state_basis``.  The ledger never merges two
     GUIDs: a new GUID is an identity replacement, not a refresh.
+    Lifecycle identity is (GUID, vendor, generation); participant_name and
+    domain_id are caller-declared metadata and do not reset its event history.
     """
 
     def __init__(self, emit=None, clock=None):
@@ -212,7 +224,7 @@ class ParticipantLedger:
         self.clock = clock or time.monotonic_ns
         self.events = []
         self.current = None
-        self.expired = {}
+        self.disappeared = {}
         self.replaced = {}
 
     def _record(self, value):
@@ -229,7 +241,7 @@ class ParticipantLedger:
                                detail=exc.detail)
         if self.current is None:
             return None, guard('participant_not_registered', layer='precondition', stage=stage)
-        if ident['guid'] != self.current['guid']:
+        if not _same_identity(ident, self.current):
             return None, guard('identity_not_current', layer='identity', stage=stage,
                                expected=self.current['guid'], observed=ident['guid'])
         return ident, None
@@ -240,7 +252,7 @@ class ParticipantLedger:
         except LeaseGuardError as exc:
             return self._record(guard(exc.reason, layer=exc.layer, stage='register',
                                       detail=exc.detail))
-        if self.current is not None and ident['guid'] != self.current['guid']:
+        if self.current is not None and not _same_identity(ident, self.current):
             return self._record(guard('identity_already_registered', layer='precondition',
                                       stage='register', expected=self.current['guid'],
                                       observed=ident['guid']))
@@ -263,6 +275,18 @@ class ParticipantLedger:
         self.current = ident
         return self._record(value)
 
+    def _time_guard(self, at_ns, stage):
+        if isinstance(at_ns, bool) or not isinstance(at_ns, int) or at_ns < 0:
+            return guard(stage + '_time_invalid', layer='evidence', stage=stage)
+        for item in reversed(self.events):
+            if _same_identity(item.get('identity'), self.current):
+                previous = next((item[k] for k in ('activity_ns', 'disappearance_ns', 'rediscovery_ns') if k in item), None)
+                if previous is not None:
+                    if at_ns <= previous:
+                        return guard('event_time_not_after_previous', layer='evidence', stage=stage)
+                    break
+        return None
+
     def activity(self, identity, *, at_ns=None, source='builtin_participant_sample',
                  evidence=None):
         ident, problem = self._require_current(identity, stage='activity')
@@ -272,14 +296,14 @@ class ParticipantLedger:
             return self._record(guard('unknown_activity_source:' + str(source),
                                       layer='evidence', stage='activity'))
         at_ns = self.clock() if at_ns is None else at_ns
-        if isinstance(at_ns, bool) or not isinstance(at_ns, int) or at_ns < 0:
-            return self._record(guard('activity_time_invalid', layer='evidence', stage='activity'))
-        value = receipt('participant_activity', stage='effect_observed',
+        problem = self._time_guard(at_ns, 'activity')
+        if problem:
+            return self._record(problem)
+        value = receipt('participant_activity', stage='declared', evidence_provenance='caller_declared_unverified',
                         identity=ident, activity_ns=at_ns, source=source,
                         evidence=evidence or [],
-                        refresh_observed=True, refresh_claimed=True,
+                        refresh_observed=False, refresh_claimed=True,
                         refresh_basis=source)
-        self.expired.pop(ident['guid'], None)
         return self._record(value)
 
     def silence(self, identity, *, window_ns, observed_sources=(), evidence=None):
@@ -290,7 +314,7 @@ class ParticipantLedger:
         if isinstance(window_ns, bool) or not isinstance(window_ns, int) or window_ns <= 0:
             return self._record(guard('silence_window_invalid', layer='config_value',
                                       stage='silence'))
-        value = receipt('participant_staleness', stage='effect_observed',
+        value = receipt('participant_staleness', stage='declared', evidence_provenance='caller_declared_unverified',
                         identity=ident, window_ns=window_ns,
                         observed_sources=list(observed_sources),
                         evidence=evidence or [],
@@ -300,67 +324,95 @@ class ParticipantLedger:
                         inference_rule='absence_of_activity_does_not_prove_expiry')
         return self._record(value)
 
+    def disappearance(self, identity, *, at_ns=None, basis='builtin_instance_disposed',
+                      evidence=None):
+        """Record a matching builtin instance transition, not its unknown cause."""
+        ident, problem = self._require_current(identity, stage='disappearance')
+        if problem:
+            return self._record(problem)
+        expected = DISAPPEARANCE_BASES.get(basis)
+        if expected is None:
+            return self._record(guard('unsupported_disappearance_basis:' + str(basis),
+                                      layer='evidence', stage='disappearance'))
+        if at_ns is not None and (isinstance(at_ns, bool) or not isinstance(at_ns, int) or at_ns < 0):
+            return self._record(guard('disappearance_time_invalid', layer='evidence',
+                                      stage='disappearance'))
+        if not isinstance(evidence, (list, tuple)):
+            evidence = []
+        matches = [item for item in evidence if isinstance(item, dict)
+                   and str(item.get('guid', '')).lower().replace('-', '') == ident['guid']
+                   and item.get('generation') == ident['generation']
+                   and not isinstance(item.get('generation'), bool)
+                   and item.get('vendor') == ident['vendor']
+                   and item.get('instance_state') == expected
+                   and item.get('valid_data') is False]
+        if not matches:
+            return self._record(guard('disappearance_requires_matching_builtin_evidence',
+                                      layer='evidence', stage='disappearance',
+                                      required_instance_state=expected,
+                                      evidence_supplied=len(evidence)))
+        at_ns = self.clock() if at_ns is None else at_ns
+        problem = self._time_guard(at_ns, 'disappearance')
+        if problem:
+            return self._record(problem)
+        value = receipt('participant_disappearance', stage='declared',
+                        evidence_provenance='caller_declared_unverified', disappearance_declared=True,
+                        identity=ident, disappearance_ns=at_ns, basis=basis,
+                        evidence=list(evidence), disappearance_observed=False,
+                        cause='unknown', expiry_observed=False, expiry_inferred=False,
+                        expiry_cause_status='unknown_no_authoritative_cause_evidence')
+        self.disappeared[ident['guid']] = value
+        return self._record(value)
+
     def expiry(self, identity, *, at_ns=None, basis='builtin_instance_disposed',
                evidence=None):
-        """Record an *observed* expiry sample (e.g. NOT_ALIVE_DISPOSED).
+        """Legacy entry point: builtin transitions are unverified disappearance declarations only.
 
-        Requires explicit builtin evidence with the matching GUID; a timeout
-        or a long silence is rejected as insufficient.
+        No currently wired producer verifies a raw-backed authoritative expiry
+        cause. Arbitrary caller assertions cannot promote an unknown to expiry.
         """
+        if basis in DISAPPEARANCE_BASES:
+            return self.disappearance(identity, at_ns=at_ns, basis=basis, evidence=evidence)
         ident, problem = self._require_current(identity, stage='expiry')
         if problem:
             return self._record(problem)
-        if basis not in EXPIRY_BASES:
-            return self._record(guard('unsupported_expiry_basis:' + str(basis),
-                                      layer='evidence', stage='expiry'))
-        evidence = evidence or []
-        seen = False
-        for item in evidence:
-            if not isinstance(item, dict):
-                continue
-            if str(item.get('guid', '')).lower().replace('-', '') != ident['guid']:
-                continue
-            if item.get('instance_state') in ('NOT_ALIVE_DISPOSED', 'NOT_ALIVE_NO_WRITERS'):
-                if item.get('valid_data') is False:
-                    seen = True
-        if not seen:
-            return self._record(guard('expiry_requires_builtin_disposal_evidence',
-                                      layer='evidence', stage='expiry',
-                                      required_instance_state=list(EXPIRY_BASES),
-                                      evidence_supplied=len(evidence)))
-        at_ns = self.clock() if at_ns is None else at_ns
-        value = receipt('participant_expiry', stage='effect_observed',
-                        identity=ident, expiry_ns=at_ns, basis=basis,
-                        evidence=evidence, expiry_observed=True,
-                        expiry_basis='builtin_sample', expiry_inferred=False)
-        self.expired[ident['guid']] = value
-        return self._record(value)
+        return self._record(guard('expiry_cause_verifier_unavailable', layer='unknown_capability',
+                                  stage='expiry', identity=ident, basis=basis,
+                                  expiry_observed=False, expiry_inferred=False))
 
     def rediscovery(self, identity, *, at_ns=None, source='builtin_participant_sample',
                     evidence=None):
-        """Record re-appearance of the same GUID after a recorded expiry/stale."""
+        """Record re-appearance of the same GUID after a recorded disappearance/stale."""
         ident, problem = self._require_current(identity, stage='rediscovery')
         if problem:
             return self._record(problem)
         if source not in ACTIVITY_SOURCES:
             return self._record(guard('unknown_activity_source:' + str(source),
                                       layer='evidence', stage='rediscovery'))
-        had_gap = ident['guid'] in self.expired or any(
-            item.get('receipt_kind') == 'participant_staleness'
-            and item.get('identity', {}).get('guid') == ident['guid']
-            for item in self.events)
+        had_gap = False
+        for item in self.events:
+            if not _same_identity(item.get('identity'), ident):
+                continue
+            if item.get('receipt_kind') in ('participant_disappearance', 'participant_staleness'):
+                had_gap = True
+            elif item.get('receipt_kind') == 'participant_rediscovery':
+                had_gap = False
         at_ns = self.clock() if at_ns is None else at_ns
-        value = receipt('participant_rediscovery', stage='effect_observed',
+        problem = self._time_guard(at_ns, 'rediscovery')
+        if problem:
+            return self._record(problem)
+        value = receipt('participant_rediscovery', stage='declared',
+                        evidence_provenance='caller_declared_unverified', rediscovery_declared=True, prior_gap_declared=had_gap,
                         identity=ident, rediscovery_ns=at_ns, source=source,
                         evidence=evidence or [],
-                        prior_gap_observed=had_gap,
-                        rediscovery_observed=True,
+                        prior_gap_observed=False,
+                        rediscovery_observed=False,
                         rediscovery_basis=source,
                         identity_generation_unchanged=True)
         if not had_gap:
             value['claim'] = 'reappearance_without_recorded_gap'
             value['prior_gap_evidence'] = False
-        self.expired.pop(ident['guid'], None)
+        self.disappeared.pop(ident['guid'], None)
         return self._record(value)
 
     def replace_identity(self, new_identity, *, reason='identity_change', evidence=None):
@@ -374,10 +426,10 @@ class ParticipantLedger:
             return self._record(guard('replacement_requires_different_guid',
                                       layer='identity', stage='replacement'))
         old = self.current
-        value = receipt('participant_identity_replacement', stage='effect_observed',
+        value = receipt('participant_identity_replacement', stage='declared', evidence_provenance='caller_declared_unverified',
                         old_identity=old, new_identity=new, reason=reason,
                         evidence=evidence or [],
-                        replacement_observed=True,
+                        replacement_observed=False, replacement_declared=True,
                         counts_as_refresh=False,
                         old_lease_reused=False,
                         new_generation=(new['generation'] if new else None))
@@ -418,33 +470,29 @@ class ParticipantLedger:
         if self.current is None:
             return receipt('participant_state', status='unregistered',
                            state_basis='no_registration')
-        guid = self.current['guid']
-        last = None
-        for item in reversed(self.events):
-            if item.get('receipt_kind') == 'participant_activity' \
-                    and item.get('identity', {}).get('guid') == guid:
+        last = disappearance = rediscovered = None
+        status, basis = 'registered_no_activity', 'registration_only'
+        for item in self.events:
+            if not _same_identity(item.get('identity'), self.current):
+                continue
+            kind = item.get('receipt_kind')
+            if kind == 'participant_activity':
                 last = item
-                break
-        expiry = self.expired.get(guid)
-        rediscovered = None
-        if expiry is not None:
-            for item in reversed(self.events):
-                if item.get('receipt_kind') == 'participant_rediscovery' \
-                        and item.get('identity', {}).get('guid') == guid:
-                    rediscovered = item
-                    break
-        if expiry is not None and rediscovered is None:
-            status, basis = 'expired_observed', 'builtin_disposal_sample'
-        elif expiry is not None:
-            status, basis = 'rediscovered', 'expiry_then_reappearance'
-        elif last is not None:
-            status, basis = 'active_observed', 'last_activity_sample'
-        else:
-            status, basis = 'registered_no_activity', 'registration_only'
+                if disappearance is None and rediscovered is None:
+                    status, basis = 'activity_declared', 'caller_declared_activity'
+            elif kind == 'participant_disappearance':
+                disappearance, rediscovered = item, None
+                status, basis = 'disappearance_declared', 'caller_declared_builtin_transition'
+            elif kind == 'participant_rediscovery' and disappearance is not None:
+                rediscovered, disappearance = item, None
+                status, basis = 'rediscovery_declared', 'caller_declared_disappearance_then_reappearance'
         return receipt('participant_state', status=status, state_basis=basis,
                        identity=self.current, last_activity=last,
-                       expiry=expiry, rediscovery=rediscovered,
-                       expiry_inferred=False)
+                       disappearance=disappearance, expiry=None, rediscovery=rediscovered,
+                       evidence_provenance='caller_declared_unverified',
+                       disappearance_observed=False, rediscovery_observed=False,
+                       expiry_observed=False, expiry_inferred=False,
+                       expiry_cause_status='unknown_no_authoritative_cause_evidence')
 
 
 def _probe_code():

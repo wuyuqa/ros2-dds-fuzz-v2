@@ -323,6 +323,61 @@ def normalize_options(value):
 
 
 
+def capture_update_readback(value):
+    """Capture supported public return fields without repr or lossy coercion.
+
+    Only the two API fields are captured; the type and parameter container are
+    explicit. Unsupported values are diagnostic, never valid readback evidence.
+    """
+    cls = type(value)
+    name = cls.__module__ + '.' + cls.__qualname__
+    base = {'type': name, 'status': 'unsupported'}
+    try:
+        if cls is dict:
+            if set(value) != {'filter_expression', 'expression_parameters'}:
+                return {**base, 'reason': 'unexpected_dict_fields'}
+            expression, parameters = value['filter_expression'], value['expression_parameters']
+            shape = 'dict'
+        elif (isinstance(value, tuple)
+              and getattr(cls, '_fields', None) == ('filter_expression', 'expression_parameters')
+              and len(value) == 2):
+            expression, parameters = value
+            shape = 'namedtuple'
+        elif name == 'types.SimpleNamespace' and set(vars(value)) == {'filter_expression', 'expression_parameters'}:
+            expression, parameters = value.filter_expression, value.expression_parameters
+            shape = 'object'
+        else:
+            return {**base, 'reason': 'unsupported_return_shape'}
+        if type(expression) is not str or type(parameters) not in (list, tuple) or any(type(x) is not str for x in parameters):
+            return {**base, 'reason': 'unsupported_field_type'}
+        return {'type': name, 'status': 'captured', 'shape': shape,
+                'fields': {'filter_expression': expression,
+                           'expression_parameters': list(parameters)},
+                'parameters_type': 'builtins.list' if type(parameters) is list else 'builtins.tuple'}
+    except Exception as exc:
+        return {**base, 'reason': 'capture_failed', 'error_type': type(exc).__name__}
+
+
+def normalize_captured_update_readback(raw, *, fixture=False):
+    """Validate the serialized capture and recompute its normalization."""
+    if type(raw) is not dict or set(raw) != {'type', 'status', 'shape', 'fields', 'parameters_type'}:
+        return None
+    allowed = {('builtins.dict', 'dict'),
+               ('rclpy.subscription_content_filter_options.ContentFilterOptions', 'namedtuple')}
+    if fixture:
+        allowed.add(('types.SimpleNamespace', 'object'))
+    if (raw.get('status') != 'captured' or (raw.get('type'), raw.get('shape')) not in allowed
+            or raw.get('parameters_type') not in ('builtins.list', 'builtins.tuple')):
+        return None
+    fields = raw.get('fields')
+    if (type(fields) is not dict or set(fields) != {'filter_expression', 'expression_parameters'}
+            or type(fields['filter_expression']) is not str
+            or type(fields['expression_parameters']) is not list
+            or any(type(x) is not str for x in fields['expression_parameters'])):
+        return None
+    return {'expression': fields['filter_expression'], 'parameters': list(fields['expression_parameters'])}
+
+
 def filter_api_failure(exc):
     """Separate public API failures from actual RCL/RMW call exceptions.
 
@@ -516,48 +571,74 @@ class ContentFilterAdapter:
             dynamic_update_covered=False, lease_covered=False)
         return self._record(value)
 
-    def update(self, expression, parameters=None, *, field_types=None):
-        """Apply an expression change and verify it by readback."""
+    def update(self, expression, parameters=None, *, field_types=None, api_event=None):
+        """Submit through the public API; distinguish API outcome from effect."""
         if self.subscription is None:
-            return self._record(_fail('submission_api', 'no_attached_subscription',
-                                      stage='submitted'))
+            return self._record(_fail('submission_api', 'no_attached_subscription', stage='submitted'))
         validation = validate_filter(expression, parameters, field_types)
         if not validation.get('ok'):
             return self._record(validation)
         target = {'expression': validation['expression'],
-                  'parameters': validation['parameters'],
-                  'enabled': validation['enabled']}
+                  'parameters': validation['parameters'], 'enabled': validation['enabled']}
+        setter = getattr(self.subscription, 'set_content_filter', None)
+        if not callable(setter):
+            return self._record(receipt('filter_update', requested=target,
+                api_status='unavailable_api', readback_status='not_attempted',
+                applied=False, filter_effect_observed=None, hit=False))
+        def emit_api(stage, **fields):
+            if api_event is not None:
+                api_event(stage, **fields)
+        emit_api('set_begin', requested=target)
         try:
-            if validation['enabled']:
-                self.subscription.set_content_filter(
-                    validation['expression'], list(validation['parameters']))
-            else:
-                # Public rcl/RMW contract: empty expression resets the CFT.
-                self.subscription.set_content_filter('', [])
+            setter(target['expression'], list(target['parameters']))
         except Exception as exc:
-            layer = 'submission_rcl' if type(exc).__name__ == 'RCLError' else 'submission_api'
-            return self._record(_fail(layer, 'set_content_filter_failed',
-                                      requested=target,
-                                      error=type(exc).__name__ + ':' + str(exc)))
-        observed = self.readback(stage='configured')
-        if not observed.get('observed'):
-            result = dict(observed)
-            result['receipt_kind'] = 'filter_update'
-            result['requested'] = target
-            result['applied'] = False
-            result['readback_status'] = 'unavailable'
-            return self._record(result)
-        got = observed['observed']
-        same = (got['expression'] == target['expression']
-                and list(got['parameters']) == list(target['parameters']))
-        value = receipt('filter_update', stage='applied' if same else 'configured',
-                        requested=target, observed=got,
-                        applied=same, readback_status='matched' if same else 'mismatched',
-                        mutation_receipt=False, hit=False)
-        if not same:
-            value.update(reason='readback_mismatch', layer='readback_mismatch',
-                         sut_bug=False, candidate_eligible=False)
-        return self._record(value)
+            emit_api('set_failure', error=type(exc).__name__ + ':' + str(exc))
+            return self._record(receipt('filter_update', requested=target,
+                api_status='failed', layer='submission_rcl' if type(exc).__name__ == 'RCLError' else 'submission_api', reason='set_content_filter_failed', error=type(exc).__name__ + ':' + str(exc),
+                readback_status='not_attempted', applied=False,
+                filter_effect_observed=None, hit=False))
+        emit_api('set_success')
+        getter = getattr(self.subscription, 'get_content_filter', None)
+        if not callable(getter):
+            return self._record(receipt('filter_update', requested=target,
+                api_status='succeeded', readback_status='unavailable_api', observed=None,
+                applied=False, filter_effect_observed=None, hit=False))
+        emit_api('get_begin')
+        try:
+            raw_value = getter()
+        except Exception as exc:
+            emit_api('get_failure', error=type(exc).__name__ + ':' + str(exc))
+            return self._record(receipt('filter_update', requested=target,
+                api_status='succeeded', readback_status='failed',
+                error=type(exc).__name__ + ':' + str(exc), observed=None,
+                applied=False, filter_effect_observed=None, hit=False))
+        raw_readback = capture_update_readback(raw_value)
+        # Preserve the public adapter's established object/dict compatibility.
+        # The raw evidence consumer independently admits only certified shapes;
+        # an adapter match alone does not authenticate the returned object type.
+        try:
+            observed = normalize_options(raw_value)
+            valid = (isinstance(observed, dict) and isinstance(observed.get('expression'), str)
+                     and isinstance(observed.get('parameters'), list)
+                     and all(isinstance(x, str) for x in observed['parameters']))
+        except Exception as exc:
+            emit_api('get_success', raw_readback=raw_readback, observed=None,
+                     normalization_error_type=type(exc).__name__)
+            return self._record(receipt('filter_update', requested=target,
+                api_status='succeeded', readback_status='failed',
+                error=type(exc).__name__ + ':' + str(exc), observed=None,
+                applied=False, filter_effect_observed=None, hit=False))
+        emit_api('get_success', raw_readback=raw_readback, observed=observed if valid else None)
+        if not valid:
+            return self._record(receipt('filter_update', requested=target,
+                api_status='succeeded', readback_status='invalid_result', observed=None,
+                applied=False, filter_effect_observed=None, hit=False))
+        same = observed['expression'] == target['expression'] and observed['parameters'] == target['parameters']
+        return self._record(receipt('filter_update', requested=target,
+            api_status='succeeded', readback_status='matched' if same else 'mismatched',
+            stage='applied' if same else 'configured', mutation_receipt=False,
+            reason=None if same else 'readback_mismatch', layer=None if same else 'readback_mismatch',
+            sut_bug=False, observed=observed, applied=same, filter_effect_observed=None, hit=False))
 
     def disable(self):
         return self.update('', [])
