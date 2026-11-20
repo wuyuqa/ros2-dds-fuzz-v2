@@ -25,6 +25,35 @@ PID_INTERPRETATION = 'raw pid/pgid are namespace identifiers, NOT host identifie
 NAMESPACES = ('user', 'mnt', 'pid', 'net')
 
 
+def _incarnation_process_exits(raw, worker, keys):
+    """Bind process exits to origin lineage and certified exit-time DDS GID.
+
+    Namespace worker_bindings remain immutable creation-time identities. This
+    is artifact consistency only, not fresh process/kernel authentication.
+    """
+    from r2f.runtime.endpoint_incarnation import endpoint_identity_at
+    created = [e for e in raw if e.get('event') == 'endpoint_created'
+               and all(_equal(e.get(k), worker.get(k)) for k in keys)]
+    if len(created) != 1:
+        raise ValueError('origin_binding_missing_or_ambiguous')
+    stable = tuple(k for k in keys if k != 'endpoint_gid')
+    exits = [e for e in raw if e.get('event') == 'process_exit'
+             and all(_equal(e.get(k), worker.get(k)) for k in stable)]
+    if len(exits) != 1:
+        raise ValueError('process_exit_missing_or_ambiguous')
+    final_identity = endpoint_identity_at(raw, created[0])
+    for event in exits:
+        current = endpoint_identity_at(raw, created[0], before_index=event['event_index'])
+        if (current['incarnation_ordinal'] != final_identity['incarnation_ordinal']
+                or current['endpoint_gid'] != final_identity['endpoint_gid']):
+            raise ValueError('process_identity_transition_after_exit')
+        if (event.get('endpoint_gid') != current['endpoint_gid']
+                or type(event.get('monotonic_ns')) is not int
+                or event['monotonic_ns'] < current['identity_valid_after_ns']):
+            raise ValueError('process_exit_incarnation_mismatch')
+    return exits
+
+
 def _encoded(value, *, ensure_ascii=True):
     return json.dumps(value, sort_keys=True, separators=(',', ':'),
                       allow_nan=False, ensure_ascii=ensure_ascii).encode()
@@ -746,7 +775,11 @@ def _audit_nested_receipts(a, manifest, request, envelope, child, raw, binding, 
         a.check(len(matches) == 1, 'worker_lineage', field, 'must identify exactly one child metadata worker generation')
         created = [e for e in raw if e.get('event') == 'endpoint_created' and all(_equal(e.get(k), worker.get(k)) for k in keys)]
         starts = [e for e in raw if e.get('event') == 'process_started' and all(_equal(e.get(k), worker.get(k)) for k in keys if k not in ('endpoint_gid', 'endpoint_generation', 'process_start_ticks'))]
-        exits = [e for e in raw if e.get('event') == 'process_exit' and all(_equal(e.get(k), worker.get(k)) for k in keys)]
+        try:
+            exits = _incarnation_process_exits(raw, worker, keys)
+        except (ValueError, KeyError, TypeError, IndexError) as exc:
+            exits = []
+            a.check(False, 'worker_lineage', field + '.exit_incarnation', str(exc))
         a.check(len(created) == len(starts) == len(exits) == 1 and type(offset) is int
                 and ready.get('event_index', -1) < starts[0]['event_index'] < created[0]['event_index'] < offset < exits[0]['event_index'],
                 'worker_lineage', field + '.chronology', 'ready -> start -> endpoint -> binding -> exit required')

@@ -468,6 +468,8 @@ def _topology_worker_errors(config, result):
     PID/PGID values are compared only inside their recorded runtime scope. The
     isolated helper binds that scope; no inner identifier is treated as a host PID.
     """
+    from r2f.runtime.endpoint_incarnation import endpoint_identity_at
+
     errors, seen, identities, gids = [], set(), set(), set()
     events = result.get('events') or []
     metadata = result.get('execution_metadata') or {}
@@ -541,13 +543,42 @@ def _topology_worker_errors(config, result):
                     or worker.get('closed') is not True or worker.get('returncode') != 0
                     or worker.get('cleanup_status') != 'closed' or worker.get('unknowns') != []):
                 raise ValueError('worker_cleanup_or_exit_invalid')
+            # Creation/metadata endpoint_gid remains the immutable origin. Only
+            # independently authenticated raw transitions authorize a new GID.
+            current = endpoint_identity_at(events, token)
+            transitions = [e for e in events if e.get('event') == 'endpoint_identity_transition'
+                           and e.get('logical_id') == token['logical_id']
+                           and e.get('generation') == token['generation']]
+            incarnation_fields = ('current_endpoint_gid', 'incarnation_ordinal', 'identity_transition_raw_refs')
+            if transitions or any(key in worker for key in incarnation_fields):
+                if not all(key in worker for key in incarnation_fields):
+                    raise ValueError('worker_incarnation_metadata_incomplete')
+                if worker['current_endpoint_gid'] != current['endpoint_gid']:
+                    raise ValueError('worker_current_endpoint_gid_mismatch')
+                if (type(worker['incarnation_ordinal']) is not int
+                        or worker['incarnation_ordinal'] != current['incarnation_ordinal']):
+                    raise ValueError('worker_incarnation_ordinal_mismatch')
+                transition_rows = refs(worker['identity_transition_raw_refs'], {'endpoint_identity_transition'})
+                if transition_rows != transitions:
+                    raise ValueError('worker_incarnation_refs_do_not_cover_actual_lineage')
             for event in exits:
+                # The prefix is exclusive; +1 includes this exit, never a later
+                # transition/ACK. Origin index/time and token refs stay intact.
+                at_exit = endpoint_identity_at(events, token, before_index=event['event_index'] + 1)
+                if at_exit['incarnation_ordinal']:
+                    if (type(event.get('monotonic_ns')) is not int
+                            or event['monotonic_ns'] < at_exit['identity_valid_after_ns']
+                            or event['event_index'] <= at_exit['identity_valid_after_ref']):
+                        raise ValueError('worker_exit_before_identity_ack')
+                if (current['incarnation_ordinal'] != at_exit['incarnation_ordinal']
+                        or current['endpoint_gid'] != at_exit['endpoint_gid']):
+                    raise ValueError('worker_identity_transition_after_exit')
                 # Public worker_exit omits PGID; process_exit and the
                 # topology_worker_exit writer receipt bind their actual PGID.
                 keys = ('process_start_ticks', 'endpoint_generation', 'endpoint_gid') + (
                     ('pgid',) if event.get('event') == 'process_exit' or 'pgid' in event else ())
                 for key in keys:
-                    if event.get(key) != token.get(key):
+                    if event.get(key) != at_exit.get(key):
                         raise ValueError('worker_exit_token_mismatch:' + key)
         except (ValueError, KeyError, TypeError, IndexError) as exc:
             errors.append('topology_worker_lineage_invalid:' + str(exc))
