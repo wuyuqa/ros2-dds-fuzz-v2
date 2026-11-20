@@ -161,7 +161,10 @@ def read_public_endpoint_qos(endpoint, kind: str) -> dict:
         getter = getattr(library, api)
         getter.argtypes = [ctypes.c_void_p]
         getter.restype = ctypes.POINTER(_QoS)
-        with endpoint.handle as handle:
+        # rclpy Destroyable.__enter__ acquires the use count but returns None.
+        # Keep the handle object itself; never depend on __enter__'s return value.
+        handle = endpoint.handle
+        with handle:
             pointer = handle.pointer
             if (not isinstance(pointer, int) or isinstance(pointer, bool)
                     or not 0 < pointer <= ctypes.c_void_p(-1).value):

@@ -20,7 +20,7 @@ class Handle:
     def __enter__(self):
         self.active = True
         self.events.append('enter')
-        return self
+        return None  # Installed rclpy Destroyable.__enter__ contract.
 
     @property
     def pointer(self):
