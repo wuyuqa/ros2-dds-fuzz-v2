@@ -11,7 +11,7 @@ from __future__ import annotations
 from copy import deepcopy
 
 from r2f.core.evidence import canonical_hash
-from .episode import (Episode, EpisodeError, EXECUTION_SCHEMA, run_episode)
+from .episode import (Episode, EpisodeError, EXECUTION_SCHEMA, run_episode, _validate_execution_state_schema)
 
 SCHEMA = "r2f.s1-episode-replay/v1"
 REDUCTION_SCHEMA = "r2f.s1-episode-reduction/v1"
@@ -60,7 +60,7 @@ def _check_original(original):
 def _compare_full(episode, replay, original):
     expected = [item["action_id"] for item in original["receipts"]]
     actual = [item["action_id"] for item in replay["receipts"]]
-    order_equal = actual == expected[:len(actual)]
+    order_equal = actual == expected
     intervals = []
     for receipt in replay["receipts"]:
         timing = receipt.get("timing") or {}
@@ -71,6 +71,8 @@ def _compare_full(episode, replay, original):
     return {
         "schema": "r2f.s1-episode-full-replay/v1",
         "action_sequence_equal": order_equal,
+        "attribution_equal": bool(replay["receipts"] and original["receipts"])
+            and attribution_signature(replay) == attribution_signature(original),
         "stop_reason": replay.get("stop_reason"),
         "stop_reason_match": replay.get("stop_reason") == original.get("stop_reason"),
         "replayed_actions": actual,
@@ -148,6 +150,7 @@ def _subset_episode(episode, action_ids):
         parent_episode_ids=list(episode.parent_episode_ids),
         tags=deepcopy(episode.tags),
         isolation_mode=episode.isolation_mode,
+        state_schema=episode.state_schema,
     )
 
 
@@ -180,6 +183,7 @@ def replay_episode(episode, original, *, mode, perform, clock, health=None,
         raise EpisodeReplayError("original execution belongs to a different episode")
     if original.get("input_sha256") != episode.input_identity():
         raise EpisodeReplayError("original execution input identity differs")
+    _validate_execution_state_schema(episode, original, error_type=EpisodeReplayError)
     if not callable(perform) or not callable(clock):
         raise EpisodeReplayError("replay requires injected perform and clock callables")
     full = run_episode(episode, perform=perform, clock=clock, health=health, store=store)
@@ -202,7 +206,8 @@ def replay_episode(episode, original, *, mode, perform, clock, health=None,
         report["candidate_eligible"] = False
         report["responsibility_layer"] = "harness"
     full_status = "full_replay"
-    if full.get("action_sequence_equal") is not True:
+    if (full_report["action_sequence_equal"] is not True
+            or full_report["attribution_equal"] is not True):
         full_status = "full_replay_diverged"
     if full.get("stop_reason") is not None and full.get("stop_reason") != original.get("stop_reason"):
         full_status = "full_replay_diverged"

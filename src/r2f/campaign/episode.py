@@ -23,7 +23,7 @@ from r2f.core._json import nonempty, snapshot
 from r2f.core.evidence import canonical_hash
 from r2f.core.execution import ExecutionStage
 from r2f.core.state_machine import StateCondition
-from r2f.core.state_signature import state_id, validate_state
+from r2f.core.state_signature import STATE_ABSTRACTION_VERSION, state_id, validate_state
 from .corpus import content_identity
 
 SCHEMA = "r2f.s1-episode/v1"
@@ -199,6 +199,7 @@ class Episode:
     parent_episode_ids: list[str] = field(default_factory=list)
     tags: dict = field(default_factory=dict)
     isolation_mode: str = "per_case"
+    state_schema: str = STATE_ABSTRACTION_VERSION
 
     def __post_init__(self):
         _safe_id(self.episode_id, "episode_id")
@@ -225,7 +226,7 @@ class Episode:
         for item in self.actions:
             if any(dep not in known or dep >= item.sequence for dep in item.depends_on):
                 raise EpisodeError("action dependencies must refer to earlier actions")
-        self.initial_state = validate_state(snapshot(self.initial_state))
+        self.initial_state = validate_state(snapshot(self.initial_state), schema=self.state_schema)
         self.allowed_state_ids = None if self.allowed_state_ids is None else list(self.allowed_state_ids)
         if self.allowed_state_ids is not None:
             if not self.allowed_state_ids or any(not _SHA.fullmatch(item) for item in self.allowed_state_ids):
@@ -246,7 +247,7 @@ class Episode:
 
     @property
     def initial_state_id(self):
-        return state_id(self.initial_state)
+        return state_id(self.initial_state, schema=self.state_schema)
 
     def input_identity(self):
         """Deterministic episode identity; execution time/raw/run fields excluded."""
@@ -263,10 +264,12 @@ class Episode:
             "isolation_mode": self.isolation_mode,
             "actions": [item.to_dict() for item in self.actions],
         }
+        if self.state_schema != STATE_ABSTRACTION_VERSION:
+            document["state_schema"] = self.state_schema
         return canonical_hash(document)
 
     def to_dict(self):
-        return {
+        document = {
             "schema": SCHEMA,
             "episode_id": self.episode_id,
             "target_id": self.target_id,
@@ -283,6 +286,9 @@ class Episode:
             "tags": snapshot(self.tags),
             "isolation_mode": self.isolation_mode,
         }
+        if self.state_schema != STATE_ABSTRACTION_VERSION:
+            document["state_schema"] = self.state_schema
+        return document
 
     @classmethod
     def from_dict(cls, data):
@@ -299,6 +305,7 @@ class Episode:
             parent_episode_ids=list(data.get("parent_episode_ids", [])),
             tags=deepcopy(data.get("tags", {})),
             isolation_mode=data.get("isolation_mode", "per_case"),
+            state_schema=data.get("state_schema", STATE_ABSTRACTION_VERSION),
         )
         if data.get("initial_state_id") != episode.initial_state_id:
             raise EpisodeError("episode initial_state_id differs from state bytes")
@@ -352,12 +359,12 @@ def _verdict(value):
 
 
 def _receipt(action, before, *, stage, status, guard, result=None, error="", history=None,
-             timing=None):
+             timing=None, state_schema=STATE_ABSTRACTION_VERSION):
     after = None
     after_id = None
     if result is not None and result.get("after_state") is not None:
-        after = validate_state(snapshot(result["after_state"]))
-        after_id = state_id(after)
+        after = validate_state(snapshot(result["after_state"]), schema=state_schema)
+        after_id = state_id(after, schema=state_schema)
     receipt = {
         "schema": "r2f.s1-episode-action-receipt/v1",
         "sequence": action.sequence,
@@ -366,7 +373,7 @@ def _receipt(action, before, *, stage, status, guard, result=None, error="", his
         "input_sha256": action.input_sha256,
         "parameters": snapshot(action.parameters),
         "before_state": snapshot(before),
-        "before_state_id": state_id(before),
+        "before_state_id": state_id(before, schema=state_schema),
         "after_state": snapshot(after),
         "after_state_id": after_id,
         "guard": snapshot(guard),
@@ -406,7 +413,7 @@ def run_episode(episode, *, perform, clock, health=None, store=None):
         raise EpisodeError("health must be callable or None")
     history = _history_snapshot(store, episode.parent_episode_ids)
     state = snapshot(episode.initial_state)
-    initial_id = state_id(state)
+    initial_id = state_id(state, schema=episode.state_schema)
     allowed = None if episode.allowed_state_ids is None else set(episode.allowed_state_ids)
     started = float(clock())
     receipts = []
@@ -451,7 +458,7 @@ def run_episode(episode, *, perform, clock, health=None, store=None):
                   "operator": item.operator, "passed": item.evaluate(state)}
                  for item in action.guard]
         if any(not item["passed"] for item in guard):
-            receipt = _receipt(action, state, stage="aborted", status="blocked",
+            receipt = _receipt(action, state, state_schema=episode.state_schema, stage="aborted", status="blocked",
                                guard=guard, error="requires not satisfied", history=history,
                                timing={"logical_order": len(receipts),
                                        "started_monotonic": float(clock()),
@@ -466,7 +473,7 @@ def run_episode(episode, *, perform, clock, health=None, store=None):
         try:
             result = perform(action, snapshot(state))
         except Exception as exc:  # harness/tool failure, never SUT attribution
-            receipt = _receipt(action, state, stage="aborted", status="tool_error",
+            receipt = _receipt(action, state, state_schema=episode.state_schema, stage="aborted", status="tool_error",
                                guard=guard, error=f"{type(exc).__name__}: {exc}", history=history,
                                timing={"logical_order": len(receipts),
                                        "started_monotonic": action_start,
@@ -481,7 +488,7 @@ def run_episode(episode, *, perform, clock, health=None, store=None):
             raise EpisodeError("perform must return a dict")
         status = result.get("status", "executed")
         stage = result.get("execution_stage", "judged" if status == "executed" else "aborted")
-        receipt = _receipt(action, state, stage=stage, status=status, guard=guard,
+        receipt = _receipt(action, state, state_schema=episode.state_schema, stage=stage, status=status, guard=guard,
                            result=result, error=result.get("error", ""), history=history,
                            timing={"logical_order": len(receipts),
                                    "started_monotonic": action_start,
@@ -539,8 +546,16 @@ def run_episode(episode, *, perform, clock, health=None, store=None):
         "maturity_denominator_changed": False,
         "os_concurrency_claimed": False,
     }
+    if episode.state_schema != STATE_ABSTRACTION_VERSION:
+        execution["state_schema"] = episode.state_schema
     execution["execution_sha256"] = canonical_hash(execution)
     return execution
+
+
+def _validate_execution_state_schema(episode, execution, *, error_type=EpisodeError):
+    # Missing schema is a legacy pair encoding, never implicit topology.
+    if execution.get("state_schema", STATE_ABSTRACTION_VERSION) != episode.state_schema:
+        raise error_type("execution state schema differs from episode")
 
 
 def _atomic_create(path, data):
@@ -590,6 +605,7 @@ class EpisodeStore:
             raise EpisodeStoreError("execution input identity differs from episode")
         if execution.get("parent_history", {}).get("parent_episode_ids") != episode.parent_episode_ids:
             raise EpisodeStoreError("execution parent history differs from episode")
+        _validate_execution_state_schema(episode, execution, error_type=EpisodeStoreError)
         record = {"schema": STORE_SCHEMA, "episode": episode.to_dict(),
                   "execution": snapshot(execution)}
         record["record_sha256"] = canonical_hash(record)
@@ -616,6 +632,7 @@ class EpisodeStore:
             raise EpisodeStoreError("stored episode id mismatch")
         if execution.get("input_sha256") != episode.input_identity():
             raise EpisodeStoreError("stored input identity mismatch")
+        _validate_execution_state_schema(episode, execution, error_type=EpisodeStoreError)
         return {"episode_id": episode_id, "episode": episode, "execution": execution,
                 "record_sha256": received, "input_sha256": episode.input_identity(),
                 "schema": STORE_SCHEMA}
