@@ -336,6 +336,54 @@ def pair_graph_facts(writer_handle, reader_handle, writer_snapshot, reader_snaps
     return fact
 
 
+def _has_publish_occurrence(pair, receive, events):
+    """Admit the producer contract by declared raw writer scope, not its data.
+
+    Hash/status/schema are inputs to verification, never selection predicates:
+    a broken receipt must not downgrade into direct-GID/body-sequence guesses.
+    Legacy captures and unsupported RMWs have no such FastDDS scope declaration.
+    """
+    return any(e.get("logical_id") == pair.get("writer")
+               and e.get("generation") == pair.get("writer_generation")
+               and e.get("rmw_identifier") == "rmw_fastrtps_cpp"
+               and ((e.get("event") == "send" and "publish_occurrence_receipt" in e)
+                    or e.get("event") in {"publish_call_begin", "rmw_publish_trace", "publish_call_end"})
+               for e in events)
+
+
+def _occurrence_pair_with_control(pair, receive, events):
+    if all(pair.get(k) is not None for k in ("control", "control_generation", "control_gid")):
+        return pair
+    writers = [e for e in events if e.get("event") == "endpoint_created"
+               and e.get("logical_id") == pair.get("writer")
+               and e.get("generation") == pair.get("writer_generation")]
+    if len(writers) != 1:
+        return pair
+    writer = writers[0]
+    controls = []
+    for created in events:
+        if (created.get("event") != "endpoint_created"
+                or worker_role_kind(created.get("role")) != "reader"
+                or "initial_content_filter" not in created
+                or created["initial_content_filter"] is not None
+                or any(writer.get(k) is None or created.get(k) != writer[k]
+                       for k in ("topic", "message_type", "run_id", "domain_id", "rmw_identifier"))):
+            continue
+        same = lambda row: (row.get("logical_id") == created.get("logical_id")
+                            and row.get("generation") == created.get("generation"))
+        if any(same(row) and row.get("event") in {
+                "content_filter_dynamic_update", "endpoint_identity_transition",
+                "endpoint_destroyed", "topology_endpoint_destroyed"}
+               for row in events):
+            continue
+        controls.append(created)
+    if len(controls) != 1:
+        return pair
+    control = controls[0]
+    return {**pair, "control": control["logical_id"],
+            "control_generation": control["generation"], "control_gid": control["endpoint_gid"]}
+
+
 def payload_delivery_witness(pair, receive, events):
     """Unique raw payload correlation, NOT MessageInfo/direct publisher GID.
 
@@ -343,6 +391,9 @@ def payload_delivery_witness(pair, receive, events):
     identities must bind to created endpoint generations, and the same run/hash
     must select exactly one publish-returned raw send in the entire capture.
     """
+    if _has_publish_occurrence(pair, receive, events):
+        from .publish_occurrence import publish_occurrence_witness
+        return publish_occurrence_witness(_occurrence_pair_with_control(pair, receive, events), receive, events)
     digest, run = receive.get("payload_sha256"), receive.get("payload_run_id")
     if not isinstance(digest, str) or len(digest) != 64 or not isinstance(run, str) or not run:
         return None, "payload_hash_or_run_missing"
@@ -491,6 +542,7 @@ def pair_delivery_fact(pair, events, *, active_writers_on_topic=None, real_ros=F
     expected = [e.get("send_sequence") for e in sends]
     direct, correlated, single, unknown = [], [], [], []
     payload_witnesses, attribution_reasons, single_limitations = [], [], []
+    effective_sequences = {}
     for event in events:
         if event.get("event") != "receive":
             continue
@@ -498,7 +550,18 @@ def pair_delivery_fact(pair, events, *, active_writers_on_topic=None, real_ros=F
             continue
         if event.get("generation") != pair.get("reader_generation"):
             continue
+        if event.get("publisher_gid") is not None and event["publisher_gid"] != writer_gid:
+            continue  # A direct sample of another writer is outside this pair.
         sequence = event.get("send_sequence")
+        occurrence_witness = None
+        if _has_publish_occurrence(pair, event, events):
+            occurrence_witness, occurrence_reason = payload_delivery_witness(pair, event, events)
+            if occurrence_witness is None:
+                unknown.append(event)
+                attribution_reasons.append("publish_occurrence_unresolved:" + str(occurrence_reason))
+                continue
+            sequence = events[occurrence_witness["send_ref"]].get("send_sequence")
+            effective_sequences[id(event)] = sequence
         if sequence not in expected:
             continue
         if event.get("reader_gid") not in (None, reader_gid):
@@ -525,6 +588,8 @@ def pair_delivery_fact(pair, events, *, active_writers_on_topic=None, real_ros=F
         if publisher_gid is not None:
             if publisher_gid == writer_gid:
                 direct.append(event)
+                if occurrence_witness is not None:
+                    payload_witnesses.append(occurrence_witness)
             continue
         witness, reason = payload_delivery_witness(pair, event, events)
         if witness is not None:
@@ -551,7 +616,7 @@ def pair_delivery_fact(pair, events, *, active_writers_on_topic=None, real_ros=F
     # (including duplicates), never sort samples by their sequence number.
     attributed = {id(e) for e in direct + correlated + single}
     rows = [e for e in events if id(e) in attributed]
-    received = [event.get("send_sequence") for event in rows]
+    received = [effective_sequences.get(id(event), event.get("send_sequence")) for event in rows]
     missing = [sequence for sequence in expected if sequence not in received]
     duplicates = sorted({sequence for sequence in received if received.count(sequence) > 1})
     fact = {
@@ -1287,6 +1352,13 @@ def _delivery_window_evidence(opened, events, *, before_index=None):
             reasons.append("other_writer_payload_not_raw_bound")
             continue
         seq = sample.get("send_sequence")
+        occurrence_witness = None
+        if _has_publish_occurrence(pair, sample, prefix):
+            occurrence_witness, occurrence_reason = payload_delivery_witness(pair, sample, prefix)
+            if occurrence_witness is None:
+                reasons.append("receive_publish_occurrence_unknown:" + str(occurrence_reason))
+                continue
+            seq = prefix[occurrence_witness["send_ref"]].get("send_sequence")
         if type(seq) is not int or seq not in expected:
             reasons.append("receive_without_current_window_send")
             continue
@@ -1294,7 +1366,7 @@ def _delivery_window_evidence(opened, events, *, before_index=None):
         if active != 1 and not direct_peer_match:
             reasons.append("receive_active_writer_generation_not_raw_unique")
             continue
-        basis = "direct_publisher_gid"
+        basis = "direct_publish_occurrence" if occurrence_witness is not None else "direct_publisher_gid"
         if publisher is None:
             witness, reason = payload_delivery_witness(pair, sample, prefix)
             if witness is None or witness["send_ref"] != expected[seq]["event_index"]:
@@ -1327,6 +1399,50 @@ def _delivery_window_evidence(opened, events, *, before_index=None):
                                      "sentinel_send_ref": evidence["sentinel_send_ref"],
                                      "sentinel_receive_ref": evidence["sentinel_receive_ref"]} for seq in missing]
     return evidence
+
+
+def _repeat_occurrence_observation(source, sent, events):
+    """Resolve identical-body sends through a real unfiltered control sample.
+
+    Positive occurrence identity is not a filtering result. In particular a
+    missing filtered-reader receive is deliberately not promoted here.
+    """
+    from .publish_occurrence import producer_occurrence_witness, publish_occurrence_witness
+    base = {"writer": source["logical_id"], "writer_generation": source["generation"],
+            "writer_gid": source["writer_gid"]}
+    pair = _occurrence_pair_with_control(base, None, events)
+    if pair.get("control") is None:
+        return None, "unfiltered_control_identity_missing_or_ambiguous"
+    pair.update(reader=pair["control"], reader_generation=pair["control_generation"],
+                reader_gid=pair["control_gid"])
+    producers = []
+    for send in (source, sent):
+        producer, reason = producer_occurrence_witness(send, events)
+        if producer is None:
+            return None, reason
+        producers.append(producer)
+    samples = {source["event_index"]: [], sent["event_index"]: []}
+    for receive in events:
+        if (receive.get("event") != "receive" or receive.get("logical_id") != pair["control"]
+                or receive.get("generation") != pair["control_generation"]
+                or receive.get("payload_sha256") != source["payload_sha256"]):
+            continue
+        witness, reason = publish_occurrence_witness(pair, receive, events)
+        if witness is None:
+            return None, reason
+        if witness["send_ref"] in samples:
+            samples[witness["send_ref"]].append(witness)
+    if any(len(value) != 1 for value in samples.values()):
+        return None, "source_or_repeat_control_occurrence_missing_or_ambiguous"
+    original, repeat = (samples[send["event_index"]][0] for send in (source, sent))
+    if (original["publication_sequence_number"] == repeat["publication_sequence_number"]
+            or original["source_timestamp"] == repeat["source_timestamp"]):
+        return None, "source_and_repeat_sample_identity_not_distinct"
+    return {"source_producer": producers[0], "repeat_producer": producers[1],
+            "source_control_witness": original, "repeat_control_witness": repeat,
+            "control": pair["control"], "control_generation": pair["control_generation"],
+            "control_gid": pair["control_gid"],
+            "identity_basis": "direct_gid_scoped_publish_occurrence"}, None
 
 
 def _repeat_data_observation(binding, events):
@@ -1363,7 +1479,17 @@ def _repeat_data_observation(binding, events):
             or source.get("payload_sha256") != sent.get("payload_sha256")
             or hashlib.sha256(source["string_data"].encode()).hexdigest() != source.get("payload_sha256")):
         return {**unknown, "reason": "repeat_identity_chronology_or_bytes_invalid"}
-    # The first occurrence can only be witnessed from the capture prefix
+    if any(isinstance(row.get("publish_occurrence_receipt"), dict)
+           and row["publish_occurrence_receipt"].get("status") == "observed"
+           for row in (source, sent)):
+        occurrence, reason = _repeat_occurrence_observation(source, sent, events)
+        return {**unknown,
+                "status": "identical_input_occurrences_observed" if occurrence is not None else "identical_input_sent",
+                "reason": reason, "source_send_ref": ref, "repeat_send_ref": sent["event_index"],
+                "input_equivalence": "complete_String.data", "payload_sha256": source["payload_sha256"],
+                "delivery_attribution": "direct_gid_scoped_publish_occurrence" if occurrence is not None else "unknown",
+                "occurrence_mapping": occurrence}
+    # Legacy first occurrence can only be witnessed from the capture prefix
     # before the repeat was sent; later equal-payload receives remain ambiguous.
     updates = [e for e in events if e.get("event") == "topology_filter_update_result"
                and source["event_index"] < e.get("event_index", -1) < sent["event_index"]]

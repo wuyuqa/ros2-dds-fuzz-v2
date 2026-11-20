@@ -456,6 +456,7 @@ def _audit_worker_cleanup(executor, node, context, emit, *, endpoint_creation_re
     """Attempt every cleanup even if telemetry fails; retain the first failure."""
     outcomes = {}
     audit_errors = []
+    take_bridge_error = None
 
     def record(event, **fields):
         try:
@@ -463,24 +464,32 @@ def _audit_worker_cleanup(executor, node, context, emit, *, endpoint_creation_re
         except BaseException as exc:
             audit_errors.append(exc)
 
-    for name, action in (("executor", executor.shutdown),
-                         ("node", node.destroy_node),
-                         ("context", context.shutdown)):
+    actions = [("executor", executor.shutdown)]
+    take_bridge = getattr(executor, "take_bridge", None)
+    if take_bridge is not None:
+        actions.append(("message_info_bridge", take_bridge.close))
+    actions.extend((("node", node.destroy_node), ("context", context.shutdown)))
+    for name, action in actions:
         try:
             result = action()
             outcomes[name] = {"status": "returned_false" if result is False else "returned",
                               "error_type": None}
         except BaseException as exc:
             outcomes[name] = {"status": "exception", "error_type": type(exc).__name__}
+            if name == "message_info_bridge":
+                take_bridge_error = exc
         record("worker_cleanup_step", component=name, **outcomes[name])
     record("worker_shutdown", cleanup_outcomes=outcomes,
            endpoint_creation_returned=endpoint_creation_returned,
            resource_release_verified=False, cleanup_scope="public_api_calls_only",
            liveliness_close_error_type=type(close_error).__name__ if close_error else None,
+           take_bridge_close_error_type=type(take_bridge_error).__name__ if take_bridge_error else None,
            cleanup_audit_error_types=[type(exc).__name__ for exc in audit_errors])
     if primary_error is None:
         if close_error is not None:
             raise close_error
+        if take_bridge_error is not None:
+            raise take_bridge_error
         if audit_errors:
             raise audit_errors[0]
     return outcomes
@@ -978,7 +987,23 @@ def _worker_main(argv):
     node_token = uuid.uuid4().hex
     node_name = f"r2f_topo_{config['logical_id']}_g{config['generation']}_{node_token[:8]}"
     node = Node(node_name, context=context, enable_rosout=False, start_parameter_services=False)
-    executor = SingleThreadedExecutor(context=context)
+    take_capability = {"status": "unavailable", "reason": "unsupported_rmw_identifier",
+                       "original_rclpy_dict_provided_gid": False}
+    if kind == "reader" and rmw_identifier == "rmw_fastrtps_cpp":
+        from .rcl_take_bridge import make_full_info_executor, BridgeUnavailable
+        try:
+            executor = make_full_info_executor(context=context, rmw_identifier=rmw_identifier)
+            take_capability = {"status": "observed", "reason": None,
+                               "observation_basis": "single_take_owner_public_rcl_api",
+                               "original_rclpy_dict_provided_gid": False,
+                               "abi": executor.take_bridge.abi_receipt}
+        except BridgeUnavailable as exc:
+            # Explicitly keep the stock path if this pinned public ABI is absent.
+            # Its callback still has unavailable GID; no second consumer is added.
+            executor = SingleThreadedExecutor(context=context)
+            take_capability = dict(exc.capability_receipt)
+    else:
+        executor = SingleThreadedExecutor(context=context)
     executor.add_node(node)
     local_gid = None
     incarnation_ordinal = 0
@@ -996,6 +1021,7 @@ def _worker_main(argv):
             "domain_observation_source": "rclpy.context.get_domain_id" if observed_domain_id is not None else "unavailable_api",
             "rmw_identifier": rmw_identifier, "node_name": node_name,
             "endpoint_generation": endpoint_generation,
+            "topic": config["topic"], "message_type": config["type_name"],
         }
         value.update(fields)
         print(json.dumps(value, sort_keys=True), flush=True)
@@ -1015,13 +1041,18 @@ def _worker_main(argv):
         get = info.get if isinstance(info, dict) else lambda key: getattr(info, key, None)
         publisher_gid = gid_bytes(get("publisher_gid"))
         from .message_info_receipt import capture_message_info
-        message_info = capture_message_info(info)
+        # Preserve the full native take receipt rather than recreating the
+        # stock rclpy four-field view and dropping the independently read GID.
+        native_info = get("message_info_receipt")
+        message_info = native_info if isinstance(native_info, dict) else capture_message_info(info)
+        take_receipt = get("rcl_take_receipt")
         emit(
-            "receive", message_info_receipt=message_info, send_sequence=body.get("send_sequence") if isinstance(body, dict) else None,
+            "receive", rcl_take_receipt=take_receipt, message_info_receipt=message_info, send_sequence=body.get("send_sequence") if isinstance(body, dict) else None,
             phase=body.get("phase") if isinstance(body, dict) else None,
             receive_sequence=receive_sequence, reader_gid=local_gid,
             publisher_gid=publisher_gid,
-            publisher_gid_status="available" if publisher_gid is not None else "unavailable_api",
+            publisher_gid_status=(get("publisher_gid_status") or
+                                  ("available" if publisher_gid is not None else "unavailable_api")),
             identity_basis="message_info_gid" if publisher_gid is not None else "endpoint_correlated",
             payload_sha256=__import__("hashlib").sha256(message.data.encode()).hexdigest(),
             string_data=message.data,
@@ -1033,12 +1064,19 @@ def _worker_main(argv):
             message_info_type=type(info).__name__,
         )
 
+    if kind == "reader":
+        emit("topology_message_info_capability", **{
+            **take_capability, "candidate_eligible": False, "filtering_effect_proven": False})
     qos = QoSProfile(**_public_qos_kwargs(config["qos"]))
     liveliness = _LivelinessEventCapture(kind, emit)
     callback_type = PublisherEventCallbacks if kind == "writer" else SubscriptionEventCallbacks
     callbacks = callback_type(liveliness=liveliness.callback) if callback_type is not None else None
     if callbacks is None:
         emit("topology_liveliness_capability", status="unavailable_api", endpoint_gid=None)
+    publish_observer = None
+    if kind == "writer":
+        from .rmw_publish_observer import PublishOccurrenceObserver
+        publish_observer = PublishOccurrenceObserver(emit, rmw_identifier)
     endpoint_creation_returned = False
     try:
         create_begin = emit("endpoint_create_begin", topic=config["topic"],
@@ -1117,8 +1155,8 @@ def _worker_main(argv):
              graph_qos=own.get("qos"),
              identity_source="get_publishers_info_by_topic" if kind == "writer"
              else "get_subscriptions_info_by_topic",
-             **({"initial_content_filter": filter_configuration}
-                if filter_configuration is not None else {}))
+             initial_content_filter=filter_configuration,
+             initial_content_filter_request=config.get("initial_content_filter"))
         liveliness.bind(local_gid)
         if kind == "reader":
             liveliness.peer_sampler = _LivelinessPeerSampler(
@@ -1256,9 +1294,14 @@ def _worker_main(argv):
                     message = String()
                     message.data = repeat_data if repeat_data is not None else json.dumps(body, sort_keys=True)
                     publish_begin_ns = time.monotonic_ns()
-                    endpoint.publish(message)
+                    occurrence = publish_observer.publish(
+                        endpoint, message, command_id=command_id,
+                        send_sequence=sequence, writer_gid=local_gid)
                     publish_return_ns = time.monotonic_ns()
-                    emit("send", publish_begin_ns=publish_begin_ns, publish_return_ns=publish_return_ns, send_sequence=sequence, phase=phase,
+                    native_receipt = ({"publish_occurrence_receipt": occurrence}
+                                      if rmw_identifier == "rmw_fastrtps_cpp" else {})
+                    emit("send", **native_receipt,
+                         publish_begin_ns=publish_begin_ns, publish_return_ns=publish_return_ns, send_sequence=sequence, phase=phase,
                          writer_gid=local_gid, publish_returned=True,
                          payload_sha256=_sha256_text(message.data), string_data=message.data,
                          declared_payload_sha256=body.get("declared_payload_sha256"),
@@ -1282,10 +1325,18 @@ def _worker_main(argv):
     finally:
         primary_error = sys.exc_info()[1]
         close_error = None
+        if publish_observer is not None:
+            try:
+                emit("publish_observer_closed", **publish_observer.close())
+            except BaseException as exc:
+                close_error = exc
         try:
             liveliness.close()
         except BaseException as exc:
             close_error = exc
+        # The same cleanup auditor owns executor -> take bridge -> node ->
+        # context teardown, so secondary close/telemetry errors cannot mask
+        # an original worker failure or skip remaining resource cleanup.
         _audit_worker_cleanup(executor, node, context, emit,
                               endpoint_creation_returned=endpoint_creation_returned,
                               primary_error=primary_error, close_error=close_error)
