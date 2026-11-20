@@ -321,7 +321,7 @@ class InitialFilterCreation(unittest.TestCase):
                                       depth=16, history=policy('KEEP_LAST'), deadline=duration,
                                       liveliness=policy('AUTOMATIC'), liveliness_lease_duration=duration)
                 return [SimpleNamespace(node_name=self.name, node_namespace='/',
-                        topic_type='std_msgs/msg/String', endpoint_gid=b'\xaa\xbb', qos_profile=qos)]
+                        topic_type='std_msgs/msg/String', endpoint_gid=b'\xaa\xbb' * 8, qos_profile=qos)]
             def destroy_node(self):
                 pass
         modules['rclpy.context'].Context = FixtureContext
@@ -330,9 +330,16 @@ class InitialFilterCreation(unittest.TestCase):
         modules['rclpy.qos'].QoSProfile = lambda **kwargs: kwargs
         modules['rclpy.subscription_content_filter_options'].ContentFilterOptions = FakeOptions
         modules['std_msgs.msg'].String = type('FixtureString', (), {})
+        fixture_qos = {'history': 'keep_last', 'depth': 16, 'reliability': 'reliable',
+                       'durability': 'volatile', 'deadline_ns': tw.INFINITE_NS,
+                       'liveliness': 'automatic', 'liveliness_lease_duration_ns': tw.INFINITE_NS}
+        # Exercise the real comparison with explicit inputs, not native readback.
+        # Do not fabricate an observed receipt, mapped library, or verified ABI.
+        fixture_actual = {'qos': deepcopy(fixture_qos), 'fixture': True,
+                          'status': 'fixture_not_real_observation', 'execution_evidence': False}
         config = {'run_id': 'offline-worker-fixture', 'domain_id': 191, 'logical_id': 'r0',
                   'generation': 1, 'topic': '/topic', 'type_name': 'std_msgs/msg/String',
-                  'qos': {}, 'initial_content_filter': initial(evaluation=True)}
+                  'qos': deepcopy(fixture_qos), 'initial_content_filter': initial(evaluation=True)}
         real_helper = tw._create_reader_with_initial_filter
         def fixture_helper(*args, **kwargs):
             return real_helper(*args, fixture=True, **kwargs)
@@ -342,9 +349,22 @@ class InitialFilterCreation(unittest.TestCase):
                 patch.object(tw.sys, 'stdin', SimpleNamespace(fileno=lambda: 12345)), \
                 patch.object(tw.os, 'read', return_value=b'{"command":"stop"}\n'), \
                 patch.object(tw, '_create_reader_with_initial_filter', side_effect=fixture_helper), \
+                patch('r2f.runtime.actual_qos.read_public_endpoint_qos',
+                      return_value=fixture_actual) as actual_readback, \
+                patch('r2f.runtime.actual_qos._load_mapped_library',
+                      side_effect=AssertionError('offline fixture must not load librcl')) as load_library, \
                 redirect_stdout(stdout):
             code = tw._worker_main(['fixture', json.dumps(config), 'reader'])
+        actual_readback.assert_called_once()
+        self.assertIsInstance(actual_readback.call_args.args[0], FakeSubscription)
+        self.assertEqual(actual_readback.call_args.args[1], 'reader')
+        load_library.assert_not_called()
         events = [json.loads(line) for line in stdout.getvalue().splitlines()]
+        created = next(e for e in events if e['event'] == 'endpoint_created')
+        self.assertEqual(created['requested_qos'], fixture_qos)
+        self.assertEqual(created['qos'], fixture_qos)
+        self.assertEqual(created['qos_request_comparison']['status'], 'matched')
+        self.assertEqual(created['actual_endpoint_qos'], fixture_actual)
         self.assertEqual(code, 0)
         result = next(e for e in events if e['event'] == 'content_filter_initial_configuration')
         self.assertEqual((result['role'], result['logical_id'], result['generation']), ('reader', 'r0', 1))

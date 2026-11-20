@@ -48,6 +48,7 @@ must be ros2_public_api with prepared real_ros=True and no fixture markers to be
 coverage eligible. This audits artifact consistency, not cryptographic runtime
 attestation/source freeze. Synthetic fixtures always remain ineligible.
 """
+from r2f.runtime.endpoint_incarnation import endpoint_identity_at
 from copy import deepcopy
 import hashlib
 import json
@@ -167,6 +168,12 @@ class _Projection:
         return self.events[:boundary["event_index"] + 1]
 
     def bound(self, event, token, *, gid_field=None):
+        token = endpoint_identity_at(self.events, token, before_index=event["event_index"] + 1)
+        valid_ref = token["identity_valid_after_ref"]
+        if (event["monotonic_ns"] < token["identity_valid_after_ns"]
+                or (event["event_index"] < valid_ref if event.get("event") == "command_done"
+                    else event["event_index"] <= valid_ref)):
+            raise ValueError("observation_before_identity_ack")
         run_id = self.events[self.receipt["input_ref"]["event_index"]].get("run_id")
         if not _text(run_id) or event.get("run_id") != run_id or token.get("run_id") != run_id:
             raise ValueError("endpoint_worker_run_binding_mismatch")
@@ -191,7 +198,8 @@ class _Projection:
         for eid in self.roles:
             path = "/endpoints/" + _pointer(eid)
             history = [e for e in prefix if e.get("logical_id") == eid
-                       and e["event"] in ("endpoint_created", "endpoint_destroyed", "topology_endpoint_destroyed")]
+                       and e["event"] in ("endpoint_created", "endpoint_destroyed", "topology_endpoint_destroyed",
+                                          "endpoint_identity_transition")]
             self.receipt[side]["history"][eid] = [self.ref(e) for e in history]
             try:
                 if history:
@@ -218,9 +226,19 @@ class _Projection:
                         old_gids.add(gid)
                         old_workers.add(worker)
                         current, generation, alive = event, gen, True
+                    elif event["event"] == "endpoint_identity_transition":
+                        if (current is None or not alive or event.get("generation") != generation):
+                            raise ValueError("transition_without_current_generation")
+                        # Full command authentication is performed by the resolver
+                        # at the boundary; this pass independently fences lifecycle.
+                        old_gids.add(_gid(event.get("after_gid")))
                     else:
                         if current is None or not alive:
                             raise ValueError("retirement_without_current_generation")
+                        current = endpoint_identity_at(self.events, current,
+                            before_index=event["event_index"] + 1)
+                        if event["monotonic_ns"] < current["identity_valid_after_ns"]:
+                            raise ValueError("retirement_before_identity_ack")
                         # Controller retirement events omit endpoint_generation;
                         # PID/GID/logical ordinal must still agree with creation.
                         if (not _integer(event.get("generation"), 1) or not _integer(event.get("pid"), 1)
@@ -235,6 +253,11 @@ class _Projection:
                     raise ValueError("lifecycle_capture_incomplete")
                 if current is not None and current["monotonic_ns"] > boundary["monotonic_ns"]:
                     raise ValueError("endpoint_creation_after_boundary_chronology")
+                if current is not None:
+                    current = endpoint_identity_at(self.events, current,
+                        before_index=boundary["event_index"] + 1)
+                    if boundary["monotonic_ns"] < current["identity_valid_after_ns"]:
+                        raise ValueError("boundary_before_identity_ack")
                 if alive:
                     tokens[eid] = current
                 life = "alive" if alive else "retired" if generation else "absent"
@@ -244,7 +267,8 @@ class _Projection:
                 self.component(side, path + "/liveness", life, rows)
                 if current is not None:
                     self.receipt[side]["identity"][eid] = {
-                        k: current[k] for k in ("generation", "endpoint_gid", "pid", "process_start_ticks", "endpoint_generation")
+                        k: current[k] for k in ("generation", "endpoint_gid", "pid", "process_start_ticks", "endpoint_generation",
+                                               "incarnation_ordinal", "identity_transition_ref")
                     }
                     self.receipt[side]["identity"][eid]["creation_ref"] = self.ref(current)
             except ValueError as exc:
@@ -269,6 +293,10 @@ class _Projection:
         if not candidates:
             raise ValueError("fresh_current_generation_snapshot_missing")
         match = candidates[-1]
+        at_match = endpoint_identity_at(self.events, token, before_index=match["event_index"] + 1)
+        at_boundary = endpoint_identity_at(self.events, token, before_index=boundary["event_index"] + 1)
+        if at_match["endpoint_gid"] != at_boundary["endpoint_gid"]:
+            raise ValueError("snapshot_before_current_incarnation")
         self.bound(match, token, gid_field="endpoint_gid")
         cid = match.get("command_id")
         if not (_text(cid) or _integer(cid)):
@@ -342,6 +370,9 @@ class _Projection:
                     elif event["event"] in ("endpoint_destroyed", "topology_endpoint_destroyed", "worker_exit"):
                         if eid in active and event.get("generation") == active[eid].get("generation"):
                             active.pop(eid)
+                active = {eid: endpoint_identity_at(self.events, origin,
+                              before_index=chain[0]["event_index"])
+                          for eid, origin in active.items()}
                 for key in ("endpoint_gid", "endpoint_generation", "pid"):
                     values = [event.get(key) for event in active.values()]
                     if None in values or len(set(values)) != len(values):
@@ -431,6 +462,15 @@ class _Projection:
                or event.get(role + "_generation") != t["generation"]
                for role, t in (("writer", w), ("reader", r))):
             raise ValueError("delivery_window_old_generation_or_pair_mismatch")
+        for role, token in (("writer", w), ("reader", r)):
+            field = role + "_gid"
+            current = endpoint_identity_at(self.events, token, before_index=event["event_index"] + 1)
+            if (event["event_index"] <= current["identity_valid_after_ref"]
+                    or event["monotonic_ns"] < current["identity_valid_after_ns"]):
+                raise ValueError("delivery_window_before_identity_ack")
+            if field in event:
+                if _gid(event[field]) != _gid(current["endpoint_gid"]):
+                    raise ValueError("delivery_window_incarnation_mismatch:" + field)
 
     def no_sends(self, w, r, boundary):
         """Independently reconstruct the committed inventory, never trust a label.
@@ -438,6 +478,8 @@ class _Projection:
         No import of runtime validator, no open/close fabrication, no replacement
         of per-peer match or endpoint health. Reuse is deliberately fail-closed.
         """
+        w = endpoint_identity_at(self.events, w, before_index=boundary["event_index"] + 1)
+        r = endpoint_identity_at(self.events, r, before_index=boundary["event_index"] + 1)
         prefix = self.prefix(boundary)
         claims = [e for e in prefix if e["event"] == "topology_delivery_no_sends"
                   and e.get("writer") == w["logical_id"] and e.get("reader") == r["logical_id"]]
@@ -479,7 +521,8 @@ class _Projection:
         for token in (w, r):
             history = [e for e in prefix if e.get("logical_id") == token["logical_id"]
                        and e["event"] in {"endpoint_created", "endpoint_destroyed", "topology_endpoint_destroyed", "topology_generation_retired"}]
-            if len(history) != 1 or history[0] != token or token["generation"] != 1:
+            if (len(history) != 1 or token["generation"] != 1
+                    or endpoint_identity_at(self.events, history[0], before_index=boundary["event_index"] + 1) != token):
                 raise ValueError("no_sends_generation_history_not_unique")
             chain = chains[token["logical_id"]] = self.snapshot_chain(token, boundary)
             if any(any(row.get(k) != token[k] for k in fields if k != "endpoint_gid") for row in chain):
@@ -528,6 +571,8 @@ class _Projection:
 
     def recreated_no_sends(self, w, r, boundary):
         """Independently consume v2; do not reuse the producer's validator."""
+        w = endpoint_identity_at(self.events, w, before_index=boundary["event_index"] + 1)
+        r = endpoint_identity_at(self.events, r, before_index=boundary["event_index"] + 1)
         prefix = self.prefix(boundary)
         claims = [e for e in prefix if e["event"] == "topology_delivery_no_sends"
                   and e.get("writer") == w["logical_id"] and e.get("reader") == r["logical_id"]]
@@ -589,6 +634,8 @@ class _Projection:
                     active = event; gen += 1; gids.add(event["endpoint_gid"])
                     workers.add((event["pid"],event["process_start_ticks"])); nonces.add(event["endpoint_generation"])
                 else:
+                    if active is not None:
+                        active = endpoint_identity_at(self.events, active, before_index=event["event_index"] + 1)
                     if active is None or event.get("cleanup_status") != "closed" or any(event.get(k) != active[k] for k in fields):
                         raise ValueError("recreated_no_sends_retirement_unbound")
                     exits = [e for e in inventory if e["event"] == "topology_worker_exit"
@@ -605,7 +652,8 @@ class _Projection:
                     active = None
                 if len(actions) != 1:
                     raise ValueError("recreated_no_sends_lifecycle_action_unbound")
-            if active != token:
+            if (active is None or endpoint_identity_at(self.events, active,
+                    before_index=boundary["event_index"] + 1) != token):
                 raise ValueError("recreated_no_sends_not_current_generation")
             histories[token["logical_id"]] = [e["event_index"] for e in history]
             chain = chains[token["logical_id"]] = self.snapshot_chain(token,boundary)
@@ -700,6 +748,8 @@ class _Projection:
             "generation_history_refs":histories,"prior_window_close_refs":[self.ref(e) for e in prior]}
 
     def delivery(self, w, r, tokens, boundary):
+        w = endpoint_identity_at(self.events, w, before_index=boundary["event_index"] + 1)
+        r = endpoint_identity_at(self.events, r, before_index=boundary["event_index"] + 1)
         prefix = self.prefix(boundary)
         closes = [e for e in prefix if e["event"] == "topology_delivery_window_closed"
                   and e.get("writer") == w["logical_id"] and e.get("reader") == r["logical_id"]]
@@ -831,7 +881,8 @@ class _Projection:
                 continue
             self.bound(event, r, gid_field="reader_gid")
             publisher = _gid(event.get("publisher_gid"))
-            if publisher is not None and publisher != _gid(w["endpoint_gid"]):
+            writer_at_sample = endpoint_identity_at(self.events, w, before_index=event["event_index"] + 1)
+            if publisher is not None and publisher != _gid(writer_at_sample["endpoint_gid"]):
                 continue
             basis, linked = "direct_publisher_gid", None
             if publisher is None:

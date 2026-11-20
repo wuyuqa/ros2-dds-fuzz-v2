@@ -12,6 +12,7 @@ import hashlib
 import json
 from pathlib import Path
 
+from r2f.runtime.endpoint_incarnation import endpoint_identity_at
 from r2f.core._json import snapshot
 from r2f.core.evidence import canonical_hash
 from r2f.core.mutation import MutationReceipt
@@ -259,11 +260,18 @@ class _Audit:
             elif kind in {"endpoint_destroyed", "topology_endpoint_destroyed"}:
                 key = (eid, event.get("generation"))
                 _require(key in self.tokens and key not in retired, "retirement_unknown_generation")
-                token = self.tokens[key]
+                token = endpoint_identity_at(self.events, self.tokens[key], before_index=event["event_index"] + 1)
+                _require(event["monotonic_ns"] >= token["identity_valid_after_ns"],
+                         "retirement_before_identity_ack")
                 _require(event.get("pid") == token["pid"] and event.get("endpoint_gid") == token["endpoint_gid"]
                          and event.get("cleanup_status") == "closed", "retirement_identity_or_cleanup_mismatch")
                 _chain(token, event)
                 retired.add(key)
+            elif kind == "endpoint_identity_transition":
+                key = (eid, event.get("generation"))
+                _require(key in self.tokens and key not in retired, "transition_unknown_or_retired_generation")
+                _require(event.get("after_gid") not in seen_gids, "worker_or_gid_reused_across_generations")
+                seen_gids.add(event.get("after_gid"))
             elif kind in _WORKER_EVENTS and eid is not None and kind not in {"endpoint_create_begin", "worker_ready"}:
                 key = (eid, event.get("generation"))
                 _require(key in self.tokens and key not in retired, "worker_event_unknown_or_retired_generation")
@@ -275,13 +283,27 @@ class _Audit:
                          "worker_start_lineage_mismatch")
                 _chain(event, token)
         _require(bool(self.tokens) or not self.specs, "endpoint_creation_raw_missing")
-        return [{**{k: t[k] for k in _LINEAGE}, "endpoint_gid": t["endpoint_gid"],
-                 "creation_ref": self.ref(t)} for t in self.tokens.values()]
+        # Summaries describe the authenticated final incarnation; tokens remain
+        # immutable creations so earlier windows can resolve their own prefix.
+        identities = []
+        for token in self.tokens.values():
+            current = endpoint_identity_at(self.events, token)
+            identities.append({**{k: current[k] for k in _LINEAGE},
+                **{k: current[k] for k in ("endpoint_gid", "incarnation_ordinal", "identity_transition_ref")},
+                "creation_ref": self.ref(token)})
+        return identities
 
     def bound(self, event, token):
+        token = endpoint_identity_at(self.events, token, before_index=event["event_index"] + 1)
+        valid_ref = token["identity_valid_after_ref"]
+        _require(event["monotonic_ns"] >= token["identity_valid_after_ns"]
+                 and (event["event_index"] >= valid_ref if event.get("event") == "command_done"
+                      else event["event_index"] > valid_ref), "worker_event_before_identity_ack")
         _require(all(event.get(k) == token[k] for k in _LINEAGE), "worker_event_lineage_mismatch")
         _require(event["event_index"] > token["event_index"] and event["monotonic_ns"] >= token["monotonic_ns"],
                  "worker_event_before_creation")
+        if "endpoint_gid" in event:
+            _require(event["endpoint_gid"] == token["endpoint_gid"], "worker_endpoint_gid_mismatch")
         if event.get("event") == "send":
             _require(event.get("writer_gid") == token["endpoint_gid"] and event.get("publish_returned") is True,
                      "send_gid_or_publish_return_missing")
@@ -391,6 +413,8 @@ class _Audit:
                 _require(self.specs[action["endpoint_id"]].get("role") == "writer",
                          "action_assert_requires_writer")
                 token = self.tokens.get((action["endpoint_id"], action["generation"]))
+                if token is not None:
+                    token = endpoint_identity_at(self.events, token, before_index=begin["event_index"])
                 _assert_api_event(inside, action, receipt, token, begin, after, done)
             self.action_receipts.append({"action_id": aid, "before": snapshot(receipt["before"]),
                 "after": snapshot(receipt["after"]), "requires": snapshot(receipt["requires"]),
@@ -549,8 +573,8 @@ def _pair_facts(audit, projection, deliveries):
             "reason_codes": ["validated_pair_window_unavailable"],
             "writer": w, "reader": r, "writer_generation": row["writer_generation"],
             "reader_generation": row["reader_generation"],
-            "writer_gid": audit.tokens.get((w, row["writer_generation"]), {}).get("endpoint_gid"),
-            "reader_gid": audit.tokens.get((r, row["reader_generation"]), {}).get("endpoint_gid"),
+            "writer_gid": side["identity"].get(w, {}).get("endpoint_gid"),
+            "reader_gid": side["identity"].get(r, {}).get("endpoint_gid"),
             "oracle_coverage": "not_declared_by_target_rule", "candidate_eligible": False,
             "cross_writer_order_required": False, "rule_verdict": None}
         row.update(_delivery_window(audit, row, deliveries))
@@ -571,8 +595,10 @@ def _ordering_observation(audit, pair, opened, close):
         "schema": "r2f.topology-per-writer-order-observation/v1",
         "scope": "per_writer_reader_generation_window",
         "writer": w, "reader": r, "writer_generation": wg, "reader_generation": rg,
-        "writer_gid": audit.tokens.get((w, wg), {}).get("endpoint_gid"),
-        "reader_gid": audit.tokens.get((r, rg), {}).get("endpoint_gid"),
+        "writer_gid": endpoint_identity_at(audit.events, audit.tokens[(w, wg)],
+            before_index=opened["event_index"] + 1)["endpoint_gid"],
+        "reader_gid": endpoint_identity_at(audit.events, audit.tokens[(r, rg)],
+            before_index=opened["event_index"] + 1)["endpoint_gid"],
         "open_ref": audit.ref(opened), "close_ref": audit.ref(close),
         "status": "unknown", "reason_codes": [], "send_order": [], "receive_order": [],
         "send_refs": [], "receive_refs": [], "witnesses": [], "inversions": [],

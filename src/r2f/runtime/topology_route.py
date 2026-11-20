@@ -4,6 +4,7 @@ No registry, runner, mutation generator, candidate lifecycle or seal lives here.
 Application audit reads hashed raw bytes, never returned facts/status. A fixture
 can prove this contract's plumbing but cannot acquire real-execution eligibility.
 """
+from .endpoint_incarnation import endpoint_identity_at
 from copy import deepcopy
 import hashlib
 import json
@@ -269,15 +270,25 @@ def _action_proof(action, events):
             retired = [e for e in events[:created["event_index"]]
                        if e.get("event") in {"endpoint_destroyed", "topology_endpoint_destroyed"}
                        and e.get("logical_id") == eid and e.get("generation") == gen - 1
-                       and e.get("cleanup_status") == "closed"
-                       and all(e.get(k) == predecessor.get(k) for k in
-                               ("endpoint_gid", "pid", "process_start_ticks", "endpoint_generation"))]
+                       and e.get("cleanup_status") == "closed"]
+            if len(retired) != 1:
+                return [], "fresh_generation_or_predecessor_retirement_not_proven"
+            try:
+                prior_identity = endpoint_identity_at(events, predecessor,
+                    before_index=retired[0]["event_index"] + 1)
+            except ValueError as exc:
+                return [], str(exc)
+            if retired[0]["monotonic_ns"] < prior_identity["identity_valid_after_ns"]:
+                return [], "retirement_before_identity_ack"
+            if any(retired[0].get(k) != prior_identity.get(k) for k in
+                   ("endpoint_gid", "pid", "process_start_ticks", "endpoint_generation")):
+                return [], "fresh_generation_or_predecessor_retirement_not_proven"
             fixture_ok = (predecessor.get("real_ros") is True
                           or all(e.get("fixture") is True and e.get("real_ros") is False
                                  for e in retired))
             if (len(retired) != 1
-                    or any(predecessor.get(k) == created.get(k) for k in
-                           ("endpoint_gid", "pid", "endpoint_generation"))
+                    or any(predecessor.get(k) == created.get(k) or prior_identity.get(k) == created.get(k)
+                           for k in ("endpoint_gid", "pid", "endpoint_generation"))
                     or not fixture_ok):
                 return [], "fresh_generation_or_predecessor_retirement_not_proven"
     elif op == "destroy":
@@ -286,7 +297,12 @@ def _action_proof(action, events):
                        and e.get("logical_id") == eid and e.get("generation") == gen]
         if len(live_tokens) != 1:
             return [], "destroy_target_generation_not_bound"
-        token = live_tokens[0]
+        try:
+            token = endpoint_identity_at(events, live_tokens[0], before_index=start["event_index"])
+        except ValueError as exc:
+            return [], str(exc)
+        if start["monotonic_ns"] < token["identity_valid_after_ns"]:
+            return [], "destroy_action_before_identity_ack"
         destroyed = [e for e in segment
                      if e.get("event") in {"endpoint_destroyed", "topology_endpoint_destroyed"}
                      and e.get("logical_id") == eid and e.get("generation") == gen
@@ -294,6 +310,12 @@ def _action_proof(action, events):
         if len(destroyed) != 1:
             return [], "endpoint_destroy_cleanup_missing_or_ambiguous"
         retired = destroyed[0]
+        try:
+            token = endpoint_identity_at(events, token, before_index=retired["event_index"] + 1)
+        except ValueError as exc:
+            return [], str(exc)
+        if retired["monotonic_ns"] < token["identity_valid_after_ns"]:
+            return [], "retirement_before_identity_ack"
         if any(retired.get(k) != token.get(k) for k in
                ("endpoint_gid", "pid", "process_start_ticks", "endpoint_generation")):
             return [], "retirement_identity_or_cleanup_mismatch"

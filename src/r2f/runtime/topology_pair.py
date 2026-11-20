@@ -27,6 +27,7 @@ import time
 from r2f.modules.s1 import topology_model as model
 
 from .domains import IsolationError
+from .endpoint_incarnation import endpoint_identity_at
 from .topology_environment_observation import TopologyEnvironmentObservation
 
 from .liveliness_evidence import evaluate_liveliness, evaluate_peer_samples
@@ -178,7 +179,11 @@ def _direct_peer_membership(token, peer, snapshot, events, *, before_index=None)
                    and e.get("logical_id") == created.get("logical_id")
                    and e.get("generation") == created.get("generation")]
         if not retired:
-            live.append(created)
+            try:
+                live.append(endpoint_identity_at(events, created,
+                            before_index=request["event_index"]))
+            except ValueError as exc:
+                return None, "per_peer_incarnation_invalid:" + str(exc)
     for field in ("logical_id", "endpoint_gid", "endpoint_generation", "pid"):
         values = [row.get(field) for row in live]
         if None in values or len(set(values)) != len(values):
@@ -363,11 +368,18 @@ def payload_delivery_witness(pair, receive, events):
     for event, eid, gen, gid in ((send, pair.get("writer"), pair.get("writer_generation"), pair.get("writer_gid")),
                                  (receive, pair.get("reader"), pair.get("reader_generation"), pair.get("reader_gid"))):
         created = [e for e in events if e.get("event") == "endpoint_created"
-                   and e.get("logical_id") == eid and e.get("generation") == gen
-                   and e.get("endpoint_gid") == gid]
+                   and e.get("logical_id") == eid and e.get("generation") == gen]
         if len(created) != 1 or any(event.get(k) is None or event.get(k) != created[0].get(k)
                                     for k in ("pid", "process_start_ticks", "endpoint_generation")):
             return None, "payload_worker_identity_not_bound"
+        try:
+            current = endpoint_identity_at(events, created[0], before_index=events.index(event) + 1)
+        except ValueError as exc:
+            return None, "payload_incarnation_invalid:" + str(exc)
+        if (current.get("endpoint_gid") != gid
+                or type(event.get("monotonic_ns")) is not int
+                or event["monotonic_ns"] < current["identity_valid_after_ns"]):
+            return None, "payload_worker_identity_not_current_incarnation"
         if not isinstance(event.get("monotonic_ns"), int) or created[0].get("monotonic_ns", event["monotonic_ns"]+1) > event["monotonic_ns"]:
             return None, "payload_worker_chronology_not_bound"
         if any(e.get("event") in {"endpoint_destroyed", "topology_endpoint_destroyed", "worker_exit"}
@@ -489,6 +501,26 @@ def pair_delivery_fact(pair, events, *, active_writers_on_topic=None, real_ros=F
         sequence = event.get("send_sequence")
         if sequence not in expected:
             continue
+        if event.get("reader_gid") not in (None, reader_gid):
+            continue
+        if any(e.get("event") == "endpoint_identity_transition"
+               and e.get("logical_id") == reader_id
+               and e.get("generation") == pair.get("reader_generation") for e in events):
+            origins = [e for e in events if e.get("event") == "endpoint_created"
+                       and e.get("logical_id") == reader_id
+                       and e.get("generation") == pair.get("reader_generation")]
+            try:
+                if len(origins) != 1:
+                    raise ValueError("reader_creation_missing_or_duplicate")
+                current = endpoint_identity_at(events, origins[0], before_index=events.index(event) + 1)
+                if (current.get("endpoint_gid") != reader_gid or event.get("reader_gid") != reader_gid
+                        or type(event.get("monotonic_ns")) is not int
+                        or event["monotonic_ns"] < current["identity_valid_after_ns"]):
+                    raise ValueError("reader_not_current_incarnation")
+            except ValueError as exc:
+                unknown.append(event)
+                attribution_reasons.append("reader_incarnation_invalid:" + str(exc))
+                continue
         publisher_gid = event.get("publisher_gid")
         if publisher_gid is not None:
             if publisher_gid == writer_gid:
@@ -759,6 +791,16 @@ def _delivery_snapshot_chain(token, command_id, events, *, after_index, before_i
                and a["monotonic_ns"] <= b["monotonic_ns"]
                for a, b in zip(chain, chain[1:])):
         raise TopologyBackendError("delivery_snapshot_chronology_invalid")
+    try:
+        current = endpoint_identity_at(events, created[0], before_index=request["event_index"])
+    except ValueError as exc:
+        raise TopologyBackendError("delivery_snapshot_incarnation_invalid:" + str(exc)) from exc
+    if (current.get("endpoint_gid") != token.get("endpoint_gid")
+            or request["monotonic_ns"] < current["identity_valid_after_ns"]
+            or request["event_index"] <= current["identity_valid_after_ref"]
+            or (("endpoint_gid" in request or current["incarnation_ordinal"] > 0)
+                and request.get("endpoint_gid") != current.get("endpoint_gid"))):
+        raise TopologyBackendError("delivery_snapshot_current_identity_unproven")
     return chain
 
 
@@ -1026,7 +1068,7 @@ def _delivery_no_obligation_basis(opened, events):
                           and e.get("generation") == opened.get(role + "_generation")]
             if len(candidates) != 1:
                 return None
-            token = tokens[role] = candidates[0]
+            token = tokens[role] = endpoint_identity_at(events, candidates[0], before_index=start)
             if (worker_role_kind(token.get("role")) != role or token.get("run_id") != opened.get("run_id")
                     or token.get("endpoint_gid") != opened.get(role + "_gid")):
                 return None
@@ -1070,7 +1112,7 @@ def _delivery_no_obligation_basis(opened, events):
                 "writer_topic": w["topic"], "reader_topic": r["topic"],
                 "writer_type": w["message_type"], "reader_type": r["message_type"],
                 "scope": "open_snapshot_only_not_persistent_nonmatch", "obligation": "not_applicable"}
-    except (TopologyBackendError, KeyError, TypeError, IndexError):
+    except (TopologyBackendError, ValueError, KeyError, TypeError, IndexError):
         return None
 
 
@@ -1094,7 +1136,11 @@ def _delivery_window_evidence(opened, events, *, before_index=None):
         if len(candidates) != 1:
             reasons.append("endpoint_creation_missing_or_ambiguous:" + role)
             continue
-        token = tokens[role] = candidates[0]
+        try:
+            token = tokens[role] = endpoint_identity_at(events, candidates[0], before_index=start)
+        except ValueError as exc:
+            reasons.append("window_incarnation_invalid:" + role + ":" + str(exc))
+            continue
         if (worker_role_kind(token.get("role")) != role or token.get("run_id") != opened.get("run_id")
                 or token.get("endpoint_gid") != opened.get(role + "_gid")):
             reasons.append("window_endpoint_identity_mismatch:" + role)
@@ -1121,6 +1167,10 @@ def _delivery_window_evidence(opened, events, *, before_index=None):
                 "expected_sequences": [], "received_sequences": [], "missing_sequences": [],
                 "gap_evidence": [], "send_refs": [], "receive_refs": [], "attribution": "unknown"}
     w, r = tokens["writer"], tokens["reader"]
+    if any(e.get("event") == "endpoint_identity_transition"
+           and any(e.get("logical_id") == t["logical_id"] and e.get("generation") == t["generation"]
+                   for t in (w, r)) for e in rows):
+        reasons.append("endpoint_incarnation_changed_inside_window")
     no_obligation = _delivery_no_obligation_basis(opened, prefix)
     claims = [e for e in rows if e.get("event") == "topology_delivery_no_obligation"
               and e.get("open_ref") == start]
@@ -1163,10 +1213,17 @@ def _delivery_window_evidence(opened, events, *, before_index=None):
             ("writer", "reader", "writer_generation", "reader_generation", "writer_gid", "reader_gid")}
 
     def bound(event, token, gid_field):
+        try:
+            current = endpoint_identity_at(events, token, before_index=event["event_index"] + 1)
+        except (ValueError, KeyError):
+            return False
         return (event.get("run_id") == opened.get("run_id")
                 and all(token.get(k) is not None and event.get(k) == token.get(k) for k in
                         ("logical_id", "generation", "pid", "process_start_ticks", "endpoint_generation"))
-                and event.get(gid_field) == token.get("endpoint_gid"))
+                and current.get("endpoint_gid") == token.get("endpoint_gid")
+                and type(event.get("monotonic_ns")) is int
+                and event["monotonic_ns"] >= current["identity_valid_after_ns"]
+                and event.get(gid_field) == current.get("endpoint_gid"))
 
     def in_clock(event):
         # The close is emitted after this evaluation, so the actual capture
@@ -1705,11 +1762,20 @@ def _execution_workers(events, raw_path):
             problems.append("actual_rmw_unknown")
         if actual and type(token.get("observed_domain_id")) is not int:
             problems.append("actual_domain_unknown")
+        incarnations = [e for e in lineage if e.get("event") == "endpoint_identity_transition"]
+        try:
+            current = endpoint_identity_at(events, token)
+        except ValueError as exc:
+            current = {}
+            problems.append("endpoint_incarnation_invalid:" + str(exc))
         workers.append({
             "role": token.get("worker_role", token.get("topology_worker_role")),
             "endpoint_role": worker_role_kind(token.get("role")), "logical_id": eid,
             "generation": generation, "worker_generation": token.get("worker_generation"),
             "endpoint_gid": token.get("endpoint_gid"), "endpoint_generation": token.get("endpoint_generation"),
+            "current_endpoint_gid": current.get("endpoint_gid"),
+            "incarnation_ordinal": current.get("incarnation_ordinal"),
+            "identity_transition_raw_refs": [ref(e) for e in incarnations],
             "pid": pid, "pgid": token.get("pgid"), "process_start_ticks": token.get("process_start_ticks"),
             "rmw_identifier": token.get("rmw_identifier") if actual else None,
             "rmw": token.get("rmw_identifier") if actual else None,
@@ -2299,8 +2365,15 @@ def run_topology(program, config, output_dir, *, backend=None):
                 if token.get("generation") < st["generation"] or not st["alive"]:
                     retired = [e for e in events if e.get("event") in {"endpoint_destroyed", "topology_endpoint_destroyed"}
                                and all(e.get(k) == token.get(k) for k in
-                                       ("logical_id", "generation", "endpoint_gid", "pid", "process_start_ticks", "endpoint_generation"))
+                                       ("logical_id", "generation", "pid", "process_start_ticks", "endpoint_generation"))
                                and e.get("cleanup_status") == "closed" and e["event_index"] > token["event_index"]]
+                    if len(retired) == 1:
+                        try:
+                            current = endpoint_identity_at(events, token, before_index=retired[0]["event_index"])
+                            if retired[0].get("endpoint_gid") != current.get("endpoint_gid"):
+                                retired = []
+                        except ValueError:
+                            retired = []
                     if len(retired) != 1:
                         lifecycle_ok = False
                         missing.append("retirement_capture_incomplete:" + eid)

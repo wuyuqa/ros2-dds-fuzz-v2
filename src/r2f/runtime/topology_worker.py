@@ -133,6 +133,70 @@ class TopologyBackendError(RuntimeError):
     """A backend/tool error, never a SUT verdict."""
 
 
+def _graph_local_gid(snapshot, node_name, kind):
+    rows = snapshot["publishers" if kind == "writer" else "subscriptions"]
+    own = [row for row in rows if row.get("node_name") == node_name]
+    if len(own) != 1:
+        raise TopologyBackendError("local_graph_endpoint_not_unique")
+    gid = own[0].get("endpoint_gid")
+    if (not isinstance(gid, str) or not re.fullmatch(r"[0-9a-f]{32}", gid)
+            or not any(c != "0" for c in gid)):
+        raise TopologyBackendError("local_graph_endpoint_gid_invalid")
+    return gid
+
+
+def _update_filter_identity(endpoint, graph, node_name, local_gid, incarnation,
+                            command, emit, *, timeout_sec=1.0):
+    """Observe a setter's identity change without dispatching executor callbacks."""
+    from .filter_backend import ContentFilterAdapter
+    command_id = command["command_id"]
+    common = {"command": "update_filter", "command_id": command_id,
+              "identity_source": "get_subscriptions_info_by_topic",
+              "topic": endpoint.topic_name}
+    started = time.monotonic_ns()
+    before = graph()
+    if _graph_local_gid(before, node_name, "reader") != local_gid:
+        raise TopologyBackendError("filter_identity_before_mismatch")
+    before_type = next(row["topic_type"] for row in before["subscriptions"]
+                       if row.get("node_name") == node_name)
+    emit("endpoint_identity_snapshot", phase="before", endpoint_gid=local_gid,
+         message_type=before_type, **common, **before)
+    adapter = ContentFilterAdapter()
+    adapter.attach(endpoint)
+    value = adapter.update(command.get("expression"), command.get("parameters"),
+                           field_types={"data": "string"},
+                           api_event=lambda stage, **fields: emit(
+                               "content_filter_api_call", command="update_filter",
+                               command_id=command_id, reader_gid=local_gid,
+                               api_stage=stage, api_monotonic_ns=time.monotonic_ns(), **fields))
+    deadline = time.monotonic() + timeout_sec
+    while True:
+        after = graph()
+        try:
+            after_gid = _graph_local_gid(after, node_name, "reader")
+            break
+        except TopologyBackendError:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(0.01)
+    after_type = next(row["topic_type"] for row in after["subscriptions"]
+                      if row.get("node_name") == node_name)
+    emit("endpoint_identity_snapshot", phase="after", endpoint_gid=after_gid,
+         message_type=after_type, **common, **after)
+    emit("content_filter_dynamic_update", command="update_filter", command_id=command_id,
+         reader_gid=after_gid, endpoint_gid=after_gid, before_gid=local_gid,
+         after_gid=after_gid, update_started_ns=started,
+         update_finished_ns=time.monotonic_ns(), filter_receipt=value)
+    next_incarnation = incarnation + (after_gid != local_gid)
+    if after_gid != local_gid:
+        emit("endpoint_identity_transition", schema="r2f.endpoint-identity-transition/v1",
+             before_gid=local_gid, after_gid=after_gid,
+             incarnation_before=incarnation, incarnation_after=next_incarnation,
+             endpoint_gid=after_gid,
+             api="rclpy.subscription.Subscription.set_content_filter", **common)
+    return after_gid, next_incarnation
+
+
 class TopologyBackendBlocked(TopologyBackendError):
     """Preflight or capability admission blocked; no endpoint was launched."""
 
@@ -917,6 +981,7 @@ def _worker_main(argv):
     executor = SingleThreadedExecutor(context=context)
     executor.add_node(node)
     local_gid = None
+    incarnation_ordinal = 0
     receive_sequence = 0
     endpoint_generation = node_token
 
@@ -994,7 +1059,7 @@ def _worker_main(argv):
         created_ns = (filter_configuration["creation_returned_monotonic_ns"]
                       if filter_configuration is not None else time.monotonic_ns())
 
-        def graph():
+        def graph(*, authenticate=True):
             def entry(info):
                 profile = info.qos_profile
                 return {
@@ -1010,14 +1075,20 @@ def _worker_main(argv):
                         "liveliness_lease_duration_ns": profile.liveliness_lease_duration.nanoseconds,
                     },
                 }
-            publishers = [entry(x) for x in node.get_publishers_info_by_topic(config["topic"])]
-            subscriptions = [entry(x) for x in node.get_subscriptions_info_by_topic(config["topic"])]
+            publishers = [entry(x) for x in node.get_publishers_info_by_topic(endpoint.topic_name)]
+            subscriptions = [entry(x) for x in node.get_subscriptions_info_by_topic(endpoint.topic_name)]
             nonlocal local_gid
-            rows = publishers if kind == "writer" else subscriptions
-            for item in rows:
-                if item["node_name"] == node_name:
-                    local_gid = item["endpoint_gid"]
-            return {"publishers": publishers, "subscriptions": subscriptions}
+            snapshot = {"publishers": publishers, "subscriptions": subscriptions}
+            if authenticate:
+                rows = publishers if kind == "writer" else subscriptions
+                if local_gid is None and not any(x["node_name"] == node_name for x in rows):
+                    return snapshot
+                observed = _graph_local_gid(snapshot, node_name, kind)
+                if local_gid is None:
+                    local_gid = observed
+                elif local_gid != observed:
+                    raise TopologyBackendError("unreceipted_endpoint_identity_change")
+            return snapshot
 
         initial_graph = graph()
         deadline = time.monotonic() + float(config.get("startup_timeout_sec", 10.0))
@@ -1140,20 +1211,15 @@ def _worker_main(argv):
                 emit("graph_snapshot", command_id=command_id, **graph())
                 emit("command_done", command_id=command_id)
             elif command["command"] == "update_filter" and kind == "reader":
-                from .filter_backend import ContentFilterAdapter
-                started = time.monotonic_ns()
-                adapter = ContentFilterAdapter()
-                adapter.attach(endpoint)
-                value = adapter.update(command.get("expression"), command.get("parameters"),
-                                       field_types={"data": "string"},
-                                       api_event=lambda stage, **fields: emit(
-                                           "content_filter_api_call", command_id=command_id,
-                                           reader_gid=local_gid, api_stage=stage,
-                                           api_monotonic_ns=time.monotonic_ns(), **fields))
-                emit("content_filter_dynamic_update", command_id=command_id,
-                     reader_gid=local_gid, update_started_ns=started,
-                     update_finished_ns=time.monotonic_ns(), filter_receipt=value)
-                emit("command_done", command_id=command_id)
+                local_gid, incarnation_ordinal = _update_filter_identity(
+                    endpoint, lambda: graph(authenticate=False), node_name, local_gid,
+                    incarnation_ordinal, command, emit)
+                liveliness.gid = local_gid
+                if liveliness.peer_sampler is not None:
+                    liveliness.peer_sampler.gid = local_gid
+                emit("command_done", command="update_filter", command_id=command_id,
+                     endpoint_gid=local_gid, reader_gid=local_gid,
+                     incarnation_ordinal=incarnation_ordinal)
             elif command["command"] == "publish_batch" and kind == "writer":
                 sequences = command.get("sequences")
                 interval = command.get("interval_sec", 0.0)
@@ -1356,7 +1422,7 @@ class _EndpointProcess:
         if command == "snapshot":
             created = next((e for e in reversed(self.events) if e.get("event") == "endpoint_created"), {})
             self.emit("topology_snapshot_requested", command="snapshot", command_id=command_id,
-                      **{k: created.get(k) for k in ("logical_id", "generation", "endpoint_gid", "pid", "process_start_ticks", "endpoint_generation")})
+                      **{k: (self.metadata or {}).get(k, created.get(k)) for k in ("logical_id", "generation", "endpoint_gid", "pid", "process_start_ticks", "endpoint_generation")})
         data = (json.dumps(payload) + "\n").encode()
         audit = command == "assert_liveliness"
         if audit:
@@ -2006,6 +2072,9 @@ class RosTopologyBackend:
                 "topic": spec["topic"], "type_name": spec["type_name"],
                 # Preserve child API observation separately from requested type.
                 "message_type": row.get("message_type"),
+                "run_id": row.get("run_id"), "domain_id": row.get("domain_id"),
+                "monotonic_clock_identity": deepcopy(row.get("monotonic_clock_identity")),
+                "incarnation_ordinal": 0,
                 "qos": deepcopy(spec["qos"]), "public_qos": prepared["public_qos"],
                 "endpoint_gid": gid, "endpoint_generation": row["endpoint_generation"],
                 "pid": pid, "pgid": row.get("pgid"), "process_start_ticks": ticks,
@@ -2069,10 +2138,21 @@ class RosTopologyBackend:
 
     def update_filter(self, handle, expression, parameters):
         command_id = self._batch(handle, "update_filter", expression=expression, parameters=parameters)
+        from .endpoint_incarnation import validate_filter_identity_update
+        try:
+            token = validate_filter_identity_update(
+                handle["process"].events,
+                {k: v for k, v in handle.items() if k != "process"}, command_id)
+        except ValueError as exc:
+            raise TopologyBackendError("filter_identity_validation_failed:" + str(exc)) from exc
         rows = [e for e in handle["process"].events if e.get("event") == "content_filter_dynamic_update"
                 and e.get("command_id") == command_id]
         if len(rows) != 1:
             raise TopologyBackendError("dynamic_filter_receipt_missing_or_duplicate")
+        identity = {key: token[key] for key in
+                    ("endpoint_gid", "incarnation_ordinal", "identity_valid_after_ns")}
+        handle.update(identity)
+        handle["process"].metadata.update(identity)
         return {"command_id": command_id, "filter_receipt": deepcopy(rows[0].get("filter_receipt")),
                 "worker_event": deepcopy(rows[0])}
 
