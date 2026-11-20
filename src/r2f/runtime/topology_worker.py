@@ -2002,6 +2002,8 @@ class RosTopologyBackend:
                 "logical_id": spec["logical_id"], "role": spec["role"],
                 "generation": generation, "worker_role": worker_role,
                 "topic": spec["topic"], "type_name": spec["type_name"],
+                # Preserve child API observation separately from requested type.
+                "message_type": row.get("message_type"),
                 "qos": deepcopy(spec["qos"]), "public_qos": prepared["public_qos"],
                 "endpoint_gid": gid, "endpoint_generation": row["endpoint_generation"],
                 "pid": pid, "pgid": row.get("pgid"), "process_start_ticks": ticks,
