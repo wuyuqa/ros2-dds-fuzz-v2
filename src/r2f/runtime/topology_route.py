@@ -656,12 +656,8 @@ def audit_topology_application(plan, input_layer_receipts, runtime):
             observed_status=observed_status)
         if not real and not fixture:
             audit["reasons"].append("raw_formal_execution_qualification_incomplete")
-        begins = [e for e in events if e.get("event") == "topology_action_begin"]
-        trace_complete = [e.get("action") for e in begins] == program["actions"]
-        ends = [e for e in events if e.get("event") == "topology_action_done"]
-        trace_complete = trace_complete and len(ends) == len(begins) and all(
-            a["event_index"] < b["event_index"] and (i + 1 == len(begins) or b["event_index"] < begins[i+1]["event_index"])
-            for i, (a, b) in enumerate(zip(begins, ends)))
+        from .topology_concurrency import action_trace_complete
+        trace_complete = action_trace_complete(events, program["actions"])
         final_actions = {a["action_id"]: a for a in program["actions"]}
         all_proofs = {aid: _action_proof(action, events) for aid, action in final_actions.items()}
         netem_audit_status = (audit.get("netem_application") or {}).get("status")

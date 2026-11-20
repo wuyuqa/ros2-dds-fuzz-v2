@@ -107,3 +107,46 @@ def audit_concurrency(events, actions, group):
             "concurrency_observed": bool(overlaps) and not fixture, "fixture_overlap_observed": bool(overlaps) and fixture,
             "fixture": fixture, "raw_refs": sorted(set(refs)), "publish_api_overlaps": overlaps,
             "candidate_eligible": False, "semantics": "strict_individual_publish_api_interval_overlap"}
+
+
+def action_trace_complete(events, actions):
+    """Check serial action blocks, allowing only raw-proven publish groups.
+
+    Controller begin/done order remains the program order. A concurrent block
+    must enclose its complete independently audited worker protocol; unrelated
+    actions remain strictly serial. Acceptance here grants no real overlap,
+    mutation hit, delivery completion or oracle result on its own.
+    """
+    begins = [e for e in events if e.get('event') == 'topology_action_begin']
+    ends = [e for e in events if e.get('event') == 'topology_action_done']
+    if ([e.get('action') for e in begins] != actions
+            or [e.get('action') for e in ends] != actions):
+        return False
+    for i, (action, begin, end) in enumerate(zip(actions, begins, ends)):
+        if (any(e.get('action_id') != action['action_id'] or e.get('action_index') != i
+                or type(e.get('event_index')) is not int for e in (begin, end))
+                or begin['event_index'] >= end['event_index']):
+            return False
+    previous_end, i = -1, 0
+    try:
+        while i < len(actions):
+            group = actions[i].get('params', {}).get('concurrency_group')
+            j = i + 1
+            if group is not None:
+                while j < len(actions) and actions[j].get('params', {}).get('concurrency_group') == group:
+                    j += 1
+                if j - i != 2 or any(a.get('op') != 'publish_batch' for a in actions[i:j]):
+                    return False
+                proof = audit_concurrency(events, actions, group)
+                # Neither requests before action begin nor action done before
+                # worker command completion may be hidden by the group marker.
+                if not (max(e['event_index'] for e in begins[i:j]) < min(proof['raw_refs'])
+                        and max(proof['raw_refs']) < min(e['event_index'] for e in ends[i:j])):
+                    return False
+            if previous_end >= min(e['event_index'] for e in begins[i:j]):
+                return False
+            previous_end = max(e['event_index'] for e in ends[i:j])
+            i = j
+    except (ValueError, KeyError, TypeError):
+        return False
+    return True
