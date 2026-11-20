@@ -55,7 +55,7 @@ _ACTION_PARAMS = {
     "publish_batch": ({"count", "start_sequence"}, {"interval_sec", "payload", "repeat_data_from", "concurrency_group"}),
     "update_filter": ({"expression", "parameters"}, set()),
     "snapshot": (set(), {"label", "timeout_sec"}),
-    "barrier": ({"condition", "timeout_sec"}, {"endpoint_ids"}),
+    "barrier": ({"condition", "timeout_sec"}, {"endpoint_ids", "publish_action_ids"}),
 }
 MUTATORS = (
     "change_topic", "change_qos", "change_filter", "add_endpoint",
@@ -261,12 +261,59 @@ def _shape(program):
         if op == "snapshot" and "label" in p and not _text(p["label"], empty=True, limit=128):
             _error(errors, f"{path}.params.label", "value", "bounded label text required")
         if op == "barrier":
-            if p["condition"] not in ("all_created", "matched", "delivery", "quiescent"):
+            if p["condition"] not in ("all_created", "matched", "delivery", "delivery_sentinel", "quiescent"):
                 _error(errors, f"{path}.params.condition", "value", "unknown barrier condition")
             targets = p.get("endpoint_ids", [])
             if (not isinstance(targets, list) or any(not isinstance(t, str) or t not in ids for t in targets)
                     or (all(isinstance(t, str) for t in targets) and len(set(targets)) != len(targets))):
                 _error(errors, f"{path}.params.endpoint_ids", "reference", "unique known endpoint ids required")
+    # Sentinel references are input dependencies, never predicted delivery.
+    endpoints = {e["logical_id"]: e for e in program["endpoints"]
+                 if isinstance(e, dict) and isinstance(e.get("logical_id"), str)}
+    prior, live = {}, {}
+    for i, action in enumerate(actions):
+        if not isinstance(action, dict) or not isinstance(action.get("params"), dict):
+            continue
+        op, eid, gen = action.get("op"), action.get("endpoint_id"), action.get("generation")
+        p = action["params"]
+        if op == "barrier" and p.get("condition") == "delivery_sentinel":
+            refs, targets = p.get("publish_action_ids"), p.get("endpoint_ids")
+            path = f"program.actions[{i}].params"
+            valid_refs = (isinstance(refs, list) and bool(refs)
+                          and all(isinstance(r, str) for r in refs)
+                          and len(set(refs)) == len(refs))
+            valid_targets = (isinstance(targets, list) and bool(targets)
+                             and all(isinstance(t, str) and t in endpoints for t in targets))
+            if not valid_refs:
+                _error(errors, path, "sentinel_publish_references", "unique nonempty publish_action_ids required")
+            if not valid_targets or not any(endpoints[t].get("role") == "reader" for t in targets):
+                _error(errors, path, "sentinel_endpoint_scope", "explicit writer and reader endpoint_ids required")
+            if valid_refs:
+                for ref in refs:
+                    pub = prior.get(ref, {})
+                    pp = pub.get("params", {})
+                    writer = pub.get("endpoint_id")
+                    if (pub.get("op") != "publish_batch" or pp.get("count") != 1
+                            or "repeat_data_from" in pp):
+                        _error(errors, path, "sentinel_publish_reference", "requires preceding single non-repeated publish_batch: " + ref)
+                    elif (not isinstance(writer, str) or not valid_targets or writer not in targets
+                          or endpoints.get(writer, {}).get("role") != "writer"
+                          or live.get(writer) != pub.get("generation")):
+                        _error(errors, path, "sentinel_current_generation", "requires scoped current writer generation: " + ref)
+            if valid_targets and any(t not in live for t in targets):
+                _error(errors, path, "sentinel_current_generation", "sentinel endpoints must be alive")
+        elif "publish_action_ids" in p:
+            _error(errors, f"program.actions[{i}].params", "sentinel_parameter", "publish_action_ids only belongs to delivery_sentinel")
+        # Shape errors already name invalid IDs. Do not use them as hash keys,
+        # but keep validating later sentinel actions rather than returning early.
+        if isinstance(eid, str) and eid in endpoints:
+            if op in ("create", "recreate"):
+                live[eid] = gen
+            elif op == "destroy":
+                live.pop(eid, None)
+        aid = action.get("action_id")
+        if _text(aid):
+            prior[aid] = action
     groups = {}
     for i, action in enumerate(actions):
         if not isinstance(action, dict) or not isinstance(action.get("params"), dict):
@@ -342,6 +389,12 @@ def _evaluate(program, count=None):
             requires += [_require("public_writer_manual_by_topic", None if policy is None else
                                   policy == "manual_by_topic", rule="writer_assert")]
         if op == "barrier":
+            if p["condition"] == "delivery_sentinel":
+                for ref in p["publish_action_ids"]:
+                    pub = next(a for a in actions if a["action_id"] == ref)
+                    requires.append(_require("sentinel_current_generation:" + ref,
+                                             states[pub["endpoint_id"]]["alive"] and
+                                             states[pub["endpoint_id"]]["generation"] == pub["generation"]))
             for target in p.get("endpoint_ids", []):
                 requires.append(_require("barrier_endpoint_alive:" + target, states[target]["alive"]))
             requires.append(_require("runtime_barrier:" + p["condition"], None, kind="observation"))
@@ -607,6 +660,7 @@ def _dependencies(program):
     for a in program["actions"]:
         aid, eid, op = a["action_id"], a["endpoint_id"], a["op"]
         refs = set(a.get("depends_on", []))
+        refs.update(a["params"].get("publish_action_ids", []))
         if eid in last:
             refs.add(last[eid])
         if fence:

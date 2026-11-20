@@ -46,8 +46,8 @@ def assert_matrix(program):
     assert by_id['original']['params']['count'] == 1
     assert by_id['original']['depends_on'] == ['matched']
     assert by_id['published_prior']['depends_on'] == ['allow_all']
-    assert by_id['reject_snapshot']['depends_on'] == ['reject_sentinel']
-    assert by_id['restore_snapshot']['depends_on'] == ['restore_sentinel']
+    assert by_id['reject_snapshot']['depends_on'] == ['reject_sentinel_observed']
+    assert by_id['restore_snapshot']['depends_on'] == ['restore_sentinel_observed']
 
 
 def test_seed_opt_in_and_matrix():
@@ -118,3 +118,21 @@ def test_parameter_like_matches_complete_serialized_envelope(metadata):
     # Prove the predicate is about full String.data: a token in metadata alone
     # also matches. This is NOT normal original metadata and grants no effect.
     assert pattern.fullmatch(envelope(original_payload, dict(metadata, run_id=SENTINEL_TOKEN)))
+
+
+def test_CFT_phases_wait_for_exact_sentinels_not_filtered_middle_delivery():
+    program = cft_matrix_program()
+    actions = program['actions']
+    refs = {a['action_id']: i for i, a in enumerate(actions)}
+    expected = [('original', 'allow_all'), ('published_prior', 'reject_original'),
+                ('reject_sentinel', 'restore_allow_all'), ('restore_sentinel', 'restore_snapshot')]
+    for publish, later in expected:
+        waits = [a for a in actions if a['op'] == 'barrier'
+                 and a['params'].get('condition') == 'delivery_sentinel'
+                 and a['params'].get('publish_action_ids') == [publish]]
+        assert len(waits) == 1
+        wait = waits[0]
+        assert refs[publish] < refs[wait['action_id']] < refs[later]
+        assert set(wait['params']['endpoint_ids']) == {'w0', 'r0', 'r1'}
+        assert publish in wait['depends_on']
+    assert topology_model.validate_program(program)['status'] == 'valid'

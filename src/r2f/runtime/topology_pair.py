@@ -585,8 +585,64 @@ def pair_delivery_fact(pair, events, *, active_writers_on_topic=None, real_ros=F
     return fact
 
 
+def _sentinel_delivery(pairs, handles, events, publications):
+    """Exact raw send/receive witnesses only; no all-samples obligation."""
+    witnesses, gaps = [], []
+    for pub in publications:
+        aid, writer, gen = pub["action_id"], pub["endpoint_id"], pub["generation"]
+        if (writer not in handles or handles[writer].get("generation") != gen
+                or pub["op"] != "publish_batch" or pub["params"].get("count") != 1
+                or "repeat_data_from" in pub["params"]):
+            raise TopologyUnsupported("sentinel_current_generation_or_publish_invalid", aid)
+        sends = [e for e in events if e.get("event") == "send" and e.get("phase") == aid]
+        if (len(sends) != 1 or sends[0].get("logical_id") != writer
+                or sends[0].get("generation") != gen
+                or sends[0].get("send_sequence") != pub["params"]["start_sequence"]):
+            gaps.append({"publish_action_id": aid, "reason": "sentinel_exact_send_missing_or_ambiguous"})
+            continue
+        readers = [h for h in handles.values() if h.get("role") == "reader"]
+        for reader in readers:
+            pair = next((p for p in pairs if p.get("writer") == writer
+                         and p.get("reader") == reader["logical_id"]), None)
+            found, reason = None, "sentinel_receive_identity_missing"
+            if pair is not None and pair.get("writer_gid") and pair.get("reader_gid"):
+                for receive in events:
+                    if receive.get("event") != "receive":
+                        continue
+                    witness, witness_reason = payload_delivery_witness(pair, receive, events)
+                    if witness is None:
+                        reason = witness_reason or "sentinel_receive_identity_missing"
+                        continue
+                    if witness.get("send_ref") != sends[0].get("event_index"):
+                        reason = "sentinel_receive_for_other_send"
+                        continue
+                    reason = "sentinel_receive_gid_or_chronology_mismatch"
+                    sent = sends[0]
+                    clock = sent.get("monotonic_clock_identity")
+                    begin, returned, emitted, received = (sent.get("publish_begin_ns"),
+                        sent.get("publish_return_ns"), sent.get("monotonic_ns"), receive.get("monotonic_ns"))
+                    # Independent worker stdout is merged by capture order, not
+                    # DDS causality. A callback may precede publish return; bind
+                    # it to the API begin in the same proven monotonic clock.
+                    if (receive.get("publisher_gid") in (None, pair.get("writer_gid"))
+                            and isinstance(clock, dict) and bool(clock)
+                            and receive.get("monotonic_clock_identity") == clock
+                            and all(type(v) is int for v in (begin, returned, emitted, received))
+                            and 0 < begin <= returned <= emitted and begin <= received):
+                        found = {"publish_action_id": aid, **witness,
+                                 "chronology_basis": "same_clock_publish_begin_before_receive"}
+                        break
+            if found:
+                witnesses.append(found)
+            else:
+                gaps.append({"publish_action_id": aid, "reader": reader["logical_id"], "reason": reason})
+        if not readers:
+            gaps.append({"publish_action_id": aid, "reason": "sentinel_reader_scope_missing"})
+    return bool(publications) and not gaps, {"sentinel_witnesses": witnesses, "sentinel_gaps": gaps}
+
+
 def _barrier_evaluate(backend, condition, endpoint_ids, handles, events,
-                      previous=None):
+                      previous=None, publications=None):
     if condition == "all_created":
         targets = list(endpoint_ids) if endpoint_ids else list(handles)
         missing = [eid for eid in targets if eid not in handles]
@@ -595,14 +651,16 @@ def _barrier_evaluate(backend, condition, endpoint_ids, handles, events,
         ok = (not missing and bool(rows)
               and all(h.get("alive") and h.get("endpoint_gid") and h.get("pid") for h in rows))
         return ok, {"alive": alive, "missing_endpoints": missing}
-    if condition in ("matched", "delivery", "quiescent") and not handles:
+    if condition in ("matched", "delivery", "delivery_sentinel", "quiescent") and not handles:
         # A barrier over zero live endpoints cannot be satisfied by an empty
         # snapshot alone; it stays an observation gap.
         return False, {"reason": "no_live_endpoints_for_barrier"}
-    if condition in ("matched", "delivery"):
+    if condition in ("matched", "delivery", "delivery_sentinel"):
         snapshot = backend.snapshot(handles)
         real_ros = bool(getattr(backend, "real_ros", False))
         pairs = _pair_rows(handles, snapshot, events, real_ros=real_ros)
+        if condition == "delivery_sentinel":
+            return _sentinel_delivery(pairs, handles, events, publications or [])
         if condition == "matched":
             ok = bool(pairs) and all(p["status"] == "matched" for p in pairs)
         else:
@@ -2892,7 +2950,7 @@ def run_topology(program, config, output_dir, *, backend=None):
                     timeout = float(params.get("timeout_sec", 1.0))
                     explicit = params.get("endpoint_ids")
                     targets = explicit or list(state)
-                    if condition in ("matched", "delivery") and explicit:
+                    if condition in ("matched", "delivery", "delivery_sentinel") and explicit:
                         # Only model-declared barrier targets are preconditions; an
                         # implicit "all endpoints" scope stays an observation gap.
                         stale = [t for t in targets
@@ -2922,7 +2980,9 @@ def run_topology(program, config, output_dir, *, backend=None):
                             satisfied, detail = _barrier_evaluate(
                                 backend, condition, targets,
                                 {eid: state[eid]["handle"] for eid in targets if state[eid]["alive"]},
-                                events, previous=previous)
+                                events, previous=previous,
+                                publications=[p for p in effective_program["actions"][:action_index]
+                                              if p["action_id"] in params.get("publish_action_ids", [])])
                         except TopologyUnsupported as exc:
                             record_guard(action, exc.code, str(exc), kind="capability",
                                          before=before)

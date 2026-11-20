@@ -27,14 +27,23 @@ def cft_matrix_program():
         actions.append(topology_model._action(aid, op, eid, 1 if eid else None,
                                               params, depends_on=deps))
 
+    def await_sample(publish_id):
+        # Observe the exact later sample, not every sample the filter may reject.
+        append(publish_id + "_observed", "barrier", params={
+            "condition": "delivery_sentinel", "timeout_sec": 5.0,
+            "endpoint_ids": [e["logical_id"] for e in program["endpoints"]],
+            "publish_action_ids": [publish_id]}, dependencies=[publish_id])
+
     append("matched", "barrier", params={"condition": "matched", "timeout_sec": 5.0,
            "endpoint_ids": [e["logical_id"] for e in program["endpoints"]]},
            dependencies=[a["action_id"] for a in actions])
     append("original", "publish_batch", "w0", {"count": 1, "start_sequence": 0,
            "payload": ORIGINAL_TOKEN})
+    await_sample("original")
     append("allow_all", "update_filter", "r0", {"expression": "", "parameters": []})
     append("published_prior", "publish_batch", "w0", {"count": 1, "start_sequence": 1,
            "payload": "L04PRIOR4D8E"})
+    await_sample("published_prior")
     # Only sentinel-bearing complete String.data matches; original has no such token.
     append("reject_original", "update_filter", "r0",
            {"expression": "data LIKE %0", "parameters": ["'%" + SENTINEL_TOKEN + "%'"]})
@@ -42,12 +51,14 @@ def cft_matrix_program():
            "repeat_data_from": "original"}, dependencies=["original", "reject_original"])
     append("reject_sentinel", "publish_batch", "w0", {"count": 1, "start_sequence": 3,
            "payload": SENTINEL_TOKEN})
+    await_sample("reject_sentinel")
     append("reject_snapshot", "snapshot", params={"label": "reject-window"})
     append("restore_allow_all", "update_filter", "r0", {"expression": "", "parameters": []})
     append("repeat_restored", "publish_batch", "w0", {"count": 1, "start_sequence": 4,
            "repeat_data_from": "original"}, dependencies=["original", "restore_allow_all"])
     append("restore_sentinel", "publish_batch", "w0", {"count": 1, "start_sequence": 5,
            "payload": SENTINEL_TOKEN})
+    await_sample("restore_sentinel")
     append("restore_snapshot", "snapshot", params={"label": "restore-window"})
     program["actions"] = actions
     if topology_model.validate_program(program)["status"] != "valid":
