@@ -405,6 +405,26 @@ def _topology_conformance_signature(metadata, facts, rule):
             if type(seq) is not int or seq < 0:
                 raise ValueError("topology witness sequence invalid")
             send, receive = event(sample.get("send_ref")), event(sample.get("receive_ref"))
+            from r2f.campaign.topology_sample_attribution import native_delivery_identity
+            native = native_delivery_identity(receive,
+                [ev for ev in events if ev.get("event") == "send"], events,
+                ref=lambda ev: dict(path=metadata["raw_path"], sha256=metadata["raw_sha256"],
+                                    event_index=ev["event_index"]))
+            if native is not None:
+                # Compare every native core field, including nested scope,
+                # control and incarnation refs. Body sequence is deliberately
+                # absent: repeated complete String.data retains its old value.
+                if any(key not in sample or canonical_hash(sample[key]) != canonical_hash(value)
+                       for key, value in native.items()):
+                    raise ValueError("topology native witness differs from raw recomputation")
+                for role, ev in (("writer", send), ("reader", receive)):
+                    token = tokens[(pair[role], pair[role + "_generation"])]
+                    if any(ev.get(key) != token.get(key) for key in
+                           ("logical_id", "generation", "endpoint_generation", "pid", "process_start_ticks")):
+                        raise ValueError("topology native witness differs from raw worker identity")
+                return seq, send, receive
+            if ("native_witness" in sample or sample.get("basis") == "direct_gid_scoped_publish_occurrence"):
+                raise ValueError("topology native witness without raw native declaration")
             for role, ev, kind in (("writer", send, "send"), ("reader", receive, "receive")):
                 token = tokens[(pair[role], pair[role + "_generation"])]
                 if (ev.get("event") != kind or ev.get("logical_id") != token["logical_id"]
@@ -446,7 +466,73 @@ def _topology_conformance_signature(metadata, facts, rule):
             if not isinstance(samples, list):
                 return None
             attributed = [witness(pair, sample) for sample in samples]
+            native_samples = [sample for sample in samples if "native_witness" in sample]
+            if len({sample["receive_ref"]["event_index"] for sample in native_samples}) != len(native_samples):
+                return None
+            native_peer_kinds = {"direct_native_per_peer", "direct_mixed_per_peer"}
+            raw_native_peer = any(
+                ev.get("logical_id") in (pair["writer"], pair["reader"])
+                and ev.get("generation") == pair["writer_generation" if ev.get("logical_id") == pair["writer"]
+                                                 else "reader_generation"]
+                and (ev.get("event") == "native_peer_provider_selected"
+                     or ev.get("event") == "endpoint_created" and ev.get("observation_mode") == "instrumentation"
+                     or ev.get("event") == "match_snapshot" and (
+                         ev.get("peer_proof_source") == "fastdds_native_stateful_peer_snapshot"
+                         or "native_peer_observation" in ev or ev.get("observation_mode") == "instrumentation"))
+                for ev in events)
+            native_peer = raw_native_peer or match.get("detail", {}).get("proof_kind") in native_peer_kinds
+
+            def native_peer_proof():
+                from r2f.campaign.topology_state_projection import _Projection
+                from r2f.runtime.endpoint_incarnation import endpoint_identity_at
+                if (match.get("status") != "observed" or match.get("value") != pair.get("observed_match")
+                        or match.get("detail", {}).get("proof_kind") not in native_peer_kinds):
+                    return None
+                refs = match.get("refs", [])
+                rows = [event(ref) for ref in refs]
+                if not rows:
+                    return None
+                # Canonical facts bind their final observation boundary. Do
+                # not truncate raw at a caller-selected earlier match ref.
+                boundary = event(facts.get("state_projection_receipt", {}).get("after", {}).get("boundary_ref"))
+                if any(type(ev.get("event_index")) is not int or ev["event_index"] != index
+                       or type(ev.get("monotonic_ns")) is not int or ev["monotonic_ns"] <= 0
+                       for index, ev in enumerate(events)):
+                    return None
+                program = metadata["final_input"]["topology_program"]
+                bindings = [ev for ev in events[:boundary["event_index"] + 1]
+                            if ev.get("event") == "input_binding"]
+                if (len(bindings) != 1 or bindings[0].get("run_id") != metadata["run_id"]
+                        or bindings[0].get("receipt", {}).get("program_sha256") != canonical_hash(program)):
+                    return None
+                projection = _Projection(program, metadata["raw_path"], metadata["raw_sha256"], events,
+                                         {"input_ref": {"event_index": bindings[0]["event_index"]}})
+                current = []
+                for role in ("writer", "reader"):
+                    creation = event(tokens[(pair[role], pair[role + "_generation"])]["creation_ref"])
+                    current.append(endpoint_identity_at(events, creation,
+                                   before_index=boundary["event_index"] + 1))
+                w, r = current
+                wc, rc = projection.snapshot_chain(w, boundary), projection.snapshot_chain(r, boundary)
+                value, required_rows, isolation = projection.match(w, r, wc, rc, boundary)
+                sources = {chain[1].get("peer_proof_source") for chain in (wc, rc)}
+                kind = ("direct_native_per_peer" if sources == {"fastdds_native_stateful_peer_snapshot"}
+                        else "direct_mixed_per_peer")
+                valid = (isolation is None and value == pair.get("observed_match")
+                        and "fastdds_native_stateful_peer_snapshot" in sources
+                        and value in {"bidirectional", "writer_only", "reader_only", "none"}
+                        and match["detail"]["proof_kind"] == kind
+                        and ("peer_proof_sources" not in match["detail"]
+                             or match["detail"]["peer_proof_sources"] == sorted(sources))
+                        and {ev["event_index"] for ev in required_rows}
+                            <= {ev["event_index"] for ev in rows})
+                return value if valid else None
+
+            native_match_value = native_peer_proof() if native_peer else None
+
             def direct_peer_match():
+                if native_peer:
+                    return native_match_value in {"bidirectional", "writer_only", "reader_only"}
                 if (match.get("status") != "observed" or match.get("value") != pair.get("observed_match")
                         or match.get("detail", {}).get("proof_kind") != "direct_per_peer_api"):
                     return False
@@ -466,6 +552,11 @@ def _topology_conformance_signature(metadata, facts, rule):
                             "reader_only": {"reader"}}.get(pair.get("observed_match"))
                 return required is not None and required <= directions
 
+            # A native declaration selects the strict peer contract even if
+            # samples exist or the claimed pair is compatible. No GID-list or
+            # communication fallback may rescue a malformed native receipt.
+            if native_peer and native_match_value is None:
+                return None
             graph_mismatch = (pair.get("compatibility") == "incompatible"
                 and compatibility.get("status") == "observed" and compatibility.get("value") == "incompatible"
                 and (bool(attributed) or direct_peer_match()))

@@ -1070,11 +1070,70 @@ def _live_history_windows(audit, pairs, projection, deliveries):
     return windows
 
 
-def _live_history_send_coverage(audit, windows, send):
+def _native_filter_rejection_disposition(audit, row, send, observations):
+    """Account ONE actual rejected sample, never rewrite a missing delivery.
+
+    The caller supplies independently revalidated actual evaluate observations.
+    A same-action accepted AND delivered later sentinel is required in this
+    exact incarnation/window. Configuration/model predictions never suffice.
+    """
+    detail = row["proofs"]["delivery_closure"]["detail"]
+    sequence = send.get("send_sequence")
+    if (row["delivery_closure"] != "closed_with_gap" or sequence not in detail.get("missing", [])
+            or sequence not in detail.get("expected", []) or sequence in detail.get("received", [])):
+        return None
+    opened, close = audit.resolve(row["open_ref"]), audit.resolve(row["close_ref"])
+    if close.get("window_complete") is not True:
+        return None
+    def bound(observation, expected_decision):
+        return (observation.get("decision") is expected_decision
+            and observation.get("writer") == row["writer"]
+            and observation.get("writer_generation") == row["writer_generation"]
+            and observation.get("writer_gid") == row["writer_identity"]["endpoint_gid"]
+            and observation.get("reader") == row["reader"]
+            and observation.get("reader_generation") == row["reader_generation"]
+            and observation.get("reader_gid") == row["reader_identity"]["endpoint_gid"]
+            and observation.get("reader_incarnation") == row["reader_identity"]["incarnation_ordinal"]
+            and opened["monotonic_ns"] <= observation.get("capture_started_ns", -1)
+                <= observation.get("capture_finished_ns", -1) <= close["monotonic_ns"]
+            and opened["event_index"] < observation.get("decision_ref", {}).get("event_index", -1)
+                < close["event_index"])
+    rejected = [o for o in observations if bound(o, False)
+                and o.get("sequence") == sequence and o.get("send_ref") == audit.ref(send)]
+    if len(rejected) != 1:
+        return None
+    rejected = rejected[0]
+    sentinel = close.get("sentinel_sequence")
+    accepted = [o for o in observations if bound(o, True) and o.get("sequence") == sentinel
+                and all(o.get(k) is not None and o[k] == rejected.get(k)
+                        for k in ("action_id", "action_result_ref", "state_ref"))
+                and rejected["capture_finished_ns"] <= o["capture_started_ns"]]
+    if len(accepted) != 1 or not _integer(sentinel) or sentinel <= sequence:
+        return None
+    accepted = accepted[0]
+    witnesses = [d for d in row["delivery_witnesses"] if d["sequence"] == sentinel
+                 and d["send_ref"] == accepted["send_ref"]
+                 and d.get("reader_gid") == accepted["reader_gid"]]
+    if len(witnesses) != 1 or accepted["send_ref"]["event_index"] <= send["event_index"]:
+        return None
+    received = audit.resolve(witnesses[0]["receive_ref"])
+    if accepted["capture_finished_ns"] > received["monotonic_ns"]:
+        return None
+    return {"schema": "r2f.cft-native-rejection-window-evidence/v1",
+            "filter_effect_observed": True, "candidate_eligible": False,
+            "basis": "actual_native_false_and_control_with_same_incarnation_accepted_delivered_sentinel",
+            "open_ref": row["open_ref"], "close_ref": row["close_ref"],
+            "rejected": rejected, "accepted_sentinel": accepted,
+            "sentinel_delivery_witness": witnesses[0],
+            "scope": "exact_sample_filter_disposition_not_delivery_or_candidate"}
+
+
+def _live_history_send_coverage(audit, windows, send, *, filter_decisions=()):
     """Every then-live reader and EVERY overlapping window needs this sample.
 
-    Even an otherwise closed window cannot waive its missing samples. Open tails,
-    invalid/duplicate/missing closes and old reader generations remain unresolved.
+    Missing samples require an exact independently validated native rejection,
+    never just configuration or absence. Open tails, invalid/duplicate/missing
+    closes and old reader generations remain unresolved.
     """
     live = {}
     for event in audit.events[:send["event_index"]]:
@@ -1111,20 +1170,33 @@ def _live_history_send_coverage(audit, windows, send):
         sequence = send.get("send_sequence")
         witnesses = [d for d in row["delivery_witnesses"] if d["send_ref"] == audit.ref(send)
                      and d["sequence"] == sequence]
+        rejection = None
         if (sequence not in detail.get("expected", []) or sequence not in detail.get("received", [])
                 or sequence in detail.get("missing", []) or len(witnesses) != 1):
-            return None
-        covered.append({"reader": row["reader"], "reader_generation": row["reader_generation"],
-                        "writer_generation": row["writer_generation"], "open_ref": row["open_ref"],
-                        "close_ref": row["close_ref"], "closure": row["delivery_closure"],
-                        "writer_identity": row["writer_identity"], "reader_identity": row["reader_identity"],
-                        "delivery_witness": witnesses[0]})
+            # A received sample never simultaneously becomes a filtered-away
+            # sample. Retain both contradictions and unproved gaps unresolved.
+            if witnesses:
+                return None
+            rejection = _native_filter_rejection_disposition(audit, row, send, filter_decisions)
+            if rejection is None:
+                return None
+        item = {"reader": row["reader"], "reader_generation": row["reader_generation"],
+                "writer_generation": row["writer_generation"], "open_ref": row["open_ref"],
+                "close_ref": row["close_ref"], "closure": row["delivery_closure"],
+                "writer_identity": row["writer_identity"], "reader_identity": row["reader_identity"],
+                "delivery_witness": witnesses[0] if witnesses else None,
+                "delivery_disposition": "received" if rejection is None else "filtered_by_actual_native_decision"}
+        if rejection is not None:
+            item["filter_decision_evidence"] = rejection
+        covered.append(item)
         seen.add(row["reader"])
     if seen != set(live):
         return None
     return {"send_ref": audit.ref(send), "writer": send["logical_id"],
             "writer_generation": send["generation"], "reader_windows": covered,
-            "scope": "received_sample_in_still_live_generation_historical_windows"}
+            "scope": ("received_or_actual_filtered_sample_in_still_live_generation_historical_windows"
+                      if any("filter_decision_evidence" in row for row in covered) else
+                      "received_sample_in_still_live_generation_historical_windows")}
 
 
 def facts_from_events(events, runtime, config):
@@ -1181,6 +1253,13 @@ def facts_from_events(events, runtime, config):
         empty_windows = _historical_no_obligation_windows(a, facts["pairs"], projection)
         historical = _recreated_history_windows(a, facts["pairs"], projection, facts["deliveries"])
         facts["historical_live_windows"] = _live_history_windows(a, facts["pairs"], projection, facts["deliveries"])
+        from .topology_filter_decision import native_filter_decision_evidence
+        facts["native_filter_decision_evidence"] = native_filter_decision_evidence(
+            a.program, a.events, peer_reference=a.native_peer_reference, ref=a.ref)
+        decision_evidence = facts["native_filter_decision_evidence"]
+        # A declared capture with partial/broken worker provenance cannot waive
+        # a historical delivery obligation using its surviving subset.
+        filter_decisions = decision_evidence["observations"] if not decision_evidence["unknowns"] else []
         # Preserve the existing final-window gate exactly; do not relabel its
         # already-accounted sends as additional historical coverage.
         current_window_sends = {s["event_index"] for s in sends if any(
@@ -1190,8 +1269,12 @@ def facts_from_events(events, runtime, config):
             for p in facts["pairs"])}
         facts["historical_send_coverage"] = [coverage for send in sends
             if (coverage := (_recreated_history_send_coverage(a, historical, send)
-                             or (_live_history_send_coverage(a, facts["historical_live_windows"], send)
+                             or (_live_history_send_coverage(a, facts["historical_live_windows"], send,
+                                                                filter_decisions=filter_decisions)
                                  if send["event_index"] not in current_window_sends else None))) is not None]
+        facts["dynamic_filter_decision_effects"] = [
+            row["filter_decision_evidence"] for coverage in facts["historical_send_coverage"]
+            for row in coverage["reader_windows"] if "filter_decision_evidence" in row]
         covered_history = {c["send_ref"]["event_index"] for c in facts["historical_send_coverage"]}
         facts["unresolved_historical_obligations"] = [a.ref(s) for s in sends
             if s["event_index"] not in current_window_sends and not _no_obligation_send_covered(a, empty_windows, s)
