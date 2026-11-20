@@ -143,9 +143,20 @@ def _direct_peer_membership(token, peer, snapshot, events, *, before_index=None)
     incomplete capture and changed generations are not membership evidence.
     """
     match = snapshot["match_snapshot"]
+    native_declared = (match.get("observation_mode") == "instrumentation"
+        or token.get("observation_mode") == "instrumentation"
+        or match.get("peer_proof_source") == "fastdds_native_stateful_peer_snapshot"
+        or (isinstance(match.get("native_peer_observation"), dict)
+            and match["native_peer_observation"].get("schema")
+                == "r2f.fastdds-native-matched-peer-observation/v1")
+        or any(row.get("event") == "native_peer_provider_selected"
+               and all(token.get(k) is not None and row.get(k) == token[k]
+                       for k in ("pid", "process_start_ticks", "endpoint_generation"))
+               for row in (events or [])[:before_index]))
     if "peer_gids_complete" not in match and "peer_proof_source" not in match:
-        return None, "per_peer_api_absent"
-    if (match.get("peer_proof_source") != "dds_matched_endpoint_api"
+        return None, "native_peer_proof_missing" if native_declared else "per_peer_api_absent"
+    if (match.get("peer_proof_source") not in {
+                "dds_matched_endpoint_api", "fastdds_native_stateful_peer_snapshot"}
             or match.get("peer_gids_complete") is not True
             or not isinstance(match.get("matched_peer_gids"), list)):
         return None, "per_peer_api_incomplete"
@@ -169,6 +180,13 @@ def _direct_peer_membership(token, peer, snapshot, events, *, before_index=None)
                    for key, value in snapshot["graph_snapshot"].items())):
         return None, "per_peer_snapshot_not_raw_backed"
     request = chain[0]
+    if match.get("peer_proof_source") == "fastdds_native_stateful_peer_snapshot":
+        from r2f.instrumentation.fastdds_peer.receipt import validate_observation
+        reason = validate_observation(match.get("native_peer_observation"), match, token, events, request)
+        if reason is not None:
+            return None, reason
+    elif native_declared:
+        return None, "native_peer_proof_source_mislabeled"
     limit = len(events) if before_index is None else before_index
     live = []
     for created in events[:request["event_index"]]:
@@ -255,6 +273,11 @@ def pair_graph_facts(writer_handle, reader_handle, writer_snapshot, reader_snaps
         return fact
     wmatch, rmatch = writer_snapshot["match_snapshot"], reader_snapshot["match_snapshot"]
     wgraph, rgraph = writer_snapshot["graph_snapshot"], reader_snapshot["graph_snapshot"]
+    fact["peer_proof_sources"] = {"writer": wmatch.get("peer_proof_source"),
+                                  "reader": rmatch.get("peer_proof_source")}
+    if "fastdds_native_stateful_peer_snapshot" in fact["peer_proof_sources"].values():
+        fact["observation_mode"] = "instrumentation"
+        fact["source"] = "native_peer_snapshot_and_public_rclpy_count_graph"
     fact["writer_count"] = wmatch.get("matched_count")
     fact["reader_count"] = rmatch.get("matched_count")
     writer_in_reader = writer_handle.get("endpoint_gid") in _gid_set(rgraph.get("publishers", []))
@@ -1715,6 +1738,10 @@ def _dynamic_cft_effect(update, events, *, real_ros):
         return fail("observed_reliable_qos_unavailable")
     pair = {**{k: after.get(k) for k in keys},
             "writer_gid": openings[1].get("writer_gid"), "reader_gid": openings[1].get("reader_gid")}
+    # A decoded body retains its original sequence on publish_same_data. Only
+    # authenticated native scope can supply a different actual occurrence; the
+    # legacy decoder must keep its original sequence equality gate.
+    native_occurrences = _has_publish_occurrence(pair, None, events)
     def sample(row):
         text = row.get("string_data")
         if not isinstance(text, str) or hashlib.sha256(text.encode()).hexdigest() != row.get("payload_sha256"):
@@ -1723,7 +1750,9 @@ def _dynamic_cft_effect(update, events, *, real_ros):
             body = json.loads(text)
         except (ValueError, TypeError):
             return None
-        if (not isinstance(body, dict) or body.get("send_sequence") != row.get("send_sequence")
+        if (not isinstance(body, dict) or type(body.get("send_sequence")) is not int
+                or body["send_sequence"] < 0
+                or (not native_occurrences and body["send_sequence"] != row.get("send_sequence"))
                 or body.get("run_id") != row.get("run_id") or body.get("writer_id") != pair["writer"]
                 or body.get("writer_generation") != pair["writer_generation"]
                 or body.get("endpoint_gid") != pair["writer_gid"]
@@ -1747,42 +1776,87 @@ def _dynamic_cft_effect(update, events, *, real_ros):
                    for e in post_sends + post_recvs)):
         return fail("sample_outside_update_time_window")
     all_sends = pre_sends + post_sends
+    producer_witnesses = []
+    if native_occurrences:
+        from .publish_occurrence import producer_occurrence_witness
+        for send in all_sends:
+            producer, reason = producer_occurrence_witness(send, events)
+            if producer is None:
+                return fail("sample_publish_occurrence_invalid:" + str(reason))
+            producer_witnesses.append(producer)
     decoded = {e["event_index"]: sample(e) for e in all_sends}
     if any(v is None for v in decoded.values()):
         return fail("sample_encoding_or_hash_invalid")
-    for receive in pre_recvs + post_recvs:
-        sample_pair = {**pair, "reader_gid": (before_identity["endpoint_gid"]
-                        if receive in pre_recvs else after_identity["endpoint_gid"])}
-        witness, _ = payload_delivery_witness(sample_pair, receive, events)
-        if witness is None or sample(receive) is None:
-            return fail("receive_sample_identity_or_encoding_invalid")
-        send = events[witness["send_ref"]]
-        if receive.get("string_data") != send.get("string_data"):
-            return fail("receive_string_data_mismatch")
+    receive_send_refs, receive_witnesses, decoded_receives = {}, [], {}
+    for receives, sends, identity in ((pre_recvs, pre_sends, before_identity),
+                                      (post_recvs, post_sends, after_identity)):
+        allowed_refs = {send["event_index"] for send in sends}
+        seen = set()
+        for receive in receives:
+            sample_pair = {**pair, "reader_gid": identity["endpoint_gid"]}
+            witness, _ = payload_delivery_witness(sample_pair, receive, events)
+            value = sample(receive)
+            if witness is None or value is None:
+                return fail("receive_sample_identity_or_encoding_invalid")
+            ref = witness.get("send_ref")
+            if ref not in allowed_refs:
+                return fail("receive_occurrence_outside_its_window")
+            if ref in seen:
+                return fail("receive_occurrence_duplicated")
+            seen.add(ref)
+            send = events[ref]
+            if receive.get("string_data") != send.get("string_data"):
+                return fail("receive_string_data_mismatch")
+            receive_send_refs[receive["event_index"]] = ref
+            decoded_receives[receive["event_index"]] = value
+            receive_witnesses.append(witness)
     missing = [e for e in post_sends if e.get("send_sequence") in after["missing_sequences"]]
     controls = [e for e in pre_sends if not decoded[e["event_index"]][1]
-                and any(r.get("send_sequence") == e.get("send_sequence") for r in pre_recvs)]
+                and any(receive_send_refs[r["event_index"]] == e["event_index"] for r in pre_recvs)]
     sentinel = events[after["sentinel_send_ref"]]
     sentinel_receive = events[after["sentinel_receive_ref"]]
-    if (type(sentinel_receive.get("monotonic_ns")) is not int
+    if (receive_send_refs.get(sentinel_receive["event_index"]) != sentinel["event_index"]
+            or type(sentinel_receive.get("monotonic_ns")) is not int
             or any(type(e.get("monotonic_ns")) is not int
                    or e["monotonic_ns"] > sentinel_receive["monotonic_ns"] for e in missing)):
         return fail("sentinel_does_not_close_missing_send")
-    if any(not sample(receive)[1] for receive in post_recvs):
+    if any(not decoded_receives[receive["event_index"]][1] for receive in post_recvs):
         return fail("post_update_received_rejected_sample")
     if (not missing or any(decoded[e["event_index"]][1] for e in missing)
             or not decoded.get(sentinel["event_index"], (None, False))[1]
             or not any(decoded[c["event_index"]][0]["declared_payload"] == decoded[m["event_index"]][0]["declared_payload"]
                        for c in controls for m in missing)):
         return fail("positive_control_predicate_or_sentinel_missing")
-    if any(e.get("event") == "receive" and e.get("logical_id") == pair["reader"]
-           and e.get("generation") == pair["reader_generation"]
-           and e.get("payload_sha256") in {m.get("payload_sha256") for m in missing}
-           and e.get("event_index", 0) > after["event_index"] for e in events):
-        return fail("late_receive_after_window")
+    missing_refs = {send["event_index"] for send in missing}
+    missing_hashes = {send.get("payload_sha256") for send in missing}
+    for receive in events:
+        if not (receive.get("event") == "receive" and receive.get("logical_id") == pair["reader"]
+                and receive.get("generation") == pair["reader_generation"]
+                and receive.get("payload_sha256") in missing_hashes
+                and receive.get("event_index", 0) > after["event_index"]):
+            continue
+        if not native_occurrences:
+            return fail("late_receive_after_window")
+        # Later restoration may legitimately publish identical bytes again.
+        # Resolve that receive's own reader incarnation and actual source scope;
+        # equality of payload hashes is not equality of DDS occurrences.
+        try:
+            identity = endpoint_identity_at(events, created[0], before_index=receive["event_index"] + 1)
+        except (ValueError, KeyError, TypeError):
+            return fail("late_receive_reader_identity_invalid")
+        witness, reason = payload_delivery_witness(
+            {**pair, "reader_gid": identity["endpoint_gid"]}, receive, events)
+        if witness is None:
+            return fail("late_receive_occurrence_unknown:" + str(reason))
+        if witness["send_ref"] in missing_refs:
+            return fail("late_receive_after_window")
+    full_equivalence = any(c.get("string_data") == m.get("string_data") for c in controls for m in missing)
     return {**unknown, "status": "delivery_contrast",
             "filter_effect_observed": None,
-            "control_equivalence": "declared_payload_only; complete String.data differs or is unverified",
+            "control_equivalence": ("complete_String.data" if full_equivalence else
+                                    "declared_payload_only; complete String.data differs or is unverified"),
+            "publish_occurrence_witnesses": producer_witnesses,
+            "sample_delivery_witnesses": receive_witnesses,
             "attribution": "unknown; missing delivery is not proof of filtering",
             "fixture_contrast_observed": True if not real_ros else None,
             "reason": None, "pre_window_ref": before["event_index"],
@@ -3568,6 +3642,8 @@ def run_topology(program, config, output_dir, *, backend=None):
             "domain_id": next(iter(actual_domains)) if len(actual_domains) == 1 and all(w["domain_id"] is not None for w in actual_workers) else None,
             "rmw": next(iter(actual_rmws)) if len(actual_rmws) == 1 and all(w["rmw_identifier"] is not None for w in actual_workers) else None,
             "actual_rmws": sorted(actual_rmws), "actual_domains": sorted(actual_domains),
+            "observation_mode": cfg.get("observation_mode", "blackbox"),
+            "fastdds_peer_instrumentation": deepcopy(cfg.get("fastdds_peer_instrumentation")),
             "workers": workers,
             "target_id": cfg.get("target_id"), "target_revision": cfg.get("target_revision"),
             "arm": cfg.get("arm"), "repeat": cfg.get("repeat"),

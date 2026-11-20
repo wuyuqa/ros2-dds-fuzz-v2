@@ -2367,6 +2367,11 @@ def _generate_case(sequence, entry, target, contract, surface, parent, mutator_i
     if topology:
         config.update(runtime_capability=TOPOLOGY_CAPABILITY, plan_hash=plan.plan_hash(),
                       topology_generation=topology_generation)
+        # Observation/build selection is explicit execution metadata, never a
+        # post-hash mutation of the submitted topology program or input capsule.
+        for key in ("observation_mode", "fastdds_peer_instrumentation"):
+            if key in profile:
+                config[key] = deepcopy(profile[key])
     if runtime_windows and "environment_windows" not in plan.final_config:
         # Preserve the historical E01 single-window input shape.
         config["environment_windows"] = json.loads(json.dumps(runtime_windows))
@@ -2471,6 +2476,10 @@ def _generate_case(sequence, entry, target, contract, surface, parent, mutator_i
     if topology:
         row.update(runtime_capability=TOPOLOGY_CAPABILITY, topology_generation=topology_generation,
                    chain_depth=len(plan.operations), candidate_eligible=False)
+        if "observation_mode" in config:
+            row["observation_mode"] = config["observation_mode"]
+        if "fastdds_peer_instrumentation" in config:
+            row["fastdds_peer_instrumentation"] = deepcopy(config["fastdds_peer_instrumentation"])
 
     config = _runtime_execution_config(
         config, execute=execute, runtime=runtime, runtime_boundary=runtime_boundary)

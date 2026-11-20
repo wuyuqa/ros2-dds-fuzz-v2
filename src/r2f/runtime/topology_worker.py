@@ -883,13 +883,20 @@ def _matched_peer_fields(observer, domain, gid, kind, count_before, count_after,
     """Expose the existing projection protocol only for a complete raw sample."""
     result = {"native_peer_observation": observation, "peer_gids_complete": False}
     peers = observation.get("matched_peer_gids", [])
+    native_schema = "r2f.fastdds-native-matched-peer-observation/v1"
+    is_native = getattr(observer, "SCHEMA", None) == native_schema
     if (observer is not None and observation.get("complete") is True
+            and isinstance(peers, list)
+            and (not is_native or observation.get("schema") == native_schema)
             and type(count_before) is int and type(count_after) is int
             and count_before == count_after == len(peers)
             and observation.get("local_gid") == gid
             and observation.get("domain_id") == domain
             and observation.get("role_kind") == kind):
-        result.update(peer_proof_source="dds_matched_endpoint_api",
+        proof_source = ("fastdds_native_stateful_peer_snapshot"
+            if is_native
+            else "dds_matched_endpoint_api")
+        result.update(peer_proof_source=proof_source,
                       peer_gids_complete=True, matched_peer_gids=peers)
     else:
         result["peer_observation_limitation"] = observation.get("reason", "native_and_public_counts_differ")
@@ -903,8 +910,9 @@ class _LivelinessPeerSampler:
     observer only reads matched endpoints through the already pinned public
     ABI. Even a complete sample cannot establish an uninterrupted peer set.
     """
-    def __init__(self, endpoint, rmw, domain, gid):
+    def __init__(self, endpoint, rmw, domain, gid, *, instrumentation=None):
         self.endpoint, self.rmw, self.domain, self.gid = endpoint, rmw, domain, gid
+        self.instrumentation = instrumentation
         self.observer = None
 
     def __call__(self):
@@ -925,6 +933,16 @@ class _LivelinessPeerSampler:
                 try:
                     if self.observer is None:
                         self.observer = CycloneMatchedPeerObserver()
+                    observation = self.observer.sample(self.domain, self.gid, 'reader')
+                except Exception as exc:
+                    observation = {'complete': False,
+                                   'reason': 'native_peer_observation_failed:' + type(exc).__name__}
+            elif self.rmw == 'rmw_fastrtps_cpp' and self.instrumentation is not None:
+                try:
+                    from .fastdds_peer_observer import FastddsMatchedPeerObserver
+                    if self.observer is None:
+                        self.observer = FastddsMatchedPeerObserver(
+                            self.endpoint, instrumentation=self.instrumentation)
                     observation = self.observer.sample(self.domain, self.gid, 'reader')
                 except Exception as exc:
                     observation = {'complete': False,
@@ -965,6 +983,10 @@ def _worker_main(argv):
     if kind is None:
         print(json.dumps({"event": "worker_error", "error": "unsupported_role"}))
         return 2
+    from r2f.instrumentation.fastdds_peer.activation import (
+        reference_from_config, manifest_for_reference, verify_vendor_mapping,
+    )
+    instrumentation = reference_from_config(config)
     import rclpy
     from rclpy.context import Context
     from rclpy.executors import SingleThreadedExecutor
@@ -979,6 +1001,10 @@ def _worker_main(argv):
     context = Context()
     rclpy.init(context=context)
     rmw_identifier = rclpy.get_rmw_implementation_identifier()
+    if instrumentation is not None and rmw_identifier != "rmw_fastrtps_cpp":
+        raise TopologyBackendError("instrumented_worker_rmw_mismatch")
+    vendor_identity = (verify_vendor_mapping(instrumentation)
+                       if rmw_identifier == "rmw_fastrtps_cpp" else None)
     try:
         observed_domain_id = context.get_domain_id()
     except (AttributeError, RuntimeError, TypeError):
@@ -992,12 +1018,15 @@ def _worker_main(argv):
     if kind == "reader" and rmw_identifier == "rmw_fastrtps_cpp":
         from .rcl_take_bridge import make_full_info_executor, BridgeUnavailable
         try:
-            executor = make_full_info_executor(context=context, rmw_identifier=rmw_identifier)
+            executor = make_full_info_executor(context=context, rmw_identifier=rmw_identifier,
+                **({"instrumentation": instrumentation} if instrumentation is not None else {}))
             take_capability = {"status": "observed", "reason": None,
                                "observation_basis": "single_take_owner_public_rcl_api",
                                "original_rclpy_dict_provided_gid": False,
                                "abi": executor.take_bridge.abi_receipt}
         except BridgeUnavailable as exc:
+            if instrumentation is not None:
+                raise TopologyBackendError("instrumented_take_bridge_unavailable:" + str(exc)) from exc
             # Explicitly keep the stock path if this pinned public ABI is absent.
             # Its callback still has unavailable GID; no second consumer is added.
             executor = SingleThreadedExecutor(context=context)
@@ -1006,6 +1035,7 @@ def _worker_main(argv):
         executor = SingleThreadedExecutor(context=context)
     executor.add_node(node)
     local_gid = None
+    native_peer_observer = None
     incarnation_ordinal = 0
     receive_sequence = 0
     endpoint_generation = node_token
@@ -1021,11 +1051,20 @@ def _worker_main(argv):
             "domain_observation_source": "rclpy.context.get_domain_id" if observed_domain_id is not None else "unavailable_api",
             "rmw_identifier": rmw_identifier, "node_name": node_name,
             "endpoint_generation": endpoint_generation,
+            "observation_mode": config.get("observation_mode", "blackbox"),
             "topic": config["topic"], "message_type": config["type_name"],
         }
         value.update(fields)
         print(json.dumps(value, sort_keys=True), flush=True)
         return value
+
+    if instrumentation is not None:
+        selected = manifest_for_reference(instrumentation)
+        emit("native_peer_provider_selected", manifest_reference=instrumentation,
+             vendor_identity=vendor_identity, provider_binary=selected["binaries"]["provider"],
+             vendor_binary=selected["binaries"]["vendor"],
+             provider_source_sha256=selected["provider_source_sha256"],
+             provider_abi=selected["patch"]["abi"], candidate_eligible=False)
 
     def gid_bytes(value):
         return bytes(value).hex() if value is not None else None
@@ -1160,7 +1199,8 @@ def _worker_main(argv):
         liveliness.bind(local_gid)
         if kind == "reader":
             liveliness.peer_sampler = _LivelinessPeerSampler(
-                endpoint, rmw_identifier, config["domain_id"], local_gid)
+                endpoint, rmw_identifier, config["domain_id"], local_gid,
+                instrumentation=instrumentation)
         emit("graph_snapshot", **initial_graph)
 
         pending_publish = None
@@ -1236,6 +1276,18 @@ def _worker_main(argv):
                         observation = observer.sample(config["domain_id"], local_gid, kind)
                     except (ValueError, OSError, AttributeError) as exc:
                         observation = {"complete": False, "reason": str(exc)}
+                elif rmw_identifier == "rmw_fastrtps_cpp" and instrumentation is not None:
+                    try:
+                        from .fastdds_peer_observer import FastddsMatchedPeerObserver
+                        if native_peer_observer is None:
+                            native_peer_observer = FastddsMatchedPeerObserver(
+                                endpoint, instrumentation=instrumentation)
+                        observer = native_peer_observer
+                        observation = observer.sample(config["domain_id"], local_gid, kind)
+                    except (ValueError, OSError, AttributeError, RuntimeError) as exc:
+                        observation = {"complete": False, "reason": str(exc),
+                            "schema": "r2f.fastdds-native-matched-peer-observation/v1",
+                            "manifest_reference": instrumentation}
                 count_after = count_api()
                 peer_fields = _matched_peer_fields(
                     observer, config["domain_id"], local_gid, kind,
@@ -1983,6 +2035,7 @@ class RosTopologyBackend:
         self.handles = {}
         self.closed = False
         self.netem_isolation = None
+        self.instrumentation_reference = None
 
     def set_event_sink(self, sink):
         self.event_sink = sink
@@ -2036,6 +2089,25 @@ class RosTopologyBackend:
             raise TopologyBackendBlocked("canonical_environment_preflight_missing")
         self.preflight = env
         self.environment = dict(self.execution_environment)
+        from r2f.instrumentation.fastdds_peer.activation import (
+            reference_from_config, manifest_for_reference, environment_for_reference,
+        )
+        try:
+            reference = reference_from_config(cfg)
+            if reference is not None:
+                selected = manifest_for_reference(reference)
+                # Keep the exact build receipt with this run; this is evidence
+                # intake, not another runner, state machine or candidate store.
+                self.output_dir.mkdir(parents=True, exist_ok=True)
+                copied = self.output_dir / "native-peer-build-manifest.json"
+                with copied.open("xb") as stream:
+                    stream.write(Path(reference["manifest_path"]).read_bytes())
+                reference = {**reference, "manifest_path": str(copied)}
+                manifest_for_reference(reference)
+                self.environment = environment_for_reference(self.environment, reference)
+            self.instrumentation_reference = reference
+        except (ValueError, OSError) as exc:
+            raise TopologyBackendBlocked("native_peer_activation_failed:" + str(exc)) from exc
         activated = env
         receipt = {
             "ok": True, "backend": self.backend_name, "ros_execution": True,
@@ -2050,6 +2122,7 @@ class RosTopologyBackend:
                 "environment_mode": env.get("environment_mode"),
             },
             "lease_context": {"status": "held_canonical_three_leases", "locks": locks},
+            "native_peer_instrumentation": deepcopy(self.instrumentation_reference),
             "limitations": [],
             "execution_evidence": False,
             "candidate_eligible": False,
@@ -2083,6 +2156,11 @@ class RosTopologyBackend:
             "startup_timeout_sec": float(self.config.get("startup_timeout_sec", 10.0)),
         }
 
+        if self.instrumentation_reference is not None:
+            worker_config["observation_mode"] = "instrumentation"
+            worker_config["fastdds_peer_instrumentation"] = {
+                key: self.instrumentation_reference[key]
+                for key in ("manifest_path", "manifest_sha256")}
         if prepared["initial_content_filter"] is not None:
             worker_config["initial_content_filter"] = deepcopy(prepared["initial_content_filter"])
 
@@ -2130,6 +2208,7 @@ class RosTopologyBackend:
                 "endpoint_gid": gid, "endpoint_generation": row["endpoint_generation"],
                 "pid": pid, "pgid": row.get("pgid"), "process_start_ticks": ticks,
                 "rmw_identifier": row.get("rmw_identifier"),
+                "observation_mode": row.get("observation_mode", "blackbox"),
                 "observed_domain_id": row.get("observed_domain_id"),
                 "node_name": row.get("node_name"),
                 "identity_source": row.get("identity_source"),

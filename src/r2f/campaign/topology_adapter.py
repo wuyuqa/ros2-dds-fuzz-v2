@@ -165,6 +165,8 @@ class _Audit:
                      "raw_run_domain_mismatch")
         from r2f.runtime.topology_route import validate_topology_route
         self.plan = validate_topology_route(config)
+        from r2f.instrumentation.fastdds_peer.receipt import validate_execution_mode
+        self.native_peer_reference = validate_execution_mode(self.events, config, raw_path=self.path)
         # validate_topology_route explicitly invokes validate_topology_plan,
         # including deterministic input-layer lineage; do not regenerate input.
         self.layers = snapshot([op.parameters["input_layer_receipts"][0] for op in self.plan.operations])
@@ -967,6 +969,9 @@ def facts_from_events(events, runtime, config):
              "fixture": True, "pairs": [], "deliveries": [], "unknown_reasons": [], "fact_values": {}}
     try:
         a = _Audit(events, runtime, config)
+        if a.native_peer_reference is not None:
+            facts.update(observation_mode="instrumentation",
+                         fastdds_peer_instrumentation=a.native_peer_reference)
         facts.update(raw={"path": a.path, "sha256": a.sha}, program_sha256=a.program_sha,
                      plan_hash=a.plan.plan_hash(), fixture=a.fixture, arm=config.get("arm"),
                      control_excluded=(config.get("arm") == "negative" or bool(config.get("control_kind"))

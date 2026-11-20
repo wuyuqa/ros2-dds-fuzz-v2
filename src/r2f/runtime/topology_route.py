@@ -112,8 +112,8 @@ def validate_topology_route(config):
             raise ValueError("topology_v2_binding_mismatch:" + key)
         if key in config and canonical_hash(config[key]) != canonical_hash(value):
             raise ValueError("topology_submitted_binding_mismatch:" + key)
-    if config.get("observation_mode", "blackbox") != "blackbox":
-        raise ValueError("topology_only_public_api_blackbox_supported")
+    from r2f.instrumentation.fastdds_peer.activation import reference_from_config
+    reference_from_config(config)  # Explicit native mode only; never implicit override.
     for key in ("rmws", "runtime_windows"):
         if config.get(key):
             raise ValueError("topology_unimplemented_runtime_control:" + key)

@@ -11,6 +11,7 @@ at module import; no publisher, subscription, context or message-body replacemen
 These pins describe one installed x86_64 Jazzy ABI, not portable ABI discovery.
 """
 import ctypes as C
+from copy import deepcopy
 import hashlib
 import json
 from pathlib import Path
@@ -111,43 +112,91 @@ _LAYOUT = {
 }
 
 
-def verify_abi():
-    """Hash/size/offset check only; no native calls or ROS initialization."""
+def _pin_selection(instrumentation):
+    """Select only the vendor pin; never mutate the installed pin table."""
+    files = dict(_PINS)
+    paths = {name: PREFIX / name for name in files}
+    reference, vendor = None, None
+    if instrumentation is not None:
+        try:
+            from r2f.instrumentation.fastdds_peer.activation import manifest_for_reference
+            manifest = manifest_for_reference(instrumentation)
+            reference = dict(instrumentation)
+            vendor = dict(manifest['binaries']['vendor'])
+            path = Path(vendor['path']).resolve(strict=True)
+            if 'lib/libfastrtps.so' not in files:
+                raise BridgeUnavailable('instrumentation_vendor_pin_missing')
+            files['lib/libfastrtps.so'] = vendor['sha256']
+            paths['lib/libfastrtps.so'] = path
+        except BridgeUnavailable:
+            raise
+        except (ImportError, OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
+            raise BridgeUnavailable('instrumentation_manifest_unavailable:' + str(exc)) from exc
+    return files, paths, reference, vendor
+
+
+def verify_abi(instrumentation=None):
+    """Hash/size/offset check only; explicit instrumentation loads no native code."""
     if (sys.platform != 'linux' or platform.machine() != 'x86_64'
             or sys.byteorder != 'little' or C.sizeof(C.c_void_p) != 8):
         raise BridgeUnavailable('unsupported_platform_abi')
     if _layout() != _LAYOUT:
         raise BridgeUnavailable('ctypes_struct_layout_mismatch')
-    for relative, expected in _PINS.items():
+    files, paths, reference, vendor = _pin_selection(instrumentation)
+    for relative, expected in files.items():
         try:
-            actual = hashlib.sha256((PREFIX / relative).read_bytes()).hexdigest()
+            actual = hashlib.sha256(paths[relative].read_bytes()).hexdigest()
         except OSError as exc:
             raise BridgeUnavailable('abi_file_unavailable:' + relative) from exc
         if actual != expected:
             raise BridgeUnavailable('abi_file_hash_mismatch:' + relative)
+    identity = [files, _LAYOUT]
+    if reference is not None:
+        identity += [reference, {name: str(path) for name, path in paths.items()}]
     return {'schema': 'r2f.rcl-take-abi/v1', 'status': 'pinned',
             'platform': 'linux-x86_64-little-endian', 'gid_storage_size': 16,
-            'layout': _layout(), 'files': dict(_PINS),
-            'pin_sha256': hashlib.sha256(json.dumps(
-                [_PINS, _LAYOUT], sort_keys=True).encode()).hexdigest()}
+            'layout': _layout(), 'files': files,
+            'observation_mode': 'instrumentation' if reference is not None else 'blackbox',
+            'manifest_reference': reference, 'vendor_binary': vendor,
+            'file_paths': {name: str(path) for name, path in paths.items()},
+            'pin_sha256': hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()}
 
 
-def _verify_loaded_libraries():
-    """Reject same-SONAME overrides: disk pins alone do not prove mapped identity."""
-    expected = {(PREFIX / name).name.split('.so')[0]: (PREFIX / name).resolve()
-                for name in _PINS if name.startswith('lib/') and '.so' in name}
+def _verify_loaded_libraries(instrumentation=None):
+    """Keep every installed path gate; only explicit vendor selection differs."""
+    _, paths, reference, _ = _pin_selection(instrumentation)
+    expected = {(PREFIX / name).name.split('.so')[0]: path.resolve()
+                for name, path in paths.items() if name.startswith('lib/') and '.so' in name}
+    # Classify by the installed SONAME, not the selected binary's basename.
+    if 'lib/libfastrtps.so' in paths:
+        vendor = paths['lib/libfastrtps.so'].resolve()
+        expected.update(libfastrtps=vendor, libfastdds=vendor)
+    records = []
     try:
-        lines = Path('/proc/self/maps').read_text().splitlines()
-        for line in lines:
+        text = Path('/proc/self/maps').read_text()
+        for line in text.splitlines():
             fields = line.split(maxsplit=5)
             if len(fields) != 6 or not fields[5].startswith('/'):
                 continue
             mapped = Path(fields[5])
             key = mapped.name.split('.so')[0]
-            if key in expected and mapped.resolve() != expected[key]:
-                raise BridgeUnavailable('mapped_library_identity_mismatch:' + key)
+            if key in expected:
+                if mapped.resolve() != expected[key]:
+                    raise BridgeUnavailable('mapped_library_identity_mismatch:' + key)
+                record = {'path': str(mapped.resolve()), 'device': fields[3], 'inode': fields[4]}
+                if record not in records:
+                    records.append(record)
     except OSError as exc:
         raise BridgeUnavailable('mapped_library_identity_unavailable') from exc
+    vendor_identity = None
+    if reference is not None:
+        try:
+            from r2f.instrumentation.fastdds_peer.activation import verify_vendor_mapping
+            vendor_identity = verify_vendor_mapping(reference, maps_text=text)
+        except (ImportError, OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
+            raise BridgeUnavailable('instrumentation_vendor_mapping_unavailable:' + str(exc)) from exc
+    return {'manifest_reference': reference, 'mapped_libraries': records,
+            'vendor_identity': vendor_identity}
 
 
 def _bind(library, name, args, result):
@@ -158,10 +207,13 @@ def _bind(library, name, args, result):
 
 
 class _Bindings:
-    def __init__(self, rmw_identifier):
+    def __init__(self, rmw_identifier, instrumentation=None):
         if rmw_identifier != RMW_IDENTIFIER:
             raise BridgeUnavailable('unsupported_rmw_identifier:' + str(rmw_identifier))
-        self.abi = verify_abi()  # Must precede loading/dereferencing any ABI.
+        self.instrumentation = deepcopy(instrumentation)
+        # Preserve the blackbox call shape as well as its unchanged pin digest.
+        self.abi = (verify_abi() if self.instrumentation is None else
+                    verify_abi(instrumentation=self.instrumentation))
         try:
             # Absolute paths; retain CDLLs throughout the bridge's lifetime.
             self.libs = {name: C.CDLL(str(PREFIX / ('lib/lib' + name + '.so')))
@@ -182,9 +234,15 @@ class _Bindings:
             # through librmw_implementation or guess from environment variables.
             get_identifier = _bind(self.libs['rmw_fastrtps_cpp'], 'rmw_get_implementation_identifier',
                                    [], C.c_char_p)
-            _verify_loaded_libraries()
+            if self.instrumentation is None:
+                _verify_loaded_libraries()
+            else:
+                self.abi.update(_verify_loaded_libraries(instrumentation=self.instrumentation))
             identifier = get_identifier()
-            _verify_loaded_libraries()
+            if self.instrumentation is None:
+                _verify_loaded_libraries()
+            else:
+                self.abi.update(_verify_loaded_libraries(instrumentation=self.instrumentation))
             if identifier != rmw_identifier.encode('ascii'):
                 raise BridgeUnavailable('loaded_rmw_identifier_mismatch')
         except BridgeUnavailable:
@@ -241,10 +299,16 @@ class RclTakeBridge:
     even if decoding/callback subsequently raises. close() never takes or destroys
     any ROS entity; it prevents further reads and waits for an active take to finish.
     """
-    def __init__(self, *, rmw_identifier=RMW_IDENTIFIER, _bindings=None, _string_type=None):
+    def __init__(self, *, rmw_identifier=RMW_IDENTIFIER, instrumentation=None,
+                 _bindings=None, _string_type=None):
         if rmw_identifier != RMW_IDENTIFIER:
             raise BridgeUnavailable('unsupported_rmw_identifier:' + str(rmw_identifier))
-        self._bindings = _bindings if _bindings is not None else _Bindings(rmw_identifier)
+        self.instrumentation = deepcopy(instrumentation)
+        self._bindings = _bindings if _bindings is not None else (
+            _Bindings(rmw_identifier) if self.instrumentation is None else
+            _Bindings(rmw_identifier, instrumentation=self.instrumentation))
+        if self._bindings.abi.get('manifest_reference') != self.instrumentation:
+            raise BridgeUnavailable('bridge_bindings_instrumentation_mismatch')
         if _string_type is None:
             try:
                 from std_msgs.msg import String
@@ -258,6 +322,16 @@ class RclTakeBridge:
         self._closed = False
         self._take_index = 0
         self._bridge_id = uuid.uuid4().hex
+        self._revalidate_instrumentation()
+
+    def _revalidate_instrumentation(self):
+        if self.instrumentation is None:
+            return
+        fresh = verify_abi(instrumentation=self.instrumentation)
+        if (fresh['pin_sha256'] != self.abi_receipt['pin_sha256']
+                or fresh['manifest_reference'] != self.abi_receipt['manifest_reference']):
+            raise BridgeUnavailable('bridge_instrumentation_identity_changed')
+        self.abi_receipt.update(_verify_loaded_libraries(instrumentation=self.instrumentation))
 
     def close(self):
         with self._lock:
@@ -271,6 +345,7 @@ class RclTakeBridge:
         try:
             if self._closed:
                 raise BridgeError('bridge_closed')
+            self._revalidate_instrumentation()
             # Fresh handle AND pointer for every take, including CFT recreation.
             handle = subscription.handle
             with handle:
@@ -290,6 +365,7 @@ class RclTakeBridge:
                         raise BridgeError('String_init_failed:' + error)
                     code = self._bindings.take(pointer, C.byref(message), C.byref(native), None)
                     returned = time.monotonic_ns()
+                    self._revalidate_instrumentation()
                     if code == RCL_RET_SUBSCRIPTION_TAKE_FAILED:
                         self._bindings.reset_error()
                         return None
@@ -320,6 +396,13 @@ class RclTakeBridge:
                         'identity_qualified': False, 'candidate_eligible': False,
                         'original_rclpy_dict_provided_gid': False,
                     }
+                    if self.instrumentation is not None:
+                        info['rcl_take_receipt']['instrumentation'] = {
+                            'manifest_reference': deepcopy(self.abi_receipt['manifest_reference']),
+                            'vendor_identity': deepcopy(self.abi_receipt['vendor_identity']),
+                            'mapped_libraries': deepcopy(self.abi_receipt['mapped_libraries']),
+                            'abi_pin_sha256': self.abi_receipt['pin_sha256'],
+                        }
                     return result, info
                 except BaseException:
                     self._bindings.reset_error()
@@ -359,7 +442,8 @@ def _executor_class(base, await_or_execute, invalid_handle, callback_types):
     return FullInfoSingleThreadedExecutor
 
 
-def make_full_info_executor(*, context=None, rmw_identifier=RMW_IDENTIFIER, bridge=None):
+def make_full_info_executor(*, context=None, rmw_identifier=RMW_IDENTIFIER, bridge=None,
+                            instrumentation=None):
     """Create an opt-in executor; raises BridgeUnavailable, NEVER installs fallback.
 
     On failure main may explicitly use its old executor (GID unavailable). On success
@@ -367,7 +451,10 @@ def make_full_info_executor(*, context=None, rmw_identifier=RMW_IDENTIFIER, brid
     this public-API bridge from the unchanged stock rclpy callback dictionary.
     """
     # Validate installed executor source before depending on its private take hook.
-    verify_abi()
+    if instrumentation is None:
+        verify_abi()
+    else:
+        verify_abi(instrumentation=instrumentation)
     try:
         from rclpy.executors import SingleThreadedExecutor, await_or_execute
         from rclpy.exceptions import InvalidHandle
@@ -376,9 +463,14 @@ def make_full_info_executor(*, context=None, rmw_identifier=RMW_IDENTIFIER, brid
         raise BridgeUnavailable('rclpy_executor_unavailable') from exc
     if bridge is not None and bridge.rmw_identifier != rmw_identifier:
         raise BridgeUnavailable('bridge_executor_rmw_identifier_mismatch')
+    if bridge is not None and getattr(bridge, 'instrumentation', None) != instrumentation:
+        raise BridgeUnavailable('bridge_executor_instrumentation_mismatch')
     owned = bridge is None
     if owned:
-        bridge = RclTakeBridge(rmw_identifier=rmw_identifier)
+        bridge = (RclTakeBridge(rmw_identifier=rmw_identifier) if instrumentation is None else
+                  RclTakeBridge(rmw_identifier=rmw_identifier, instrumentation=instrumentation))
+    elif instrumentation is not None:
+        bridge._revalidate_instrumentation()
     cls = _executor_class(SingleThreadedExecutor, await_or_execute,
                           InvalidHandle, Subscription.CallbackType)
     try:

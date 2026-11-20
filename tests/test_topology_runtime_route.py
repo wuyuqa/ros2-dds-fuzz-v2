@@ -93,7 +93,7 @@ def test_exact_opt_in_outside_default_catalog(tmp_path):
     ("final_input", {}, "topology_final_config_mismatch"),
     ("topology_program", {}, "topology_submitted_program_mismatch"),
     ("input_layer_receipts", [], "topology_input_layer_receipts_mismatch"),
-    ("observation_mode", "instrumentation", "topology_only_public_api_blackbox_supported"),
+    ("observation_mode", "instrumentation", "topology_observation_mode_unsupported"),
     ("environment_mutation", {"kind": "discovery_netem"}, "topology_netem_spec_required"),
     ("environment_mutation", {"kind": "discovery_netem", "spec": NETEM_SPEC}, "offline_fixture_cannot_claim_environment_mutation"),
     ("environment_mutation", {"kind": "discovery_drop"}, "topology_netem_drop_not_supported"),

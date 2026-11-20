@@ -325,7 +325,8 @@ def validate_topology_profile(profile):
     from r2f.modules.s1.topology_targets import (
         TOPOLOGY_CAPABILITY, TOPOLOGY_TARGET, TOPOLOGY_SURFACE, TOPOLOGY_MUTATOR)
     from r2f.modules.s1 import fuzz_mutators_v2
-    allowed = PROFILE_METADATA_FIELDS | {'source_schema', 'operator_whitelist', 'runtime_capability'}
+    allowed = PROFILE_METADATA_FIELDS | {'source_schema', 'operator_whitelist', 'runtime_capability',
+                                         'observation_mode', 'fastdds_peer_instrumentation'}
     unknown = set(profile) - allowed
     if unknown:
         raise ValueError('unsupported topology profile field:' + ','.join(sorted(unknown)))
@@ -355,6 +356,14 @@ def validate_topology_profile(profile):
             rmw not in ('rmw_cyclonedds_cpp', 'rmw_fastrtps_cpp') for rmw in rmws) or \
             len(set(rmws)) != len(rmws):
         raise ValueError('topology_rmws_invalid')
+    if 'observation_mode' in profile or 'fastdds_peer_instrumentation' in profile:
+        from r2f.instrumentation.fastdds_peer.activation import reference_from_config
+        mode = profile.get('observation_mode', 'blackbox')
+        if mode == 'instrumentation' and rmws != ['rmw_fastrtps_cpp']:
+            raise ValueError('native_peer_profile_requires_single_fastdds_rmw')
+        reference_from_config({'rmw': rmws[0], 'observation_mode': mode,
+            **({'fastdds_peer_instrumentation': profile['fastdds_peer_instrumentation']}
+               if 'fastdds_peer_instrumentation' in profile else {})})
     budget = profile.get('budget')
     if not isinstance(budget, dict) or set(budget) != {'max_inputs', 'max_seconds'} or \
             type(budget['max_inputs']) is not int or not 1 <= budget['max_inputs'] <= 256:
