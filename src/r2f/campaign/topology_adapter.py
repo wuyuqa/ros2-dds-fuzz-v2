@@ -1377,6 +1377,10 @@ def facts_from_events(events, runtime, config):
             and s["event_index"] not in covered_history]
         facts["application_audit"] = _application(a)
         facts["source_provenance_qualified"] = _source_qualification(a)
+        if "episode" in a.program:
+            from .topology_episode import audit_topology_episode
+            facts["episode_observation"] = audit_topology_episode(a.program, runtime, config)
+            _require(facts["episode_observation"]["structural_valid"], "topology_episode_evidence_invalid")
         facts["execution_evidence"] = not a.fixture
         env = [e for e in a.events if e["event"] == "environment_preflight"]
         locks = [e for e in a.events if e["event"] == "isolation_locks_acquired"]
@@ -1405,6 +1409,11 @@ def facts_from_events(events, runtime, config):
             and facts["application_audit"].get("status") == "application_observed"
             and facts["application_audit"].get("execution_evidence") is True
             and facts["application_audit"].get("canonical_receipt_matches") is True)
+        if "episode_observation" in facts:
+            observation = facts["episode_observation"]
+            facts["candidate_eligible"] = (facts["candidate_eligible"] and observation["completed"]
+                and observation["execution_evidence"] and observation["checkpoint_observations_complete"]
+                and observation["reset_verified"])
     except (KeyError, ValueError, TypeError, OSError, UnicodeError, IndexError) as exc:
         facts["evidence_error"] = str(exc)
         facts["diagnostic_valid"] = False

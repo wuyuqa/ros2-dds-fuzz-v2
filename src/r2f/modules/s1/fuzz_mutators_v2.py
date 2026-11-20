@@ -1713,14 +1713,62 @@ def concurrent_writers_program():
     return program
 
 
-def corpus_v2(*, include_catalog=True, seed=0, include_concurrent=False, include_cft_matrix=False):
+CONTINUOUS_EPISODE_SEED = "topology.continuous_episode"
+
+
+def continuous_episode_program():
+    """Bounded 1W1R two-generation episode input; resets remain unproven."""
+    program = topology_model.generate_program(7, writers=1, readers=1, budget={
+        "max_writers": 1, "max_readers": 1, "max_endpoints": 2, "max_actions": 50,
+        "max_batch_size": 3, "max_total_samples": 6, "max_timeout_sec": 5.0,
+        "max_generations": 2})
+    for endpoint in program["endpoints"]:
+        endpoint["topic"] = "/r2f/topology/episode"
+        endpoint["qos"].update(reliability="reliable", history="keep_last", depth=16)
+    action = topology_model._action
+    actions = []
+    for generation in (1, 2):
+        create = "create" if generation == 1 else "recreate"
+        actions.extend([
+            action(f"{create}_w{generation}", create, "w0", generation),
+            action(f"{create}_r{generation}", create, "r0", generation),
+            action(f"matched_{generation}", "barrier", params={
+                "condition": "matched", "timeout_sec": 5.0, "endpoint_ids": ["w0", "r0"]}),
+            action(f"publish_{generation}", "publish_batch", "w0", generation,
+                   {"count": 3, "start_sequence": 0, "interval_sec": 0.01,
+                    "payload": "continuous-episode"}),
+            action(f"delivered_{generation}", "barrier", params={
+                "condition": "delivery", "timeout_sec": 5.0, "endpoint_ids": ["w0", "r0"]}),
+            action(f"checkpoint_{generation}", "snapshot", params={"label": f"episode-{generation}"}),
+        ])
+        if generation == 1:
+            actions.extend([action("destroy_r1", "destroy", "r0", 1),
+                            action("destroy_w1", "destroy", "w0", 1)])
+    for previous, current in zip(actions, actions[1:]):
+        current["depends_on"] = [previous["action_id"]]
+    program["actions"] = actions
+    program["episode"] = {
+        "schema": topology_model.EPISODE_CONFIG_SCHEMA, "max_seconds": 120.0,
+        "checkpoint_action_ids": ["checkpoint_1", "checkpoint_2"],
+        "reset_action_ids": ["recreate_w2", "recreate_r2"],
+    }
+    if topology_model.validate_program(program)["status"] != "valid":
+        raise ValueError("continuous episode seed violated the topology contract")
+    return program
+
+
+def corpus_v2(*, include_catalog=True, seed=0, include_concurrent=False, include_cft_matrix=False,
+              include_episode=False):
     """Offline seed corpus: legal, boundary, environment and guard seeds.
 
     The manifest separates ``authored`` entries from ``pending`` runtime
     capabilities and ``unsupported`` modelling gaps.  Nothing here is a real
     run, a mutation hit, or a candidate. ``include_concurrent`` is explicit
-    opt-in; omitted preserves every legacy corpus and ingestion identity.
+    opt-in, as is ``include_episode``; omitted preserves every legacy corpus
+    and ingestion identity.
     """
+    if type(include_episode) is not bool:
+        raise ValueError("include_episode must be bool")
     entries, manifest = [], []
     for kind in ("empty_roles", "writer_only", "reader_only", "multi_endpoint"):
         document = _topology_edge_program(kind)
@@ -1748,6 +1796,15 @@ def corpus_v2(*, include_catalog=True, seed=0, include_concurrent=False, include
         entries.append(entry)
         manifest.append({"seed_id": entry["seed_id"], "surface_id": "S1.topology",
             "status": "authored", "kind": "concurrent_writers",
+            "expected_disposition": "expect_pass", "content_sha256": entry["content_sha256"]})
+
+    if include_episode:
+        entry = _seed_entry("S1.topology", CONTINUOUS_EPISODE_SEED,
+            continuous_episode_program(), "bounded_continuous_episode", "expect_pass",
+            "authored deterministic 1W1R two-generation episode input; checkpoints/reset unverified")
+        entries.append(entry)
+        manifest.append({"seed_id": entry["seed_id"], "surface_id": "S1.topology",
+            "status": "authored", "kind": "continuous_episode",
             "expected_disposition": "expect_pass", "content_sha256": entry["content_sha256"]})
 
     if include_cft_matrix:

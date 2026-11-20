@@ -2894,7 +2894,8 @@ def run_topology(program, config, output_dir, *, backend=None):
         emit("topology_provenance", runtime_kind="ros2_public_api" if backend.real_ros else "offline_fixture",
              fixture=not backend.real_ros, backend=backend.backend_name,
              source=source_before, input_program_sha256=sha256_json(effective_program))
-        state_boundary("before_program")
+        initial_boundary = state_boundary("before_program")
+        episode_snapshots = {}
 
         # Opt-in environment mutation: only a real, isolated namespace may host
         # the existing tc-netem carrier.  Nothing here is derived from config.
@@ -2931,7 +2932,7 @@ def run_topology(program, config, output_dir, *, backend=None):
         concurrent_begun = {}
         concurrent_results = {}
         failed_concurrent_groups = set()
-        for action_index, action in enumerate(effective_program["actions"]):
+        def execute_action(action_index, action):
             if action["action_id"] not in concurrent_begun:
                 check_topology_source("before_action:" + action["action_id"])
             action_id = action["action_id"]
@@ -2958,7 +2959,7 @@ def run_topology(program, config, output_dir, *, backend=None):
                     st = state.get(eid)
                     if st is None:
                         record_guard(action, "unknown_endpoint", "endpoint is not declared")
-                        continue
+                        return
                     before = {"generation": st["generation"], "alive": st["alive"],
                               "next_sequence": st["next_sequence"]}
                 if op in ("create", "recreate"):
@@ -2968,13 +2969,13 @@ def run_topology(program, config, output_dir, *, backend=None):
                             record_guard(action, "first_generation_guard",
                                          "create requires generation 1 from generation 0",
                                          before=before)
-                            continue
+                            return
                     else:
                         if not (st["generation"] > 0 and gen == st["generation"] + 1):
                             record_guard(action, "next_generation_guard",
                                          "recreate requires previous generation + 1",
                                          before=before)
-                            continue
+                            return
                     if st["alive"] and st["handle"] is not None:
                         # recreate replaces a live endpoint; destroy is a real step.
                         try:
@@ -2984,7 +2985,7 @@ def run_topology(program, config, output_dir, *, backend=None):
                         except TopologyBackendError as exc:
                             record_guard(action, "predecessor_destroy_failed",
                                          type(exc).__name__, kind="tool", before=before)
-                            continue
+                            return
                         old = st["handle"]
                         st["history"].append({"event": "retired", "logical_id": eid,
                                               "generation": old["generation"],
@@ -3002,7 +3003,7 @@ def run_topology(program, config, output_dir, *, backend=None):
                     except TopologyUnsupported as exc:
                         record_guard(action, exc.code, str(exc), kind="capability",
                                      details=exc.details, before=before)
-                        continue
+                        return
                     try:
                         close_delivery_windows("endpoint_lifecycle_changed", endpoint_id=eid,
                                                topic=endpoint_specs[eid]["topic"])
@@ -3010,15 +3011,15 @@ def run_topology(program, config, output_dir, *, backend=None):
                     except TopologyUnsupported as exc:
                         record_guard(action, exc.code, str(exc), kind="capability",
                                      details=exc.details, before=before)
-                        continue
+                        return
                     except TopologyBackendTimeout as exc:
                         record_guard(action, "endpoint_create_timeout", str(exc), kind="tool",
                                      before=before)
-                        continue
+                        return
                     except TopologyBackendError as exc:
                         record_guard(action, "endpoint_create_error", type(exc).__name__,
                                      kind="tool", before=before)
-                        continue
+                        return
                     if backend.real_ros:
                         from .topology_namespace import current_child_context
                         namespace_context = current_child_context()
@@ -3040,13 +3041,13 @@ def run_topology(program, config, output_dir, *, backend=None):
                                   requires=[{"id": "fresh_endpoint_identity", "status": "satisfied",
                                              "kind": "identity"}],
                                   identity_bound=True)
-                    continue
+                    return
                 if op == "destroy":
                     st = state[eid]
                     if not (st["alive"] and st["generation"] == gen):
                         record_guard(action, "current_generation_alive_guard",
                                      "destroy requires current live generation", before=before)
-                        continue
+                        return
                     try:
                         close_delivery_windows("endpoint_lifecycle_changed", endpoint_id=eid,
                                                topic=endpoint_specs[eid]["topic"])
@@ -3054,7 +3055,7 @@ def run_topology(program, config, output_dir, *, backend=None):
                     except TopologyBackendError as exc:
                         record_guard(action, "endpoint_destroy_error", type(exc).__name__,
                                      kind="tool", before=before)
-                        continue
+                        return
                     old = st["handle"]
                     st["history"].append({"event": "retired", "logical_id": eid,
                                           "generation": gen,
@@ -3065,13 +3066,13 @@ def run_topology(program, config, output_dir, *, backend=None):
                                   disposition="applied", satisfied=True,
                                   requires=[{"id": "current_generation_alive", "status": "satisfied"}],
                                   cleanup=cleanup)
-                    continue
+                    return
                 if op == "update_filter":
                     st = state[eid]
                     if not (st["alive"] and st["generation"] == gen and endpoint_specs[eid]["role"] == "reader"):
                         record_guard(action, "reader_generation_alive_guard",
                                      "update_filter requires a live reader generation", before=before)
-                        continue
+                        return
                     try:
                         # Commit a real pre-update observation before issuing the API call.
                         backend.pump(0.0)
@@ -3079,7 +3080,7 @@ def run_topology(program, config, output_dir, *, backend=None):
                         update = backend.update_filter(st["handle"], params["expression"], params["parameters"])
                     except TopologyBackendError as exc:
                         record_guard(action, "filter_update_transport_error", str(exc), kind="tool", before=before)
-                        continue
+                        return
                     receipt = update.get("filter_receipt") or {}
                     update_event = emit("topology_filter_update_result", action_id=aid, logical_id=eid,
                                generation=gen, reader_gid=st["handle"].get("endpoint_gid"),
@@ -3108,7 +3109,7 @@ def run_topology(program, config, output_dir, *, backend=None):
                                   filter_action_evidence=action_evidence, filter_action_error=evidence_error,
                                   filter_update_receipt=receipt, filter_effect_observed=None,
                                   execution_evidence=False)
-                    continue
+                    return
                 if op == "publish_batch":
                     if params.get("concurrency_group") in failed_concurrent_groups:
                         record_action(action, action_before, {k: state[eid][k] for k in ("generation", "alive", "next_sequence")},
@@ -3116,25 +3117,25 @@ def run_topology(program, config, output_dir, *, backend=None):
                                       requires=[{"id": "concurrent_group_completed", "status": "unsatisfied"}],
                                       reason="concurrent_group_failed", side_effects="unknown_consult_raw_group",
                                       execution_evidence=False)
-                        continue
+                        return
                     st = state[eid]
                     if not (st["alive"] and st["generation"] == gen and
                             endpoint_specs[eid]["role"] == "writer"):
                         record_guard(action, "writer_generation_alive_guard",
                                      "publish_batch requires a live writer generation", before=before)
-                        continue
+                        return
                     count, start = params.get("count"), params.get("start_sequence")
                     if type(count) is not int or type(start) is not int:
                         record_guard(action, "invalid_batch_params", "count/start_sequence must be integers",
                                      before=before)
-                        continue
+                        return
                     sequences = list(range(start, start + count))
                     if start < st["next_sequence"]:
                         record_guard(action, "nonoverlapping_writer_generation_sequence",
                                      "batch overlaps a previous sequence on this writer generation",
                                      details={"start_sequence": start,
                                               "next_sequence": st["next_sequence"]}, before=before)
-                        continue
+                        return
                     interval = params.get("interval_sec", 0.0)
                     payload = params.get("payload")
                     if (isinstance(interval, bool) or not isinstance(interval, (int, float))
@@ -3143,7 +3144,7 @@ def run_topology(program, config, output_dir, *, backend=None):
                                      "interval_sec must be finite in 0..%s" % MAX_INTERVAL_SEC,
                                      kind="capability",
                                      details={"interval_sec": interval}, before=before)
-                        continue
+                        return
                     repeat_data = None
                     repeat_source = None
                     if params.get("repeat_data_from") is not None:
@@ -3154,7 +3155,7 @@ def run_topology(program, config, output_dir, *, backend=None):
                                       and e.get("publish_returned") is True]
                         if len(candidates) != 1 or not isinstance(candidates[0].get("string_data"), str):
                             record_guard(action, "repeat_source_missing_or_ambiguous", "repeat requires one prior raw send from same writer generation", before=before)
-                            continue
+                            return
                         repeat_source = candidates[0]
                         repeat_data = repeat_source["string_data"]
                     try:
@@ -3249,12 +3250,12 @@ def run_topology(program, config, output_dir, *, backend=None):
                         interrupt_writer_windows(eid, "publish_batch_unsupported")
                         record_guard(action, exc.code, str(exc), kind="capability",
                                      details=exc.details, before=before)
-                        continue
+                        return
                     except TopologyBackendTimeout as exc:
                         interrupt_writer_windows(eid, "publish_batch_timeout")
                         record_guard(action, "publish_batch_timeout", str(exc), kind="tool",
                                      details={"command_id": exc.command_id}, before=before)
-                        continue
+                        return
                     except TopologyBackendError as exc:
                         interrupt_writer_windows(eid, "publish_batch_tool_error")
                         if params.get("concurrency_group") is not None:
@@ -3266,7 +3267,7 @@ def run_topology(program, config, output_dir, *, backend=None):
                         else:
                             record_guard(action, "publish_batch_error", type(exc).__name__,
                                          kind="tool", before=before)
-                        continue
+                        return
                     st["next_sequence"] = max(st["next_sequence"], start + count)
                     after = {**before, "next_sequence": st["next_sequence"],
                              "sent_sequences": publish.get("sent_sequences"),
@@ -3285,15 +3286,18 @@ def run_topology(program, config, output_dir, *, backend=None):
                                       "order_scope": "writer_generation",
                                       "cross_writer_order_required": False,
                               })
-                    continue
+                    return
                 if op == "snapshot":
                     if eid is not None and not (state[eid]["alive"] and state[eid]["generation"] == gen):
                         record_guard(action, "snapshot_target_alive_guard",
                                      "snapshot requires a live current generation",
                                      before=before)
-                        continue
+                        return
                     targets = [eid] if eid is not None else None
+                    snapshot_start = len(events)
                     snapshot = snapshot_handles(targets)
+                    if "episode" in effective_program:
+                        episode_snapshots[aid] = (snapshot_start, snapshot)
                     receipt = note_snapshot(aid, snapshot, params.get("label"))
                     result["precondition_receipts"].append({
                         "step_id": "action:" + aid, "receipt_kind": "precondition",
@@ -3311,7 +3315,7 @@ def run_topology(program, config, output_dir, *, backend=None):
                     if not snapshot.get("complete"):
                         result["unknowns"].append({"action_id": aid,
                                                    "reason": "snapshot_incomplete"})
-                    continue
+                    return
                 if op == "barrier":
                     condition = params.get("condition")
                     timeout = float(params.get("timeout_sec", 1.0))
@@ -3326,7 +3330,7 @@ def run_topology(program, config, output_dir, *, backend=None):
                             record_guard(action, "barrier_target_alive_guard",
                                          "barrier requires live target endpoints",
                                          details={"stale_endpoints": stale}, before=before)
-                            continue
+                            return
                     deadline = time.monotonic() + timeout
                     previous = None
                     satisfied = False
@@ -3336,7 +3340,7 @@ def run_topology(program, config, output_dir, *, backend=None):
                         record_guard(action, "barrier_target_alive_guard",
                                      "quiescent barrier requires at least one live endpoint",
                                      before=before)
-                        continue
+                        return
                     if condition == "quiescent":
                         first = backend.snapshot({eid: state[eid]["handle"] for eid in targets
                                                   if state[eid]["alive"]})
@@ -3371,7 +3375,7 @@ def run_topology(program, config, output_dir, *, backend=None):
                             break
                         time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
                     if satisfied is None:
-                        continue
+                        return
                     cancelled = not satisfied
                     receipt = {
                         "step_id": "action:" + aid, "receipt_kind": "observation",
@@ -3403,30 +3407,30 @@ def run_topology(program, config, output_dir, *, backend=None):
                                                 if st["alive"]},
                                                real_ros=bool(backend.real_ros)),
                                 _PAIR_KEY)
-                    continue
+                    return
                 if op == "assert_liveliness":
                     st = state[eid]
                     spec = endpoint_specs[eid]
                     if not (st["alive"] and st["generation"] == gen and spec["role"] == "writer"):
                         record_guard(action, "writer_generation_alive_guard",
                                      "assert_liveliness requires a live writer generation", before=before)
-                        continue
+                        return
                     policy = (spec.get("qos") or {}).get("liveliness")
                     if policy != "manual_by_topic":
                         record_guard(action, "public_writer_manual_by_topic",
                                      "assert_liveliness requires manual_by_topic policy",
                                      details={"liveliness": policy}, before=before)
-                        continue
+                        return
                     try:
                         value = backend.assert_liveliness(st["handle"])
                     except TopologyUnsupported as exc:
                         record_guard(action, exc.code, str(exc), kind="capability",
                                      details=exc.details, before=before)
-                        continue
+                        return
                     except TopologyBackendError as exc:
                         record_guard(action, "assert_liveliness_error", type(exc).__name__,
                                      kind="tool", before=before)
-                        continue
+                        return
                     # The legacy action disposition describes the API action,
                     # not a DDS liveliness state transition.  No independently
                     # verified, writer-attributed lifecycle producer is wired.
@@ -3446,7 +3450,7 @@ def run_topology(program, config, output_dir, *, backend=None):
                                   lifecycle_evidence=lifecycle,
                                   requires=[{"id": "public_writer_manual_by_topic",
                                              "status": "satisfied"}])
-                    continue
+                    return
                 record_guard(action, "unknown_operation", "unsupported op " + str(op))
             finally:
                 action_receipts = [r for r in result["precondition_receipts"]
@@ -3462,6 +3466,90 @@ def run_topology(program, config, output_dir, *, backend=None):
                 emit("state_step_after", **terminal, fixture=not backend.real_ros)
                 emit("topology_action_done", action_id=action_id, action_index=action_index,
                      action=deepcopy(action), receipt=terminal)
+
+        if "episode" not in effective_program:
+            for action_index, action in enumerate(effective_program["actions"]):
+                execute_action(action_index, action)
+        else:
+            from r2f.campaign.episode import EpisodeStore, run_episode
+            from r2f.campaign.topology_episode import (
+                capture_prefix, reset_from_events, topology_episode,
+            )
+            episode_root = output_dir / "episode"
+            initial_after = state_boundary("episode_initial")
+            initial_projection, initial_prefix = capture_prefix(
+                raw, raw_path, episode_root, "initial",
+                before_ref=initial_boundary["event_index"],
+                after_ref=initial_after["event_index"], program=effective_program)
+            episode = topology_episode(effective_program, cfg, initial_projection["state_after"])
+            episode_store = EpisodeStore(episode_root)
+            emit("topology_episode_begin", episode_id=episode.episode_id,
+                 input_sha256=episode.input_identity(), initial_prefix=initial_prefix,
+                 restoration_supported=False, candidate_eligible=False)
+            previous_boundary = initial_after["event_index"]
+            checkpoints = set(effective_program["episode"]["checkpoint_action_ids"])
+            resets = set(effective_program["episode"].get("reset_action_ids", []))
+
+            def perform_episode_action(episode_action, observed_state):
+                nonlocal previous_boundary
+                action = effective_program["actions"][episode_action.sequence]
+                execute_action(episode_action.sequence, action)
+                snapshot_start, snapshot = episode_snapshots.get(action["action_id"], (None, None))
+                if action["action_id"] in checkpoints:
+                    close_delivery_windows()
+                after_boundary = state_boundary("episode_after:" + action["action_id"],
+                    snapshot, snapshot_start_ref=snapshot_start)
+                projected, prefix = capture_prefix(raw, raw_path, episode_root,
+                    f"action-{episode_action.sequence:04d}", before_ref=previous_boundary,
+                    after_ref=after_boundary["event_index"], program=effective_program)
+                # A previous immutable cut must remain the same observed state
+                # when projected from the longer prefix; never predict it.
+                if projected["state_before"] != observed_state:
+                    raise TopologyBackendError("episode_observed_state_chain_changed")
+                previous_boundary = after_boundary["event_index"]
+                terminal = [e for e in events if e.get("event") == "topology_action_done"
+                            and e.get("action_id") == action["action_id"]][-1]
+                receipt = terminal["receipt"]
+                observation = {"prefix": prefix, "action_done_ref": terminal["event_index"],
+                    "runtime_action_receipt": deepcopy(receipt),
+                    "observation_complete": projected["state_after"]["observation_completeness"] == "complete",
+                    "execution_evidence": projected["receipt"]["execution_evidence"],
+                    "candidate_eligible": False}
+                if action["action_id"] in resets:
+                    observation["reset"] = reset_from_events(events, action, prefix)
+                rejected = receipt.get("disposition") in {
+                    "guard_reject", "capability_reject", "tool_error", "environment_unverified"}
+                return {"status": "failed" if rejected else "executed",
+                    "execution_stage": "aborted" if rejected else "effect_observed",
+                    "after_state": projected["state_after"], "oracle_verdict": "unknown",
+                    "responsibility_layer": "harness" if receipt.get("disposition") == "tool_error" else "observation",
+                    "reason_code": receipt.get("code", ""), "observation": observation}
+
+            def commit_episode_action(receipt, receipts):
+                committed = episode_store.commit_progress(episode, receipts,
+                    checkpoint=receipt["action_id"] in checkpoints)
+                emit("topology_episode_action_committed", episode_id=episode.episode_id,
+                     action_id=receipt["action_id"], sequence=receipt["sequence"],
+                     receipt_sha256=sha256_json(receipt), progress=committed,
+                     checkpoint=receipt["action_id"] in checkpoints,
+                     restoration_supported=False, candidate_eligible=False)
+                raw.flush()
+                os.fsync(raw.fileno())
+
+            execution = run_episode(episode, perform=perform_episode_action,
+                clock=time.monotonic, on_receipt=commit_episode_action)
+            saved = episode_store.add(episode, execution)
+            result["episode"] = {"episode_id": episode.episode_id,
+                "input_sha256": episode.input_identity(), "execution": execution,
+                "store_root": str(episode_root), "record_sha256": saved["record_sha256"],
+                "restoration_supported": False, "candidate_eligible": False}
+            emit("topology_episode_end", episode_id=episode.episode_id,
+                 input_sha256=episode.input_identity(), record_sha256=saved["record_sha256"],
+                 store_root=str(episode_root), stop_reason=execution["stop_reason"],
+                 action_count=execution["action_count"], restoration_supported=False,
+                 candidate_eligible=False)
+            if execution["stop_reason"] != "episode_completed":
+                raise TopologyBackendError("episode_stopped:" + str(execution["stop_reason"]))
 
         check_topology_source("after_actions")
         # Final observation of the surviving generations before cleanup.

@@ -1633,9 +1633,11 @@ def topology_corpus_from_profile(profile, source_corpus=None, *, cycle_id=None):
                      for spec in cycle['seed_specs'])
     from r2f.modules.s1.topology_cft_matrix import CFT_MATRIX_SEED
     cft_matrix = any(spec['seed_id'] == CFT_MATRIX_SEED for spec in cycle['seed_specs'])
-    source = (fuzz_mutators_v2.corpus_v2(include_concurrent=concurrent, include_cft_matrix=True)
-              if cft_matrix else fuzz_mutators_v2.corpus_v2(include_concurrent=True) if concurrent
-              else fuzz_mutators_v2.corpus_v2()) if source_corpus is None else source_corpus
+    episode = any(spec['seed_id'] == fuzz_mutators_v2.CONTINUOUS_EPISODE_SEED
+                  for spec in cycle['seed_specs'])
+    source = (fuzz_mutators_v2.corpus_v2(include_concurrent=concurrent,
+              include_cft_matrix=cft_matrix, include_episode=episode)
+              if source_corpus is None else source_corpus)
     normalized, ingestion = normalize_topology_seed_corpus(source)
     dispositions = {row['seed_id']: row for row in ingestion['entries']}
     target = topology_target_declaration()

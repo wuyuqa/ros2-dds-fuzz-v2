@@ -20,6 +20,7 @@ import math
 import random
 
 SCHEMA = "r2f.s1-topology-program/v1"
+EPISODE_CONFIG_SCHEMA = "r2f.s1-topology-episode-config/v1"
 DEFAULT_BUDGET = {
     "max_writers": 4, "max_readers": 4, "max_endpoints": 8,
     "max_actions": 128, "max_batch_size": 64, "max_total_samples": 1024,
@@ -115,6 +116,45 @@ def _object(value, required, optional, path, errors):
     return required <= set(value)
 
 
+def _episode_config(program, actions, errors):
+    """Optional bounded input declaration, never checkpoint/reset evidence."""
+    if "episode" not in program:
+        return
+    episode = program["episode"]
+    path = "program.episode"
+    if not _object(episode, {"schema", "max_seconds", "checkpoint_action_ids"},
+                   {"reset_action_ids"}, path, errors):
+        return
+    if episode["schema"] != EPISODE_CONFIG_SCHEMA:
+        _error(errors, path + ".schema", "schema", "unknown episode config schema")
+    seconds = episode["max_seconds"]
+    if not (type(seconds) in (int, float) and 0 < seconds <= 180 and math.isfinite(seconds)):
+        _error(errors, path + ".max_seconds", "value", "finite positive seconds <=180, not bool")
+    if len(actions) > 50:
+        _error(errors, "program.actions", "episode_budget", "episode supports at most 50 actions")
+    by_id = {a["action_id"]: a for a in actions
+             if isinstance(a, dict) and _text(a.get("action_id"))}
+    for key, op in (("checkpoint_action_ids", "snapshot"), ("reset_action_ids", "reset")):
+        if key not in episode:
+            continue
+        refs = episode[key]
+        if (not isinstance(refs, list) or (key == "checkpoint_action_ids" and not refs)
+                or not all(_text(ref) for ref in refs) or len(set(refs)) != len(refs)):
+            _error(errors, path + "." + key, "reference", "unique action ids required; checkpoints nonempty")
+            continue
+        for ref in refs:
+            action = by_id.get(ref, {})
+            valid = (action.get("op") == "snapshot" if op == "snapshot" else
+                     action.get("op") in ("create", "recreate")
+                     and type(action.get("generation")) is int and action["generation"] >= 2)
+            if not valid:
+                _error(errors, path + "." + key, "reference",
+                       "requires existing " + op + " action: " + ref)
+    if any(isinstance(a, dict) and isinstance(a.get("params"), dict)
+           and "concurrency_group" in a["params"] for a in actions):
+        _error(errors, "program.actions", "episode_concurrency", "episode adapter does not support concurrency groups")
+
+
 def _shape(program):
     errors = []
     try:
@@ -122,7 +162,7 @@ def _shape(program):
     except (ValueError, TypeError, RecursionError):
         return [{"path": "program", "code": "json", "message": "finite JSON required"}], None
     if not _object(program, {"schema", "endpoints", "actions"},
-                   {"budget", "environment"}, "program", errors):
+                   {"budget", "environment", "episode"}, "program", errors):
         return errors, None
     if program["schema"] != SCHEMA:
         _error(errors, "program.schema", "schema", f"expected {SCHEMA}")
@@ -337,6 +377,7 @@ def _shape(program):
                        for _, a in members)
                 or any("repeat_data_from" in a["params"] for _, a in members)):
             _error(errors, "program.actions", "concurrency_group", "requires contiguous two distinct writers, no intra-group dependency or repeated data")
+    _episode_config(program, actions, errors)
     if samples > budget["max_total_samples"]:
         _error(errors, "program.actions", "budget", "total publications exceed sample budget")
     return errors, budget

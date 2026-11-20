@@ -13,6 +13,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from copy import deepcopy
 import json
+import hashlib
 import math
 import os
 from pathlib import Path
@@ -390,12 +391,14 @@ def _receipt(action, before, *, stage, status, guard, result=None, error="", his
         "parent_history": snapshot(history),
         "timing": snapshot(timing or {}),
     }
+    if result is not None and "observation" in result:
+        receipt["observation"] = snapshot(result["observation"])
     if receipt["oracle_verdict"] in {"pass", "fail"} and not receipt["rule_id"]:
         raise EpisodeError("pass/fail receipt requires a rule_id")
     return receipt
 
 
-def run_episode(episode, *, perform, clock, health=None, store=None):
+def run_episode(episode, *, perform, clock, health=None, store=None, on_receipt=None):
     """Execute one bounded episode with an injected action/health/clock backend.
 
     ``perform(action, state) -> dict`` returns an after_state, observed effects,
@@ -409,6 +412,8 @@ def run_episode(episode, *, perform, clock, health=None, store=None):
         raise EpisodeError("perform must be callable")
     if not callable(clock):
         raise EpisodeError("clock must be callable")
+    if on_receipt is not None and not callable(on_receipt):
+        raise EpisodeError("on_receipt must be callable or None")
     if health is not None and not callable(health):
         raise EpisodeError("health must be callable or None")
     history = _history_snapshot(store, episode.parent_episode_ids)
@@ -421,6 +426,16 @@ def run_episode(episode, *, perform, clock, health=None, store=None):
     if allowed is not None and initial_id not in allowed:
         stop_reason = "initial_state_outside_allowed_model"
         stop_details = {"state_id": initial_id}
+    def notify_receipt():
+        if on_receipt is None:
+            return None
+        try:
+            on_receipt(snapshot(receipts[-1]), snapshot(receipts))
+        except Exception as exc:
+            return {"action_id": receipts[-1]["action_id"], "responsibility_layer": "harness",
+                    "error": type(exc).__name__ + ": " + str(exc)}
+        return None
+
     for action in episode.actions:
         if stop_reason is not None:
             break
@@ -465,6 +480,10 @@ def run_episode(episode, *, perform, clock, health=None, store=None):
                                        "finished_monotonic": float(clock()),
                                        "os_concurrency_claimed": False})
             receipts.append(receipt)
+            observer_error = notify_receipt()
+            if observer_error:
+                stop_reason, stop_details = "receipt_observer_tool_failure", observer_error
+                break
             stop_reason = "guard_blocked"
             stop_details = {"failed_conditions": [item["condition_id"] for item in guard
                                                   if not item["passed"]]}
@@ -481,6 +500,10 @@ def run_episode(episode, *, perform, clock, health=None, store=None):
                                        "os_concurrency_claimed": False})
             receipt["tool_error"] = True
             receipts.append(receipt)
+            observer_error = notify_receipt()
+            if observer_error:
+                stop_reason, stop_details = "receipt_observer_tool_failure", observer_error
+                break
             stop_reason = "tool_failure"
             stop_details = {"action_id": action.action_id, "error": receipt["error"]}
             break
@@ -495,6 +518,10 @@ def run_episode(episode, *, perform, clock, health=None, store=None):
                                    "finished_monotonic": float(clock()),
                                    "os_concurrency_claimed": False})
         receipts.append(receipt)
+        observer_error = notify_receipt()
+        if observer_error:
+            stop_reason, stop_details = "receipt_observer_tool_failure", observer_error
+            break
         if status == "failed" or receipt["execution_stage"] == "aborted":
             stop_reason = "action_failed"
             stop_details = {"action_id": action.action_id,
@@ -558,9 +585,30 @@ def _validate_execution_state_schema(episode, execution, *, error_type=EpisodeEr
         raise error_type("execution state schema differs from episode")
 
 
+def _fsync_directory(path):
+    """Persist published directory entries, not just their file contents."""
+    descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _durable_mkdir(path):
+    path = Path(path).resolve()
+    existed = path.is_dir()
+    path.mkdir(parents=True, exist_ok=True)
+    if not existed:
+        # A newly created subtree can include previously created but not yet
+        # synced output directories. Persist ancestry once when publishing it;
+        # subsequent records only need their containing directory synced.
+        for directory in (path, *path.parents):
+            _fsync_directory(directory)
+
+
 def _atomic_create(path, data):
     path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
+    _durable_mkdir(path.parent)
     payload = (json.dumps(data, sort_keys=True, indent=2, ensure_ascii=False,
                           allow_nan=False) + "\n").encode("utf-8")
     fd, temporary = tempfile.mkstemp(prefix=".episode-", dir=str(path.parent))
@@ -579,6 +627,7 @@ def _atomic_create(path, data):
             os.unlink(temporary)
         except FileNotFoundError:
             pass
+    _fsync_directory(path.parent)
 
 
 class EpisodeStore:
@@ -611,6 +660,34 @@ class EpisodeStore:
         record["record_sha256"] = canonical_hash(record)
         _atomic_create(self._path(episode.episode_id), record)
         return snapshot(record)
+
+    def commit_progress(self, episode, receipts, *, checkpoint=False):
+        """Durably commit a completed action prefix before any next side effect.
+
+        These immutable records do not restore a running DDS context. A caller
+        may recover the observation history, never infer a resumed runtime.
+        """
+        if not isinstance(episode, Episode) or not receipts:
+            raise EpisodeStoreError("progress requires an episode and nonempty receipt prefix")
+        if type(checkpoint) is not bool or len(receipts) > len(episode.actions):
+            raise EpisodeStoreError("invalid progress prefix")
+        for action, receipt in zip(episode.actions, receipts):
+            if (receipt.get("action_id") != action.action_id
+                    or receipt.get("sequence") != action.sequence
+                    or receipt.get("input_sha256") != action.input_sha256):
+                raise EpisodeStoreError("progress action binding differs from episode")
+            validate_state(receipt["before_state"], schema=episode.state_schema)
+            if receipt.get("after_state") is not None:
+                validate_state(receipt["after_state"], schema=episode.state_schema)
+        record = {"schema": "r2f.s1-episode-progress/v1", "episode_id": episode.episode_id,
+                  "input_sha256": episode.input_identity(), "state_schema": episode.state_schema,
+                  "action_count": len(receipts), "checkpoint": checkpoint,
+                  "receipts": snapshot(receipts), "restoration_supported": False}
+        record["record_sha256"] = canonical_hash(record)
+        path = self.root / "checkpoints" / episode.episode_id / (f"{len(receipts)-1:04d}.json")
+        _atomic_create(path, record)
+        return {"path": str(path.resolve()), "record_sha256": record["record_sha256"],
+                "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
 
     def load(self, episode_id):
         path = self._path(episode_id)
