@@ -346,71 +346,156 @@ class RclTakeBridge:
             if self._closed:
                 raise BridgeError('bridge_closed')
             self._revalidate_instrumentation()
-            # Fresh handle AND pointer for every take, including CFT recreation.
-            handle = subscription.handle
-            with handle:
-                pointer = handle.pointer
-                if type(pointer) is not int or pointer <= 0 or pointer >= 1 << 64:
-                    raise BridgeError('invalid_rcl_subscription_pointer')
-                message = _String()
-                native = _MessageInfo()
-                # Unknown values must not accidentally look like sequence 0.
-                native.publication_sequence_number = UINT64_MAX
-                native.reception_sequence_number = UINT64_MAX
-                self._take_index += 1
-                started = time.monotonic_ns()
-                try:
-                    if not self._bindings.init(C.byref(message)):
-                        error = self._bindings.error()
-                        raise BridgeError('String_init_failed:' + error)
-                    code = self._bindings.take(pointer, C.byref(message), C.byref(native), None)
-                    returned = time.monotonic_ns()
+            return self._take_locked(subscription, revalidate_after=True)
+        finally:
+            self._lock.release()
+
+
+    def _take_locked(self, subscription, *, revalidate_after):
+        """One consumption, with a fresh borrow and native buffer, under our lock."""
+        # Fresh handle AND pointer for every take, including CFT recreation.
+        handle = subscription.handle
+        with handle:
+            pointer = handle.pointer
+            if type(pointer) is not int or pointer <= 0 or pointer >= 1 << 64:
+                raise BridgeError('invalid_rcl_subscription_pointer')
+            message = _String()
+            native = _MessageInfo()
+            # Unknown values must not accidentally look like sequence 0.
+            native.publication_sequence_number = UINT64_MAX
+            native.reception_sequence_number = UINT64_MAX
+            self._take_index += 1
+            started = time.monotonic_ns()
+            try:
+                if not self._bindings.init(C.byref(message)):
+                    error = self._bindings.error()
+                    raise BridgeError('String_init_failed:' + error)
+                code = self._bindings.take(pointer, C.byref(message), C.byref(native), None)
+                returned = time.monotonic_ns()
+                if revalidate_after:
                     self._revalidate_instrumentation()
-                    if code == RCL_RET_SUBSCRIPTION_TAKE_FAILED:
-                        self._bindings.reset_error()
-                        return None
-                    if code != 0:
-                        error = self._bindings.error()
-                        raise BridgeError('rcl_take_failed:' + str(code) + ':' + error)
-                    data = message.data
-                    if not data.data or data.capacity <= data.size:
-                        raise BridgeError('invalid_native_String_size_or_capacity')
-                    if C.string_at(data.data + data.size, 1) != b'\0':
-                        raise BridgeError('native_String_not_null_terminated')
-                    text = C.string_at(data.data, data.size).decode('utf-8', errors='strict')
-                    info = _metadata(native, self.rmw_identifier)
-                    result = self._string_type()
-                    result.data = text
-                    info['rcl_take_receipt'] = {
-                        'schema': 'r2f.rcl-take-receipt/v1', 'api': 'public rcl_take',
-                        'observation_basis': 'single_take_owner_public_rcl_api',
-                        'bridge_id': self._bridge_id, 'take_index': self._take_index,
-                        'rcl_subscription_pointer': hex(pointer),
-                        'pointer_scope': 'borrowed_fresh_inside_current_subscription_handle',
-                        'rmw_identifier': self.rmw_identifier, 'return_code': code,
-                        'message_type': 'std_msgs/msg/String', 'raw': False,
-                        'take_begin_monotonic_ns': started,
-                        'take_return_monotonic_ns': returned,
-                        'abi_pin_sha256': self.abi_receipt['pin_sha256'],
-                        'message_info_receipt': info['message_info_receipt'],
-                        'identity_qualified': False, 'candidate_eligible': False,
-                        'original_rclpy_dict_provided_gid': False,
-                    }
-                    if self.instrumentation is not None:
-                        info['rcl_take_receipt']['instrumentation'] = {
-                            'manifest_reference': deepcopy(self.abi_receipt['manifest_reference']),
-                            'vendor_identity': deepcopy(self.abi_receipt['vendor_identity']),
-                            'mapped_libraries': deepcopy(self.abi_receipt['mapped_libraries']),
-                            'abi_pin_sha256': self.abi_receipt['pin_sha256'],
-                        }
-                    return result, info
-                except BaseException:
+                if code == RCL_RET_SUBSCRIPTION_TAKE_FAILED:
                     self._bindings.reset_error()
-                    raise
-                finally:
-                    # Zero-initialized String is safe even after partial init failure.
-                    # All copied Python values outlive the single native buffer.
-                    self._bindings.fini(C.byref(message))
+                    return None
+                if code != 0:
+                    error = self._bindings.error()
+                    raise BridgeError('rcl_take_failed:' + str(code) + ':' + error)
+                data = message.data
+                if not data.data or data.capacity <= data.size:
+                    raise BridgeError('invalid_native_String_size_or_capacity')
+                if C.string_at(data.data + data.size, 1) != b'\0':
+                    raise BridgeError('native_String_not_null_terminated')
+                text = C.string_at(data.data, data.size).decode('utf-8', errors='strict')
+                info = _metadata(native, self.rmw_identifier)
+                result = self._string_type()
+                result.data = text
+                info['rcl_take_receipt'] = {
+                    'schema': 'r2f.rcl-take-receipt/v1', 'api': 'public rcl_take',
+                    'observation_basis': 'single_take_owner_public_rcl_api',
+                    'bridge_id': self._bridge_id, 'take_index': self._take_index,
+                    'rcl_subscription_pointer': hex(pointer),
+                    'pointer_scope': 'borrowed_fresh_inside_current_subscription_handle',
+                    'rmw_identifier': self.rmw_identifier, 'return_code': code,
+                    'message_type': 'std_msgs/msg/String', 'raw': False,
+                    'take_begin_monotonic_ns': started,
+                    'take_return_monotonic_ns': returned,
+                    'abi_pin_sha256': self.abi_receipt['pin_sha256'],
+                    'message_info_receipt': info['message_info_receipt'],
+                    'identity_qualified': False, 'candidate_eligible': False,
+                    'original_rclpy_dict_provided_gid': False,
+                }
+                if self.instrumentation is not None:
+                    info['rcl_take_receipt']['instrumentation'] = {
+                        'manifest_reference': deepcopy(self.abi_receipt['manifest_reference']),
+                        'vendor_identity': deepcopy(self.abi_receipt['vendor_identity']),
+                        'mapped_libraries': deepcopy(self.abi_receipt['mapped_libraries']),
+                        'abi_pin_sha256': self.abi_receipt['pin_sha256'],
+                    }
+                return result, info
+            except BaseException:
+                self._bindings.reset_error()
+                raise
+            finally:
+                # Zero-initialized String is safe even after partial init failure.
+                # All copied Python values outlive the single native buffer.
+                self._bindings.fini(C.byref(message))
+
+    def take_batch(self, subscription, *, max_samples=64, max_duration_ns=10_000_000):
+        """Bounded single-owner drain; no result escapes until full post-validation.
+
+        The budget covers data draining only, excluding expensive verification.
+        Each sample retains its actual rcl_take begin/return times. Full bytes,
+        manifest and mapping checks bracket the batch, NOT each individual take.
+        Errors discard the entire Python batch; consumed samples are never retried.
+        """
+        if (type(max_samples) is not int or not 1 <= max_samples <= 64
+                or type(max_duration_ns) is not int or not 1 <= max_duration_ns <= 50_000_000):
+            raise BridgeError('invalid_take_batch_budget')
+        if subscription.msg_type is not self._string_type or subscription.raw is not False:
+            raise BridgeUnavailable('only_std_msgs_msg_String_raw_false_supported')
+        if not self._lock.acquire(blocking=False):
+            raise BridgeError('concurrent_or_reentrant_take_not_supported')
+        try:
+            if self._closed:
+                raise BridgeError('bridge_closed')
+            before_started = time.monotonic_ns()
+            self._revalidate_instrumentation()
+            before_finished = time.monotonic_ns()
+            before = deepcopy(self.abi_receipt)
+            batch_id = uuid.uuid4().hex
+            samples = []
+            primary = None
+            drain_started = time.monotonic_ns()
+            deadline = drain_started + max_duration_ns
+            try:
+                for _ in range(max_samples):
+                    # Always permit the first attempt; check fairness between takes.
+                    if samples and time.monotonic_ns() >= deadline:
+                        break
+                    sample = self._take_locked(subscription, revalidate_after=False)
+                    if sample is None:
+                        break
+                    samples.append(sample)
+            except BaseException as exc:
+                primary = exc
+                raise
+            finally:
+                drain_finished = time.monotonic_ns()
+                after_started = time.monotonic_ns()
+                try:
+                    self._revalidate_instrumentation()
+                    after_finished = time.monotonic_ns()
+                    after = deepcopy(self.abi_receipt)
+                except BaseException as validation_error:
+                    if primary is None:
+                        raise
+                    # InvalidHandle alone is routinely ignored by the executor.
+                    # A failed mandatory final proof must never take that path.
+                    failure = BridgeError('take_batch_and_post_validation_failed:' + str(validation_error))
+                    failure.post_validation_error = validation_error
+                    raise failure from primary
+            proof = {
+                'schema': 'r2f.rcl-take-batch-validation/v1', 'batch_id': batch_id,
+                'bridge_id': self._bridge_id, 'validation_scope': 'batch_before_after',
+                'max_samples': max_samples, 'max_duration_ns': max_duration_ns,
+                'budget_scope': 'data_drain_only_checked_between_takes',
+                'sample_count': len(samples),
+                'before_validation_started_ns': before_started,
+                'before_validation_finished_ns': before_finished,
+                'drain_started_ns': drain_started, 'drain_finished_ns': drain_finished,
+                'after_validation_started_ns': after_started,
+                'after_validation_finished_ns': after_finished,
+                'before_abi': before, 'after_abi': after,
+                'manifest_reference': deepcopy(self.instrumentation),
+                'candidate_eligible': False, 'filter_effect_observed': None,
+            }
+            for ordinal, (_, info) in enumerate(samples, 1):
+                receipt = info['rcl_take_receipt']
+                receipt['batch_ordinal'] = ordinal
+                receipt['batch_validation'] = deepcopy(proof)
+                if self.instrumentation is not None:
+                    receipt['instrumentation']['validation_scope'] = 'batch_before_after'
+            return samples
         finally:
             self._lock.release()
 
@@ -428,13 +513,21 @@ def _executor_class(base, await_or_execute, invalid_handle, callback_types):
             if kind not in (callback_types.MessageOnly, callback_types.WithMessageInfo):
                 raise BridgeError('unsupported_subscription_callback_type')
             try:
-                msg_info = self.take_bridge.take(sub)
-                if msg_info is None:
+                batch_take = getattr(self.take_bridge, 'take_batch', None)
+                if (getattr(self.take_bridge, 'instrumentation', None) is not None
+                        and callable(batch_take)):
+                    samples = batch_take(sub)
+                else:
+                    # Blackbox/legacy and injected bridges without batch stay single-take.
+                    msg_info = self.take_bridge.take(sub)
+                    samples = [] if msg_info is None else [msg_info]
+                if not samples:
                     return None
-                args = (msg_info[0],) if kind is callback_types.MessageOnly else msg_info
 
                 async def _execute():
-                    await await_or_execute(sub.callback, *args)
+                    for msg_info in samples:
+                        args = ((msg_info[0],) if kind is callback_types.MessageOnly else msg_info)
+                        await await_or_execute(sub.callback, *args)
 
                 return _execute
             except invalid_handle:
