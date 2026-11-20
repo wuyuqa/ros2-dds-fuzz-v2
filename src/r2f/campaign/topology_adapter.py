@@ -376,8 +376,26 @@ class _Audit:
                      and all(isinstance(r, dict) and _text(r.get("id"))
                              and r.get("status") in {"satisfied", "unsatisfied", "unknown"}
                              for r in receipt["requires"]), "action_state_or_requires_missing")
+            allowed_terminals = {"applied", "effect_observed", "observed", "satisfied"}
+            if action["op"] == "update_filter":
+                # Only this action may claim configured, and only after its
+                # independent raw command/configuration/state proof is checked.
+                from r2f.runtime.filter_action_receipt import filter_action_evidence
+                evidence = filter_action_evidence(action, self.events, before_index=done["event_index"])
+                _require(receipt.get("filter_action_evidence") == evidence
+                         and receipt["requires"] == evidence["requires"]
+                         and receipt.get("disposition") == evidence["disposition"]
+                         and receipt.get("execution_evidence") is False
+                         and receipt.get("filter_effect_observed") is None
+                         and receipt.get("filter_update_receipt") ==
+                             self.events[evidence["update_ref"]].get("receipt"),
+                         "action_filter_state_not_raw_backed")
+                _require(begin["event_index"] < evidence["api_call_refs"][0]
+                         and evidence["ack_ref"] < evidence["update_ref"] < done["event_index"],
+                         "action_filter_command_outside_action")
+                allowed_terminals.add("configured")
             _require(receipt.get("satisfied") is True and all(r["status"] == "satisfied" for r in receipt["requires"])
-                     and receipt.get("disposition") in {"applied", "effect_observed", "observed", "satisfied"},
+                     and receipt.get("disposition") in allowed_terminals,
                      "action_requires_or_terminal_not_reached")
             after = _one([e for e in self.events if begin["event_index"] < e["event_index"] < done["event_index"]],
                          "state_step_after", step_id="action:" + aid)
@@ -411,6 +429,11 @@ class _Audit:
                          "action_publish_after_state_mismatch")
             elif op in {"snapshot", "barrier"}:
                 _require(any(e["event"] == "command_done" for e in inside), "action_snapshot_ack_missing")
+            elif op == "update_filter":
+                _require(self.specs[action["endpoint_id"]].get("role") == "reader"
+                         and receipt["after"] == {**receipt["before"], "filter_update_raw_ref": evidence["update_ref"]}
+                         and evidence["update_ref"] < after["event_index"],
+                         "action_filter_after_state_mismatch")
             elif op == "assert_liveliness":
                 _require(self.specs[action["endpoint_id"]].get("role") == "writer",
                          "action_assert_requires_writer")
@@ -432,6 +455,15 @@ class _Audit:
         _require(token is not None, "receive_generation_unbound")
         self.bound(event, token)
         _require(event.get("payload_run_id") == self.config["run_id"], "receive_payload_old_run")
+        from .topology_sample_attribution import native_delivery_identity
+        native = native_delivery_identity(event, sends, self.events, ref=self.ref)
+        if native is not None:
+            sent = self.resolve(native["send_ref"])
+            writer = self.tokens[(sent["logical_id"], sent["generation"])]
+            self.bound(sent, writer)
+            _require(self.specs[sent["logical_id"]]["role"] == "writer"
+                     and self.specs[event["logical_id"]]["role"] == "reader", "delivery_role_mismatch")
+            return native
         seq = event.get("send_sequence")
         _require(_integer(seq), "receive_sequence_missing")
         publisher = event.get("publisher_gid")

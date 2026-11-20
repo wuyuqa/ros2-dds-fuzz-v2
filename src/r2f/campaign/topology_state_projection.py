@@ -17,7 +17,10 @@ Raw protocol (additive to topology_pair JSONL; missing additions fail closed):
   Same logical_id/generation/pid/endpoint_generation/command_id, current GID,
   strictly request < match < graph < ACK. These are command ACKs, not DDS ACKs.
 * Per-peer match proof is match_snapshot.matched_peer_gids (complete list),
-  peer_gids_complete=True and peer_proof_source='dds_matched_endpoint_api'.
+  peer_gids_complete=True and peer_proof_source='dds_matched_endpoint_api',
+  or an explicit fastdds_native_stateful_peer_snapshot with validated native
+  provenance, current command capture and strictly fresh observation ordinal.
+  Declared native evidence cannot downgrade to public/count/isolation proof.
   Alternatively topology_controlled_isolation with nonempty isolation_id,
   writer/reader generations, inventory_complete=True, graph_refs to the two
   current graphs. Both inventories must contain ONLY that exact writer/reader.
@@ -49,6 +52,8 @@ coverage eligible. This audits artifact consistency, not cryptographic runtime
 attestation/source freeze. Synthetic fixtures always remain ineligible.
 """
 from r2f.runtime.endpoint_incarnation import endpoint_identity_at
+from r2f.runtime.publish_occurrence import producer_occurrence_witness
+from r2f.campaign.topology_sample_attribution import native_delivery_identity
 from copy import deepcopy
 import hashlib
 import json
@@ -61,6 +66,7 @@ from r2f.core.topology_state import (
     PAIR_DOMAINS, abstract_topology_state, logical_endpoints, topology_state_id,
 )
 from r2f.instrumentation.sedp import check_offered_requested
+from r2f.instrumentation.fastdds_peer.receipt import validate_observation
 
 SCHEMA = "r2f.s1-topology-state-projection/v1"
 _BOUNDARIES = {"topology_state_boundary", "state_step_before", "state_step_after", "topology_pair_observation"}
@@ -350,15 +356,35 @@ class _Projection:
         return proof
 
     def match(self, w, r, wc, rc, boundary):
-        direct = []
+        direct, native_sources = [], []
         for token, peer, chain in ((w, r, wc), (r, w, rc)):
             row = chain[1]
-            if (row.get("peer_proof_source") == "dds_matched_endpoint_api"
-                    and row.get("peer_gids_complete") is True
-                    and isinstance(row.get("matched_peer_gids"), list)):
+            source = row.get("peer_proof_source")
+            selections = [e for e in self.events[:chain[0]["event_index"]]
+                          if e.get("event") == "native_peer_provider_selected"
+                          and all(token.get(k) is not None and e.get(k) == token[k]
+                                  for k in ("pid", "process_start_ticks", "endpoint_generation"))]
+            native_declared = (source == "fastdds_native_stateful_peer_snapshot"
+                               or row.get("observation_mode") == "instrumentation"
+                               or token.get("observation_mode") == "instrumentation"
+                               or isinstance(row.get("native_peer_observation"), dict)
+                               or bool(selections))
+            if native_declared and source != "fastdds_native_stateful_peer_snapshot":
+                raise ValueError("native_peer_proof_source_mislabeled")
+            complete = (row.get("peer_gids_complete") is True
+                        and isinstance(row.get("matched_peer_gids"), list))
+            if native_declared and not complete:
+                raise ValueError("native_peer_membership_incomplete")
+            if source in {"dds_matched_endpoint_api", "fastdds_native_stateful_peer_snapshot"} and complete:
                 gids = [_gid(gid) for gid in row["matched_peer_gids"]]
                 if None in gids or len(gids) != len(set(gids)) or row["matched_count"] != len(gids):
                     raise ValueError("per_peer_list_count_contradiction")
+                if native_declared:
+                    reason = validate_observation(row.get("native_peer_observation"), row,
+                                                  token, self.events, chain[0])
+                    if reason is not None:
+                        raise ValueError(reason)
+                    native_sources.extend(selections)
                 # Same strict local raw universe as the producer: an extra
                 # unbound peer or missing/aliased generation is not a complete
                 # observation of this captured topology. No expected QoS graph.
@@ -419,7 +445,7 @@ class _Projection:
             direct = measured
         value = ("bidirectional" if all(direct) else "writer_only" if direct[0]
                  else "reader_only" if direct[1] else "none")
-        return value, [w, r, *wc, *rc] + ([proof] if proof else []), proof
+        return value, [w, r, *wc, *rc, *native_sources] + ([proof] if proof else []), proof
 
     def compatibility(self, w, r, wc, rc):
         if w["topic"] != r["topic"]:
@@ -569,6 +595,34 @@ class _Projection:
             "no_sends_ref": self.ref(claim), "inventory_end_ref": self.ref(seal),
             "inventory_sha256": digest, "generation_scope": expected["scope"]}
 
+    def _native_send_evidence(self, send, boundary):
+        """Declared scopes must verify even when no reader received this send."""
+        events = self.prefix(boundary)
+        declared = any(e.get("logical_id") == send.get("logical_id")
+                       and e.get("generation") == send.get("generation")
+                       and (e["event"] in {"publish_call_begin", "rmw_publish_trace", "publish_call_end"}
+                            or e["event"] == "send" and "publish_occurrence_receipt" in e)
+                       for e in events)
+        if not declared:
+            return []
+        witness, reason = producer_occurrence_witness(send, events)
+        if witness is None:
+            raise ValueError("native_publish_occurrence_invalid:" + str(reason))
+        indices = [witness["send_ref"], *witness["scope_refs"].values()]
+        indices.extend(witness["writer_identity"][key] for key in
+                       ("creation_ref", "transition_ref", "ack_ref", "valid_after_ref")
+                       if witness["writer_identity"][key] is not None)
+        return [self.resolve(index, boundary=boundary) for index in indices]
+
+    def _native_evidence_rows(self, identity, boundary):
+        """Keep all helper proof refs bound to this raw capture and boundary."""
+        if isinstance(identity, dict):
+            if set(identity) == {"path", "sha256", "event_index"}:
+                return [self.resolve(identity, boundary=boundary)]
+            return [row for value in identity.values()
+                    for row in self._native_evidence_rows(value, boundary)]
+        return []
+
     def recreated_no_sends(self, w, r, boundary):
         """Independently consume v2; do not reuse the producer's validator."""
         w = endpoint_identity_at(self.events, w, before_index=boundary["event_index"] + 1)
@@ -675,16 +729,25 @@ class _Projection:
             self.chain_order([boundary,exit_event,ends[0]])
         creates = [e for e in self.events if e["event"] == "endpoint_created"]
         sends = [e for e in self.events if e["event"] == "send"]
+        native_rows, native_identities = [], []
         for send in sends:
             tokens = [e for e in creates if e.get("logical_id") == send.get("logical_id") and e.get("generation") == send.get("generation")]
             if (len(tokens) != 1 or any(send.get(k) != tokens[0].get(k) for k in fields if k != "endpoint_gid")
                     or send.get("writer_gid") != tokens[0]["endpoint_gid"] or send.get("publish_returned") is not True
-                    or send["event_index"] >= end or not _text(send.get("payload_sha256"))
-                    or len([s for s in sends if s.get("payload_sha256") == send["payload_sha256"]]) != 1):
+                    or send["event_index"] >= end or not _text(send.get("payload_sha256"))):
                 raise ValueError("recreated_no_sends_ambiguous_send")
+            native = self._native_send_evidence(send, seal)
+            if not native and len([s for s in sends if s.get("payload_sha256") == send["payload_sha256"]]) != 1:
+                raise ValueError("recreated_no_sends_ambiguous_send")
+            native_rows.extend(native)
             if send.get("logical_id") == w["logical_id"] and (send["generation"] >= w["generation"] or send["event_index"] >= w["event_index"]):
                 raise ValueError("recreated_no_sends_current_generation_sent")
         for receive in (e for e in self.events if e["event"] == "receive"):
+            native = native_delivery_identity(receive, sends, inventory, ref=self.ref)
+            if native is not None:
+                native_rows.extend(self._native_evidence_rows(native, seal))
+                native_identities.append(native)
+                continue
             matching = [s for s in sends if s.get("payload_sha256") == receive.get("payload_sha256")
                         and s.get("logical_id") == receive.get("payload_writer_id")
                         and s.get("generation") == receive.get("payload_writer_generation")
@@ -741,11 +804,12 @@ class _Projection:
                     "candidate_eligible":False,"mutation_hit":False,"semantic_effect":False}
         if any(claim.get(k) != v for k,v in expected.items()):
             raise ValueError("recreated_no_sends_proof_contradicts_raw")
-        refs = [w,r,seal,claim,*chains[w["logical_id"]],*chains[r["logical_id"]],*prior]
+        refs = [w,r,seal,claim,*chains[w["logical_id"]],*chains[r["logical_id"]],*prior,*native_rows]
         return "no_obligation",refs,{"expected":[],"received":[],"missing":[],"applicability_kind":"not_applicable_no_sends",
             "no_sends_ref":self.ref(claim),"inventory_end_ref":self.ref(seal),"inventory_sha256":digest,
             "generation_scope":expected["scope"],"no_sends_schema":expected["schema"],
-            "generation_history_refs":histories,"prior_window_close_refs":[self.ref(e) for e in prior]}
+            "generation_history_refs":histories,"prior_window_close_refs":[self.ref(e) for e in prior],
+            "native_delivery_identities":native_identities}
 
     def delivery(self, w, r, tokens, boundary):
         w = endpoint_identity_at(self.events, w, before_index=boundary["event_index"] + 1)
@@ -828,9 +892,10 @@ class _Projection:
                 "observed_match_used": matched, "cross_writer_order_required": False,
                 "limitation": "snapshot_scope_only_not_persistent_nonmatch"}
         sends = [e for e in rows if e["event"] == "send" and e.get("logical_id") == w["logical_id"]]
-        expected = {}
+        expected, native_rows = {}, []
         for event in sends:
             self.bound(event, w, gid_field="writer_gid")
+            native_rows.extend(self._native_send_evidence(event, close))
             seq = event.get("send_sequence")
             if not _integer(seq) or seq in expected:
                 raise ValueError("send_sequence_invalid_or_duplicate_in_writer_generation")
@@ -854,7 +919,8 @@ class _Projection:
                 elif event["event"] in ("endpoint_destroyed", "topology_endpoint_destroyed"):
                     active.pop(eid, None)
             return [t for t in active.values() if t.get("topic") == w["topic"]]
-        samples, attributions = [], []
+        samples, attributions, native_identities = [], [], []
+        capture_sends = [e for e in self.prefix(close) if e["event"] == "send"]
         def payload_send(sample):
             digest = sample.get("payload_sha256")
             run_id = sample.get("payload_run_id")
@@ -880,24 +946,35 @@ class _Projection:
             if event["event"] != "receive" or event.get("logical_id") != r["logical_id"]:
                 continue
             self.bound(event, r, gid_field="reader_gid")
-            publisher = _gid(event.get("publisher_gid"))
-            writer_at_sample = endpoint_identity_at(self.events, w, before_index=event["event_index"] + 1)
-            if publisher is not None and publisher != _gid(writer_at_sample["endpoint_gid"]):
-                continue
-            basis, linked = "direct_publisher_gid", None
-            if publisher is None:
-                linked = payload_send(event)
-                if linked is not None:
-                    if linked.get("logical_id") != w["logical_id"]:
-                        continue
-                    self.bound(linked, w, gid_field="writer_gid")
-                    basis = "endpoint_correlated_payload"
-                elif len(possible_writers_at(event)) == 1 and isolation is not None:
-                    basis = "controlled_isolation_endpoint_correlated"
-                else:
-                    ambiguous.append(event)
+            # Select the strict native contract BEFORE any GID/body fallback.
+            # Its sequence is a witnessed producer occurrence, not String.data's
+            # sequence nor a guessed DDS publication-sequence offset.
+            native = native_delivery_identity(event, capture_sends, self.prefix(close), ref=self.ref)
+            if native is not None:
+                if (native["writer"], native["writer_generation"]) != (w["logical_id"], w["generation"]):
                     continue
-            seq = event.get("send_sequence")
+                linked = self.resolve(native["send_ref"], boundary=close)
+                self.bound(linked, w, gid_field="writer_gid")
+                seq, basis = native["sequence"], native["basis"]
+            else:
+                publisher = _gid(event.get("publisher_gid"))
+                writer_at_sample = endpoint_identity_at(self.events, w, before_index=event["event_index"] + 1)
+                if publisher is not None and publisher != _gid(writer_at_sample["endpoint_gid"]):
+                    continue
+                basis, linked = "direct_publisher_gid", None
+                if publisher is None:
+                    linked = payload_send(event)
+                    if linked is not None:
+                        if linked.get("logical_id") != w["logical_id"]:
+                            continue
+                        self.bound(linked, w, gid_field="writer_gid")
+                        basis = "endpoint_correlated_payload"
+                    elif len(possible_writers_at(event)) == 1 and isolation is not None:
+                        basis = "controlled_isolation_endpoint_correlated"
+                    else:
+                        ambiguous.append(event)
+                        continue
+                seq = event.get("send_sequence")
             if not _integer(seq):
                 raise ValueError("received_sequence_missing")
             if seq not in expected:
@@ -911,7 +988,10 @@ class _Projection:
             received.setdefault(seq, []).append(event)
             samples.append(event)
             attributions.append(basis)
-        refs = [w, r, opened, close, *match_rows, *sends, *samples, *ambiguous]
+            if native is not None:
+                native_identities.append(native)
+                native_rows.extend(self._native_evidence_rows(native, close))
+        refs = [w, r, opened, close, *match_rows, *sends, *samples, *ambiguous, *native_rows]
         for event in [*sends, *samples, *ambiguous]:
             if not opened["monotonic_ns"] <= event["monotonic_ns"] <= close["monotonic_ns"]:
                 raise ValueError("delivery_sample_outside_window_clock")
@@ -923,7 +1003,8 @@ class _Projection:
                   "directed_pair_communication": bool(samples), "observed_match_used": matched,
                   "cross_writer_order_required": False, "cross_worker_log_order": "not_assumed",
                   "payload_uniqueness_scope": "raw_prefix_through_window_close",
-                  "open_ref": self.ref(opened), "close_ref": self.ref(close)}
+                  "open_ref": self.ref(opened), "close_ref": self.ref(close),
+                  "native_delivery_identities": native_identities}
         if not expected:
             return "no_obligation", refs, detail
         sentinel = close.get("sentinel_sequence")
@@ -1048,8 +1129,14 @@ class _Projection:
                         if wc is None or rc is None:
                             raise ValueError("current_snapshot_chain_missing")
                         value, rows, proof = self.match(tokens[w], tokens[r], wc, rc, boundary)
+                        sources = sorted({c[1]["peer_proof_source"] for c in (wc, rc)
+                                          if isinstance(c[1].get("peer_proof_source"), str)})
+                        kind = ("controlled_isolation" if proof else
+                                "direct_native_per_peer" if sources == ["fastdds_native_stateful_peer_snapshot"] else
+                                "direct_per_peer_api" if sources == ["dds_matched_endpoint_api"] else
+                                "direct_mixed_per_peer")
                         pair["observed_match"] = self.component(side, path + "/observed_match", value, rows,
-                            proof_kind="controlled_isolation" if proof else "direct_per_peer_api",
+                            proof_kind=kind, peer_proof_sources=sources,
                             isolation_id=proof.get("isolation_id") if proof else None)
                     except ValueError as exc:
                         diagnostics = [e for e in self.prefix(boundary) if e["event"] == "topology_pair_observation"]

@@ -3085,9 +3085,27 @@ def run_topology(program, config, output_dir, *, backend=None):
                                generation=gen, reader_gid=st["handle"].get("endpoint_gid"),
                                command_id=update.get("command_id"), receipt=receipt,
                                filter_effect_observed=None, fixture=not backend.real_ros)
+                    action_evidence = None
+                    evidence_error = None
+                    if backend.real_ros or receipt.get("state_receipt") is not None:
+                        from .filter_action_receipt import filter_action_evidence
+                        try:
+                            action_evidence = filter_action_evidence(
+                                action, events, before_index=update_event["event_index"] + 1)
+                        except (ValueError, KeyError, TypeError) as exc:
+                            evidence_error = str(exc)
+                    # An observed disabled state is not a successful empty setter
+                    # or synthetic get readback. The command's original errors
+                    # stay in filter_update_receipt, and no filtering hit is added.
+                    legacy_fixture = not backend.real_ros and action_evidence is None and evidence_error is None
                     record_action(action, before, {**before, "filter_update_raw_ref": update_event["event_index"]},
-                                  disposition="configured" if receipt.get("applied") is True else "unknown",
-                                  satisfied=receipt.get("applied") is True,
+                                  disposition=(action_evidence["disposition"] if action_evidence else
+                                      "configured" if legacy_fixture and receipt.get("applied") is True else "unknown"),
+                                  satisfied=(action_evidence is not None or
+                                      legacy_fixture and receipt.get("applied") is True),
+                                  requires=(action_evidence["requires"] if action_evidence else [] if legacy_fixture else
+                                      [{"id": "raw_bound_filter_action_state", "status": "unknown"}]),
+                                  filter_action_evidence=action_evidence, filter_action_error=evidence_error,
                                   filter_update_receipt=receipt, filter_effect_observed=None,
                                   execution_evidence=False)
                     continue
