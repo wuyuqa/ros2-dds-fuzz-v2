@@ -145,8 +145,24 @@ def _graph_local_gid(snapshot, node_name, kind):
     return gid
 
 
+def _observe_filter_state(endpoint, emit, *, command, command_id, reader_gid, phase):
+    """Observe a live reader's state at an explicitly identity-bound raw point."""
+    from .filter_backend import ContentFilterAdapter
+    common = {"command": command, "command_id": command_id, "phase": phase,
+              "reader_gid": reader_gid, "endpoint_gid": reader_gid,
+              "topic": endpoint.topic_name}
+    adapter = ContentFilterAdapter()
+    adapter.attach(endpoint)
+    value = adapter.observe_state(api_event=lambda stage, **fields: emit(
+        "content_filter_state_api_call", api_stage=stage,
+        api_monotonic_ns=time.monotonic_ns(), **common, **fields))
+    value.update(common)
+    emit("content_filter_state_observation", filter_receipt=value, **common)
+    return value
+
+
 def _update_filter_identity(endpoint, graph, node_name, local_gid, incarnation,
-                            command, emit, *, timeout_sec=1.0):
+                            command, emit, *, timeout_sec=1.0, state_observer=None):
     """Observe a setter's identity change without dispatching executor callbacks."""
     from .filter_backend import ContentFilterAdapter
     command_id = command["command_id"]
@@ -183,6 +199,13 @@ def _update_filter_identity(endpoint, graph, node_name, local_gid, incarnation,
                       if row.get("node_name") == node_name)
     emit("endpoint_identity_snapshot", phase="after", endpoint_gid=after_gid,
          message_type=after_type, **common, **after)
+    # The production worker supplies this independent observer. Legacy helper
+    # callers without it produce no state evidence, never a fabricated disabled
+    # value. Keep set/get outcomes unchanged, even when state is observed false.
+    if state_observer is not None:
+        value["state_receipt"] = state_observer(
+            endpoint, emit, command="update_filter", command_id=command_id,
+            reader_gid=after_gid, phase="after")
     emit("content_filter_dynamic_update", command="update_filter", command_id=command_id,
          reader_gid=after_gid, endpoint_gid=after_gid, before_gid=local_gid,
          after_gid=after_gid, update_started_ns=started,
@@ -1196,6 +1219,9 @@ def _worker_main(argv):
              else "get_subscriptions_info_by_topic",
              initial_content_filter=filter_configuration,
              initial_content_filter_request=config.get("initial_content_filter"))
+        if kind == "reader":
+            _observe_filter_state(endpoint, emit, command="create_endpoint", command_id=None,
+                                  reader_gid=local_gid, phase="initial")
         liveliness.bind(local_gid)
         if kind == "reader":
             liveliness.peer_sampler = _LivelinessPeerSampler(
@@ -1303,7 +1329,7 @@ def _worker_main(argv):
             elif command["command"] == "update_filter" and kind == "reader":
                 local_gid, incarnation_ordinal = _update_filter_identity(
                     endpoint, lambda: graph(authenticate=False), node_name, local_gid,
-                    incarnation_ordinal, command, emit)
+                    incarnation_ordinal, command, emit, state_observer=_observe_filter_state)
                 liveliness.gid = local_gid
                 if liveliness.peer_sampler is not None:
                     liveliness.peer_sampler.gid = local_gid

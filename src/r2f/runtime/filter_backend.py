@@ -466,6 +466,56 @@ class ContentFilterAdapter:
                         observed=observed, is_cft_enabled=enabled)
         return self._record(value)
 
+    def observe_state(self, *, api_event=None):
+        """Read the public bool property independently of set/get and requests.
+
+        A disabled state is NOT an empty-expression readback, matched status,
+        successful setter, sample effect, or peer/match observation. Descriptor
+        failures and non-bool values are retained without truth-value coercion.
+        """
+        import inspect
+        api = 'rclpy.subscription.Subscription.is_cft_enabled'
+        started = self.clock()
+
+        def emit_api(stage, **fields):
+            if api_event is not None:
+                api_event(stage, api=api, **fields)
+
+        emit_api('state_begin', started_monotonic_ns=started)
+        result = {'status': 'unavailable_api', 'is_cft_enabled': None, 'state': None}
+        try:
+            missing = object()
+            if self.subscription is None:
+                result['reason'] = 'no_attached_subscription'
+            elif inspect.getattr_static(self.subscription, 'is_cft_enabled', missing) is missing:
+                result['reason'] = 'is_cft_enabled_unavailable'
+            else:
+                raw = self.subscription.is_cft_enabled
+                result['result_type'] = type(raw).__name__
+                try:
+                    json.dumps(raw, allow_nan=False)
+                except (TypeError, ValueError):
+                    result['raw_result_status'] = 'not_json_serializable'
+                else:
+                    result['raw_result'] = raw
+                if type(raw) is bool:
+                    result.update(status='observed', is_cft_enabled=raw,
+                                  state='enabled' if raw else 'disabled', reason=None)
+                else:
+                    result.update(status='invalid_result', reason='is_cft_enabled_not_bool')
+        except Exception as exc:
+            result.update(status='failed', reason='is_cft_enabled_failed', **filter_api_failure(exc))
+        completed = self.clock()
+        emit_api({'observed': 'state_success', 'failed': 'state_failure',
+                  'unavailable_api': 'state_unavailable', 'invalid_result': 'state_invalid'}[result['status']],
+                 completed_monotonic_ns=completed, **result)
+        return self._record(receipt(
+            'filter_state', api=api, started_monotonic_ns=started,
+            completed_monotonic_ns=completed, **result,
+            observation_basis='public_subscription_is_cft_enabled',
+            filter_effect_observed=None, filter_false_implies_unmatch=False,
+            hit=False, conformance_claim=False))
+
     def initial_readback(self, *, fixture=False):
         """Observe both initial-configuration APIs independently, never inputs.
 

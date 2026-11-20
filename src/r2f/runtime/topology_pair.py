@@ -1768,6 +1768,41 @@ def _dynamic_cft_effect(update, events, *, real_ros):
         return [events[i] for i in refs]
     pre_sends, post_sends = rows(before, "send_refs"), rows(after, "send_refs")
     pre_recvs, post_recvs = rows(before, "receive_refs"), rows(after, "receive_refs")
+    control_window_refs = [before["event_index"]]
+    if native_occurrences:
+        # The immediate health window can contain unrelated traffic. An exact
+        # repeated body may have its positive delivery control in an earlier
+        # closed window. Keep the immediate window/transition gates above and
+        # additionally authenticate that earlier window; never rewrite either.
+        rejected_bodies = {e.get("string_data") for e in post_sends
+                           if isinstance(e.get("string_data"), str)
+                           and not pattern.fullmatch(e["string_data"])}
+        if not rejected_bodies.intersection(e.get("string_data") for e in pre_sends):
+            for earlier in reversed(pre[:-1]):
+                old_sends = rows(earlier, "send_refs")
+                if not rejected_bodies.intersection(e.get("string_data") for e in old_sends):
+                    continue
+                old_ref = earlier.get("open_ref")
+                if (type(old_ref) is not int or not 0 <= old_ref < earlier["event_index"]
+                        or any(earlier.get(k) != before.get(k) for k in keys)):
+                    return fail("prior_control_window_identity_invalid")
+                old_open = events[old_ref]
+                if any(old_open.get(k) != openings[0].get(k)
+                       for k in (*keys, "writer_gid", "reader_gid")):
+                    return fail("prior_control_window_identity_invalid")
+                proof = _delivery_window_evidence(old_open, events,
+                                                 before_index=earlier["event_index"])
+                if (not proof.get("window_complete") or not earlier.get("window_complete")
+                        or proof.get("missing_sequences")
+                        or any(proof.get(k) != earlier.get(k) for k in
+                               ("closure_status", "send_refs", "receive_refs", "missing_sequences",
+                                "sentinel_send_ref", "sentinel_receive_ref"))):
+                    return fail("prior_control_window_not_raw_closed")
+                old_recvs = rows(earlier, "receive_refs")
+                pre_sends = list({e["event_index"]: e for e in old_sends + pre_sends}.values())
+                pre_recvs = list({e["event_index"]: e for e in old_recvs + pre_recvs}.values())
+                control_window_refs.insert(0, earlier["event_index"])
+                break
     if not pre_sends or not post_sends or not pre_recvs or not post_recvs:
         return fail("raw_sample_rows_missing")
     if (any(type(e.get("monotonic_ns")) is not int or e["monotonic_ns"] > start
@@ -1862,6 +1897,7 @@ def _dynamic_cft_effect(update, events, *, real_ros):
             "reason": None, "pre_window_ref": before["event_index"],
             "post_window_ref": after["event_index"], "worker_update_ref": worker["event_index"],
             "positive_control_send_refs": [e["event_index"] for e in controls],
+            "positive_control_window_refs": control_window_refs,
             "missing_send_refs": [e["event_index"] for e in missing],
             "sentinel_receive_ref": after["sentinel_receive_ref"],
             "interpretation": "sample_delivery_contrast_not_a_sut_verdict"}

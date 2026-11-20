@@ -120,8 +120,119 @@ def _registered_target(capsule):
     return registry.get_target(identifier), registry.get_services(identifier), exploratory
 
 
+_OBSERVATION_KEYS = ('observation_mode', 'fastdds_peer_instrumentation')
+_TOPOLOGY_TARGET = 'discovery.endpoint_topology.fuzz_v1'
+
+
+def _replay_observation_config(capsule):
+    """Restore execution selection only after checking its original raw binding.
+
+    Never infer from runtime_config/profile/history. No native library load.
+    SHA256 supplies artifact integrity, not authenticity of an unsigned capsule.
+    """
+    try:
+        final = capsule.input['effective_input']['final_input']
+        if set(final).intersection(_OBSERVATION_KEYS):
+            raise ValueError('observation_selection_is_execution_metadata_not_input')
+        execution = capsule.execution or {}
+        metadata = execution.get('runtime_execution_metadata') or {}
+        if not isinstance(metadata, dict):
+            raise ValueError('observation_runtime_metadata_invalid')
+        declared = any(key in execution for key in _OBSERVATION_KEYS)
+        hints = (declared or metadata.get('observation_mode') not in (None, 'blackbox')
+                 or metadata.get('fastdds_peer_instrumentation') is not None)
+        if capsule.input['target_id'] != _TOPOLOGY_TARGET:
+            if hints:
+                raise ValueError('observation_selection_unsupported_target')
+            return {}
+        if not execution:
+            return {}
+        raw_metadata = None
+        if execution.get('raw_path') or execution.get('raw_sha256'):
+            raw = Path(execution['raw_path']).read_bytes()
+            if hashlib.sha256(raw).hexdigest() != execution.get('raw_sha256'):
+                raise ValueError('observation_original_raw_hash_mismatch')
+            events = [json.loads(line) for line in raw.splitlines() if line.strip()]
+            records = [event for event in events if event.get('event') == 'topology_execution_metadata']
+            native = any(event.get('event') == 'native_peer_provider_selected' for event in events)
+            if len(records) > 1 or ((hints or native) and len(records) != 1):
+                raise ValueError('observation_raw_metadata_not_unique')
+            if records:
+                raw_metadata = records[0].get('metadata')
+                if not isinstance(raw_metadata, dict):
+                    raise ValueError('observation_raw_metadata_invalid')
+                hints = (hints or native
+                         or raw_metadata.get('observation_mode') not in (None, 'blackbox')
+                         or raw_metadata.get('fastdds_peer_instrumentation') is not None)
+        mode = execution.get('observation_mode', 'blackbox')
+        reference = execution.get('fastdds_peer_instrumentation')
+        if mode not in ('blackbox', 'instrumentation'):
+            raise ValueError('observation_original_mode_unsupported')
+        if mode == 'blackbox' and reference is not None:
+            raise ValueError('observation_blackbox_has_native_reference')
+        if not hints:
+            return {}
+        if raw_metadata is None:
+            raise ValueError('observation_original_raw_binding_required')
+        # Isolated wrapper PID annotations are deliberately irrelevant here;
+        # selection, sealed input and source identity are NEVER normalized away.
+        for record in (metadata, raw_metadata):
+            if (record.get('observation_mode', 'blackbox') != mode
+                    or record.get('fastdds_peer_instrumentation') != reference):
+                raise ValueError('observation_execution_selection_mismatch')
+        if mode == 'instrumentation' and not all(key in execution for key in _OBSERVATION_KEYS):
+            raise ValueError('observation_original_execution_selection_missing')
+        from r2f.core.replay import validate_replay_input, _v2_execution_input
+        validate_replay_input(capsule.input)
+        _v2_execution_input(execution, capsule.input)
+        scenario = Scenario.from_dict(capsule.input['scenario'])
+        if scenario.mutation_plan is None:
+            raise ValueError('observation_saved_plan_missing')
+        context = {key: execution.get(key) for key in
+                   ('run_id', 'target_id', 'target_revision', 'rmw', 'domain_id', 'arm', 'repeat')}
+        context.update(input_identity_schema=capsule.input['input_identity_schema'],
+                       effective_input_sha256=capsule.input['effective_input_sha256'],
+                       plan_hash=scenario.mutation_plan.plan_hash())
+        if not context['run_id'] or type(context['domain_id']) is not int:
+            raise ValueError('observation_original_execution_identity_missing')
+        for key in ('target_id', 'target_revision', 'rmw', 'arm', 'repeat', 'seed', 'mutation_kind', 'carrier'):
+            if canonical_hash(execution.get(key)) != canonical_hash(capsule.input[key]):
+                raise ValueError('observation_original_input_identity_mismatch:' + key)
+        for record in (metadata, raw_metadata):
+            if (record.get('schema') != 'r2f.topology-execution-metadata/v1'
+                    or record.get('context_basis') != 'sealed_input_declaration_not_sut_observation'
+                    or canonical_hash(record.get('sealed_execution_context')) != canonical_hash(context)
+                    or record.get('raw_refs_hash_binding') != 'enclosing_result.raw_sha256'
+                    or record.get('raw_path') != execution.get('raw_path')
+                    or record.get('input_program_sha256') != canonical_hash(final['topology_program'])
+                    or canonical_hash(record.get('source_manifest')) != canonical_hash(capsule.input['source_manifest'])):
+                raise ValueError('observation_original_sealed_context_mismatch')
+            for key in ('run_id', 'target_id', 'target_revision', 'rmw', 'domain_id', 'arm', 'repeat'):
+                if canonical_hash(record.get(key)) != canonical_hash(context[key]):
+                    raise ValueError('observation_original_runtime_identity_mismatch:' + key)
+        selection = {key: _copy_json(execution[key]) for key in _OBSERVATION_KEYS if key in execution}
+        if mode == 'instrumentation':
+            from r2f.instrumentation.fastdds_peer.activation import reference_from_config
+            reference_from_config(dict(selection, rmw=scenario.rmw))  # file-only validation
+        return selection
+    except (ValueError, KeyError, TypeError, OSError, AttributeError) as exc:
+        raise _Failure('fail_artifact', 'observation_execution_metadata_invalid',
+                       str(exc), 'preflight') from exc
+
+
+def _observation_replay_declaration(capsule, config):
+    selection = {key: _copy_json(config[key]) for key in _OBSERVATION_KEYS if key in config}
+    return {'schema': 'r2f.replay-observation-selection/v1', 'selection': selection,
+            'effective_observation_mode': selection.get('observation_mode', 'blackbox'),
+            'basis': ('original_execution_and_sha256_bound_raw_metadata' if selection
+                      else 'legacy_or_planned_default_blackbox'),
+            'original_execution_sha256': canonical_hash(capsule.execution),
+            'original_raw_sha256': (capsule.execution or {}).get('raw_sha256'),
+            'input_identity_unchanged': True}
+
+
 def _replay_config(capsule, replay_id, domain, source):
-    """Project only sealed input/plan into the existing runtime boundary.
+    """Project sealed input/plan plus verified original observation execution mode.
 
     The default run_pair is already the exact-id dispatcher for endpoint,
     namespace and projection backends. No original runtime_config/profile is
@@ -131,6 +242,7 @@ def _replay_config(capsule, replay_id, domain, source):
     scenario = Scenario.from_dict(capsule.input['scenario'])
     effective = capsule.input['effective_input']
     final = effective['final_input']
+    observation = _replay_observation_config(capsule)
     execution = dict(
         run_id=replay_id, campaign_id=replay_id,
         cell_id=f'{scenario.rmw}.{scenario.arm}.{scenario.repeat}', campaign_kind='replay',
@@ -144,6 +256,7 @@ def _replay_config(capsule, replay_id, domain, source):
         input_layer_receipts=_copy_json(effective['input_layer_receipts']),
         evidence_purpose='normal_conformance_replay',
         control_kind='fault' if scenario.arm == 'negative' else None)
+    execution.update(observation)  # execution-only; never part of effective input
     reject_execution_identity(final)
     if set(final) & set(execution):
         raise ValueError('submitted input shadows replay execution metadata: '
@@ -241,6 +354,9 @@ def _bind_execution_input(row, config, capsule):
         row.update(input_identity_schema=INPUT_SCHEMA_V2, final_input=final,
                    actual_submitted_payload_sha256=canonical_hash(final),
                    input_layer_receipts=_copy_json(config['input_layer_receipts']))
+    for key in _OBSERVATION_KEYS:
+        if key in config:
+            row[key] = _copy_json(config[key])
     return row
 
 
@@ -591,6 +707,10 @@ def _topology_context_errors(config, result, *, output_root, audited_pid_scope=N
     """Common execution context gates, without legacy two-role assumptions."""
     errors = []
     metadata = result.get('execution_metadata') or {}
+    if config.get('observation_mode') == 'instrumentation':
+        for key in _OBSERVATION_KEYS:
+            if canonical_hash(metadata.get(key)) != canonical_hash(config.get(key)):
+                errors.append('execution_metadata_observation_selection_mismatch:' + key)
     for key in ('run_id', 'target_id', 'target_revision', 'rmw', 'arm', 'repeat', 'domain_id'):
         if canonical_hash(metadata.get(key)) != canonical_hash(config.get(key)):
             errors.append('execution_metadata_identity_mismatch:' + key)
@@ -928,6 +1048,8 @@ def replay_cell(capsule_path, *, output_dir, domain_id, runtime=None,
                     _replay_config(capsule, replay_id, domain, before), execute=True,
                     runtime=runtime, runtime_boundary=runtime_boundary)
                 context['config'] = config
+                if capsule.input['target_id'] == _TOPOLOGY_TARGET:
+                    report['observation_replay'] = _observation_replay_declaration(capsule, config)
                 _write(output / 'runtime_config.json', config)
                 runtime_dir = output / 'runtime'
                 runtime_dir.mkdir()
@@ -1243,4 +1365,8 @@ def _check_audit_config(root, original, report, errors):
         runtime_boundary=boundary)
     if canonical_hash(config) != canonical_hash(expected):
         errors.append('replay config differs from deterministic capsule reconstruction')
+    if (report.get('observation_replay') is not None
+            or expected.get('observation_mode') == 'instrumentation'):
+        if report.get('observation_replay') != _observation_replay_declaration(original, expected):
+            errors.append('replay observation declaration differs from original execution selection')
     _check_domain(original, report['domain_id'])
