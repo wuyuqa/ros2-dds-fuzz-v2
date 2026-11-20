@@ -27,7 +27,7 @@ import time
 from r2f.modules.s1 import topology_model as model
 
 from .domains import IsolationError
-from .endpoint_incarnation import endpoint_identity_at
+from .endpoint_incarnation import endpoint_identity_at, validate_filter_identity_update
 from .topology_environment_observation import TopologyEnvironmentObservation
 
 from .liveliness_evidence import evaluate_liveliness, evaluate_peer_samples
@@ -1477,13 +1477,43 @@ def _dynamic_cft_effect(update, events, *, real_ros):
             or worker.get("event_index", uid) >= uid or worker.get("filter_receipt") != receipt
             or worker.get("reader_gid") != update.get("reader_gid")):
         return fail("worker_update_chronology_or_receipt_invalid")
+    created = [e for e in events if e.get("event") == "endpoint_created"
+               and e.get("logical_id") == update.get("logical_id")
+               and e.get("generation") == update.get("generation")]
+    if len(created) != 1 or any(worker.get(k) is None or worker.get(k) != created[0].get(k)
+            for k in ("pid", "process_start_ticks", "endpoint_generation")):
+        return fail("reader_identity_not_bound")
+    related = [e for e in events if e.get("logical_id") == update.get("logical_id")
+               and e.get("generation") == update.get("generation")
+               and e.get("command_id") == update.get("command_id")]
+    incarnation_contract = ("before_gid" in worker or "after_gid" in worker
+        or any(e.get("event") in {"endpoint_identity_snapshot", "endpoint_identity_transition"}
+               for e in related))
+    # New captures explicitly distinguish API's old reader identity from the
+    # independently observed post-update identity. Legacy stable-GID captures
+    # retain their exact old gate, never an arbitrary changed-GID fallback.
+    try:
+        before_identity = endpoint_identity_at(events, created[0], before_index=worker["event_index"]
+            if not incarnation_contract else min(e["event_index"] for e in related))
+        if incarnation_contract:
+            after_identity = validate_filter_identity_update(events, before_identity, worker.get("command_id"))
+            if (after_identity["endpoint_gid"] != update.get("reader_gid")
+                    or after_identity["identity_valid_after_ref"] >= uid
+                    or after_identity["identity_valid_after_ns"] > update.get("monotonic_ns", -1)):
+                return fail("update_incarnation_not_committed_before_result")
+        else:
+            after_identity = before_identity
+            if after_identity["endpoint_gid"] != update.get("reader_gid"):
+                return fail("reader_identity_not_bound")
+    except (ValueError, KeyError, TypeError) as exc:
+        return fail("update_incarnation_evidence_invalid:" + str(exc))
     calls = [e for e in events if e.get("event") == "content_filter_api_call"
              and e.get("logical_id") == update.get("logical_id")
              and e.get("command_id") == update.get("command_id")]
     if (len(calls) != 4 or [e.get("api_stage") for e in calls] !=
             ["set_begin", "set_success", "get_begin", "get_success"]
             or any(e.get("generation") != worker.get("generation")
-                   or e.get("reader_gid") != worker.get("reader_gid")
+                   or e.get("reader_gid") != before_identity.get("endpoint_gid")
                    or any(e.get(k) != worker.get(k) for k in
                           ("pid", "process_start_ticks", "endpoint_generation"))
                    or type(e.get("api_monotonic_ns")) is not int for e in calls)
@@ -1501,13 +1531,16 @@ def _dynamic_cft_effect(update, events, *, real_ros):
                                                  fixture=not real_ros)
     if captured is None or captured != calls[-1].get("observed") or captured != observed:
         return fail("raw_api_readback_invalid_or_inconsistent")
-    created = [e for e in events if e.get("event") == "endpoint_created"
-               and e.get("logical_id") == update.get("logical_id")
-               and e.get("generation") == update.get("generation")
-               and e.get("endpoint_gid") == update.get("reader_gid")]
-    if len(created) != 1 or any(worker.get(k) is None or worker.get(k) != created[0].get(k)
-            for k in ("pid", "process_start_ticks", "endpoint_generation")):
-        return fail("reader_identity_not_bound")
+    # These receipts prove API identity/config observation only. Keep them when
+    # a later delivery/occurrence gate is unknown; never label them filter effect.
+    unknown.update(api_call_refs=[e["event_index"] for e in calls],
+        reader_identity={"before_gid": before_identity["endpoint_gid"],
+            "after_gid": after_identity["endpoint_gid"],
+            "incarnation_before": before_identity["incarnation_ordinal"],
+            "incarnation_after": after_identity["incarnation_ordinal"],
+            "transition_ref": after_identity["identity_transition_ref"],
+            "ack_ref": after_identity["identity_valid_after_ref"]},
+        api_identity_observed=True, configuration_readback_observed=True)
     closes = [e for e in events if e.get("event") == "topology_delivery_window_closed"
               and e.get("reader") == update.get("logical_id")
               and e.get("reader_generation") == update.get("generation")]
@@ -1526,7 +1559,13 @@ def _dynamic_cft_effect(update, events, *, real_ros):
            for x in (before, after)):
         return fail("window_open_ref_invalid")
     openings = [events[x["open_ref"]] for x in (before, after)]
-    if any(openings[0].get(k) != openings[1].get(k) for k in ("writer_gid", "reader_gid")):
+    if openings[0].get("writer_gid") != openings[1].get("writer_gid"):
+        return fail("window_gid_changed")
+    if (openings[0].get("reader_gid") != before_identity["endpoint_gid"]
+            or openings[1].get("reader_gid") != after_identity["endpoint_gid"]):
+        return fail("window_reader_incarnation_mismatch")
+    if (openings[0].get("reader_gid") != openings[1].get("reader_gid")
+            and not incarnation_contract):
         return fail("window_gid_changed")
     if openings[1].get("reader_gid") != update.get("reader_gid"):
         return fail("window_reader_gid_mismatch")
@@ -1586,7 +1625,9 @@ def _dynamic_cft_effect(update, events, *, real_ros):
     if any(v is None for v in decoded.values()):
         return fail("sample_encoding_or_hash_invalid")
     for receive in pre_recvs + post_recvs:
-        witness, _ = payload_delivery_witness(pair, receive, events)
+        sample_pair = {**pair, "reader_gid": (before_identity["endpoint_gid"]
+                        if receive in pre_recvs else after_identity["endpoint_gid"])}
+        witness, _ = payload_delivery_witness(sample_pair, receive, events)
         if witness is None or sample(receive) is None:
             return fail("receive_sample_identity_or_encoding_invalid")
         send = events[witness["send_ref"]]
@@ -1615,7 +1656,6 @@ def _dynamic_cft_effect(update, events, *, real_ros):
         return fail("late_receive_after_window")
     return {**unknown, "status": "delivery_contrast",
             "filter_effect_observed": None,
-            "api_call_refs": [e["event_index"] for e in calls],
             "control_equivalence": "declared_payload_only; complete String.data differs or is unverified",
             "attribution": "unknown; missing delivery is not proof of filtering",
             "fixture_contrast_observed": True if not real_ros else None,
