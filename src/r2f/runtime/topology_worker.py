@@ -1025,14 +1025,23 @@ def _worker_main(argv):
         if local_gid is None:
             emit("worker_error", error="endpoint_gid_not_observed_within_startup_timeout")
             return 1
-        # Endpoint-info QoS/type are observed graph reflection. Requested
-        # creation arguments stay separate and never backfill missing fields.
+        # Graph retains the independent remote contract and GID/type. Local
+        # history/depth and resolved defaults come only from the actual public
+        # endpoint API; endpoint.qos_profile is merely the supplied Python object.
         own_rows = initial_graph["publishers" if kind == "writer" else "subscriptions"]
         own = next((row for row in own_rows if row["endpoint_gid"] == local_gid), {})
+        from .actual_qos import read_public_endpoint_qos
+        from .qos_binding import compare_public_qos
+        actual = read_public_endpoint_qos(endpoint, kind)
+        comparison = compare_public_qos(config["qos"], actual["qos"])
+        if comparison["status"] != "matched":
+            raise RuntimeError("endpoint_actual_qos_request_mismatch:" + str(comparison["mismatches"]))
         emit("endpoint_created", endpoint_gid=local_gid, created_monotonic_ns=created_ns,
              create_begin_monotonic_ns=create_begin["monotonic_ns"],
-             topic=endpoint.topic_name, qos=own.get("qos"), message_type=own.get("topic_type"),
-             requested_qos=config["qos"], configuration_source="public_graph_endpoint_reflection",
+             topic=endpoint.topic_name, qos=actual["qos"], message_type=own.get("topic_type"),
+             requested_qos=config["qos"], configuration_source="public_endpoint_actual_qos",
+             actual_endpoint_qos=actual, qos_request_comparison=comparison,
+             graph_qos=own.get("qos"),
              identity_source="get_publishers_info_by_topic" if kind == "writer"
              else "get_subscriptions_info_by_topic",
              **({"initial_content_filter": filter_configuration}

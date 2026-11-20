@@ -36,6 +36,8 @@ class OfflinePool:
     deliver = True
     wrong_readback = False
     extra_graph = False
+    actual_receipts = False
+    graph_depth_zero = False
     instances = []
 
     def __init__(self, c, env, output_dir, emit, **kwargs):
@@ -49,12 +51,18 @@ class OfflinePool:
                   endpoint_generation=token['endpoint_generation'],
                   rmw_identifier=pair.role_rmw(self.config, role), **fields)
 
+    def graph_qos(self, role):
+        qos = deepcopy(self.config[role + '_qos'])
+        if self.graph_depth_zero:
+            qos.update(depth=0, history='unknown')
+        return qos
+
     def graph(self):
         return {'publishers': [{'endpoint_gid': 'writer-gid', 'topic_type': 'std_msgs/msg/String',
-                                  'qos': self.config['writer_qos']}] + (
+                                  'qos': self.graph_qos('writer')}] + (
                     [{'endpoint_gid': 'foreign-writer'}] if self.extra_graph else []),
                 'subscriptions': [{'endpoint_gid': 'reader-gid', 'topic_type': 'std_msgs/msg/String',
-                                     'qos': self.config['reader_qos']}]}
+                                     'qos': self.graph_qos('reader')}]}
 
     def start(self, role):
         self.tokens[role] = {'pid': 4001 if role == 'writer' else 4002,
@@ -64,10 +72,26 @@ class OfflinePool:
         self.row(role, 'endpoint_created', endpoint_gid=role + '-gid',
                  created_monotonic_ns=time.monotonic_ns(), topic=self.config['topic'],
                  message_type='std_msgs/msg/String', qos=self.config[role + '_qos'])
-        qos = deepcopy(self.config[role + '_qos'])
+        qos = self.graph_qos(role)
         if self.wrong_readback:
             qos['reliability'] = 'invalid'
-        self.row(role, 'qos_binding_observed', observed_self=qos,
+        extra = {}
+        if self.actual_receipts:
+            actual = deepcopy(self.config[role + '_qos'])
+            actual.setdefault('history', 'keep_last')
+            actual.setdefault('deadline_ns', 0)
+            actual.setdefault('liveliness', 'automatic')
+            actual.setdefault('liveliness_lease_duration_ns', 0)
+            # Explicit fixture only: not a real C-API call/library proof.
+            actual['deadline_ns'] = 9223372036854775807
+            actual['liveliness_lease_duration_ns'] = 9223372036854775807
+            extra['actual_endpoint_qos'] = {
+                'schema': 'r2f.public-endpoint-qos/v1', 'status': 'observed',
+                'api': 'rcl_' + ('publisher' if role == 'writer' else 'subscription') + '_get_actual_qos',
+                'pid': self.tokens[role]['pid'], 'sampled_monotonic_ns': time.monotonic_ns(),
+                'qos': actual, 'library': {'path': '/offline/fixture/librcl.so', 'sha256': 'a' * 64},
+                'abi': {'verified': True}, 'offline_fixture': True}
+        self.row(role, 'qos_binding_observed', observed_self=qos, **extra,
                  observed_self_gid=role + '-gid',
                  observation_api='get_' + ('publishers' if role == 'writer' else 'subscriptions') + '_info_by_topic')
 
@@ -106,10 +130,11 @@ class OfflinePool:
 
 class G01RuntimeWiring(unittest.TestCase):
     def run_offline(self, kind='RR', *, matched=1, deliver=True, wrong_readback=False,
-                    extra_graph=False, **overrides):
+                    extra_graph=False, actual_receipts=False, graph_depth_zero=False, **overrides):
         pool_type = type('ConfiguredOfflinePool', (OfflinePool,),
                          dict(matched=matched, deliver=deliver, wrong_readback=wrong_readback,
-                              extra_graph=extra_graph))
+                              extra_graph=extra_graph, actual_receipts=actual_receipts,
+                              graph_depth_zero=graph_depth_zero))
         sidecar = SimpleNamespace(base_env={}, role_env={}, capture_worker=lambda *a: {},
                                   collect=lambda *a: {'status': 'offline_fixture', 'candidate_count': 0})
         def acquire(c, out, emit, **kwargs):
@@ -136,6 +161,61 @@ class G01RuntimeWiring(unittest.TestCase):
                 raw = [json.loads(line) for line in Path(result['raw_path']).read_text().splitlines()]
                 self.assertEqual(raw, result['events'])
             return result, pair.normalize_config(c)
+
+    def test_actual_qos_fixture_preserves_graph_depth_and_default_resolution(self):
+        from r2f.runtime.qos_binding import compare_public_qos
+        for kind in ('RR', 'RB', 'BB', 'BR'):
+            with self.subTest(kind=kind):
+                result, c = self.run_offline(kind, actual_receipts=True, graph_depth_zero=True,
+                                            matched=0 if kind == 'BR' else 1)
+                self.assertEqual(result['runtime_status'], 'completed', result['reason'])
+                self.assertTrue(result['relation_observation']['oracle_input'], result['relation_observation'])
+                for row in result['events']:
+                    if row['event'] == 'qos_binding_observed':
+                        self.assertEqual(row['observed_self']['depth'], 0)
+                        actual = row['actual_endpoint_qos']['qos']
+                        self.assertEqual(actual['depth'], c[row['role'] + '_qos']['depth'])
+                        compared = compare_public_qos(dict(c[row['role'] + '_qos'], deadline_ns=0), actual)
+                        self.assertEqual(compared['status'], 'matched')
+                        self.assertTrue(compared['default_resolutions'])
+
+    def test_graph_depth_zero_without_actual_receipt_keeps_legacy_failure(self):
+        result, _ = self.run_offline(graph_depth_zero=True)
+        self.assertNotEqual(result['runtime_status'], 'completed')
+        self.assertIn('actual_qos_readback_mismatch', result['reason'])
+        self.assertFalse(result['mutation_receipt']['hit'])
+
+    def test_actual_receipt_tampering_and_graph_rxo_remain_fail_closed(self):
+        result, c = self.run_offline(actual_receipts=True, graph_depth_zero=True)
+        self.assertEqual(result['runtime_status'], 'completed', result['reason'])
+        for damage in ('pid', 'sample_before_create', 'sample_after_event', 'api', 'schema',
+                       'library', 'abi', 'missing_field', 'explicit_depth', 'graph_reliability',
+                       'binding_identity', 'binding_time', 'null_receipt'):
+            with self.subTest(damage=damage):
+                rows = deepcopy(result['events'])
+                binding = next(e for e in rows if e['event'] == 'qos_binding_observed')
+                receipt = binding['actual_endpoint_qos']
+                token = next(e for e in rows if e['event'] == 'endpoint_created')
+                if damage == 'pid': receipt['pid'] += 1
+                elif damage == 'sample_before_create': receipt['sampled_monotonic_ns'] = token['created_monotonic_ns'] - 1
+                elif damage == 'sample_after_event': receipt['sampled_monotonic_ns'] = binding['monotonic_ns'] + 1
+                elif damage == 'api': receipt['api'] = 'rcl_subscription_get_actual_qos'
+                elif damage == 'schema': receipt['schema'] = 'wrong'
+                elif damage == 'library': receipt['library']['sha256'] = 'bad'
+                elif damage == 'abi': receipt['abi']['verified'] = False
+                elif damage == 'missing_field': receipt['qos'].pop('history')
+                elif damage == 'explicit_depth': receipt['qos']['depth'] += 1
+                elif damage == 'binding_identity': binding['pid'] += 1
+                elif damage == 'binding_time': binding['monotonic_ns'] = token['monotonic_ns'] - 1
+                elif damage == 'null_receipt': binding['actual_endpoint_qos'] = None
+                else:
+                    for row in rows:
+                        if row['event'] == 'graph_snapshot':
+                            row['publishers'][0]['qos']['reliability'] = 'best_effort'
+                observed = g01_runtime_observation(rows, c)
+                self.assertFalse(observed['oracle_input'], observed)
+                self.assertFalse(observed['relation_effect_observed'])
+                self.assertFalse(observed['candidate_eligible'])
 
     def test_all_four_pairs_reach_observer_and_existing_guard(self):
         for kind in ('RR', 'RB', 'BB', 'BR'):

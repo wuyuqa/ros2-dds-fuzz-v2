@@ -348,10 +348,25 @@ def _bound_creations(record, endpoint_id, spec, events, program, *, fixture):
                 or any(token.get(k) != e.get(k) for e in (begin, end) for k in ("run_id", "domain_id"))):
             record["reasons"].append("raw_endpoint_run_or_domain_mismatch:" + endpoint_id)
         backend = OFFLINE_BACKEND if fixture else ROS_BACKEND
-        source = "offline_fixture" if fixture else "public_graph_endpoint_reflection"
+        source = ("offline_fixture" if fixture else "public_endpoint_actual_qos"
+                  if "actual_endpoint_qos" in token else "public_graph_endpoint_reflection")
         if (token.get("backend") != backend or token.get("real_ros") is not (not fixture)
                 or token.get("configuration_source") != source):
             record["reasons"].append("raw_endpoint_provenance_mismatch:" + endpoint_id)
+        if "actual_endpoint_qos" in token:
+            from .qos_binding import validate_created_qos
+            try:
+                if fixture:
+                    raise ValueError("fixture_cannot_claim_public_actual_qos")
+                public = endpoint_expressibility(spec, {"rmw": token.get("rmw_identifier")})["public_qos"]
+                comparison = validate_created_qos(token, public)
+                if comparison["default_resolutions"]:
+                    record.setdefault("qos_default_resolutions", []).append({
+                        "logical_id": endpoint_id, "generation": token.get("generation"),
+                        "raw_event_index": token.get("event_index"),
+                        "resolutions": comparison["default_resolutions"]})
+            except (ValueError, TypeError, KeyError, TopologyUnsupported) as exc:
+                record["reasons"].append("raw_actual_qos_receipt_invalid:" + endpoint_id + ":" + str(exc))
         if not fixture and (not isinstance(token.get("qos"), dict)
                             or any(k not in token["qos"] for k in REFLECTED_QOS_FIELDS)):
             record["reasons"].append("raw_public_qos_reflection_incomplete:" + endpoint_id)
@@ -396,7 +411,20 @@ def _check_configuration(record, delta, events, program, layer_program, *, fixtu
                 elif not have:
                     record["reasons"].append(endpoint_id + ":" + why_want)
                 elif canonical_hash(observed) != canonical_hash(want):
-                    record["reasons"].append("layer_value_not_reflected:" + endpoint_id + ":" + field)
+                    # Only the explicitly unspecified duration can resolve to
+                    # a different effective value, with the complete actual
+                    # endpoint receipt independently validated above. Preserve
+                    # that value; do not report a literal zero-time effect.
+                    public = PUBLIC_QOS_FIELD.get(field)
+                    resolutions = created.get("qos_request_comparison", {}).get("default_resolutions", [])
+                    resolved = (not fixture and "actual_endpoint_qos" in created
+                                and field in DURATION_FIELDS and want == 0
+                                and {"field": public, "requested": 0, "observed": observed,
+                                     "basis": "RMW_DURATION_UNSPECIFIED"} in resolutions)
+                    if resolved:
+                        values[field] = observed
+                    else:
+                        record["reasons"].append("layer_value_not_reflected:" + endpoint_id + ":" + field)
                 else:
                     values[field] = observed
             verified[endpoint_id] = {"role": created.get("role"), "fields": values,

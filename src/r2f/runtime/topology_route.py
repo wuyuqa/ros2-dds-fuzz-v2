@@ -689,7 +689,21 @@ def audit_topology_application(plan, input_layer_receipts, runtime):
                                       "S1.topology.qos.liveliness": "liveliness"}
                     if operator in CONFIG_OPERATORS:
                         mandatory.add(changed_fields.get(receipt["slot_id"].split("#", 1)[0], "unimplemented_configuration_slot"))
-                    qos_matches = isinstance(observed_qos, dict) and all(observed_qos.get(k) == expected_qos.get(k) and k in observed_qos for k in mandatory)
+                    if "actual_endpoint_qos" in created:
+                        from .qos_binding import validate_created_qos
+                        try:
+                            comparison = validate_created_qos(created, expected_qos)
+                            qos_matches = True
+                            if comparison["default_resolutions"]:
+                                layer.setdefault("qos_default_resolutions", []).append({
+                                    "logical_id": created.get("logical_id"),
+                                    "generation": created.get("generation"),
+                                    "raw_event_index": created.get("event_index"),
+                                    "resolutions": comparison["default_resolutions"]})
+                        except (ValueError, TypeError, KeyError):
+                            qos_matches = False
+                    else:
+                        qos_matches = isinstance(observed_qos, dict) and all(observed_qos.get(k) == expected_qos.get(k) and k in observed_qos for k in mandatory)
                 else:
                     qos_matches = observed_qos == expected_qos
                 if not qos_matches:

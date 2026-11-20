@@ -813,6 +813,45 @@ __all__ = [
 ]
 
 
+def _g01_graph_qos_matches(graph_qos, actual):
+    """Reconcile available RxO fields; graph history/depth stay diagnostic."""
+    if not isinstance(graph_qos, dict):
+        return False
+    for key in ('reliability', 'durability', 'deadline_ns', 'liveliness',
+                'liveliness_lease_duration_ns'):
+        if key not in graph_qos:
+            continue
+        value = graph_qos[key]
+        if value is None or value in ('unknown', 'system_default'):
+            continue
+        if key.endswith('_ns') and value == 0:
+            continue
+        if value != actual.get(key):
+            return False
+    return True
+
+
+def g01_binding_readback(binding, token, requested):
+    """Validate actual endpoint evidence, retaining strict legacy readback."""
+    observed = binding.get('observed_self')
+    if 'actual_endpoint_qos' not in binding:
+        if not isinstance(observed, dict) or any(observed.get(k) != v for k, v in requested.items()):
+            raise RelationSurfaceError('g01_actual_qos_readback_mismatch:' + token['role'])
+        return observed
+    from .qos_binding import compare_public_qos, validate_actual_qos_receipt
+    try:
+        actual = validate_actual_qos_receipt(binding['actual_endpoint_qos'], token,
+                                             binding.get('monotonic_ns'))
+        comparison = compare_public_qos(requested, actual)
+    except (RuntimeError, ValueError, TypeError, KeyError) as exc:
+        raise RelationSurfaceError('g01_actual_qos_receipt_invalid:' + token['role']) from exc
+    if comparison.get('status') != 'matched':
+        raise RelationSurfaceError('g01_actual_qos_readback_mismatch:' + token['role'])
+    if not _g01_graph_qos_matches(observed, actual):
+        raise RelationSurfaceError('g01_graph_qos_mismatch:' + token['role'])
+    return actual
+
+
 def g01_configuration_readback(events, config):
     """Verify only API configuration intervention; never a match/effect claim."""
     _require_event_indexes(events)
@@ -850,9 +889,9 @@ def g01_configuration_readback(events, config):
         if (binding.get("observed_self_gid") != token["endpoint_gid"]
                 or binding.get("observation_api") != api
                 or not isinstance(observed, dict)
-                or any(observed.get(k) != v for k, v in config[role + "_qos"].items())
                 or not token["monotonic_ns"] <= binding.get("monotonic_ns", -1)):
             raise RelationSurfaceError("g01_qos_readback_mismatch:" + role)
+        g01_binding_readback(binding, token, config[role + "_qos"])
         # WorkerPool authenticates these on the pipe. Replays must retain
         # the same identity fields; a same-role foreign process cannot pass.
         for row in events:
@@ -951,7 +990,16 @@ def g01_runtime_observation(events, config):
                     if len(entries) != 1 or entries[0].get("topic_type") != "std_msgs/msg/String":
                         raise RelationSurfaceError("g01_graph_type_or_cardinality_invalid:" + role)
                     qos = entries[0].get("qos")
-                    if not isinstance(qos, dict) or any(qos.get(k) != v for k, v in config[endpoint_role + "_qos"].items()):
+                    binding = next(e for e in events if e.get("event") == "qos_binding_observed"
+                                   and e.get("role") == endpoint_role)
+                    if "actual_endpoint_qos" in binding:
+                        actual = g01_binding_readback(binding, tokens[endpoint_role],
+                                                     config[endpoint_role + "_qos"])
+                        graph_matches = _g01_graph_qos_matches(qos, actual)
+                    else:
+                        graph_matches = isinstance(qos, dict) and all(
+                            qos.get(k) == v for k, v in config[endpoint_role + "_qos"].items())
+                    if not graph_matches:
                         raise RelationSurfaceError("g01_graph_qos_mismatch:" + endpoint_role)
                 valid.append(proof)
             requested = [e for e in events if e.get("event") == "worker_command_requested"

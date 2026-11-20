@@ -1043,14 +1043,16 @@ def _observe_g01_pair(c, result, pool, emit, step, publish, observe):
         observe('capture_worker', role, token['pid'], token)
         binding = wait_for_qos_binding(events, pool, role, token['endpoint_gid'],
                                        c['startup_timeout_sec'], emit=emit, exactly_one=True)
-        actual = binding['observed_self']
-        if (not isinstance(actual, dict)
-                or any(actual.get(k) != v for k, v in c[role + '_qos'].items())):
-            raise RuntimeError('g01_actual_qos_readback_mismatch:' + role)
+        from .relation_observer import g01_binding_readback
+        g01_binding_readback(binding, token, c[role + '_qos'])
     if tokens['writer']['pid'] == tokens['reader']['pid']:
         raise RuntimeError('g01_endpoint_processes_not_independent')
     result['effective_rmws'] = effective_rmws_receipt(c, tokens)
-    emit('qos_binding_verified', observation_api='per_role_public_graph_readback',
+    emit('qos_binding_verified', observation_api=(
+         'per_role_public_endpoint_actual_qos_and_graph_readback'
+         if all('actual_endpoint_qos' in next(e for e in events
+             if e['event'] == 'qos_binding_observed' and e.get('role') == role)
+             for role in tokens) else 'per_role_public_graph_readback'),
          endpoints={role: token['endpoint_gid'] for role, token in tokens.items()})
     from .relation_observer import g01_configuration_readback
     g01_configuration_readback(events, c)

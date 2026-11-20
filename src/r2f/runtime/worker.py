@@ -86,6 +86,14 @@ def self_qos_entry(graph, role, endpoint_gid):
     return None
 
 
+def g01_actual_endpoint_qos(config, endpoint, kind):
+    """G01-only endpoint readback; never replace graph/config values."""
+    if config.get('target_id') != 'discovery.match_compatibility.fuzz_v1':
+        return {}
+    from r2f.runtime.actual_qos import read_public_endpoint_qos
+    return {'actual_endpoint_qos': read_public_endpoint_qos(endpoint, kind=kind)}
+
+
 def main():
     config = json.loads(sys.argv[1])
     role = sys.argv[2]
@@ -194,10 +202,11 @@ def main():
          topic=config['topic'], qos=q, message_type='std_msgs/msg/String')
     emit('graph_snapshot', **initial_graph)
     if str(config.get('target_id', '')).endswith('.fuzz_v1'):
-        # The only observed values used for exploratory parameter binding come
-        # from the same SDK graph call that reports this endpoint's GID.
+        # Keep the graph observation intact. G01 additionally records a local
+        # endpoint actual-QoS receipt; legacy targets retain graph-only tokens.
         own = self_qos_entry(initial_graph, role, local_gid) if local_gid else None
         emit('qos_binding_observed', requested=q,
+             **g01_actual_endpoint_qos(config, endpoint, endpoint_role),
              observed_self=own['qos'] if own else None,
              observed_self_gid=own['endpoint_gid'] if own else None,
              observation_api='get_%s_info_by_topic' % ('publishers' if endpoint_role in ('writer', 'probe') else 'subscriptions'))

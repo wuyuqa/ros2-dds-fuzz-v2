@@ -246,8 +246,14 @@ class _Audit:
                 from r2f.runtime.topology_worker import endpoint_expressibility
                 public_input = endpoint_expressibility(spec, self.config)["public_qos"]
                 actual_qos = event.get("qos")
-                _require(actual_qos == public_input or self.fixture and actual_qos == spec.get("qos"),
-                         "endpoint_actual_qos_mismatch")
+                if "actual_endpoint_qos" in event:
+                    from r2f.runtime.qos_binding import validate_created_qos
+                    _require(not self.fixture, "fixture_cannot_claim_public_actual_qos")
+                    validate_created_qos(event, public_input)
+                else:
+                    # Existing raw keeps its original exact reflection contract.
+                    _require(actual_qos == public_input or self.fixture and actual_qos == spec.get("qos"),
+                             "endpoint_actual_qos_mismatch")
                 self.tokens[key] = event
             elif kind in {"endpoint_destroyed", "topology_endpoint_destroyed"}:
                 key = (eid, event.get("generation"))
