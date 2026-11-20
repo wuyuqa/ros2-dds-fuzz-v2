@@ -153,7 +153,8 @@ def test_real_runtime_reset_needs_exit_retirement_and_distinct_new_identity():
     assert reset_from_events([previous, retired, current], action, prefix)['status'] == 'unknown'
 
 
-def test_unified_fact_consumer_requires_persisted_episode_evidence(tmp_path):
+@pytest.fixture
+def routed_episode(tmp_path):
     from r2f.core.evidence import INPUT_SCHEMA_V2, effective_input_hash
     from r2f.modules.s1.topology_input import make_topology_plan, topology_input_layer_receipts, TOPOLOGY_TARGET, TOPOLOGY_CAPABILITY
     from r2f.runtime.ros2_pair import run_pair
@@ -174,9 +175,19 @@ def test_unified_fact_consumer_requires_persisted_episode_evidence(tmp_path):
         **CFG}
     runtime = run_pair(config, tmp_path, topology_backend=OfflineTopologyBackend())
     assert runtime['status'] == 'executed', runtime.get('reason')
+    return config, runtime
+
+
+def test_unified_fact_consumer_requires_persisted_episode_evidence(tmp_path, routed_episode):
+    from r2f.campaign.topology_adapter import facts_from_events
+    config, runtime = routed_episode
     facts = facts_from_events(runtime['events'], runtime, config)
     assert facts['diagnostic_valid'], facts.get('evidence_error')
     assert facts['episode_observation']['structural_valid'] is True
+    assert facts['unresolved_historical_obligations'] == []
+    assert len(facts['retired_episode_history_windows']) == 1
+    assert {row['send_ref']['event_index'] for row in facts['historical_send_coverage']} == {
+        e['event_index'] for e in runtime['events'] if e['event']=='send' and e['generation']==1}
     assert facts['candidate_eligible'] is False
     progress = next((tmp_path/'episode'/'checkpoints').glob('*/0000.json'))
     progress.unlink()
@@ -226,3 +237,36 @@ def test_directory_sync_failure_stops_subsequent_actions_and_cleans_up(tmp_path,
     assert result['episode']['execution']['receipts'][0]['status'] == 'executed'
     assert result['cleanup_receipt']['closed'] is True
     assert [e['action_id'] for e in result['events'] if e['event'] == 'topology_action_begin'] == ['create_w1']
+
+
+@pytest.mark.parametrize('fault', ['missing_exit', 'wrong_exit_gid', 'cleanup_unknown',
+                                  'successor_same_gid', 'incomplete_close', 'missing_delivery'])
+def test_retired_episode_history_cannot_borrow_new_generation_proof(routed_episode, fault):
+    """Authored offline private-consumer counterexamples, not real executions."""
+    from types import SimpleNamespace
+    from r2f.campaign.topology_adapter import (_Audit, facts_from_events,
+        _retired_episode_history_windows, _retired_episode_send_coverage)
+    config, runtime = routed_episode
+    facts = facts_from_events(runtime['events'], runtime, config)
+    original = _Audit(runtime['events'], runtime, config)
+    events = deepcopy(original.events)
+    old_close = next(e for e in events if e['event']=='topology_delivery_window_closed'
+                     and e['writer_generation']==e['reader_generation']==1)
+    retired = next(e for e in events if e['event']=='endpoint_destroyed' and e['logical_id']=='r0')
+    exited = next(e for e in events if e['event']=='topology_worker_exit' and e['logical_id']=='r0' and e['generation']==1)
+    successor = next(e for e in events if e['event']=='endpoint_created' and e['logical_id']=='r0' and e['generation']==2)
+    deliveries = deepcopy(facts['deliveries'])
+    if fault == 'missing_exit': exited['event'] = 'authored_missing_exit'
+    elif fault == 'wrong_exit_gid': exited['endpoint_gid'] = 'f'*32
+    elif fault == 'cleanup_unknown': retired['cleanup_status'] = 'unknown'
+    elif fault == 'successor_same_gid': successor['endpoint_gid'] = retired['endpoint_gid']
+    elif fault == 'incomplete_close': old_close['window_complete'] = False
+    else: deliveries = [d for d in deliveries if d['writer_generation'] != 1]
+    audit = SimpleNamespace(program=original.program, path=original.path, sha=original.sha,
+        events=events, binding=original.binding, specs=original.specs,
+        tokens={(e['logical_id'],e['generation']):e for e in events if e['event']=='endpoint_created'},
+        ref=original.ref, resolve=lambda ref: events[ref['event_index'] if isinstance(ref,dict) else ref])
+    projection = {'receipt': facts['state_projection_receipt']}
+    windows = _retired_episode_history_windows(audit, projection, deliveries, facts['episode_observation'])
+    sends = [e for e in events if e['event']=='send' and e['generation']==1]
+    assert all(_retired_episode_send_coverage(audit,windows,send) is None for send in sends)

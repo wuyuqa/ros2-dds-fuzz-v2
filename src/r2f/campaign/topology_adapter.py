@@ -1095,10 +1095,6 @@ def _live_history_windows(audit, pairs, projection, deliveries):
     Invalid chains remain explicit records. A closed-with-gap window proves only
     its received samples; this function grants no CFT/filtering exemption.
     """
-    from .topology_state_projection import _Projection
-    projector = _Projection(audit.program, audit.path, audit.sha, audit.events,
-                            {"input_ref": audit.ref(audit.binding)})
-    boundary = audit.resolve(projection["receipt"]["after"]["boundary_ref"])
     final = {e["logical_id"]: e for e in projection["state_after"]["endpoints"]}
     live_pairs = {(p["writer"], p.get("writer_generation"), p["reader"], p.get("reader_generation"))
                   for p in pairs if all(final.get(eid, {}).get("liveness") == "alive"
@@ -1106,6 +1102,15 @@ def _live_history_windows(audit, pairs, projection, deliveries):
                                         and (eid, generation) in audit.tokens
                                         for eid, generation in ((p["writer"], p.get("writer_generation")),
                                                                 (p["reader"], p.get("reader_generation"))))}
+    return _history_windows_for_pairs(audit, projection, deliveries, live_pairs,
+                                      "still_live_logical_generation_historical_window")
+
+
+def _history_windows_for_pairs(audit, projection, deliveries, live_pairs, scope):
+    from .topology_state_projection import _Projection
+    projector = _Projection(audit.program, audit.path, audit.sha, audit.events,
+                            {"input_ref": audit.ref(audit.binding)})
+    boundary = audit.resolve(projection["receipt"]["after"]["boundary_ref"])
     windows = []
     for close in audit.events[:boundary["event_index"] + 1]:
         key = (close.get("writer"), close.get("writer_generation"),
@@ -1117,7 +1122,7 @@ def _live_history_windows(audit, pairs, projection, deliveries):
                "close_ref": audit.ref(close), "delivery_closure": "unknown",
                "delivery_window_identity_complete": False, "window_projection_valid": False,
                "delivery_witnesses": [], "reason": None,
-               "scope": "still_live_logical_generation_historical_window"}
+               "scope": scope}
         try:
             opened = projector.resolve(close["open_ref"], boundary=close)
             row["open_ref"] = audit.ref(opened)
@@ -1162,8 +1167,62 @@ def _live_history_windows(audit, pairs, projection, deliveries):
                             "delivery_closure": "unknown", "delivery_window_identity_complete": False,
                             "window_projection_valid": False, "delivery_witnesses": [],
                             "reason": "live_history_window_close_missing_or_unbound",
-                            "scope": "still_live_logical_generation_historical_window"})
+                            "scope": scope})
     return windows
+
+
+
+def _retired_episode_history_windows(audit, projection, deliveries, episode_observation):
+    """Only opt-in completed episodes may reconcile a retired BOTH-peer window.
+
+    Its own close, both worker exits/retirements and fresh successors are needed.
+    No current-generation NONE/readback or CFT rejection waives old delivery.
+    The legacy still-live-generation fence remains unchanged.
+    """
+    if ("episode" not in audit.program or not episode_observation.get("structural_valid")
+            or not episode_observation.get("completed")):
+        return []
+    boundary = audit.resolve(projection["receipt"]["after"]["boundary_ref"])
+    qualified = set()
+    for close in audit.events[:boundary["event_index"] + 1]:
+        if close.get("event") != "topology_delivery_window_closed":
+            continue
+        key = (close.get("writer"), close.get("writer_generation"),
+               close.get("reader"), close.get("reader_generation"))
+        try:
+            for eid, generation in ((key[0], key[1]), (key[2], key[3])):
+                token = audit.tokens[(eid, generation)]
+                successor = audit.tokens[(eid, generation + 1)]
+                retired = [e for e in audit.events[:boundary["event_index"] + 1]
+                    if e.get("event") in {"endpoint_destroyed", "topology_endpoint_destroyed"}
+                    and e.get("logical_id") == eid and e.get("generation") == generation]
+                exited = [e for e in audit.events[:boundary["event_index"] + 1]
+                    if e.get("event") == "topology_worker_exit"
+                    and e.get("logical_id") == eid and e.get("generation") == generation]
+                _require(len(retired) == len(exited) == 1, "episode_history_retirement_or_exit_missing")
+                retired, exited = retired[0], exited[0]
+                _chain(token, close, retired, successor)
+                _chain(token, close, exited, successor)
+                identity = endpoint_identity_at(audit.events, token, before_index=retired["event_index"] + 1)
+                _require(retired.get("cleanup_status") == "closed" and exited.get("returncode") == 0
+                    and all(all(e.get(k) == identity.get(k) for k in (*_LINEAGE, "endpoint_gid"))
+                            for e in (retired, exited)), "episode_history_retirement_identity_incomplete")
+                _require((token["pid"], token["process_start_ticks"]) !=
+                    (successor["pid"], successor["process_start_ticks"])
+                    and successor["endpoint_gid"] != identity["endpoint_gid"],
+                    "episode_history_successor_not_fresh")
+            qualified.add(key)
+        except (ValueError, KeyError, TypeError, IndexError):
+            continue
+    return _history_windows_for_pairs(audit, projection, deliveries, qualified,
+                                     "verified_retired_episode_generation_historical_window")
+
+
+def _retired_episode_send_coverage(audit, windows, send):
+    coverage = _live_history_send_coverage(audit, windows, send)
+    if coverage is not None:
+        coverage["scope"] = "received_sample_in_verified_retired_episode_generation_windows"
+    return coverage
 
 
 def _native_filter_rejection_disposition(audit, row, send, observations):
@@ -1349,6 +1408,12 @@ def facts_from_events(events, runtime, config):
         empty_windows = _historical_no_obligation_windows(a, facts["pairs"], projection)
         historical = _recreated_history_windows(a, facts["pairs"], projection, facts["deliveries"])
         facts["historical_live_windows"] = _live_history_windows(a, facts["pairs"], projection, facts["deliveries"])
+        if "episode" in a.program:
+            from .topology_episode import audit_topology_episode
+            facts["episode_observation"] = audit_topology_episode(a.program, runtime, config)
+            _require(facts["episode_observation"]["structural_valid"], "topology_episode_evidence_invalid")
+            facts["retired_episode_history_windows"] = _retired_episode_history_windows(
+                a, projection, facts["deliveries"], facts["episode_observation"])
         from .topology_filter_decision import native_filter_decision_evidence
         facts["native_filter_decision_evidence"] = native_filter_decision_evidence(
             a.program, a.events, peer_reference=a.native_peer_reference, ref=a.ref)
@@ -1365,6 +1430,8 @@ def facts_from_events(events, runtime, config):
             for p in facts["pairs"])}
         facts["historical_send_coverage"] = [coverage for send in sends
             if (coverage := (_recreated_history_send_coverage(a, historical, send)
+                             or (_retired_episode_send_coverage(a, facts["retired_episode_history_windows"], send)
+                                 if "episode_observation" in facts else None)
                              or (_live_history_send_coverage(a, facts["historical_live_windows"], send,
                                                                 filter_decisions=filter_decisions)
                                  if send["event_index"] not in current_window_sends else None))) is not None]
@@ -1377,10 +1444,6 @@ def facts_from_events(events, runtime, config):
             and s["event_index"] not in covered_history]
         facts["application_audit"] = _application(a)
         facts["source_provenance_qualified"] = _source_qualification(a)
-        if "episode" in a.program:
-            from .topology_episode import audit_topology_episode
-            facts["episode_observation"] = audit_topology_episode(a.program, runtime, config)
-            _require(facts["episode_observation"]["structural_valid"], "topology_episode_evidence_invalid")
         facts["execution_evidence"] = not a.fixture
         env = [e for e in a.events if e["event"] == "environment_preflight"]
         locks = [e for e in a.events if e["event"] == "isolation_locks_acquired"]
