@@ -949,8 +949,10 @@ def _worker_main(argv):
             body = None
         get = info.get if isinstance(info, dict) else lambda key: getattr(info, key, None)
         publisher_gid = gid_bytes(get("publisher_gid"))
+        from .message_info_receipt import capture_message_info
+        message_info = capture_message_info(info)
         emit(
-            "receive", send_sequence=body.get("send_sequence") if isinstance(body, dict) else None,
+            "receive", message_info_receipt=message_info, send_sequence=body.get("send_sequence") if isinstance(body, dict) else None,
             phase=body.get("phase") if isinstance(body, dict) else None,
             receive_sequence=receive_sequence, reader_gid=local_gid,
             publisher_gid=publisher_gid,

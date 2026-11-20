@@ -1713,7 +1713,7 @@ def concurrent_writers_program():
     return program
 
 
-def corpus_v2(*, include_catalog=True, seed=0, include_concurrent=False):
+def corpus_v2(*, include_catalog=True, seed=0, include_concurrent=False, include_cft_matrix=False):
     """Offline seed corpus: legal, boundary, environment and guard seeds.
 
     The manifest separates ``authored`` entries from ``pending`` runtime
@@ -1748,6 +1748,16 @@ def corpus_v2(*, include_catalog=True, seed=0, include_concurrent=False):
         entries.append(entry)
         manifest.append({"seed_id": entry["seed_id"], "surface_id": "S1.topology",
             "status": "authored", "kind": "concurrent_writers",
+            "expected_disposition": "expect_pass", "content_sha256": entry["content_sha256"]})
+
+    if include_cft_matrix:
+        from .topology_cft_matrix import CFT_MATRIX_SEED, cft_matrix_program
+        entry = _seed_entry("S1.topology", CFT_MATRIX_SEED,
+            cft_matrix_program(), "dynamic_cft_matrix", "expect_pass",
+            "authored deterministic 1W2R complete String.data CFT matrix input")
+        entries.append(entry)
+        manifest.append({"seed_id": entry["seed_id"], "surface_id": "S1.topology",
+            "status": "authored", "kind": "dynamic_cft_matrix",
             "expected_disposition": "expect_pass", "content_sha256": entry["content_sha256"]})
 
     # Environment / guard seeds are built through topology_model's own

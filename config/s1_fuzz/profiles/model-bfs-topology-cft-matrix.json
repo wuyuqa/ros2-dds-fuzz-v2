@@ -1,0 +1,99 @@
+{
+  "schema_version": "r2f.s1-fuzz-profile/v1",
+  "profile_id": "model-bfs-topology-cft-matrix",
+  "campaign_kind": "exploratory",
+  "activation": "F2",
+  "enabled": false,
+  "required_catalog_included": false,
+  "runtime_capability": "topology_v1",
+  "target_ids": [
+    "discovery.endpoint_topology.fuzz_v1"
+  ],
+  "surfaces": [
+    "S1.topology.program"
+  ],
+  "rmws": [
+    "rmw_cyclonedds_cpp"
+  ],
+  "seed_catalog_status": "authored_v2",
+  "source_schema": "r2f.s1-seed-corpus/v2",
+  "chain_length": 1,
+  "operator_whitelist": [
+    "action.insert"
+  ],
+  "mutator_whitelist": [
+    "I2.topology_program.v1"
+  ],
+  "budget": {
+    "max_inputs": 1,
+    "max_seconds": 180
+  },
+  "corpus": {
+    "capacity": 256,
+    "bucket_limit": 3
+  },
+  "seed_specs": [
+    {
+      "seed_id": "topology.cft_matrix",
+      "target_id": "discovery.endpoint_topology.fuzz_v1",
+      "surface_id": "S1.topology.program",
+      "mutator_id": "I2.topology_program.v1",
+      "boundary_class": "authored_topology",
+      "expected_disposition": "expect_pass",
+      "executable": true
+    }
+  ],
+  "declared_seed_specs_union": [
+    {
+      "seed_id": "topology.cft_matrix",
+      "target_id": "discovery.endpoint_topology.fuzz_v1",
+      "surface_id": "S1.topology.program",
+      "mutator_id": "I2.topology_program.v1",
+      "boundary_class": "authored_topology",
+      "expected_disposition": "expect_pass",
+      "executable": true
+    }
+  ],
+  "cycles": [
+    {
+      "cycle_id": "topology-authored",
+      "target_id": "discovery.endpoint_topology.fuzz_v1",
+      "surfaces": [
+        "S1.topology.program"
+      ],
+      "seed_specs": [
+        {
+          "seed_id": "topology.cft_matrix",
+          "target_id": "discovery.endpoint_topology.fuzz_v1",
+          "surface_id": "S1.topology.program",
+          "mutator_id": "I2.topology_program.v1",
+          "boundary_class": "authored_topology",
+          "expected_disposition": "expect_pass",
+          "executable": true
+        }
+      ]
+    }
+  ],
+  "description": "Opt-in 1W2R dynamic CFT full String.data reject/restore input with unfiltered control. No filter_effect/oracle or independent occurrence attribution is supplied.",
+  "execution_boundary": "Disabled; canonical offline planning only. Live effect and occurrence ambiguity remain independently unknown.",
+  "scheduler_policy": "bfs",
+  "search": {
+    "schema": "r2f.input-search-config/v1",
+    "mode": "input_search_bfs",
+    "max_depth": 1,
+    "max_nodes": 4,
+    "max_tasks": 4,
+    "samples_per_class": 1
+  },
+  "topology_search": {
+    "schema": "r2f.topology-search/v1",
+    "samples": [
+      {
+        "operator_id": "action.insert",
+        "slot_id": "S1.topology.actions",
+        "class_id": "snapshot",
+        "context": {}
+      }
+    ]
+  }
+}
