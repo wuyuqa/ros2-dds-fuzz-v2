@@ -312,7 +312,7 @@ class _Audit:
         if event.get("event") == "receive":
             _require(event.get("reader_gid") == token["endpoint_gid"], "receive_reader_gid_mismatch")
 
-    def action_before(self, action, begin):
+    def action_before(self, action, begin, *, require_success=True):
         """Replay only physical lifecycle/publish receipts, not predicted graph."""
         current = {eid: {"generation": 0, "alive": False, "next_sequence": 0} for eid in self.specs}
         for event in self.events[:begin["event_index"]]:
@@ -330,7 +330,7 @@ class _Audit:
         expected = current[eid] if eid is not None else {"alive": sorted(k for k, v in current.items() if v["alive"])}
         _require(begin.get("before") == expected, "action_before_not_observed_lifecycle")
         op, gen = action["op"], action.get("generation")
-        if eid is not None:
+        if eid is not None and require_success:
             state = current[eid]
             if op == "create":
                 _require(not state["alive"] and state["generation"] == 0 and gen == 1, "action_create_requires_failed")
@@ -341,6 +341,89 @@ class _Audit:
             if op == "publish_batch":
                 _require(self.specs[eid]["role"] == "writer" and action["params"]["start_sequence"] >= state["next_sequence"],
                          "action_writer_sequence_requires_failed")
+        return expected
+
+    def rejected_action(self, action, begin, done, receipt, physical_before):
+        """Authenticate only two pre-side-effect rejections, never API success.
+
+        Other capability/backend errors can follow partial effects and remain
+        unknown. In particular, recreate may already have destroyed its predecessor.
+        """
+        aid, eid, gen = action["action_id"], action["endpoint_id"], action["generation"]
+        _require(canonical_hash(begin.get("before")) == canonical_hash(physical_before),
+                 "action_guard_before_not_raw_backed")
+        _require(eid in self.specs and action.get("params", {}).get("concurrency_group") is None,
+                 "action_guard_scope_not_supported")
+        op = action["op"]
+        if op == "create" and receipt.get("disposition") == "capability_reject":
+            _require(gen == 1 and physical_before == {"generation": 0, "alive": False, "next_sequence": 0},
+                     "action_guard_create_state_invalid")
+            from r2f.runtime.topology_worker import endpoint_expressibility, TopologyUnsupported
+            try:
+                endpoint_expressibility(self.specs[eid], self.config)
+            except TopologyUnsupported as exc:
+                _require(exc.code == "qos_not_expressible", "action_guard_capability_not_supported")
+                code, kind, message, details = exc.code, "capability", str(exc), exc.details
+            else:
+                raise ValueError("action_guard_capability_not_reproduced")
+        elif op == "publish_batch" and receipt.get("disposition") == "guard_reject":
+            _require(not (physical_before["alive"] and physical_before["generation"] == gen
+                          and self.specs[eid]["role"] == "writer"),
+                     "action_guard_writer_predicate_not_reproduced")
+            code, kind = "writer_generation_alive_guard", "guard"
+            message, details = "publish_batch requires a live writer generation", {}
+        else:
+            raise ValueError("action_guard_not_independently_supported")
+        expected = {"step_id": "action:" + aid, "receipt_kind": "precondition", "action": action,
+            "requires": [{"id": code, "status": "unsatisfied", "kind": kind}],
+            "code": code, "kind": kind, "before": physical_before, "after": physical_before,
+            "satisfied": False, "disposition": "capability_reject" if kind == "capability" else "guard_reject",
+            "method": "runtime_guard_before_side_effect", "no_side_effect": True,
+            "message": message, "details": details, "execution_evidence": False}
+        _require(canonical_hash(receipt) == canonical_hash(expected), "action_guard_terminal_not_recomputed")
+        before = _one(self.events, "state_step_before", step_id=expected["step_id"])
+        guard = _one(self.events, "topology_guard_reject", step_id=expected["step_id"])
+        after = _one(self.events, "state_step_after", step_id=expected["step_id"])
+        _chain(begin, before, guard, after, done)
+        # Compare JSON values rather than Python equality: bool is not an integer receipt.
+        _require(canonical_hash({k: before.get(k) for k in
+                    ("step_id", "action", "before", "after", "requires", "satisfied")}) == canonical_hash({
+                    "step_id": expected["step_id"], "action": action, "before": physical_before,
+                    "after": None, "requires": [], "satisfied": None}), "action_guard_before_not_raw_backed")
+        guard_fields = ("step_id", "code", "kind", "message", "no_side_effect", "details", "before")
+        _require(all(k in guard for k in guard_fields)
+                 and canonical_hash({k: guard[k] for k in guard_fields}) == canonical_hash({k: expected[k] for k in guard_fields})
+                 and all(k in after for k in expected)
+                 and canonical_hash({k: after[k] for k in expected}) == canonical_hash(expected),
+                 "action_guard_receipt_not_raw_backed")
+        envelope = {"event", "event_index", "run_id", "domain_id", "monotonic_ns", "time_ns",
+                    "pid", "pgid", "role", "backend", "monotonic_clock_identity"}
+        _require(set(before) == envelope | {"step_id", "action", "before", "after", "requires", "satisfied", "fixture"}
+                 and set(guard) == envelope | set(guard_fields)
+                 and set(after) == envelope | set(expected) | {"fixture"}
+                 and before.get("fixture") is self.fixture and after.get("fixture") is self.fixture,
+                 "action_guard_receipt_not_raw_backed")
+        controller = ("pid", "pgid", "role", "backend", "monotonic_clock_identity")
+        _require(_integer(begin.get("pid"), 1) and _text(begin.get("role"))
+                 and all(begin.get(k) is not None for k in controller)
+                 and all(canonical_hash({k: e.get(k) for k in controller}) ==
+                         canonical_hash({k: begin[k] for k in controller})
+                         for e in (self.begin, before, guard, after, done)), "action_guard_controller_mismatch")
+        # This narrow branch accepts no intervening events at all. Asynchronous
+        # observations/concurrent commands require their own attribution, not a waiver.
+        _require(self.events[begin["event_index"] + 1:done["event_index"]] == [before, guard, after],
+                 "action_guard_side_effect_or_unattributed_event")
+        next_begin = min((e["event_index"] for e in self.events[done["event_index"] + 1:]
+                          if e["event"] == "topology_action_begin" and e.get("action", {}).get("endpoint_id") == eid),
+                         default=self.end["event_index"])
+        _require(not any(any(e.get(k) == eid for k in ("logical_id", "endpoint_id", "writer", "reader"))
+                         for e in self.events[done["event_index"] + 1:next_begin]),
+                 "action_guard_effect_outside_terminal")
+        accepted_indices = {e["event_index"] for e in (begin, before, guard, after, done)}
+        _require(not any(e["event_index"] not in accepted_indices and
+                         (e.get("action_id") == aid or e.get("phase") == aid or e.get("step_id") == expected["step_id"])
+                         for e in self.events), "action_guard_trace_outside_terminal")
+        return before, guard, after
 
     def actions(self):
         begins = [e for e in self.events if e["event"] == "topology_action_begin"]
@@ -353,7 +436,9 @@ class _Audit:
             aid = action["action_id"]
             begin = _one(self.events, "topology_action_begin", action_id=aid)
             done = _one(self.events, "topology_action_done", action_id=aid)
-            self.action_before(action, begin)
+            receipt = done.get("receipt")
+            rejected = isinstance(receipt, dict) and receipt.get("disposition") in {"guard_reject", "capability_reject"}
+            physical_before = self.action_before(action, begin, require_success=not rejected)
             group = action.get("params", {}).get("concurrency_group")
             prev_group = (self.program["actions"][i - 1].get("params", {}).get("concurrency_group") if i else None)
             if group is not None and group == prev_group:
@@ -376,6 +461,14 @@ class _Audit:
                      and all(isinstance(r, dict) and _text(r.get("id"))
                              and r.get("status") in {"satisfied", "unsatisfied", "unknown"}
                              for r in receipt["requires"]), "action_state_or_requires_missing")
+            if rejected:
+                before, guard, after = self.rejected_action(action, begin, done, receipt, physical_before)
+                self.action_receipts.append({"action_id": aid, "before": snapshot(receipt["before"]),
+                    "after": snapshot(receipt["after"]), "requires": snapshot(receipt["requires"]),
+                    "terminal": receipt["disposition"], "raw_begin": self.ref(begin), "raw_after": self.ref(after),
+                    "raw_done": self.ref(done), "raw_state_before": self.ref(before), "raw_guard": self.ref(guard)})
+                previous = done
+                continue
             allowed_terminals = {"applied", "effect_observed", "observed", "satisfied"}
             if action["op"] == "update_filter":
                 # Only this action may claim configured, and only after its
@@ -446,6 +539,9 @@ class _Audit:
                 "terminal": receipt["disposition"], "raw_begin": self.ref(begin), "raw_after": self.ref(after),
                 "raw_done": self.ref(done)})
             previous = done
+        _require({e["event_index"] for e in self.events if e["event"] == "topology_guard_reject"}
+                 == {r["raw_guard"]["event_index"] for r in self.action_receipts if "raw_guard" in r},
+                 "action_guard_unbound_or_duplicate")
         _chain(previous, self.end)
         return self.action_receipts
 
