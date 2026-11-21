@@ -165,7 +165,8 @@ def resolve(target, rule_id, *, scope):
         fact_ids = sorted({f for r in related for f in r.required_fact_ids})
         role = "primary"
     independent = rule_id == runtime_id
-    return snapshot({"schema": SCHEMA, "target_id": target.target_id,
+    from .coverage import target_lineage
+    return snapshot({"coverage_lineage": target_lineage(target), "schema": SCHEMA, "target_id": target.target_id,
         "target_revision": target.target_revision, "rule_id": rule_id, "rule_role": role,
         "verdict_rule_ids": [runtime_id], "independent_verdict": independent,
         "verdict_semantics": "runtime_rule" if independent else "shared_evaluator_not_independent",

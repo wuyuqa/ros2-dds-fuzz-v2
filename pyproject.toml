@@ -11,3 +11,6 @@ dependencies = []
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+"r2f.modules.s1" = ["s1_coverage.json", "seed_lineage.json"]

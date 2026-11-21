@@ -1,0 +1,572 @@
+{
+  "schema": "r2f.s1-seed-lineage/v1",
+  "capture": {
+    "kind": "new_seed_metadata_snapshot",
+    "captured_at": "2026-11-21T09:57:36.002202+00:00",
+    "source_worktree": "/home/wuyuqa/.codex/worktrees/s1-coverage-package-fix/ros2-dds-fuzz-v2",
+    "source_head": "62d0b716a8ae6a2881c6b766b370cb6546b27d3d",
+    "source_frozen": false,
+    "source_scope": "Seed files and provider match capture HEAD; whole worktree is dirty.",
+    "provider_file": {
+      "path": "src/r2f/modules/s1/fuzz_catalog.py",
+      "file_sha256": "00797c074e13926bae83a6a60e94f28e28a32854f3671227b4cbcb55c5656497",
+      "matches_capture_head": true
+    },
+    "coverage_capture_file_sha256": "5f886f6a4e7d47e2ecb975e034c1d386f22fe82b06aeb4c7a66cd75fefbb7106",
+    "model_context": {
+      "provider": "r2f.modules.s1.catalog.coverage_lineage",
+      "model_binding_count": 11,
+      "seed_ids_with_model_context": [
+        "E01",
+        "E02",
+        "E03",
+        "G01",
+        "P01",
+        "P02",
+        "P03",
+        "P04",
+        "P05",
+        "P06",
+        "W02"
+      ]
+    }
+  },
+  "seeds": {
+    "P01": {
+      "seed_id": "P01",
+      "status": "authored",
+      "surface_refs": [
+        "P01"
+      ],
+      "capability": {
+        "status": "authored",
+        "f1_routable": true,
+        "runtime_binding": "late_joiner.reader_delay_sec",
+        "note": "template only; not execution evidence"
+      },
+      "provider": "r2f.modules.s1.fuzz_catalog.load_seeds",
+      "content_sha256": "7becb254dee03ae330c871c6309bbcb7a4212057d41d7d3692f53840b0eeb48d",
+      "source_file": {
+        "path": "config/s1_fuzz/seeds/p01.json",
+        "file_sha256": "b43c23bc09be84378af33661942c8d1c1dd85d02131e82f62f7ec1c6486a1334",
+        "matches_capture_head": true
+      },
+      "context": {
+        "target_family": "discovery.late_endpoint",
+        "model_target_ids": [
+          "discovery.late_endpoint.fuzz_v1",
+          "discovery.late_join_delivery.fuzz_v1"
+        ],
+        "relation": "captured_declaration_context_not_runtime_qualification",
+        "capability_requirements": {
+          "tools": [
+            "public_ros2_api"
+          ],
+          "sut_guards": [
+            "writer_prejoin_before_reader_create"
+          ],
+          "runtime_binding": "late_joiner.reader_delay_sec"
+        },
+        "provenance": {
+          "kind": "template",
+          "source": "plan 3.1/4 initial corpus shape; existing semantic_input defaults",
+          "derived_from_execution": false
+        }
+      },
+      "execution_evidence": false,
+      "maturity_evidence": false
+    },
+    "P02": {
+      "seed_id": "P02",
+      "status": "authored",
+      "surface_refs": [
+        "P02"
+      ],
+      "capability": {
+        "status": "authored",
+        "f1_routable": true,
+        "runtime_binding": "projection.qos_profile",
+        "note": "template only; not execution evidence"
+      },
+      "provider": "r2f.modules.s1.fuzz_catalog.load_seeds",
+      "content_sha256": "280b74dd7f0569035c598a659b825a562de29b3a18e1546b329d97138bcf85a1",
+      "source_file": {
+        "path": "config/s1_fuzz/seeds/p02.json",
+        "file_sha256": "0123415ea37b0b75bad88bab7e3f4bae4a0b257a44aaa97b5523e30163ae13be",
+        "matches_capture_head": true
+      },
+      "context": {
+        "target_family": "builtin.discovery_projection_reconciliation",
+        "model_target_ids": [
+          "builtin.discovery_projection_reconciliation.fuzz_v1"
+        ],
+        "relation": "captured_declaration_context_not_runtime_qualification",
+        "capability_requirements": {
+          "tools": [
+            "public_ros2_api"
+          ],
+          "sut_guards": [
+            "endpoint_created_before_observation"
+          ],
+          "runtime_binding": "projection.qos_profile"
+        },
+        "provenance": {
+          "kind": "template",
+          "source": "plan 3.1/4 P02 reliability enum; existing projection_pair QoS schema",
+          "derived_from_execution": false
+        }
+      },
+      "execution_evidence": false,
+      "maturity_evidence": false
+    },
+    "P03": {
+      "seed_id": "P03",
+      "status": "authored",
+      "surface_refs": [
+        "P03"
+      ],
+      "capability": {
+        "status": "authored",
+        "f1_routable": true,
+        "runtime_binding": "projection.qos_profile",
+        "note": "template only; durability enum only, no history-completeness claim"
+      },
+      "provider": "r2f.modules.s1.fuzz_catalog.load_seeds",
+      "content_sha256": "b360cab50cecd65cf3958ffd13956f1aac33f33a4d01d3cda695c9e1e478bc35",
+      "source_file": {
+        "path": "config/s1_fuzz/seeds/p03.json",
+        "file_sha256": "78255e874aac15d6bdee48f2ec5b89f3db3f272e1bf31b864b69da69d474228c",
+        "matches_capture_head": true
+      },
+      "context": {
+        "target_family": "builtin.discovery_projection_reconciliation",
+        "model_target_ids": [
+          "builtin.discovery_projection_reconciliation.fuzz_v1"
+        ],
+        "relation": "captured_declaration_context_not_runtime_qualification",
+        "capability_requirements": {
+          "tools": [
+            "public_ros2_api"
+          ],
+          "sut_guards": [
+            "endpoint_created_before_observation"
+          ],
+          "runtime_binding": "projection.qos_profile"
+        },
+        "provenance": {
+          "kind": "template",
+          "source": "plan 3.1/4 P03 durability enum; existing projection_pair QoS schema",
+          "derived_from_execution": false
+        }
+      },
+      "execution_evidence": false,
+      "maturity_evidence": false
+    },
+    "P04": {
+      "seed_id": "P04",
+      "status": "authored",
+      "surface_refs": [
+        "P04"
+      ],
+      "capability": {
+        "status": "authored",
+        "f1_routable": true,
+        "runtime_binding": "projection.qos_profile",
+        "note": "template only; engineering sampling values, not normative bounds"
+      },
+      "provider": "r2f.modules.s1.fuzz_catalog.load_seeds",
+      "content_sha256": "4f12d2f21cb834603d9d06c834893296f252fa585565d68b88a5ea886f796e23",
+      "source_file": {
+        "path": "config/s1_fuzz/seeds/p04.json",
+        "file_sha256": "4963b2aba90f3649e59b1600f7ab6b94487a7352aada82dd20aebb4002a77038",
+        "matches_capture_head": true
+      },
+      "context": {
+        "target_family": "builtin.discovery_projection_reconciliation",
+        "model_target_ids": [
+          "builtin.discovery_projection_reconciliation.fuzz_v1"
+        ],
+        "relation": "captured_declaration_context_not_runtime_qualification",
+        "capability_requirements": {
+          "tools": [
+            "public_ros2_api"
+          ],
+          "sut_guards": [
+            "endpoint_created_before_observation"
+          ],
+          "runtime_binding": "projection.qos_profile"
+        },
+        "provenance": {
+          "kind": "template",
+          "source": "plan 3.1/4 P04 deadline classes zero/finite/infinite; existing projection_pair QoS schema",
+          "derived_from_execution": false
+        }
+      },
+      "execution_evidence": false,
+      "maturity_evidence": false
+    },
+    "P05": {
+      "seed_id": "P05",
+      "status": "authored",
+      "surface_refs": [
+        "P05"
+      ],
+      "capability": {
+        "status": "authored",
+        "f1_routable": true,
+        "runtime_binding": "projection.qos_profile",
+        "note": "template only; liveliness kind projection, not lease expiry or assert behavior"
+      },
+      "provider": "r2f.modules.s1.fuzz_catalog.load_seeds",
+      "content_sha256": "89fecca809f8ccc2af92f1320203a717e266560e4c46314a78b1e182b1c76d9b",
+      "source_file": {
+        "path": "config/s1_fuzz/seeds/p05.json",
+        "file_sha256": "a886f0db7844b6bb67fb5ae5c8650eb62c61c1748fe688bc5068cd2b91e34c3b",
+        "matches_capture_head": true
+      },
+      "context": {
+        "target_family": "builtin.discovery_projection_reconciliation",
+        "model_target_ids": [
+          "builtin.discovery_projection_reconciliation.fuzz_v1"
+        ],
+        "relation": "captured_declaration_context_not_runtime_qualification",
+        "capability_requirements": {
+          "tools": [
+            "public_ros2_api"
+          ],
+          "sut_guards": [
+            "endpoint_created_before_observation"
+          ],
+          "runtime_binding": "projection.qos_profile"
+        },
+        "provenance": {
+          "kind": "template",
+          "source": "plan 3.1/4 P05 liveliness enum; existing projection_pair QoS schema",
+          "derived_from_execution": false
+        }
+      },
+      "execution_evidence": false,
+      "maturity_evidence": false
+    },
+    "P06": {
+      "seed_id": "P06",
+      "status": "authored",
+      "surface_refs": [
+        "P06"
+      ],
+      "capability": {
+        "status": "authored",
+        "f1_routable": true,
+        "runtime_binding": "projection.qos_profile",
+        "note": "template only; lease configuration projection is not lease lifecycle coverage"
+      },
+      "provider": "r2f.modules.s1.fuzz_catalog.load_seeds",
+      "content_sha256": "a52621f9257ecad81b96b3d5ec4ae1fb4f3c63781089d4b5ef8ddd093bcb3ded",
+      "source_file": {
+        "path": "config/s1_fuzz/seeds/p06.json",
+        "file_sha256": "febf7770a021dae1a0aa1f87befdcb8310b1b20e438675b92c991c8a1a0e1848",
+        "matches_capture_head": true
+      },
+      "context": {
+        "target_family": "builtin.discovery_projection_reconciliation",
+        "model_target_ids": [
+          "builtin.discovery_projection_reconciliation.fuzz_v1"
+        ],
+        "relation": "captured_declaration_context_not_runtime_qualification",
+        "capability_requirements": {
+          "tools": [
+            "public_ros2_api"
+          ],
+          "sut_guards": [
+            "endpoint_created_before_observation"
+          ],
+          "runtime_binding": "projection.qos_profile"
+        },
+        "provenance": {
+          "kind": "template",
+          "source": "plan 3.1/4 P06 lease duration classes zero/finite/infinite; existing projection_pair QoS schema",
+          "derived_from_execution": false
+        }
+      },
+      "execution_evidence": false,
+      "maturity_evidence": false
+    },
+    "E01": {
+      "seed_id": "E01",
+      "status": "authored",
+      "surface_refs": [
+        "E01"
+      ],
+      "capability": {
+        "status": "authored",
+        "f1_routable": true,
+        "runtime_binding": "discovery.drop_duration_sec",
+        "note": "template only; requires isolated netns and pair-bound counter"
+      },
+      "provider": "r2f.modules.s1.fuzz_catalog.load_seeds",
+      "content_sha256": "7fb085f91585a867400e0e2ed0b28489d7b13fe85bb12bb5b07f6a380a9768f9",
+      "source_file": {
+        "path": "config/s1_fuzz/seeds/e01.json",
+        "file_sha256": "f514f33d29b53cf791863e6f057cc11f496a6236b7a6f093979e86ad7acea590",
+        "matches_capture_head": true
+      },
+      "context": {
+        "target_family": "discovery.interruption_recovery",
+        "model_target_ids": [
+          "discovery.interruption_recovery.fuzz_v1"
+        ],
+        "relation": "captured_declaration_context_not_runtime_qualification",
+        "capability_requirements": {
+          "tools": [
+            "isolated_netns_nft_discovery_drop",
+            "pair_bound_drop_counter"
+          ],
+          "sut_guards": [
+            "discovery_activity_observed_after_restore"
+          ],
+          "runtime_binding": "discovery.drop_duration_sec"
+        },
+        "provenance": {
+          "kind": "template",
+          "source": "plan 3.1/4 D01 short-window shape; existing namespace drop carrier",
+          "derived_from_execution": false
+        }
+      },
+      "execution_evidence": false,
+      "maturity_evidence": false
+    },
+    "E02": {
+      "seed_id": "E02",
+      "status": "capability_pending",
+      "surface_refs": [
+        "E02"
+      ],
+      "capability": {
+        "status": "capability_pending",
+        "f1_routable": false,
+        "runtime_binding": null,
+        "reason": "multi-window runner/orchestration is not wired; seed is a template only"
+      },
+      "provider": "r2f.modules.s1.fuzz_catalog.load_seeds",
+      "content_sha256": "5728b2ec173f2b2eb23162e074b144e48742fa635f7c375ac3ab7b71be462a6d",
+      "source_file": {
+        "path": "config/s1_fuzz/seeds/e02.json",
+        "file_sha256": "c5060067ba647dac509efe70dc055038e896cb8ea4b63ac7af19903bf6b72805",
+        "matches_capture_head": true
+      },
+      "context": {
+        "target_family": "discovery.interruption_recovery",
+        "model_target_ids": [
+          "discovery.interruption_recovery.fuzz_windows_v1"
+        ],
+        "relation": "captured_declaration_context_not_runtime_qualification",
+        "capability_requirements": {
+          "tools": [
+            "isolated_netns_nft_discovery_drop",
+            "pair_bound_drop_counter",
+            "multi_window_runner"
+          ],
+          "sut_guards": [
+            "previous_window_restored",
+            "discovery_activity_observed_after_restore"
+          ],
+          "runtime_binding": null
+        },
+        "provenance": {
+          "kind": "template",
+          "source": "plan 3.1/4 E02 two-window drop/restore with 200ms restore interval; no live multi-window runner yet",
+          "derived_from_execution": false
+        }
+      },
+      "execution_evidence": false,
+      "maturity_evidence": false
+    },
+    "E03": {
+      "seed_id": "E03",
+      "status": "capability_pending",
+      "surface_refs": [
+        "E03"
+      ],
+      "capability": {
+        "status": "capability_pending",
+        "f1_routable": false,
+        "runtime_binding": null,
+        "reason": "event-anchored offset runner is not wired; seed is a template only"
+      },
+      "provider": "r2f.modules.s1.fuzz_catalog.load_seeds",
+      "content_sha256": "231c9e5a63af284eb7b4d2169f2dbb28eee843be8fae9f7ca3be1f6390b4c320",
+      "source_file": {
+        "path": "config/s1_fuzz/seeds/e03.json",
+        "file_sha256": "f7cf0c3e3f26c775acf930a8b17d68a61133e7a07b305616226cbdb3b57aa6e5",
+        "matches_capture_head": true
+      },
+      "context": {
+        "target_family": "discovery.interruption_recovery",
+        "model_target_ids": [
+          "discovery.interruption_recovery.fuzz_windows_v1"
+        ],
+        "relation": "captured_declaration_context_not_runtime_qualification",
+        "capability_requirements": {
+          "tools": [
+            "isolated_netns_nft_discovery_drop",
+            "pair_bound_drop_counter",
+            "event_anchor_runner"
+          ],
+          "sut_guards": [
+            "anchor_event_observed",
+            "discovery_activity_observed_after_restore"
+          ],
+          "runtime_binding": null
+        },
+        "provenance": {
+          "kind": "template",
+          "source": "plan 3.1/4 E03 fresh_match anchor with 100ms offset; no event-anchored runner yet",
+          "derived_from_execution": false
+        }
+      },
+      "execution_evidence": false,
+      "maturity_evidence": false
+    },
+    "G01": {
+      "seed_id": "G01",
+      "status": "capability_pending",
+      "surface_refs": [
+        "G01"
+      ],
+      "capability": {
+        "status": "capability_pending",
+        "f1_routable": false,
+        "runtime_binding": null,
+        "reason": "per-role offered/requested reliability is not wired in the current runtime"
+      },
+      "provider": "r2f.modules.s1.fuzz_catalog.load_seeds",
+      "content_sha256": "3fca5d558f2c341fb0e04c77f9cba02050fe10cbbc8025b34a5a656895844fb7",
+      "source_file": {
+        "path": "config/s1_fuzz/seeds/g01.json",
+        "file_sha256": "c2eb6027c059e6f93d6e66b08d555229898b0af9341289608909069841a27394",
+        "matches_capture_head": true
+      },
+      "context": {
+        "target_family": "discovery.match_compatibility",
+        "model_target_ids": [
+          "discovery.match_compatibility.fuzz_v1"
+        ],
+        "relation": "captured_declaration_context_not_runtime_qualification",
+        "capability_requirements": {
+          "tools": [
+            "public_ros2_api",
+            "per_role_qos_runtime"
+          ],
+          "sut_guards": [
+            "identity_backed_match_or_delivery_only"
+          ],
+          "runtime_binding": null
+        },
+        "provenance": {
+          "kind": "template",
+          "source": "plan 3.1/4 G01 BR relation; no live carrier yet",
+          "derived_from_execution": false
+        }
+      },
+      "execution_evidence": false,
+      "maturity_evidence": false
+    },
+    "W01": {
+      "seed_id": "W01",
+      "status": "authored",
+      "surface_refs": [
+        "W01"
+      ],
+      "capability": {
+        "status": "authored",
+        "f1_routable": true,
+        "runtime_binding": "pair.history_and_sample_counts",
+        "note": "auxiliary workload template only; depth is not a required SEDP wire field"
+      },
+      "provider": "r2f.modules.s1.fuzz_catalog.load_seeds",
+      "content_sha256": "a9b3243428352727ef3a2f650550162ecb8d28b930a004d140da631614d796cd",
+      "source_file": {
+        "path": "config/s1_fuzz/seeds/w01.json",
+        "file_sha256": "2c75d01d574bf99c2f5b4eddc90a53f56874f5127b22897399e30f72a36a5889",
+        "matches_capture_head": true
+      },
+      "context": {
+        "target_family": "discovery.late_join_delivery",
+        "model_target_ids": [],
+        "relation": "captured_declaration_context_not_runtime_qualification",
+        "capability_requirements": {
+          "tools": [
+            "public_ros2_api"
+          ],
+          "sut_guards": [
+            "delivery_obligation_reviewed"
+          ],
+          "runtime_binding": "pair.history_and_sample_counts"
+        },
+        "provenance": {
+          "kind": "template",
+          "source": "plan 3.1/4 W01 depth/pre/post auxiliary workload; not a core S1 semantic surface",
+          "derived_from_execution": false
+        }
+      },
+      "execution_evidence": false,
+      "maturity_evidence": false
+    },
+    "W02": {
+      "seed_id": "W02",
+      "status": "authored",
+      "surface_refs": [
+        "W02"
+      ],
+      "capability": {
+        "status": "authored",
+        "f1_routable": true,
+        "runtime_binding": "pair.history_and_sample_counts",
+        "note": "auxiliary publish-interval template only; not a high-throughput claim"
+      },
+      "provider": "r2f.modules.s1.fuzz_catalog.load_seeds",
+      "content_sha256": "0b65614d614b0dca48989db90030faf3193ebbbd58d97f3d67b7761ac8c02e94",
+      "source_file": {
+        "path": "config/s1_fuzz/seeds/w02.json",
+        "file_sha256": "844ab16d3bed94b226f97ca24e50c2189bc70918d25073d4013269c44a061690",
+        "matches_capture_head": true
+      },
+      "context": {
+        "target_family": "discovery.late_join_delivery",
+        "model_target_ids": [
+          "discovery.late_endpoint.fuzz_v1",
+          "discovery.late_join_delivery.fuzz_v1"
+        ],
+        "relation": "captured_declaration_context_not_runtime_qualification",
+        "capability_requirements": {
+          "tools": [
+            "public_ros2_api"
+          ],
+          "sut_guards": [
+            "actual_send_interval_observed"
+          ],
+          "runtime_binding": "pair.history_and_sample_counts"
+        },
+        "provenance": {
+          "kind": "template",
+          "source": "plan 3.1/4 W02 publish interval; not a throughput measurement",
+          "derived_from_execution": false
+        }
+      },
+      "execution_evidence": false,
+      "maturity_evidence": false
+    }
+  },
+  "qualified_for_current_source": false,
+  "runtime_qualification": "unverified",
+  "execution_evidence": false,
+  "maturity_evidence": false,
+  "limitations": [
+    "Newly collected seed metadata; not present in the original s1_coverage.json capture.",
+    "Authored status, file hashes and context describe only the captured source inputs.",
+    "Captured refs do not establish that seed files exist or load in the installed environment.",
+    "Current corpus availability is reported separately; missing files imply unknown loadability.",
+    "No runtime, hit, semantic effect, replay, candidate or current-source maturity qualification.",
+    "W01 is authored but has no captured model target binding; no binding is inferred."
+  ]
+}

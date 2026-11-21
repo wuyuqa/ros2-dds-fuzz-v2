@@ -1,0 +1,3262 @@
+{
+  "schema": "r2f.s1-coverage-lineage/v1",
+  "scope": "source/model/evidence metadata; never an execution or maturity ledger",
+  "source_captures": {
+    "case-matrix.json": {
+      "locator": "captured:results/main-review/s1-primary-research-20261121/case-matrix.json",
+      "artifact_sha256": "3b1955c25f56d6b024afe6a8cc03f2fb6a7adaf9b5e0637de844a92523f93b1f",
+      "verification_scope": "captured_artifact_only",
+      "format": "json"
+    },
+    "coverage.json": {
+      "locator": "captured:results/main-review/s1-primary-research-20261121/coverage.json",
+      "artifact_sha256": "3ff44c42dd8da9830c60317c1d28e3c7855f034d9abb758aee255ac6e904f60a",
+      "verification_scope": "captured_artifact_only",
+      "format": "json"
+    },
+    "primary-artifact-validation.json": {
+      "locator": "captured:results/main-review/s1-primary-research-20261121/primary-artifact-validation.json",
+      "artifact_sha256": "3e6115c18e0ae7c8f0243ed741f6d066974b4beaa3a4f42876fd656cca49aab2",
+      "verification_scope": "captured_artifact_only",
+      "format": "json"
+    },
+    "retained-evidence.json": {
+      "locator": "captured:results/main-review/s1-primary-research-20261121/retained-evidence.json",
+      "artifact_sha256": "f2701ad74bbe82d0d58c8d6b3e2abc7e2fd617f59092d297ce4f3b85d7932bbb",
+      "verification_scope": "captured_artifact_only",
+      "format": "json"
+    },
+    "parent-spec": {
+      "locator": "captured:issue-6/spec.md@2026-11-21",
+      "artifact_sha256": "472156512d38fa5d1aeb2569f8675251eb28da726145255a71e664af3b9ccad0",
+      "verification_scope": "captured_spec_not_completion_evidence",
+      "format": "markdown"
+    }
+  },
+  "cases": [
+    {
+      "taxonomy_line": 143,
+      "original_taxonomy_row": "| 2 | [issue #215](https://github.com/eclipse-cyclonedds/cyclonedds/issues/215) | `yes` | `L0_DDSI_RTPS_INTEROP` | `S1_DISCOVERY_MATCHING_GRAPH` | `S1.B3` | `medium` | issue 和维护者评论指向 find_topic 跨 participant 发现谓词；修复通过 topic discovery 和 scoped API 恢复/明确查找语义。 |",
+      "source_url": "https://github.com/eclipse-cyclonedds/cyclonedds/issues/215",
+      "group": "binding-cases",
+      "case_id": "core215",
+      "research_classification": "API范围契约演进",
+      "coverage_rows": [
+        "C02",
+        "C09"
+      ],
+      "disposition": "作用域对照；不是旧API自动恢复语义",
+      "fix": {
+        "pr_url": "https://github.com/eclipse-cyclonedds/cyclonedds/pull/615",
+        "merged_at": "2021-03-26T15:11:40Z",
+        "merge_sha": "ab139936eaaad0d29ec5a430d29e6d1847c5ae50",
+        "direct_parents": [
+          "83b17f1311828a8b8d541d9650fcb14e47605c81"
+        ],
+        "patch_files": "see core-topic-discovery.json",
+        "exact_comparison": {
+          "pre": "332e37199336a02f54b1c057d2fd891d5a66c45e",
+          "post": "83b17f1311828a8b8d541d9650fcb14e47605c81",
+          "status": "proposed_not_executed",
+          "implementation_direct_parents": [
+            "332e37199336a02f54b1c057d2fd891d5a66c45e"
+          ]
+        }
+      },
+      "proposed_pre_post": {
+        "pre": "332e37199336a02f54b1c057d2fd891d5a66c45e",
+        "post": "83b17f1311828a8b8d541d9650fcb14e47605c81",
+        "status": "proposed_not_executed",
+        "implementation_direct_parents": [
+          "332e37199336a02f54b1c057d2fd891d5a66c45e"
+        ]
+      },
+      "versions": {
+        "affected_range": "unknown",
+        "first_fixed_release": "unknown",
+        "reported_version": "未给 release"
+      },
+      "research_report": "/home/wuyuqa/ros2-dds-fuzz-v2/results/main-review/s1-primary-research-20261121/binding-cases/report.md",
+      "reproduced_here": false,
+      "new_discovery": false,
+      "source_ref": {
+        "artifact_id": "case-matrix.json",
+        "json_pointer": "/cases/0"
+      },
+      "runtime_applicability": {
+        "status": "case_specific_validation_required",
+        "basis": "作用域对照；不是旧API自动恢复语义",
+        "source_ref": {
+          "artifact_id": "case-matrix.json",
+          "json_pointer": "/cases/0"
+        },
+        "limitation": "Knowledge/feature mapping does not add an OpenDDS/XRCE/native/binding backend requirement or prove that a ROS adapter reproduces this case. Applicable generic S1 obligations remain open."
+      }
+    },
+    {
+      "taxonomy_line": 147,
+      "original_taxonomy_row": "| 8 | [issue #3770](https://github.com/eProsima/Fast-DDS/issues/3770) | `yes` | `L0_DDSI_RTPS_INTEROP` | `S1_DISCOVERY_MATCHING_GRAPH` | `S1.B3` | `high` | PR 描述明确是 PDP discovery race，participant proxy cleared before assignRemoteEndpoints；按发现数据/endpoint 投影错误归 S1。 |",
+      "source_url": "https://github.com/eProsima/Fast-DDS/issues/3770",
+      "group": "core-cases",
+      "case_id": "Fast-DDS-issue3770",
+      "research_classification": "core并发生命周期缺陷",
+      "coverage_rows": [
+        "C01",
+        "C06",
+        "C08"
+      ],
+      "disposition": "首选历史验证；PR4220",
+      "fix": {
+        "pr_url": "https://github.com/eProsima/Fast-DDS/pull/4220",
+        "title": "[19696][20409] Fix data race on PDP",
+        "state": "closed",
+        "merged": true,
+        "merged_at": "2024-02-22T11:30:21Z",
+        "base_ref": "master",
+        "api_base_sha_not_assumed_parent": "5f65a65196dff2453ff86df711db018fefed1e54",
+        "head_sha": "32836dadc0049f0a1137b00750d681d5e4dbb087",
+        "merge_sha": "305383295a9bbb9f12c5c0aa303667872d65ea33",
+        "actual_parents_from_commit_api": [
+          "8c3e3b30e769ef94bdbc04da519ed193855ad05c"
+        ],
+        "recommended_exact_pre": "8c3e3b30e769ef94bdbc04da519ed193855ad05c",
+        "recommended_exact_post": "305383295a9bbb9f12c5c0aa303667872d65ea33",
+        "commit_url": "https://github.com/eProsima/Fast-DDS/commit/305383295a9bbb9f12c5c0aa303667872d65ea33",
+        "parent_source_url": "https://api.github.com/repos/eProsima/Fast-DDS/commits/305383295a9bbb9f12c5c0aa303667872d65ea33",
+        "evidence": [
+          "api/Fast-DDS-4220-pr.json",
+          "api/Fast-DDS-4220-merge.json",
+          "api/Fast-DDS-4220-files.json"
+        ]
+      },
+      "proposed_pre_post": {
+        "pre": "8c3e3b30e769ef94bdbc04da519ed193855ad05c",
+        "post": "305383295a9bbb9f12c5c0aa303667872d65ea33"
+      },
+      "versions": {
+        "affected": {
+          "status": "unknown",
+          "reported": "报告仅写lastest master，未给精确SHA；Ubuntu Focal 20.04 amd64。",
+          "release_range": "没有核实引入提交或所有受影响release。上一release不包含此merge不能单独证明必然有相同缺陷。"
+        },
+        "release": {
+          "first_confirmed_fixed_stable": "v2.13.3",
+          "scope": "2.13发布线，release明确列#4220且compare证明包含merge；全分支最早修复release未穷尽核实，unknown。",
+          "url": "https://github.com/eProsima/Fast-DDS/releases/tag/v2.13.3",
+          "other_listed_backport_releases": [
+            "v2.12.2: #4429",
+            "v2.10.4: #4430",
+            "v2.6.8: #4431"
+          ],
+          "backport_caveat": "仅发布说明列出；未逐个核实backport merge SHA，不将其当#4220同一commit。",
+          "evidence": [
+            "api/Fast-DDS-releases.json",
+            "api/Fast-DDS-4220-compare-v2.13.3.json",
+            "api/Fast-DDS-4220-compare-v2.13.2.json"
+          ]
+        }
+      },
+      "research_report": "/home/wuyuqa/ros2-dds-fuzz-v2/results/main-review/s1-primary-research-20261121/core-cases/report.md",
+      "reproduced_here": false,
+      "new_discovery": false,
+      "source_ref": {
+        "artifact_id": "case-matrix.json",
+        "json_pointer": "/cases/1"
+      },
+      "runtime_applicability": {
+        "status": "case_specific_validation_required",
+        "basis": "首选历史验证；PR4220",
+        "source_ref": {
+          "artifact_id": "case-matrix.json",
+          "json_pointer": "/cases/1"
+        },
+        "limitation": "Knowledge/feature mapping does not add an OpenDDS/XRCE/native/binding backend requirement or prove that a ROS adapter reproduces this case. Applicable generic S1 obligations remain open."
+      }
+    },
+    {
+      "taxonomy_line": 151,
+      "original_taxonomy_row": "| 13 | [issue #115](https://github.com/eProsima/Micro-XRCE-DDS-Client/issues/115) | `yes` | `L0_DDSI_RTPS_INTEROP` | `S1_DISCOVERY_MATCHING_GRAPH` | `S1.B1` | `high` | issue/PR 明确是 discovery profile 行为，修复发现成功状态传播；按 Micro XRCE agent/participant discovery 行为归 S1。 |",
+      "source_url": "https://github.com/eProsima/Micro-XRCE-DDS-Client/issues/115",
+      "group": "binding-cases",
+      "case_id": "xrce115",
+      "research_classification": "XRCE发现控制流回归",
+      "coverage_rows": [
+        "C04",
+        "C11"
+      ],
+      "disposition": "保留profile/完成状态特征；非普通ROS2 DDS路径",
+      "fix": {
+        "pr_url": "https://github.com/eProsima/Micro-XRCE-DDS-Client/pull/119",
+        "merged_at": "2019-12-18T15:43:06Z",
+        "merge_sha": "10e8ea65ebbd761b8b280212c19f9603fca0e852",
+        "direct_parents": [
+          "2cb399934eab37687402da884abead9fbd60cd96"
+        ],
+        "patch_files": [
+          "src/c/profile/discovery/discovery.c"
+        ],
+        "exact_comparison": {
+          "pre": "2cb399934eab37687402da884abead9fbd60cd96",
+          "post": "10e8ea65ebbd761b8b280212c19f9603fca0e852",
+          "status": "proposed_not_executed"
+        }
+      },
+      "proposed_pre_post": {
+        "pre": "2cb399934eab37687402da884abead9fbd60cd96",
+        "post": "10e8ea65ebbd761b8b280212c19f9603fca0e852",
+        "status": "proposed_not_executed"
+      },
+      "versions": {
+        "reported_good_version": "1.0.2（报告者说法）",
+        "reported_affected_since": "1.1.0（报告者说法，边界未穷举）",
+        "affected_range": "unknown",
+        "first_fixed_release": "unknown",
+        "reported_good_source": "1a113ee584000e23bf7816819f74d61432d7c807",
+        "reported_bad_source": "abcef44b1cf166445f923ce7e49ef524350d9842"
+      },
+      "research_report": "/home/wuyuqa/ros2-dds-fuzz-v2/results/main-review/s1-primary-research-20261121/binding-cases/report.md",
+      "reproduced_here": false,
+      "new_discovery": false,
+      "source_ref": {
+        "artifact_id": "case-matrix.json",
+        "json_pointer": "/cases/2"
+      },
+      "runtime_applicability": {
+        "status": "case_specific_validation_required",
+        "basis": "保留profile/完成状态特征；非普通ROS2 DDS路径",
+        "source_ref": {
+          "artifact_id": "case-matrix.json",
+          "json_pointer": "/cases/2"
+        },
+        "limitation": "Knowledge/feature mapping does not add an OpenDDS/XRCE/native/binding backend requirement or prove that a ROS adapter reproduces this case. Applicable generic S1 obligations remain open."
+      }
+    },
+    {
+      "taxonomy_line": 245,
+      "original_taxonomy_row": "| 168 | [pr](https://github.com/eclipse-cyclonedds/cyclonedds-python/pull/130) | `yes` | `L0_DDSI_RTPS_INTEROP` | `S1_DISCOVERY_MATCHING_GRAPH` | `S1.B3` | `high` | The repair is a builtin discovery data projection/schema mismatch, not a generic Python crash. |",
+      "source_url": "https://github.com/eclipse-cyclonedds/cyclonedds-python/pull/130",
+      "group": "binding-cases",
+      "case_id": "py130",
+      "research_classification": "Python binding数据结构缺陷",
+      "coverage_rows": [
+        "C08",
+        "C09"
+      ],
+      "disposition": "投影验证代表；单独归因binding",
+      "fix": {
+        "pr_url": "https://github.com/eclipse-cyclonedds/cyclonedds-python/pull/130",
+        "merged_at": "2022-08-19T07:16:12Z",
+        "merge_sha": "30ddbb02b093edcc80b7fd9a1666b75b55dcece5",
+        "direct_parents": [
+          "9f35714c6ef418092ab706d42b50a614abb5334f",
+          "0e20923e501fd3d19a1e8af5d344d5ae04f461c1"
+        ],
+        "patch_files": [
+          "clayer/pysertype.c",
+          "cyclonedds/builtin.py",
+          "tests/test_builtin.py"
+        ],
+        "exact_comparison": {
+          "pre": "9f35714c6ef418092ab706d42b50a614abb5334f",
+          "post": "30ddbb02b093edcc80b7fd9a1666b75b55dcece5",
+          "status": "proposed_not_executed"
+        }
+      },
+      "proposed_pre_post": {
+        "pre": "9f35714c6ef418092ab706d42b50a614abb5334f",
+        "post": "30ddbb02b093edcc80b7fd9a1666b75b55dcece5",
+        "status": "proposed_not_executed"
+      },
+      "versions": {
+        "affected_range": "unknown",
+        "first_fixed_release": "unknown",
+        "reported_version": "PR 未标明精确发布版"
+      },
+      "research_report": "/home/wuyuqa/ros2-dds-fuzz-v2/results/main-review/s1-primary-research-20261121/binding-cases/report.md",
+      "reproduced_here": false,
+      "new_discovery": false,
+      "source_ref": {
+        "artifact_id": "case-matrix.json",
+        "json_pointer": "/cases/3"
+      },
+      "runtime_applicability": {
+        "status": "case_specific_validation_required",
+        "basis": "投影验证代表；单独归因binding",
+        "source_ref": {
+          "artifact_id": "case-matrix.json",
+          "json_pointer": "/cases/3"
+        },
+        "limitation": "Knowledge/feature mapping does not add an OpenDDS/XRCE/native/binding backend requirement or prove that a ROS adapter reproduces this case. Applicable generic S1 obligations remain open."
+      }
+    },
+    {
+      "taxonomy_line": 246,
+      "original_taxonomy_row": "| 169 | [issue](https://github.com/eclipse-cyclonedds/cyclonedds-python/issues/200) | `yes_tooling_semantic_defect` | `L0_DDSI_RTPS_INTEROP` | `S1_DISCOVERY_MATCHING_GRAPH` | `S1.B3` | `medium` | Although it consumes discovery data, the fix is in the Python CLI presentation layer and changes an internal table class, with no evidence… |",
+      "source_url": "https://github.com/eclipse-cyclonedds/cyclonedds-python/issues/200",
+      "group": "binding-cases",
+      "case_id": "py200",
+      "research_classification": "CLI观察工具缺陷",
+      "coverage_rows": [
+        "C10",
+        "C17"
+      ],
+      "disposition": "工具分流对照",
+      "fix": {
+        "pr_url": "https://github.com/eclipse-cyclonedds/cyclonedds-python/pull/209",
+        "merged_at": "2023-08-10T10:52:36Z",
+        "merge_sha": "fbb1a52c628860b365329c3f740b3a39dbd03b2f",
+        "direct_parents": [
+          "909ead3c4145fc963e81d266acbadc771983c01b"
+        ],
+        "patch_files": [
+          "cyclonedds/tools/cli/discovery/main.py"
+        ],
+        "exact_comparison": {
+          "pre": "909ead3c4145fc963e81d266acbadc771983c01b",
+          "post": "fbb1a52c628860b365329c3f740b3a39dbd03b2f",
+          "status": "proposed_not_executed"
+        }
+      },
+      "proposed_pre_post": {
+        "pre": "909ead3c4145fc963e81d266acbadc771983c01b",
+        "post": "fbb1a52c628860b365329c3f740b3a39dbd03b2f",
+        "status": "proposed_not_executed"
+      },
+      "versions": {
+        "reported_affected_version": "0.10.2（报告者环境，不是本次安装验证）",
+        "affected_range": "unknown",
+        "first_fixed_release": "unknown"
+      },
+      "research_report": "/home/wuyuqa/ros2-dds-fuzz-v2/results/main-review/s1-primary-research-20261121/binding-cases/report.md",
+      "reproduced_here": false,
+      "new_discovery": false,
+      "source_ref": {
+        "artifact_id": "case-matrix.json",
+        "json_pointer": "/cases/4"
+      },
+      "runtime_applicability": {
+        "status": "case_specific_validation_required",
+        "basis": "工具分流对照",
+        "source_ref": {
+          "artifact_id": "case-matrix.json",
+          "json_pointer": "/cases/4"
+        },
+        "limitation": "Knowledge/feature mapping does not add an OpenDDS/XRCE/native/binding backend requirement or prove that a ROS adapter reproduces this case. Applicable generic S1 obligations remain open."
+      }
+    },
+    {
+      "taxonomy_line": 257,
+      "original_taxonomy_row": "| 199 | [pull#5221](https://github.com/OpenDDS/OpenDDS/pull/5221) | `yes_semantic_defect` | `L0_DDSI_RTPS_INTEROP` | `S1_DISCOVERY_MATCHING_GRAPH` | `S1.B3` | `high` | Although repository recovery is discovery-adjacent, the PR is explicitly a Coverity iterator/spin fix with no issue-level DDS-visible seman… |",
+      "source_url": "https://github.com/OpenDDS/OpenDDS/pull/5221",
+      "group": "boundary-cases",
+      "case_id": "OpenDDS/OpenDDS#5221",
+      "research_classification": "运行时并发/恢复风险修补",
+      "coverage_rows": [
+        "C06",
+        "C07"
+      ],
+      "disposition": "与5202关联；不双计自然异常",
+      "fix": {
+        "state": "closed",
+        "merged": true,
+        "fix_sha": "e66d6283562495cf2a9cdf2ec0b10a3060d4ab7c",
+        "fix_sha_kind": "merged_patch_commit_not_a_verified_semantic_fix",
+        "fix_direct_parents": [
+          "cd2fd8a5b712ceca5cb34b5b0e9ff62ca030ba02",
+          "d34243bb9068a53fea78d7ea37e6b3603e6ae4fd"
+        ],
+        "patch_commits": [
+          {
+            "sha": "a7b525003ff1e75099f33cddff65517729442310",
+            "direct_parents": [
+              "d6182a63c9a51f56db543239cdca1013dc44889f"
+            ]
+          },
+          {
+            "sha": "d34243bb9068a53fea78d7ea37e6b3603e6ae4fd",
+            "direct_parents": [
+              "a7b525003ff1e75099f33cddff65517729442310"
+            ]
+          }
+        ]
+      },
+      "proposed_pre_post": {
+        "pre": "cd2fd8a5b712ceca5cb34b5b0e9ff62ca030ba02",
+        "post": "e66d6283562495cf2a9cdf2ec0b10a3060d4ab7c"
+      },
+      "versions": {
+        "affected_release": "unknown",
+        "first_fixed_release": "unknown",
+        "release_evidence_limit": "已读取官方releases API；未建立逐tag的补丁祖先关系和受影响版本动态证据。milestone、merge日期、release发布时间不足以证明首修release。"
+      },
+      "research_report": "/home/wuyuqa/ros2-dds-fuzz-v2/results/main-review/s1-primary-research-20261121/boundary-cases/report.md",
+      "reproduced_here": false,
+      "new_discovery": false,
+      "source_ref": {
+        "artifact_id": "case-matrix.json",
+        "json_pointer": "/cases/5"
+      },
+      "runtime_applicability": {
+        "status": "case_specific_validation_required",
+        "basis": "与5202关联；不双计自然异常",
+        "source_ref": {
+          "artifact_id": "case-matrix.json",
+          "json_pointer": "/cases/5"
+        },
+        "limitation": "Knowledge/feature mapping does not add an OpenDDS/XRCE/native/binding backend requirement or prove that a ROS adapter reproduces this case. Applicable generic S1 obligations remain open."
+      }
+    },
+    {
+      "taxonomy_line": 259,
+      "original_taxonomy_row": "| 201 | [pull#2292](https://github.com/eclipse-cyclonedds/cyclonedds/pull/2292) | `yes` | `L0_DDSI_RTPS_INTEROP` | `S1_DISCOVERY_MATCHING_GRAPH` | `S1.B1` | `medium-high` | The concrete failure is crash/hang, but the repaired invariant is DDSI discovery graph consistency for remote proxy participants/endpoints… |",
+      "source_url": "https://github.com/eclipse-cyclonedds/cyclonedds/pull/2292",
+      "group": "core-cases",
+      "case_id": "cyclonedds-PR2292",
+      "research_classification": "core发现图创建删除竞态",
+      "coverage_rows": [
+        "C01",
+        "C03",
+        "C06",
+        "C07"
+      ],
+      "disposition": "第二厂商/lease边界验证候选",
+      "fix": {
+        "pr_url": "https://github.com/eclipse-cyclonedds/cyclonedds/pull/2292",
+        "title": "Handle deleting proxypp during new proxy endpoint",
+        "state": "closed",
+        "merged": true,
+        "merged_at": "2025-09-25T09:55:52Z",
+        "base_ref": "master",
+        "api_base_sha_not_assumed_parent": "8aa30158deed93185d67fb64a9efe4a0787e2682",
+        "head_sha": "5547044f0d9b86f09e11f06e602dcf67cb5d75df",
+        "merge_sha": "9f73bef0d488cd5f3896d4988333ff2a289e0ace",
+        "actual_parents_from_commit_api": [
+          "8aa30158deed93185d67fb64a9efe4a0787e2682"
+        ],
+        "recommended_exact_pre": "8aa30158deed93185d67fb64a9efe4a0787e2682",
+        "recommended_exact_post": "9f73bef0d488cd5f3896d4988333ff2a289e0ace",
+        "commit_url": "https://github.com/eclipse-cyclonedds/cyclonedds/commit/9f73bef0d488cd5f3896d4988333ff2a289e0ace",
+        "parent_source_url": "https://api.github.com/repos/eclipse-cyclonedds/cyclonedds/commits/9f73bef0d488cd5f3896d4988333ff2a289e0ace",
+        "evidence": [
+          "api/cyclonedds-2292-pr.json",
+          "api/cyclonedds-2292-merge.json",
+          "api/cyclonedds-2292-files.json"
+        ]
+      },
+      "proposed_pre_post": {
+        "pre": "8aa30158deed93185d67fb64a9efe4a0787e2682",
+        "post": "9f73bef0d488cd5f3896d4988333ff2a289e0ace"
+      },
+      "versions": {
+        "affected": {
+          "status": "unknown",
+          "reported": "PR报告master CI罕见出现，未给受影响release范围。",
+          "release_range": "0.10.5不含此merge不代表同一代码和缺陷存在于该版本；引入版本/各release可达性unknown。"
+        },
+        "release": {
+          "first_confirmed_fixed_stable": "11.0.0",
+          "scope": "已取得官方release列表中merge之后首个稳定release，compare确认包含该merge；notes没有直接列#2292。所有历史tag/backport最早版本未穷尽，unknown。",
+          "url": "https://github.com/eclipse-cyclonedds/cyclonedds/releases/tag/11.0.0",
+          "evidence": [
+            "api/cyclonedds-releases.json",
+            "api/cyclonedds-2292-compare-0.10.5.json",
+            "api/cyclonedds-2292-compare-11.0.0.json"
+          ]
+        }
+      },
+      "research_report": "/home/wuyuqa/ros2-dds-fuzz-v2/results/main-review/s1-primary-research-20261121/core-cases/report.md",
+      "reproduced_here": false,
+      "new_discovery": false,
+      "source_ref": {
+        "artifact_id": "case-matrix.json",
+        "json_pointer": "/cases/6"
+      },
+      "runtime_applicability": {
+        "status": "case_specific_validation_required",
+        "basis": "第二厂商/lease边界验证候选",
+        "source_ref": {
+          "artifact_id": "case-matrix.json",
+          "json_pointer": "/cases/6"
+        },
+        "limitation": "Knowledge/feature mapping does not add an OpenDDS/XRCE/native/binding backend requirement or prove that a ROS adapter reproduces this case. Applicable generic S1 obligations remain open."
+      }
+    },
+    {
+      "taxonomy_line": 262,
+      "original_taxonomy_row": "| 207 | [PR #294](https://github.com/eclipse-cyclonedds/cyclonedds-cxx/pull/294) | `yes` | `L0_DDSI_RTPS_INTEROP` | `S1_DISCOVERY_MATCHING_GRAPH` | `S1.B1` | `medium` | The patch is partly an API update, but the restored behavior is typed topic discovery/matching rather than a build-only change. |",
+      "source_url": "https://github.com/eclipse-cyclonedds/cyclonedds-cxx/pull/294",
+      "group": "binding-cases",
+      "case_id": "cxx294",
+      "research_classification": "C++ binding API适配",
+      "coverage_rows": [
+        "C09",
+        "C16"
+      ],
+      "disposition": "保留查找语义兼容面",
+      "fix": {
+        "pr_url": "https://github.com/eclipse-cyclonedds/cyclonedds-cxx/pull/294",
+        "merged_at": "2022-07-18T13:22:44Z",
+        "merge_sha": "6bd08ab9639d1bb897fce1e14f3f470ff579f354",
+        "direct_parents": [
+          "ce6d5e60f3277031d6c6da1f60a1d35b78858a22"
+        ],
+        "patch_files": [
+          "src/ddscxx/include/dds/topic/detail/TTopicImpl.hpp",
+          "src/ddscxx/include/org/eclipse/cyclonedds/domain/DomainParticipantDelegate.hpp",
+          "src/ddscxx/src/org/eclipse/cyclonedds/domain/DomainParticipantDelegate.cpp",
+          "src/ddscxx/src/org/eclipse/cyclonedds/topic/AnyTopicDelegate.cpp",
+          "src/ddscxx/tests/DataWriter.cpp",
+          "src/ddscxx/tests/FindTopic.cpp",
+          "src/ddscxx/tests/Topic.cpp"
+        ],
+        "exact_comparison": {
+          "pre": "ce6d5e60f3277031d6c6da1f60a1d35b78858a22",
+          "post": "6bd08ab9639d1bb897fce1e14f3f470ff579f354",
+          "status": "proposed_not_executed"
+        }
+      },
+      "proposed_pre_post": {
+        "pre": "ce6d5e60f3277031d6c6da1f60a1d35b78858a22",
+        "post": "6bd08ab9639d1bb897fce1e14f3f470ff579f354",
+        "status": "proposed_not_executed"
+      },
+      "versions": {
+        "affected_range": "unknown",
+        "first_fixed_release": "unknown",
+        "reported_version": "没有可确认 release 范围"
+      },
+      "research_report": "/home/wuyuqa/ros2-dds-fuzz-v2/results/main-review/s1-primary-research-20261121/binding-cases/report.md",
+      "reproduced_here": false,
+      "new_discovery": false,
+      "source_ref": {
+        "artifact_id": "case-matrix.json",
+        "json_pointer": "/cases/7"
+      },
+      "runtime_applicability": {
+        "status": "case_specific_validation_required",
+        "basis": "保留查找语义兼容面",
+        "source_ref": {
+          "artifact_id": "case-matrix.json",
+          "json_pointer": "/cases/7"
+        },
+        "limitation": "Knowledge/feature mapping does not add an OpenDDS/XRCE/native/binding backend requirement or prove that a ROS adapter reproduces this case. Applicable generic S1 obligations remain open."
+      }
+    },
+    {
+      "taxonomy_line": 275,
+      "original_taxonomy_row": "| 223 | [pull](https://github.com/eProsima/Fast-DDS/pull/6153) | `yes` | `L0_DDSI_RTPS_INTEROP` | `S1_DISCOVERY_MATCHING_GRAPH` | `S1.B1` | `medium-high` | The concrete defect is a data race, but the protected state belongs to PDP discovery writer destination selection and participant discovery… |",
+      "source_url": "https://github.com/eProsima/Fast-DDS/pull/6153",
+      "group": "core-cases",
+      "case_id": "Fast-DDS-PR6153",
+      "research_classification": "core数据竞争修复backport",
+      "coverage_rows": [
+        "C04",
+        "C06"
+      ],
+      "disposition": "后续内部race/TSAN；与6100同一修复链",
+      "fix": {
+        "pr_url": "https://github.com/eProsima/Fast-DDS/pull/6153",
+        "title": "[23822] Protect PDPStatelessWriter attributes (backport #6100)",
+        "state": "closed",
+        "merged": true,
+        "merged_at": "2026-03-06T09:19:36Z",
+        "base_ref": "3.2.x",
+        "api_base_sha_not_assumed_parent": "64d464671a2c60c87370c200306c2e6486e74ffe",
+        "head_sha": "bdd319b4b9e23ee50bd92ae8cc93e580506d35fc",
+        "merge_sha": "d72431f5b3dc12e9246ccd3d83947f9ee35de145",
+        "actual_parents_from_commit_api": [
+          "64d464671a2c60c87370c200306c2e6486e74ffe"
+        ],
+        "recommended_exact_pre": "64d464671a2c60c87370c200306c2e6486e74ffe",
+        "recommended_exact_post": "d72431f5b3dc12e9246ccd3d83947f9ee35de145",
+        "commit_url": "https://github.com/eProsima/Fast-DDS/commit/d72431f5b3dc12e9246ccd3d83947f9ee35de145",
+        "parent_source_url": "https://api.github.com/repos/eProsima/Fast-DDS/commits/d72431f5b3dc12e9246ccd3d83947f9ee35de145",
+        "evidence": [
+          "api/Fast-DDS-6153-pr.json",
+          "api/Fast-DDS-6153-merge.json",
+          "api/Fast-DDS-6153-files.json"
+        ]
+      },
+      "proposed_pre_post": {
+        "pre": "64d464671a2c60c87370c200306c2e6486e74ffe",
+        "post": "d72431f5b3dc12e9246ccd3d83947f9ee35de145"
+      },
+      "versions": {
+        "affected": {
+          "status": "unknown",
+          "reported": "PR面向3.2.x；上游#6100要求3.3.x/3.2.x/2.14.x backport。",
+          "release_range": "branch/backport请求不证明各release均受影响；引入版本和完整范围unknown。"
+        },
+        "release": {
+          "first_confirmed_fixed_stable": "v3.2.4",
+          "scope": "3.2发布线官方notes列#6153且含merge；上游#6100已在v3.4.1 notes出现，不应将2026年backport误作缺陷首次修复。",
+          "url": "https://github.com/eProsima/Fast-DDS/releases/tag/v3.2.4",
+          "upstream_release_url": "https://github.com/eProsima/Fast-DDS/releases/tag/v3.4.1",
+          "evidence": [
+            "api/Fast-DDS-releases.json",
+            "api/Fast-DDS-6153-compare-v3.2.3.json",
+            "api/Fast-DDS-6153-compare-v3.2.4.json"
+          ]
+        }
+      },
+      "research_report": "/home/wuyuqa/ros2-dds-fuzz-v2/results/main-review/s1-primary-research-20261121/core-cases/report.md",
+      "reproduced_here": false,
+      "new_discovery": false,
+      "source_ref": {
+        "artifact_id": "case-matrix.json",
+        "json_pointer": "/cases/8"
+      },
+      "runtime_applicability": {
+        "status": "case_specific_validation_required",
+        "basis": "后续内部race/TSAN；与6100同一修复链",
+        "source_ref": {
+          "artifact_id": "case-matrix.json",
+          "json_pointer": "/cases/8"
+        },
+        "limitation": "Knowledge/feature mapping does not add an OpenDDS/XRCE/native/binding backend requirement or prove that a ROS adapter reproduces this case. Applicable generic S1 obligations remain open."
+      }
+    },
+    {
+      "taxonomy_line": 337,
+      "original_taxonomy_row": "| 411 | [pr](https://github.com/eProsima/Fast-DDS/pull/6336) | `yes_api_semantic_extension_defect` | `L0_DDSI_RTPS_INTEROP` | `S1_DISCOVERY_MATCHING_GRAPH` | `S1.B3` | `high` | The PR is explicitly a new feature/API extension; there is no linked failure showing an existing DDS semantic contract was violated. Under… |",
+      "source_url": "https://github.com/eProsima/Fast-DDS/pull/6336",
+      "group": "core-cases",
+      "case_id": "Fast-DDS-PR6336",
+      "research_classification": "功能扩展",
+      "coverage_rows": [
+        "C10",
+        "C15"
+      ],
+      "disposition": "正常自定义准入，不计已知缺陷",
+      "fix": {
+        "pr_url": "https://github.com/eProsima/Fast-DDS/pull/6336",
+        "title": "[24282] Add should_endpoints_match callback in DomainParticipant and RTPSParticipant",
+        "state": "closed",
+        "merged": true,
+        "merged_at": "2026-03-25T10:06:15Z",
+        "base_ref": "master",
+        "api_base_sha_not_assumed_parent": "e8c9e8bf45108cc669dba7e98a4dc06bb83d272f",
+        "head_sha": "a0446020ed3b7b12204dbca9d9a4c76c89340960",
+        "merge_sha": "d7c2a94b834a79d2698573c4035af57c05d2a88d",
+        "actual_parents_from_commit_api": [
+          "f6ccfcf45bda06a712f5886cb24f9250f8c1f396"
+        ],
+        "recommended_exact_pre": "f6ccfcf45bda06a712f5886cb24f9250f8c1f396",
+        "recommended_exact_post": "d7c2a94b834a79d2698573c4035af57c05d2a88d",
+        "commit_url": "https://github.com/eProsima/Fast-DDS/commit/d7c2a94b834a79d2698573c4035af57c05d2a88d",
+        "parent_source_url": "https://api.github.com/repos/eProsima/Fast-DDS/commits/d7c2a94b834a79d2698573c4035af57c05d2a88d",
+        "evidence": [
+          "api/Fast-DDS-6336-pr.json",
+          "api/Fast-DDS-6336-merge.json",
+          "api/Fast-DDS-6336-files.json"
+        ]
+      },
+      "proposed_pre_post": {
+        "pre": "f6ccfcf45bda06a712f5886cb24f9250f8c1f396",
+        "post": "d7c2a94b834a79d2698573c4035af57c05d2a88d"
+      },
+      "versions": {
+        "affected": {
+          "status": "not_applicable_feature",
+          "reported": "旧版缺少新扩展能力不是受影响漏洞版本。"
+        },
+        "release": {
+          "first_confirmed_feature_stable": "v3.6.0",
+          "scope": "官方release notes列#6336且compare确认包含；上一稳定v3.5.0不含该merge。其他分支是否另有等价实现unknown。",
+          "url": "https://github.com/eProsima/Fast-DDS/releases/tag/v3.6.0",
+          "evidence": [
+            "api/Fast-DDS-releases.json",
+            "api/Fast-DDS-6336-compare-v3.5.0.json",
+            "api/Fast-DDS-6336-compare-v3.6.0.json"
+          ]
+        }
+      },
+      "research_report": "/home/wuyuqa/ros2-dds-fuzz-v2/results/main-review/s1-primary-research-20261121/core-cases/report.md",
+      "reproduced_here": false,
+      "new_discovery": false,
+      "source_ref": {
+        "artifact_id": "case-matrix.json",
+        "json_pointer": "/cases/9"
+      },
+      "runtime_applicability": {
+        "status": "case_specific_validation_required",
+        "basis": "正常自定义准入，不计已知缺陷",
+        "source_ref": {
+          "artifact_id": "case-matrix.json",
+          "json_pointer": "/cases/9"
+        },
+        "limitation": "Knowledge/feature mapping does not add an OpenDDS/XRCE/native/binding backend requirement or prove that a ROS adapter reproduces this case. Applicable generic S1 obligations remain open."
+      }
+    },
+    {
+      "taxonomy_line": 342,
+      "original_taxonomy_row": "| 445 | [issue#2057](https://github.com/OpenDDS/OpenDDS/issues/2057) | `yes_low_confidence` | `L0_DDSI_RTPS_INTEROP` | `S1_DISCOVERY_MATCHING_GRAPH` | `S1.B3` | `medium` | The externally visible contract is endpoint/topic/type matching. Confidence is reduced because PR #2128 is closed but not merged, so it is… |",
+      "source_url": "https://github.com/OpenDDS/OpenDDS/issues/2057",
+      "group": "boundary-cases",
+      "case_id": "OpenDDS/OpenDDS#2057",
+      "research_classification": "上游语义异常报告；确切修复未定位",
+      "coverage_rows": [
+        "C09",
+        "C13",
+        "C15"
+      ],
+      "disposition": "PR2128未合并；精确fix unknown",
+      "fix": {
+        "state": "closed",
+        "merged": "not_applicable_issue",
+        "fix_sha": "unknown",
+        "fix_sha_kind": null,
+        "fix_direct_parents": "unknown",
+        "patch_commits": null
+      },
+      "proposed_pre_post": {
+        "pre": "u",
+        "post": "unknown"
+      },
+      "versions": {
+        "affected_release": "unknown",
+        "first_fixed_release": "unknown",
+        "release_evidence_limit": "已读取官方releases API；未建立逐tag的补丁祖先关系和受影响版本动态证据。milestone、merge日期、release发布时间不足以证明首修release。"
+      },
+      "research_report": "/home/wuyuqa/ros2-dds-fuzz-v2/results/main-review/s1-primary-research-20261121/boundary-cases/report.md",
+      "reproduced_here": false,
+      "new_discovery": false,
+      "source_ref": {
+        "artifact_id": "case-matrix.json",
+        "json_pointer": "/cases/10"
+      },
+      "runtime_applicability": {
+        "status": "case_specific_validation_required",
+        "basis": "PR2128未合并；精确fix unknown",
+        "source_ref": {
+          "artifact_id": "case-matrix.json",
+          "json_pointer": "/cases/10"
+        },
+        "limitation": "Knowledge/feature mapping does not add an OpenDDS/XRCE/native/binding backend requirement or prove that a ROS adapter reproduces this case. Applicable generic S1 obligations remain open."
+      }
+    },
+    {
+      "taxonomy_line": 344,
+      "original_taxonomy_row": "| 472 | [issue#1097](https://github.com/eclipse-cyclonedds/cyclonedds/issues/1097) | `yes` | `L0_DDSI_RTPS_INTEROP` | `S1_DISCOVERY_MATCHING_GRAPH` | `S1.B1` | `high` | The repair directly targets DDSI discovery identity uniqueness, not merely the observed crash after fork. |",
+      "source_url": "https://github.com/eclipse-cyclonedds/cyclonedds/issues/1097",
+      "group": "core-cases",
+      "case_id": "cyclonedds-issue1097",
+      "research_classification": "限定初始化顺序的GUID/IID缺陷",
+      "coverage_rows": [
+        "C02",
+        "C05"
+      ],
+      "disposition": "保留fork专项；先不进入普通rclpy首批",
+      "fix": {
+        "pr_url": "https://github.com/eclipse-cyclonedds/cyclonedds/pull/1103",
+        "title": "Initialize instance id generator from /dev/urandom",
+        "state": "closed",
+        "merged": true,
+        "merged_at": "2022-01-12T12:52:21Z",
+        "base_ref": "master",
+        "api_base_sha_not_assumed_parent": "51394dfdf46bef4fa4a12a497ec37d41ff8933da",
+        "head_sha": "91f1ef8f372fa0ceb0d28aa07fc413904fecafbf",
+        "merge_sha": "9c6ec032e8e5b32f945692e091fbeb834a390d77",
+        "actual_parents_from_commit_api": [
+          "51394dfdf46bef4fa4a12a497ec37d41ff8933da"
+        ],
+        "recommended_exact_pre": "51394dfdf46bef4fa4a12a497ec37d41ff8933da",
+        "recommended_exact_post": "9c6ec032e8e5b32f945692e091fbeb834a390d77",
+        "commit_url": "https://github.com/eclipse-cyclonedds/cyclonedds/commit/9c6ec032e8e5b32f945692e091fbeb834a390d77",
+        "parent_source_url": "https://api.github.com/repos/eclipse-cyclonedds/cyclonedds/commits/9c6ec032e8e5b32f945692e091fbeb834a390d77",
+        "evidence": [
+          "api/cyclonedds-1103-pr.json",
+          "api/cyclonedds-1103-merge.json",
+          "api/cyclonedds-1103-files.json"
+        ]
+      },
+      "proposed_pre_post": {
+        "pre": "51394dfdf46bef4fa4a12a497ec37d41ff8933da",
+        "post": "9c6ec032e8e5b32f945692e091fbeb834a390d77"
+      },
+      "versions": {
+        "affected": {
+          "status": "unknown",
+          "reported": "issue无精确受影响版本/SHA；有x64 Ubuntu及最初平台差异观察。",
+          "release_range": "不能仅根据0.8.2在merge之前就断言其所有构建可复现；缺陷引入版本unknown。"
+        },
+        "release": {
+          "first_confirmed_fixed_stable": "0.9.0",
+          "first_confirmed_prerelease": "0.9.0b1",
+          "scope": "已取得的官方release列表按时间与compare祖先关系，0.9.0b1及0.9.0含merge，0.8.2不含；所有历史tags/backports的最早修复版本未穷尽，unknown。",
+          "url": "https://github.com/eclipse-cyclonedds/cyclonedds/releases/tag/0.9.0",
+          "evidence": [
+            "api/cyclonedds-releases.json",
+            "api/cyclonedds-1103-compare-0.8.2.json",
+            "api/cyclonedds-1103-compare-0.9.0b1.json",
+            "api/cyclonedds-1103-compare-0.9.0.json"
+          ]
+        }
+      },
+      "research_report": "/home/wuyuqa/ros2-dds-fuzz-v2/results/main-review/s1-primary-research-20261121/core-cases/report.md",
+      "reproduced_here": false,
+      "new_discovery": false,
+      "source_ref": {
+        "artifact_id": "case-matrix.json",
+        "json_pointer": "/cases/11"
+      },
+      "runtime_applicability": {
+        "status": "case_specific_validation_required",
+        "basis": "保留fork专项；先不进入普通rclpy首批",
+        "source_ref": {
+          "artifact_id": "case-matrix.json",
+          "json_pointer": "/cases/11"
+        },
+        "limitation": "Knowledge/feature mapping does not add an OpenDDS/XRCE/native/binding backend requirement or prove that a ROS adapter reproduces this case. Applicable generic S1 obligations remain open."
+      }
+    },
+    {
+      "taxonomy_line": 353,
+      "original_taxonomy_row": "| 501 | [pull](https://github.com/eProsima/Micro-XRCE-DDS/pull/41) | `yes_broad_semantic_defect` | `L0_DDSI_RTPS_INTEROP` | `S1_DISCOVERY_MATCHING_GRAPH` | `S1.B1` | `high` | The change only increases a test timeout; there is no implementation change to participant/agent discovery state, matching, locator reachab… |",
+      "source_url": "https://github.com/eProsima/Micro-XRCE-DDS/pull/41",
+      "group": "boundary-cases",
+      "case_id": "eProsima/Micro-XRCE-DDS#41",
+      "research_classification": "仅测试等待预算调整",
+      "coverage_rows": [
+        "C04",
+        "C11"
+      ],
+      "disposition": "超时归因学习，不计协议修复",
+      "fix": {
+        "state": "closed",
+        "merged": true,
+        "fix_sha": "cf762efdd70dff387b2d4b1c7a29c40b4fdb5903",
+        "fix_sha_kind": "merged_patch_commit_not_a_verified_semantic_fix",
+        "fix_direct_parents": [
+          "2ff2383b09fb8b5ee529e920489eaae559986145"
+        ],
+        "patch_commits": [
+          {
+            "sha": "b68deff5e4f931279ed94071da5ac11b9249f23e",
+            "direct_parents": [
+              "2ff2383b09fb8b5ee529e920489eaae559986145"
+            ]
+          }
+        ]
+      },
+      "proposed_pre_post": {
+        "pre": "2ff2383b09fb8b5ee529e920489eaae559986145",
+        "post": "cf762efdd70dff387b2d4b1c7a29c40b4fdb5903"
+      },
+      "versions": {
+        "affected_release": "unknown",
+        "first_fixed_release": "unknown",
+        "release_evidence_limit": "已读取官方releases API；未建立逐tag的补丁祖先关系和受影响版本动态证据。milestone、merge日期、release发布时间不足以证明首修release。"
+      },
+      "research_report": "/home/wuyuqa/ros2-dds-fuzz-v2/results/main-review/s1-primary-research-20261121/boundary-cases/report.md",
+      "reproduced_here": false,
+      "new_discovery": false,
+      "source_ref": {
+        "artifact_id": "case-matrix.json",
+        "json_pointer": "/cases/12"
+      },
+      "runtime_applicability": {
+        "status": "case_specific_validation_required",
+        "basis": "超时归因学习，不计协议修复",
+        "source_ref": {
+          "artifact_id": "case-matrix.json",
+          "json_pointer": "/cases/12"
+        },
+        "limitation": "Knowledge/feature mapping does not add an OpenDDS/XRCE/native/binding backend requirement or prove that a ROS adapter reproduces this case. Applicable generic S1 obligations remain open."
+      }
+    },
+    {
+      "taxonomy_line": 354,
+      "original_taxonomy_row": "| 503 | [pull](https://github.com/OpenDDS/OpenDDS/pull/5162) | `yes_broad_semantic_defect` | `L0_DDSI_RTPS_INTEROP` | `S1_DISCOVERY_MATCHING_GRAPH` | `S1.B4` | `high` | The repaired behavior is in test orchestration, not OpenDDS discovery/matching implementation. The underlying DDS behavior that samples wri… |",
+      "source_url": "https://github.com/OpenDDS/OpenDDS/pull/5162",
+      "group": "boundary-cases",
+      "case_id": "OpenDDS/OpenDDS#5162",
+      "research_classification": "仅测试同步竞态修补",
+      "coverage_rows": [
+        "C11",
+        "C17"
+      ],
+      "disposition": "B4必要前置对照",
+      "fix": {
+        "state": "closed",
+        "merged": true,
+        "fix_sha": "be6c960e058555f9f9aec4cbb910f7e7f7fc0e72",
+        "fix_sha_kind": "merged_patch_commit_not_a_verified_semantic_fix",
+        "fix_direct_parents": [
+          "59a25cea0355b5c78b794d5a18edace350c0ea4c",
+          "ced10379a90999e83da653aaf7191752b744b109"
+        ],
+        "patch_commits": [
+          {
+            "sha": "ced10379a90999e83da653aaf7191752b744b109",
+            "direct_parents": [
+              "59a25cea0355b5c78b794d5a18edace350c0ea4c"
+            ]
+          }
+        ]
+      },
+      "proposed_pre_post": {
+        "pre": "59a25cea0355b5c78b794d5a18edace350c0ea4c",
+        "post": "be6c960e058555f9f9aec4cbb910f7e7f7fc0e72"
+      },
+      "versions": {
+        "affected_release": "unknown",
+        "first_fixed_release": "unknown",
+        "release_evidence_limit": "已读取官方releases API；未建立逐tag的补丁祖先关系和受影响版本动态证据。milestone、merge日期、release发布时间不足以证明首修release。"
+      },
+      "research_report": "/home/wuyuqa/ros2-dds-fuzz-v2/results/main-review/s1-primary-research-20261121/boundary-cases/report.md",
+      "reproduced_here": false,
+      "new_discovery": false,
+      "source_ref": {
+        "artifact_id": "case-matrix.json",
+        "json_pointer": "/cases/13"
+      },
+      "runtime_applicability": {
+        "status": "case_specific_validation_required",
+        "basis": "B4必要前置对照",
+        "source_ref": {
+          "artifact_id": "case-matrix.json",
+          "json_pointer": "/cases/13"
+        },
+        "limitation": "Knowledge/feature mapping does not add an OpenDDS/XRCE/native/binding backend requirement or prove that a ROS adapter reproduces this case. Applicable generic S1 obligations remain open."
+      }
+    },
+    {
+      "taxonomy_line": 355,
+      "original_taxonomy_row": "| 507 | [pull](https://github.com/OpenDDS/OpenDDS/pull/5202) | `yes_low_confidence` | `L0_DDSI_RTPS_INTEROP` | `S1_DISCOVERY_MATCHING_GRAPH` | `S1.B3` | `medium` | The code is adjacent to OpenDDS discovery repository failover, but the public evidence is a Coverity potential invalid-iterator cleanup wit… |",
+      "source_url": "https://github.com/OpenDDS/OpenDDS/pull/5202",
+      "group": "boundary-cases",
+      "case_id": "OpenDDS/OpenDDS#5202",
+      "research_classification": "运行时静态迭代器风险修补",
+      "coverage_rows": [
+        "C06",
+        "C07"
+      ],
+      "disposition": "与5221同问题两轮修补；非已复现语义异常",
+      "fix": {
+        "state": "closed",
+        "merged": true,
+        "fix_sha": "d71c898597edc2233ff6aebdfbc52d0b7c5f7767",
+        "fix_sha_kind": "merged_patch_commit_not_a_verified_semantic_fix",
+        "fix_direct_parents": [
+          "b35d326f135e3d54dff1d724ebb4721c4ec8b304",
+          "891e3f8ef89b8e14a3ae935866a0eab578202af5"
+        ],
+        "patch_commits": [
+          {
+            "sha": "891e3f8ef89b8e14a3ae935866a0eab578202af5",
+            "direct_parents": [
+              "e5fc4c91d6b2663c705178fd97ce7293f4f36583"
+            ]
+          }
+        ]
+      },
+      "proposed_pre_post": {
+        "pre": "b35d326f135e3d54dff1d724ebb4721c4ec8b304",
+        "post": "d71c898597edc2233ff6aebdfbc52d0b7c5f7767"
+      },
+      "versions": {
+        "affected_release": "unknown",
+        "first_fixed_release": "unknown",
+        "release_evidence_limit": "已读取官方releases API；未建立逐tag的补丁祖先关系和受影响版本动态证据。milestone、merge日期、release发布时间不足以证明首修release。"
+      },
+      "research_report": "/home/wuyuqa/ros2-dds-fuzz-v2/results/main-review/s1-primary-research-20261121/boundary-cases/report.md",
+      "reproduced_here": false,
+      "new_discovery": false,
+      "source_ref": {
+        "artifact_id": "case-matrix.json",
+        "json_pointer": "/cases/14"
+      },
+      "runtime_applicability": {
+        "status": "case_specific_validation_required",
+        "basis": "与5221同问题两轮修补；非已复现语义异常",
+        "source_ref": {
+          "artifact_id": "case-matrix.json",
+          "json_pointer": "/cases/14"
+        },
+        "limitation": "Knowledge/feature mapping does not add an OpenDDS/XRCE/native/binding backend requirement or prove that a ROS adapter reproduces this case. Applicable generic S1 obligations remain open."
+      }
+    }
+  ],
+  "obligations": [
+    {
+      "id": "C01",
+      "description": "端点创建、消失、重建，旧关联清除与新generation身份绑定",
+      "captured_assessment": {
+        "id": "C01",
+        "category": "B1/B3",
+        "surface": "端点创建、消失、重建与generation",
+        "existing": "topology程序、fresh identity、destroy/recreate已接线；当前source保留1W1R两代正常episode",
+        "status": "局部真实正常路径；非缺陷检出证明",
+        "gap_or_required_validation": "需要远端proxy删除/新建、旧关联清除与异常时序的独立观测；正常退出不等于异常失联",
+        "references": "src/r2f/runtime/topology_pair.py:3059;src/r2f/runtime/topology_worker.py:14;retained-evidence.json"
+      },
+      "source_ref": {
+        "artifact_id": "coverage.json",
+        "json_pointer": "/rows/0"
+      },
+      "spec_ref": {
+        "artifact_id": "parent-spec",
+        "line": 85
+      },
+      "story_ids": [
+        1,
+        2,
+        5,
+        8,
+        24,
+        35
+      ],
+      "model_links": [
+        {
+          "target_id": "discovery.endpoint_topology.fuzz_v1",
+          "surface_ids": [
+            "S1.topology.program"
+          ],
+          "relation": "context_not_full_coverage"
+        },
+        {
+          "target_id": "discovery.late_endpoint",
+          "surface_ids": [],
+          "relation": "context_not_full_coverage"
+        },
+        {
+          "target_id": "discovery.late_join_delivery",
+          "surface_ids": [],
+          "relation": "context_not_full_coverage"
+        },
+        {
+          "target_id": "discovery.late_endpoint.fuzz_v1",
+          "surface_ids": [
+            "P01"
+          ],
+          "relation": "context_not_full_coverage"
+        },
+        {
+          "target_id": "discovery.late_join_delivery.fuzz_v1",
+          "surface_ids": [
+            "P01"
+          ],
+          "relation": "context_not_full_coverage"
+        }
+      ],
+      "applicability": {
+        "status": "applicable",
+        "basis": "Parent spec retains this complete-S1 obligation; adapter absence or missing observation does not exclude it.",
+        "source_ref": {
+          "artifact_id": "parent-spec",
+          "line": 85
+        }
+      },
+      "current_source_status": "unverified",
+      "missing_observation_policy": "unknown",
+      "remaining_obligations": [
+        "需要远端proxy删除/新建、旧关联清除与异常时序的独立观测；正常退出不等于异常失联",
+        "Validate applicable behavior on the newly frozen source; this sidecar grants no execution or maturity credit."
+      ],
+      "semantic_boundary": "normal_destroy_recreate_not_crash_or_hidden_state_restore",
+      "unmapped_model_reason": "",
+      "mapping_basis": {
+        "kind": "engineering_crosswalk_not_normative_or_execution_evidence",
+        "source_refs": [
+          {
+            "artifact_id": "parent-spec",
+            "line": 85
+          },
+          {
+            "artifact_id": "coverage.json",
+            "json_pointer": "/rows/0"
+          }
+        ]
+      },
+      "evidence_refs": [
+        "retained-normal-episode-32759d8"
+      ],
+      "evidence_status": "source_captured_partial_real_validation",
+      "replay_status": "not_in_capture"
+    },
+    {
+      "id": "C02",
+      "description": "participant数量、端点归属、同进程/跨进程与共享关系",
+      "captured_assessment": {
+        "id": "C02",
+        "category": "B1",
+        "surface": "participant数量、归属与共享",
+        "existing": "模型有participant_id，worker按端点代次建进程；有独立native Cyclone participant observer",
+        "status": "部分；participant_id仅声明",
+        "gap_or_required_validation": "需可控participant分组、同进程/跨进程归属与实测GUID；native observer存在不证明接入多participant扰动",
+        "references": "src/r2f/runtime/topology_worker.py:682;src/r2f/runtime/native_participant.py:9"
+      },
+      "source_ref": {
+        "artifact_id": "coverage.json",
+        "json_pointer": "/rows/1"
+      },
+      "spec_ref": {
+        "artifact_id": "parent-spec",
+        "line": 86
+      },
+      "story_ids": [
+        7
+      ],
+      "model_links": [
+        {
+          "target_id": "discovery.endpoint_topology.fuzz_v1",
+          "surface_ids": [
+            "S1.topology.program"
+          ],
+          "relation": "context_not_full_coverage"
+        }
+      ],
+      "applicability": {
+        "status": "applicable",
+        "basis": "Parent spec retains this complete-S1 obligation; adapter absence or missing observation does not exclude it.",
+        "source_ref": {
+          "artifact_id": "parent-spec",
+          "line": 86
+        }
+      },
+      "current_source_status": "unverified",
+      "missing_observation_policy": "unknown",
+      "remaining_obligations": [
+        "需可控participant分组、同进程/跨进程归属与实测GUID；native observer存在不证明接入多participant扰动",
+        "Validate applicable behavior on the newly frozen source; this sidecar grants no execution or maturity credit."
+      ],
+      "semantic_boundary": "declared_participant_id_not_observed_ownership",
+      "unmapped_model_reason": "",
+      "mapping_basis": {
+        "kind": "engineering_crosswalk_not_normative_or_execution_evidence",
+        "source_refs": [
+          {
+            "artifact_id": "parent-spec",
+            "line": 86
+          },
+          {
+            "artifact_id": "coverage.json",
+            "json_pointer": "/rows/1"
+          }
+        ]
+      },
+      "evidence_refs": [],
+      "evidence_status": "unobserved",
+      "replay_status": "not_in_capture"
+    },
+    {
+      "id": "C03",
+      "description": "SPDP participant lease过期、刷新及proxy清理；与writer liveliness分离",
+      "captured_assessment": {
+        "id": "C03",
+        "category": "B1",
+        "surface": "SPDP participant lease过期/刷新",
+        "existing": "输入有lease.value/env.lease_expiry/env.lease_refresh；runtime有writer liveliness配置",
+        "status": "生命周期缺口",
+        "gap_or_required_validation": "应独立控制participant公告/lease/时钟证据，记录proxy回收与刷新；不能以writer liveliness配置代证",
+        "references": "src/r2f/runtime/topology_operator_application.py:550;src/r2f/modules/s1/topology_model.py:12"
+      },
+      "source_ref": {
+        "artifact_id": "coverage.json",
+        "json_pointer": "/rows/2"
+      },
+      "spec_ref": {
+        "artifact_id": "parent-spec",
+        "line": 87
+      },
+      "story_ids": [
+        11,
+        20,
+        36
+      ],
+      "model_links": [
+        {
+          "target_id": "discovery.endpoint_topology.fuzz_v1",
+          "surface_ids": [
+            "S1.topology.program"
+          ],
+          "relation": "context_not_full_coverage"
+        },
+        {
+          "target_id": "builtin.discovery_projection_reconciliation.fuzz_v1",
+          "surface_ids": [
+            "P05",
+            "P06"
+          ],
+          "relation": "context_not_full_coverage"
+        }
+      ],
+      "applicability": {
+        "status": "applicable",
+        "basis": "Parent spec retains this complete-S1 obligation; adapter absence or missing observation does not exclude it.",
+        "source_ref": {
+          "artifact_id": "parent-spec",
+          "line": 87
+        }
+      },
+      "current_source_status": "unverified",
+      "missing_observation_policy": "unknown",
+      "remaining_obligations": [
+        "应独立控制participant公告/lease/时钟证据，记录proxy回收与刷新；不能以writer liveliness配置代证",
+        "Validate applicable behavior on the newly frozen source; this sidecar grants no execution or maturity credit."
+      ],
+      "semantic_boundary": "participant_lease_not_writer_liveliness",
+      "unmapped_model_reason": "",
+      "mapping_basis": {
+        "kind": "engineering_crosswalk_not_normative_or_execution_evidence",
+        "source_refs": [
+          {
+            "artifact_id": "parent-spec",
+            "line": 87
+          },
+          {
+            "artifact_id": "coverage.json",
+            "json_pointer": "/rows/2"
+          }
+        ]
+      },
+      "evidence_refs": [],
+      "evidence_status": "unobserved",
+      "replay_status": "not_in_capture"
+    },
+    {
+      "id": "C04",
+      "description": "发现profile、公告与版本条件，含执行前置及实际采用配置",
+      "captured_assessment": {
+        "id": "C04",
+        "category": "B1",
+        "surface": "发现profile/announcement/版本条件",
+        "existing": "已有RMW绑定、环境manifest、vendor版本固定插桩；未在已检topology route找到发现profile状态模型",
+        "status": "尚缺逐profile/版本验证合同",
+        "gap_or_required_validation": "保留XRCE/profile学习特征，须明确载体、环境及版本；不因当前ROS适配器缺失就删除分类",
+        "references": "src/r2f/runtime/topology_worker.py:303;src/r2f/instrumentation/fastdds_peer/patch_vendor.py:23"
+      },
+      "source_ref": {
+        "artifact_id": "coverage.json",
+        "json_pointer": "/rows/3"
+      },
+      "spec_ref": {
+        "artifact_id": "parent-spec",
+        "line": 88
+      },
+      "story_ids": [
+        12,
+        37
+      ],
+      "model_links": [],
+      "applicability": {
+        "status": "applicable",
+        "basis": "Parent spec retains this complete-S1 obligation; adapter absence or missing observation does not exclude it.",
+        "source_ref": {
+          "artifact_id": "parent-spec",
+          "line": 88
+        }
+      },
+      "current_source_status": "unverified",
+      "missing_observation_policy": "unknown",
+      "remaining_obligations": [
+        "保留XRCE/profile学习特征，须明确载体、环境及版本；不因当前ROS适配器缺失就删除分类",
+        "Validate applicable behavior on the newly frozen source; this sidecar grants no execution or maturity credit."
+      ],
+      "semantic_boundary": "vendor_profile_not_generic_ros_graph",
+      "unmapped_model_reason": "No discovery-profile/announcement contract in the inspected S1 target declarations; retain the obligation and XRCE/version knowledge.",
+      "mapping_basis": {
+        "kind": "engineering_crosswalk_not_normative_or_execution_evidence",
+        "source_refs": [
+          {
+            "artifact_id": "parent-spec",
+            "line": 88
+          },
+          {
+            "artifact_id": "coverage.json",
+            "json_pointer": "/rows/3"
+          }
+        ]
+      },
+      "evidence_refs": [],
+      "evidence_status": "unobserved",
+      "replay_status": "not_in_capture"
+    },
+    {
+      "id": "C05",
+      "description": "GUID/IID唯一性、重复身份及有限适用的fork初始化条件",
+      "captured_assessment": {
+        "id": "C05",
+        "category": "B1/B3",
+        "surface": "GUID唯一性、fork/重复身份",
+        "existing": "现有generation/GID/PID/start_ticks绑定与输入identity",
+        "status": "身份验证有基础；fork路径未证",
+        "gap_or_required_validation": "fork遗传状态/多进程冲突需独立环境与隔离约束，不把generation改变当作GUID生成算法验证",
+        "references": "src/r2f/runtime/topology_pair.py:75;src/r2f/runtime/topology_worker.py:14"
+      },
+      "source_ref": {
+        "artifact_id": "coverage.json",
+        "json_pointer": "/rows/4"
+      },
+      "spec_ref": {
+        "artifact_id": "parent-spec",
+        "line": 89
+      },
+      "story_ids": [
+        13
+      ],
+      "model_links": [
+        {
+          "target_id": "discovery.endpoint_topology.fuzz_v1",
+          "surface_ids": [
+            "S1.topology.program"
+          ],
+          "relation": "context_not_full_coverage"
+        }
+      ],
+      "applicability": {
+        "status": "applicable",
+        "basis": "Parent spec retains this complete-S1 obligation; adapter absence or missing observation does not exclude it.",
+        "source_ref": {
+          "artifact_id": "parent-spec",
+          "line": 89
+        }
+      },
+      "current_source_status": "unverified",
+      "missing_observation_policy": "unknown",
+      "remaining_obligations": [
+        "fork遗传状态/多进程冲突需独立环境与隔离约束，不把generation改变当作GUID生成算法验证",
+        "Validate applicable behavior on the newly frozen source; this sidecar grants no execution or maturity credit."
+      ],
+      "semantic_boundary": "generation_binding_not_guid_generation_or_fork_support",
+      "unmapped_model_reason": "",
+      "mapping_basis": {
+        "kind": "engineering_crosswalk_not_normative_or_execution_evidence",
+        "source_refs": [
+          {
+            "artifact_id": "parent-spec",
+            "line": 89
+          },
+          {
+            "artifact_id": "coverage.json",
+            "json_pointer": "/rows/4"
+          }
+        ]
+      },
+      "evidence_refs": [],
+      "evidence_status": "unobserved",
+      "replay_status": "not_in_capture"
+    },
+    {
+      "id": "C06",
+      "description": "discovery内部更新/删除交错及可核证的竞态路径",
+      "captured_assessment": {
+        "id": "C06",
+        "category": "B1/B3",
+        "surface": "discovery内部并发/竞态",
+        "existing": "存在concurrent publish组及顺序create/destroy程序",
+        "status": "仅特定并发；非发现内部race控制",
+        "gap_or_required_validation": "需将触发前置和PDP/EDP关键时序关联；并发publish不证明同时发现删除/更新",
+        "references": "src/r2f/runtime/topology_pair.py:3181;src/r2f/runtime/topology_worker.py:2352"
+      },
+      "source_ref": {
+        "artifact_id": "coverage.json",
+        "json_pointer": "/rows/5"
+      },
+      "spec_ref": {
+        "artifact_id": "parent-spec",
+        "line": 90
+      },
+      "story_ids": [
+        14,
+        20,
+        21,
+        36
+      ],
+      "model_links": [
+        {
+          "target_id": "discovery.endpoint_topology.fuzz_v1",
+          "surface_ids": [
+            "S1.topology.program"
+          ],
+          "relation": "context_not_full_coverage"
+        }
+      ],
+      "applicability": {
+        "status": "applicable",
+        "basis": "Parent spec retains this complete-S1 obligation; adapter absence or missing observation does not exclude it.",
+        "source_ref": {
+          "artifact_id": "parent-spec",
+          "line": 90
+        }
+      },
+      "current_source_status": "unverified",
+      "missing_observation_policy": "unknown",
+      "remaining_obligations": [
+        "需将触发前置和PDP/EDP关键时序关联；并发publish不证明同时发现删除/更新",
+        "Validate applicable behavior on the newly frozen source; this sidecar grants no execution or maturity credit."
+      ],
+      "semantic_boundary": "concurrent_publish_not_internal_discovery_race",
+      "unmapped_model_reason": "",
+      "mapping_basis": {
+        "kind": "engineering_crosswalk_not_normative_or_execution_evidence",
+        "source_refs": [
+          {
+            "artifact_id": "parent-spec",
+            "line": 90
+          },
+          {
+            "artifact_id": "coverage.json",
+            "json_pointer": "/rows/5"
+          }
+        ]
+      },
+      "evidence_refs": [],
+      "evidence_status": "unobserved",
+      "replay_status": "not_in_capture"
+    },
+    {
+      "id": "C07",
+      "description": "discovery中断真实命中与恢复后的状态一致性",
+      "captured_assessment": {
+        "id": "C07",
+        "category": "B1",
+        "surface": "发现中断与恢复",
+        "existing": "required interruption_recovery、fuzz_windows与隔离carrier/恢复证据合同已存在",
+        "status": "已有代码及历史证据；本轮未重核当前source完整矩阵",
+        "gap_or_required_validation": "中断命中需真实discovery流量；恢复需新活动与独立状态；增加已有端点/重建/lease边界组合，不能只验证数据收发",
+        "references": "results/main-review/s1-expectation-audit-20261121/review.md:35;src/r2f/modules/s1/catalog.py:34"
+      },
+      "source_ref": {
+        "artifact_id": "coverage.json",
+        "json_pointer": "/rows/6"
+      },
+      "spec_ref": {
+        "artifact_id": "parent-spec",
+        "line": 91
+      },
+      "story_ids": [
+        15,
+        38
+      ],
+      "model_links": [
+        {
+          "target_id": "discovery.interruption_recovery",
+          "surface_ids": [],
+          "relation": "context_not_full_coverage"
+        },
+        {
+          "target_id": "discovery.interruption_recovery.fuzz_v1",
+          "surface_ids": [
+            "E01"
+          ],
+          "relation": "context_not_full_coverage"
+        },
+        {
+          "target_id": "discovery.interruption_recovery.fuzz_windows_v1",
+          "surface_ids": [
+            "E02",
+            "E03"
+          ],
+          "relation": "context_not_full_coverage"
+        },
+        {
+          "target_id": "discovery.endpoint_topology.fuzz_v1",
+          "surface_ids": [
+            "S1.topology.program"
+          ],
+          "relation": "context_not_full_coverage"
+        }
+      ],
+      "applicability": {
+        "status": "applicable",
+        "basis": "Parent spec retains this complete-S1 obligation; adapter absence or missing observation does not exclude it.",
+        "source_ref": {
+          "artifact_id": "parent-spec",
+          "line": 91
+        }
+      },
+      "current_source_status": "unverified",
+      "missing_observation_policy": "unknown",
+      "remaining_obligations": [
+        "中断命中需真实discovery流量；恢复需新活动与独立状态；增加已有端点/重建/lease边界组合，不能只验证数据收发",
+        "Validate applicable behavior on the newly frozen source; this sidecar grants no execution or maturity credit."
+      ],
+      "semantic_boundary": "data_delivery_not_discovery_hit_or_restore",
+      "unmapped_model_reason": "",
+      "mapping_basis": {
+        "kind": "engineering_crosswalk_not_normative_or_execution_evidence",
+        "source_refs": [
+          {
+            "artifact_id": "parent-spec",
+            "line": 91
+          },
+          {
+            "artifact_id": "coverage.json",
+            "json_pointer": "/rows/6"
+          }
+        ]
+      },
+      "evidence_refs": [],
+      "evidence_status": "unobserved",
+      "replay_status": "not_in_capture"
+    },
+    {
+      "id": "C08",
+      "description": "builtin、发现数据、内部状态及graph投影的独立对账",
+      "captured_assessment": {
+        "id": "C08",
+        "category": "B3",
+        "surface": "builtin/发现数据/graph投影",
+        "existing": "已有reconciliation target、SEDP parser、FastDDS peer及Cyclone trace桥",
+        "status": "部分实现，独立来源已设计",
+        "gap_or_required_validation": "需按版本与schema逐字段验证；graph不能自比较；标准字段与诊断字段分离，补残留/并发更新场景",
+        "references": "src/r2f/instrumentation/sedp_fields.py:11;src/r2f/instrumentation/sedp_fields.py:177;src/r2f/instrumentation/fastdds_peer/provider.cpp:23"
+      },
+      "source_ref": {
+        "artifact_id": "coverage.json",
+        "json_pointer": "/rows/7"
+      },
+      "spec_ref": {
+        "artifact_id": "parent-spec",
+        "line": 92
+      },
+      "story_ids": [
+        16,
+        20,
+        21
+      ],
+      "model_links": [
+        {
+          "target_id": "builtin.discovery_projection_reconciliation",
+          "surface_ids": [],
+          "relation": "context_not_full_coverage"
+        },
+        {
+          "target_id": "builtin.discovery_projection_reconciliation.fuzz_v1",
+          "surface_ids": [
+            "P02",
+            "P03",
+            "P04",
+            "P05",
+            "P06"
+          ],
+          "relation": "context_not_full_coverage"
+        },
+        {
+          "target_id": "discovery.endpoint_topology.fuzz_v1",
+          "surface_ids": [
+            "S1.topology.program"
+          ],
+          "relation": "context_not_full_coverage"
+        }
+      ],
+      "applicability": {
+        "status": "applicable",
+        "basis": "Parent spec retains this complete-S1 obligation; adapter absence or missing observation does not exclude it.",
+        "source_ref": {
+          "artifact_id": "parent-spec",
+          "line": 92
+        }
+      },
+      "current_source_status": "unverified",
+      "missing_observation_policy": "unknown",
+      "remaining_obligations": [
+        "需按版本与schema逐字段验证；graph不能自比较；标准字段与诊断字段分离，补残留/并发更新场景",
+        "Validate applicable behavior on the newly frozen source; this sidecar grants no execution or maturity credit."
+      ],
+      "semantic_boundary": "independent_builtin_internal_graph_sources_required",
+      "unmapped_model_reason": "",
+      "mapping_basis": {
+        "kind": "engineering_crosswalk_not_normative_or_execution_evidence",
+        "source_refs": [
+          {
+            "artifact_id": "parent-spec",
+            "line": 92
+          },
+          {
+            "artifact_id": "coverage.json",
+            "json_pointer": "/rows/7"
+          }
+        ]
+      },
+      "evidence_refs": [],
+      "evidence_status": "unobserved",
+      "replay_status": "not_in_capture"
+    },
+    {
+      "id": "C09",
+      "description": "typed topic查找、作用域和binding差异",
+      "captured_assessment": {
+        "id": "C09",
+        "category": "B3",
+        "surface": "typed topic查找及跨binding发现",
+        "existing": "模型有topic/type字段和精确名匹配；rclpy worker只有String",
+        "status": "类型/binding执行缺口",
+        "gap_or_required_validation": "C/C++/Python原生find_topic与rclpy graph不同；需具体adapter与真实schema集合，不能直接把binding历史case列已覆盖",
+        "references": "src/r2f/runtime/topology_worker.py:623;src/r2f/modules/s1/topology_model.py:9"
+      },
+      "source_ref": {
+        "artifact_id": "coverage.json",
+        "json_pointer": "/rows/8"
+      },
+      "spec_ref": {
+        "artifact_id": "parent-spec",
+        "line": 93
+      },
+      "story_ids": [
+        10,
+        17
+      ],
+      "model_links": [
+        {
+          "target_id": "discovery.endpoint_topology.fuzz_v1",
+          "surface_ids": [
+            "S1.topology.program"
+          ],
+          "relation": "context_not_full_coverage"
+        }
+      ],
+      "applicability": {
+        "status": "applicable",
+        "basis": "Parent spec retains this complete-S1 obligation; adapter absence or missing observation does not exclude it.",
+        "source_ref": {
+          "artifact_id": "parent-spec",
+          "line": 93
+        }
+      },
+      "current_source_status": "unverified",
+      "missing_observation_policy": "unknown",
+      "remaining_obligations": [
+        "C/C++/Python原生find_topic与rclpy graph不同；需具体adapter与真实schema集合，不能直接把binding历史case列已覆盖",
+        "Validate applicable behavior on the newly frozen source; this sidecar grants no execution or maturity credit."
+      ],
+      "semantic_boundary": "topic_type_labels_not_native_typed_topic_lookup",
+      "unmapped_model_reason": "",
+      "mapping_basis": {
+        "kind": "engineering_crosswalk_not_normative_or_execution_evidence",
+        "source_refs": [
+          {
+            "artifact_id": "parent-spec",
+            "line": 93
+          },
+          {
+            "artifact_id": "coverage.json",
+            "json_pointer": "/rows/8"
+          }
+        ]
+      },
+      "evidence_refs": [],
+      "evidence_status": "unobserved",
+      "replay_status": "not_in_capture"
+    },
+    {
+      "id": "C10",
+      "description": "tooling视图及API扩展的适用性、正常行为与归因",
+      "captured_assessment": {
+        "id": "C10",
+        "category": "B3",
+        "surface": "tooling视图、API扩展与返回数据",
+        "existing": "现有report/raw/schema校验及builtin投影",
+        "status": "语义线索保留；第三方CLI/API没有本次直接执行证据",
+        "gap_or_required_validation": "CLI展示、API新增和DDS core分账；不能功能扩展直接计缺陷；视图正常/异常对照单独建",
+        "references": "results/main-review/s1-expectation-audit-20261121/review.md:62"
+      },
+      "source_ref": {
+        "artifact_id": "coverage.json",
+        "json_pointer": "/rows/9"
+      },
+      "spec_ref": {
+        "artifact_id": "parent-spec",
+        "line": 94
+      },
+      "story_ids": [
+        17
+      ],
+      "model_links": [
+        {
+          "target_id": "builtin.discovery_projection_reconciliation",
+          "surface_ids": [],
+          "relation": "context_not_full_coverage"
+        },
+        {
+          "target_id": "builtin.discovery_projection_reconciliation.fuzz_v1",
+          "surface_ids": [
+            "P02",
+            "P03",
+            "P04",
+            "P05",
+            "P06"
+          ],
+          "relation": "context_not_full_coverage"
+        }
+      ],
+      "applicability": {
+        "status": "applicable",
+        "basis": "Parent spec retains this complete-S1 obligation; adapter absence or missing observation does not exclude it.",
+        "source_ref": {
+          "artifact_id": "parent-spec",
+          "line": 94
+        }
+      },
+      "current_source_status": "unverified",
+      "missing_observation_policy": "unknown",
+      "remaining_obligations": [
+        "CLI展示、API新增和DDS core分账；不能功能扩展直接计缺陷；视图正常/异常对照单独建",
+        "Validate applicable behavior on the newly frozen source; this sidecar grants no execution or maturity credit."
+      ],
+      "semantic_boundary": "tool_or_api_feature_not_dds_core_defect",
+      "unmapped_model_reason": "",
+      "mapping_basis": {
+        "kind": "engineering_crosswalk_not_normative_or_execution_evidence",
+        "source_refs": [
+          {
+            "artifact_id": "parent-spec",
+            "line": 94
+          },
+          {
+            "artifact_id": "coverage.json",
+            "json_pointer": "/rows/9"
+          }
+        ]
+      },
+      "evidence_refs": [],
+      "evidence_status": "unobserved",
+      "replay_status": "not_in_capture"
+    },
+    {
+      "id": "C11",
+      "description": "discovery/matching前置条件、fresh observation与测试编排",
+      "captured_assessment": {
+        "id": "C11",
+        "category": "B4",
+        "surface": "发现/匹配前置与编排",
+        "existing": "fresh双向snapshot+command ACK+delivery窗口，guard/requires/negative合同",
+        "status": "既有实现及离线审核；仍需案例适配",
+        "gap_or_required_validation": "matched与graph出现分开；无交付义务窗口不能判丢包；B4测试修复不计DDS自然候选",
+        "references": "src/r2f/runtime/topology_pair.py:843;src/r2f/modules/s1/topology_oracles.py:129"
+      },
+      "source_ref": {
+        "artifact_id": "coverage.json",
+        "json_pointer": "/rows/10"
+      },
+      "spec_ref": {
+        "artifact_id": "parent-spec",
+        "line": 95
+      },
+      "story_ids": [
+        22,
+        24,
+        38
+      ],
+      "model_links": [
+        {
+          "target_id": "discovery.late_endpoint",
+          "surface_ids": [],
+          "relation": "context_not_full_coverage"
+        },
+        {
+          "target_id": "discovery.late_join_delivery",
+          "surface_ids": [],
+          "relation": "context_not_full_coverage"
+        },
+        {
+          "target_id": "discovery.interruption_recovery",
+          "surface_ids": [],
+          "relation": "context_not_full_coverage"
+        },
+        {
+          "target_id": "builtin.discovery_projection_reconciliation",
+          "surface_ids": [],
+          "relation": "context_not_full_coverage"
+        },
+        {
+          "target_id": "discovery.late_endpoint.fuzz_v1",
+          "surface_ids": [],
+          "relation": "context_not_full_coverage"
+        },
+        {
+          "target_id": "discovery.late_join_delivery.fuzz_v1",
+          "surface_ids": [],
+          "relation": "context_not_full_coverage"
+        },
+        {
+          "target_id": "discovery.interruption_recovery.fuzz_v1",
+          "surface_ids": [],
+          "relation": "context_not_full_coverage"
+        },
+        {
+          "target_id": "builtin.discovery_projection_reconciliation.fuzz_v1",
+          "surface_ids": [],
+          "relation": "context_not_full_coverage"
+        },
+        {
+          "target_id": "discovery.match_compatibility.fuzz_v1",
+          "surface_ids": [],
+          "relation": "context_not_full_coverage"
+        },
+        {
+          "target_id": "discovery.interruption_recovery.fuzz_windows_v1",
+          "surface_ids": [],
+          "relation": "context_not_full_coverage"
+        },
+        {
+          "target_id": "discovery.endpoint_topology.fuzz_v1",
+          "surface_ids": [],
+          "relation": "context_not_full_coverage"
+        }
+      ],
+      "applicability": {
+        "status": "applicable",
+        "basis": "Parent spec retains this complete-S1 obligation; adapter absence or missing observation does not exclude it.",
+        "source_ref": {
+          "artifact_id": "parent-spec",
+          "line": 95
+        }
+      },
+      "current_source_status": "unverified",
+      "missing_observation_policy": "unknown",
+      "remaining_obligations": [
+        "matched与graph出现分开；无交付义务窗口不能判丢包；B4测试修复不计DDS自然候选",
+        "Validate applicable behavior on the newly frozen source; this sidecar grants no execution or maturity credit."
+      ],
+      "semantic_boundary": "fresh_match_and_window_prerequisites_not_candidate",
+      "unmapped_model_reason": "",
+      "mapping_basis": {
+        "kind": "engineering_crosswalk_not_normative_or_execution_evidence",
+        "source_refs": [
+          {
+            "artifact_id": "parent-spec",
+            "line": 95
+          },
+          {
+            "artifact_id": "coverage.json",
+            "json_pointer": "/rows/10"
+          }
+        ]
+      },
+      "evidence_refs": [],
+      "evidence_status": "unobserved",
+      "replay_status": "not_in_capture"
+    },
+    {
+      "id": "C12",
+      "description": "多writer/reader、有向边与聚合计数歧义",
+      "captured_assessment": {
+        "id": "C12",
+        "category": "横向",
+        "surface": "多writer/reader与拓扑结构",
+        "existing": "模型默认上限4W4R；程序增删/换序/generation；拓扑pair观察",
+        "status": "模型及运行接线；本次复用实证仅1W1R",
+        "gap_or_required_validation": "N节点每条有向边的身份、计数歧义和独立peer证据必须验证；不能由聚合count推全图",
+        "references": "src/r2f/modules/s1/topology_model.py:25;src/r2f/runtime/topology_pair.py:265"
+      },
+      "source_ref": {
+        "artifact_id": "coverage.json",
+        "json_pointer": "/rows/11"
+      },
+      "spec_ref": {
+        "artifact_id": "parent-spec",
+        "line": 96
+      },
+      "story_ids": [
+        9
+      ],
+      "model_links": [
+        {
+          "target_id": "discovery.endpoint_topology.fuzz_v1",
+          "surface_ids": [
+            "S1.topology.program"
+          ],
+          "relation": "context_not_full_coverage"
+        }
+      ],
+      "applicability": {
+        "status": "applicable",
+        "basis": "Parent spec retains this complete-S1 obligation; adapter absence or missing observation does not exclude it.",
+        "source_ref": {
+          "artifact_id": "parent-spec",
+          "line": 96
+        }
+      },
+      "current_source_status": "unverified",
+      "missing_observation_policy": "unknown",
+      "remaining_obligations": [
+        "N节点每条有向边的身份、计数歧义和独立peer证据必须验证；不能由聚合count推全图",
+        "Validate applicable behavior on the newly frozen source; this sidecar grants no execution or maturity credit."
+      ],
+      "semantic_boundary": "aggregate_count_not_per_directed_edge_proof",
+      "unmapped_model_reason": "",
+      "mapping_basis": {
+        "kind": "engineering_crosswalk_not_normative_or_execution_evidence",
+        "source_refs": [
+          {
+            "artifact_id": "parent-spec",
+            "line": 96
+          },
+          {
+            "artifact_id": "coverage.json",
+            "json_pointer": "/rows/11"
+          }
+        ]
+      },
+      "evidence_refs": [],
+      "evidence_status": "unobserved",
+      "replay_status": "not_in_capture"
+    },
+    {
+      "id": "C13",
+      "description": "多topic、多真实类型及匹配边界",
+      "captured_assessment": {
+        "id": "C13",
+        "category": "横向",
+        "surface": "多topic/type及匹配边界",
+        "existing": "精确topic/type模型；任意有效topic输入；worker固定String",
+        "status": "topic可表达，类型多样性缺口",
+        "gap_or_required_validation": "补真实类型载体和错配/正确匹配对照；XTypes coercion归S4边界，不能本模型代判",
+        "references": "src/r2f/modules/s1/topology_model.py:9;src/r2f/runtime/topology_worker.py:623"
+      },
+      "source_ref": {
+        "artifact_id": "coverage.json",
+        "json_pointer": "/rows/12"
+      },
+      "spec_ref": {
+        "artifact_id": "parent-spec",
+        "line": 97
+      },
+      "story_ids": [
+        10,
+        19
+      ],
+      "model_links": [
+        {
+          "target_id": "discovery.endpoint_topology.fuzz_v1",
+          "surface_ids": [
+            "S1.topology.program"
+          ],
+          "relation": "context_not_full_coverage"
+        },
+        {
+          "target_id": "discovery.match_compatibility.fuzz_v1",
+          "surface_ids": [
+            "G01"
+          ],
+          "relation": "context_not_full_coverage"
+        }
+      ],
+      "applicability": {
+        "status": "applicable",
+        "basis": "Parent spec retains this complete-S1 obligation; adapter absence or missing observation does not exclude it.",
+        "source_ref": {
+          "artifact_id": "parent-spec",
+          "line": 97
+        }
+      },
+      "current_source_status": "unverified",
+      "missing_observation_policy": "unknown",
+      "remaining_obligations": [
+        "补真实类型载体和错配/正确匹配对照；XTypes coercion归S4边界，不能本模型代判",
+        "Validate applicable behavior on the newly frozen source; this sidecar grants no execution or maturity credit."
+      ],
+      "semantic_boundary": "declared_type_name_not_real_type_carrier",
+      "unmapped_model_reason": "",
+      "mapping_basis": {
+        "kind": "engineering_crosswalk_not_normative_or_execution_evidence",
+        "source_refs": [
+          {
+            "artifact_id": "parent-spec",
+            "line": 97
+          },
+          {
+            "artifact_id": "coverage.json",
+            "json_pointer": "/rows/12"
+          }
+        ]
+      },
+      "evidence_refs": [],
+      "evidence_status": "unobserved",
+      "replay_status": "not_in_capture"
+    },
+    {
+      "id": "C14",
+      "description": "CFT初始、更新、启停、实际过滤与样本身份",
+      "captured_assessment": {
+        "id": "C14",
+        "category": "横向",
+        "surface": "CFT初始/更新/启停/样本判定",
+        "existing": "初始CFT读回、update_filter、矩阵seed、FastDDS evaluation hook均存在",
+        "status": "部分接线；更新API回执不等于样本过滤effect",
+        "gap_or_required_validation": "验证实际字段schema、完整序列化payload与DDS occurrence；保持filter效果和发现匹配分离；同内容重复不够证明同一次DDS样本",
+        "references": "src/r2f/modules/s1/topology_cft_matrix.py:1;src/r2f/runtime/topology_pair.py:3083;src/r2f/runtime/filter_backend.py:472"
+      },
+      "source_ref": {
+        "artifact_id": "coverage.json",
+        "json_pointer": "/rows/13"
+      },
+      "spec_ref": {
+        "artifact_id": "parent-spec",
+        "line": 98
+      },
+      "story_ids": [
+        18
+      ],
+      "model_links": [
+        {
+          "target_id": "discovery.endpoint_topology.fuzz_v1",
+          "surface_ids": [
+            "S1.topology.program"
+          ],
+          "relation": "context_not_full_coverage"
+        }
+      ],
+      "applicability": {
+        "status": "applicable",
+        "basis": "Parent spec retains this complete-S1 obligation; adapter absence or missing observation does not exclude it.",
+        "source_ref": {
+          "artifact_id": "parent-spec",
+          "line": 98
+        }
+      },
+      "current_source_status": "unverified",
+      "missing_observation_policy": "unknown",
+      "remaining_obligations": [
+        "验证实际字段schema、完整序列化payload与DDS occurrence；保持filter效果和发现匹配分离；同内容重复不够证明同一次DDS样本",
+        "Validate applicable behavior on the newly frozen source; this sidecar grants no execution or maturity credit."
+      ],
+      "semantic_boundary": "filter_effect_not_endpoint_matching",
+      "unmapped_model_reason": "",
+      "mapping_basis": {
+        "kind": "engineering_crosswalk_not_normative_or_execution_evidence",
+        "source_refs": [
+          {
+            "artifact_id": "parent-spec",
+            "line": 98
+          },
+          {
+            "artifact_id": "coverage.json",
+            "json_pointer": "/rows/13"
+          }
+        ]
+      },
+      "evidence_refs": [],
+      "evidence_status": "unobserved",
+      "replay_status": "not_in_capture"
+    },
+    {
+      "id": "C15",
+      "description": "QoS/partition/type条件及跨模块语义边界",
+      "captured_assessment": {
+        "id": "C15",
+        "category": "横向/跨模块",
+        "surface": "QoS/partition/type兼容条件",
+        "existing": "模型支持多QoS及literal partition预测；worker拒非空partition、KEEP_ALL、非shared等不支持选项",
+        "status": "模型范围大于当前runtime",
+        "gap_or_required_validation": "为S1提供触发背景；QoS policy错误归S2、type契约归S4，保留关联；不能unsupported输入计SUT失败",
+        "references": "src/r2f/runtime/topology_worker.py:634;src/r2f/modules/s1/topology_model.py:538"
+      },
+      "source_ref": {
+        "artifact_id": "coverage.json",
+        "json_pointer": "/rows/14"
+      },
+      "spec_ref": {
+        "artifact_id": "parent-spec",
+        "line": 99
+      },
+      "story_ids": [
+        19
+      ],
+      "model_links": [
+        {
+          "target_id": "discovery.endpoint_topology.fuzz_v1",
+          "surface_ids": [
+            "S1.topology.program"
+          ],
+          "relation": "context_not_full_coverage"
+        },
+        {
+          "target_id": "discovery.match_compatibility.fuzz_v1",
+          "surface_ids": [
+            "G01"
+          ],
+          "relation": "context_not_full_coverage"
+        },
+        {
+          "target_id": "builtin.discovery_projection_reconciliation",
+          "surface_ids": [],
+          "relation": "context_not_full_coverage"
+        },
+        {
+          "target_id": "builtin.discovery_projection_reconciliation.fuzz_v1",
+          "surface_ids": [
+            "P02",
+            "P03",
+            "P04",
+            "P05",
+            "P06"
+          ],
+          "relation": "context_not_full_coverage"
+        }
+      ],
+      "applicability": {
+        "status": "applicable",
+        "basis": "Parent spec retains this complete-S1 obligation; adapter absence or missing observation does not exclude it.",
+        "source_ref": {
+          "artifact_id": "parent-spec",
+          "line": 99
+        }
+      },
+      "current_source_status": "unverified",
+      "missing_observation_policy": "unknown",
+      "remaining_obligations": [
+        "为S1提供触发背景；QoS policy错误归S2、type契约归S4，保留关联；不能unsupported输入计SUT失败",
+        "Validate applicable behavior on the newly frozen source; this sidecar grants no execution or maturity credit."
+      ],
+      "semantic_boundary": "s1_trigger_context_with_s2_qos_s4_type_attribution",
+      "unmapped_model_reason": "",
+      "mapping_basis": {
+        "kind": "engineering_crosswalk_not_normative_or_execution_evidence",
+        "source_refs": [
+          {
+            "artifact_id": "parent-spec",
+            "line": 99
+          },
+          {
+            "artifact_id": "coverage.json",
+            "json_pointer": "/rows/14"
+          }
+        ]
+      },
+      "evidence_refs": [],
+      "evidence_status": "unobserved",
+      "replay_status": "not_in_capture"
+    },
+    {
+      "id": "C16",
+      "description": "vendor/版本、历史pre/post和跨实现适用性",
+      "captured_assessment": {
+        "id": "C16",
+        "category": "横向/跨模块",
+        "surface": "跨vendor、版本与历史pre/post控制",
+        "existing": "manifest和RMW身份绑定；FastDDS peer patch固定2.14.7",
+        "status": "每次配置一种RMW；跨版本/混合pair未获本轮证据",
+        "gap_or_required_validation": "首个切片选一种再扩展；固定patch不能直接套旧版本。版本兼容/profile仍保留覆盖义务",
+        "references": "src/r2f/runtime/topology_worker.py:303;src/r2f/instrumentation/fastdds_peer/patch_vendor.py:23"
+      },
+      "source_ref": {
+        "artifact_id": "coverage.json",
+        "json_pointer": "/rows/15"
+      },
+      "spec_ref": {
+        "artifact_id": "parent-spec",
+        "line": 100
+      },
+      "story_ids": [
+        17,
+        21,
+        33,
+        37
+      ],
+      "model_links": [
+        {
+          "target_id": "discovery.late_endpoint",
+          "surface_ids": [],
+          "relation": "context_not_full_coverage"
+        },
+        {
+          "target_id": "discovery.late_join_delivery",
+          "surface_ids": [],
+          "relation": "context_not_full_coverage"
+        },
+        {
+          "target_id": "discovery.interruption_recovery",
+          "surface_ids": [],
+          "relation": "context_not_full_coverage"
+        },
+        {
+          "target_id": "builtin.discovery_projection_reconciliation",
+          "surface_ids": [],
+          "relation": "context_not_full_coverage"
+        },
+        {
+          "target_id": "discovery.late_endpoint.fuzz_v1",
+          "surface_ids": [],
+          "relation": "context_not_full_coverage"
+        },
+        {
+          "target_id": "discovery.late_join_delivery.fuzz_v1",
+          "surface_ids": [],
+          "relation": "context_not_full_coverage"
+        },
+        {
+          "target_id": "discovery.interruption_recovery.fuzz_v1",
+          "surface_ids": [],
+          "relation": "context_not_full_coverage"
+        },
+        {
+          "target_id": "builtin.discovery_projection_reconciliation.fuzz_v1",
+          "surface_ids": [],
+          "relation": "context_not_full_coverage"
+        },
+        {
+          "target_id": "discovery.match_compatibility.fuzz_v1",
+          "surface_ids": [],
+          "relation": "context_not_full_coverage"
+        },
+        {
+          "target_id": "discovery.interruption_recovery.fuzz_windows_v1",
+          "surface_ids": [],
+          "relation": "context_not_full_coverage"
+        },
+        {
+          "target_id": "discovery.endpoint_topology.fuzz_v1",
+          "surface_ids": [],
+          "relation": "context_not_full_coverage"
+        }
+      ],
+      "applicability": {
+        "status": "applicable",
+        "basis": "Parent spec retains this complete-S1 obligation; adapter absence or missing observation does not exclude it.",
+        "source_ref": {
+          "artifact_id": "parent-spec",
+          "line": 100
+        }
+      },
+      "current_source_status": "unverified",
+      "missing_observation_policy": "unknown",
+      "remaining_obligations": [
+        "首个切片选一种再扩展；固定patch不能直接套旧版本。版本兼容/profile仍保留覆盖义务",
+        "Validate applicable behavior on the newly frozen source; this sidecar grants no execution or maturity credit."
+      ],
+      "semantic_boundary": "fix_ancestry_not_complete_affected_release_range",
+      "unmapped_model_reason": "",
+      "mapping_basis": {
+        "kind": "engineering_crosswalk_not_normative_or_execution_evidence",
+        "source_refs": [
+          {
+            "artifact_id": "parent-spec",
+            "line": 100
+          },
+          {
+            "artifact_id": "coverage.json",
+            "json_pointer": "/rows/15"
+          }
+        ]
+      },
+      "evidence_refs": [],
+      "evidence_status": "unobserved",
+      "replay_status": "not_in_capture"
+    },
+    {
+      "id": "C17",
+      "description": "异常保存、agent归因、用户确认和独立缺陷记账",
+      "captured_assessment": {
+        "id": "C17",
+        "category": "全流程",
+        "surface": "异常收集、agent归因、人工确认与根因计数",
+        "existing": "review_packet/record函数存在；普通runner review_records为空",
+        "status": "决策已定、生产接线缺口",
+        "gap_or_required_validation": "接通自动证据包/导入/人工确认/root cause+known-new。crash/timeout保留待查；工具错不计DDS缺陷",
+        "references": "src/r2f/reports/candidate_report.py:389;src/r2f/campaign/runner.py:1301"
+      },
+      "source_ref": {
+        "artifact_id": "coverage.json",
+        "json_pointer": "/rows/16"
+      },
+      "spec_ref": {
+        "artifact_id": "parent-spec",
+        "line": 101
+      },
+      "story_ids": [
+        23,
+        24,
+        25,
+        26,
+        27,
+        28,
+        29,
+        30,
+        32,
+        33,
+        34,
+        41
+      ],
+      "model_links": [],
+      "applicability": {
+        "status": "applicable",
+        "basis": "Parent spec retains this complete-S1 obligation; adapter absence or missing observation does not exclude it.",
+        "source_ref": {
+          "artifact_id": "parent-spec",
+          "line": 101
+        }
+      },
+      "current_source_status": "unverified",
+      "missing_observation_policy": "unknown",
+      "remaining_obligations": [
+        "接通自动证据包/导入/人工确认/root cause+known-new。crash/timeout保留待查；工具错不计DDS缺陷",
+        "Validate applicable behavior on the newly frozen source; this sidecar grants no execution or maturity credit."
+      ],
+      "semantic_boundary": "pending_anomaly_not_user_confirmed_independent_discovery",
+      "unmapped_model_reason": "Cross-cutting anomaly/review/confirmation obligations belong to existing runner/candidate/report seams, not a new S1 semantic target.",
+      "mapping_basis": {
+        "kind": "engineering_crosswalk_not_normative_or_execution_evidence",
+        "source_refs": [
+          {
+            "artifact_id": "parent-spec",
+            "line": 101
+          },
+          {
+            "artifact_id": "coverage.json",
+            "json_pointer": "/rows/16"
+          }
+        ]
+      },
+      "evidence_refs": [],
+      "evidence_status": "unobserved",
+      "replay_status": "not_in_capture"
+    },
+    {
+      "id": "C18",
+      "description": "重放、反馈身份、原始失败保留和证据封存",
+      "captured_assessment": {
+        "id": "C18",
+        "category": "全流程",
+        "surface": "重放、反馈与证据封存",
+        "existing": "replay capsule、正常episode重建；之前确认feedback身份遗漏与索引循环引用",
+        "status": "有限重建实证；两项工具修复未实施",
+        "gap_or_required_validation": "修复后新source验证；历史pre/post不能混版本；重放失败保留原案；最终required72与扩展证据分账",
+        "references": "results/main-review/s1-expectation-audit-20261121/review.md:77;retained-evidence.json"
+      },
+      "source_ref": {
+        "artifact_id": "coverage.json",
+        "json_pointer": "/rows/17"
+      },
+      "spec_ref": {
+        "artifact_id": "parent-spec",
+        "line": 102
+      },
+      "story_ids": [
+        3,
+        4,
+        6,
+        22,
+        31,
+        35,
+        38,
+        39,
+        40,
+        41,
+        42
+      ],
+      "model_links": [],
+      "applicability": {
+        "status": "applicable",
+        "basis": "Parent spec retains this complete-S1 obligation; adapter absence or missing observation does not exclude it.",
+        "source_ref": {
+          "artifact_id": "parent-spec",
+          "line": 102
+        }
+      },
+      "current_source_status": "unverified",
+      "missing_observation_policy": "unknown",
+      "remaining_obligations": [
+        "修复后新source验证；历史pre/post不能混版本；重放失败保留原案；最终required72与扩展证据分账",
+        "Validate applicable behavior on the newly frozen source; this sidecar grants no execution or maturity credit."
+      ],
+      "semantic_boundary": "input_identity_not_execution_receipt_or_current_source_seal",
+      "unmapped_model_reason": "Cross-cutting feedback/replay/source-seal obligations belong to existing scheduler/replay/evidence seams, not a new S1 semantic target.",
+      "mapping_basis": {
+        "kind": "engineering_crosswalk_not_normative_or_execution_evidence",
+        "source_refs": [
+          {
+            "artifact_id": "parent-spec",
+            "line": 102
+          },
+          {
+            "artifact_id": "coverage.json",
+            "json_pointer": "/rows/17"
+          }
+        ]
+      },
+      "evidence_refs": [
+        "retained-normal-episode-32759d8"
+      ],
+      "evidence_status": "source_captured_partial_real_validation",
+      "replay_status": "not_in_capture"
+    }
+  ],
+  "user_stories": [
+    {
+      "id": 1,
+      "text": "作为研究者，我希望从规范、分类与历史案例提炼缺陷特征，以便构建能指导探索的模型。",
+      "source_ref": {
+        "artifact_id": "parent-spec",
+        "line": 25
+      },
+      "obligation_ids": [
+        "C01"
+      ]
+    },
+    {
+      "id": 2,
+      "text": "作为研究者，我希望保留全部S1分类和横向面，以便避免只完成几个示例就误判全面覆盖。",
+      "source_ref": {
+        "artifact_id": "parent-spec",
+        "line": 26
+      },
+      "obligation_ids": [
+        "C01"
+      ]
+    },
+    {
+      "id": 3,
+      "text": "作为维护者，我希望复用已有target、provider和runner，以便集中修补缺口并保持证据一致。",
+      "source_ref": {
+        "artifact_id": "parent-spec",
+        "line": 27
+      },
+      "obligation_ids": [
+        "C18"
+      ]
+    },
+    {
+      "id": 4,
+      "text": "作为研究者，我希望区分已登记、可生成、可执行、已观察和已验证，以便准确判断工具能力。",
+      "source_ref": {
+        "artifact_id": "parent-spec",
+        "line": 28
+      },
+      "obligation_ids": [
+        "C18"
+      ]
+    },
+    {
+      "id": 5,
+      "text": "作为研究者，我希望模型生成种子、变异和状态序列，以便探索有意义的前置条件与边界。",
+      "source_ref": {
+        "artifact_id": "parent-spec",
+        "line": 29
+      },
+      "obligation_ids": [
+        "C01"
+      ]
+    },
+    {
+      "id": 6,
+      "text": "作为研究者，我希望输入相同可追溯到确定身份，以便重放和比较结果。",
+      "source_ref": {
+        "artifact_id": "parent-spec",
+        "line": 30
+      },
+      "obligation_ids": [
+        "C18"
+      ]
+    },
+    {
+      "id": 7,
+      "text": "作为研究者，我希望控制多participant的数量、归属及共享关系，以便研究发现图更新。",
+      "source_ref": {
+        "artifact_id": "parent-spec",
+        "line": 31
+      },
+      "obligation_ids": [
+        "C02"
+      ]
+    },
+    {
+      "id": 8,
+      "text": "作为研究者，我希望创建、删除和重建端点并关联真实身份与代次，以便识别残留或错误关联。",
+      "source_ref": {
+        "artifact_id": "parent-spec",
+        "line": 32
+      },
+      "obligation_ids": [
+        "C01"
+      ]
+    },
+    {
+      "id": 9,
+      "text": "作为研究者，我希望探索多writer/reader和有向匹配关系，以便发现聚合计数掩盖的错误。",
+      "source_ref": {
+        "artifact_id": "parent-spec",
+        "line": 33
+      },
+      "obligation_ids": [
+        "C12"
+      ]
+    },
+    {
+      "id": 10,
+      "text": "作为研究者，我希望执行多topic及真实类型组合，以便验证模型而非只改变类型名称字符串。",
+      "source_ref": {
+        "artifact_id": "parent-spec",
+        "line": 34
+      },
+      "obligation_ids": [
+        "C09",
+        "C13"
+      ]
+    },
+    {
+      "id": 11,
+      "text": "作为研究者，我希望分别观察participant发现lease与writer liveliness，以便避免错误解释时序。",
+      "source_ref": {
+        "artifact_id": "parent-spec",
+        "line": 35
+      },
+      "obligation_ids": [
+        "C03"
+      ]
+    },
+    {
+      "id": 12,
+      "text": "作为研究者，我希望覆盖发现profile、公告和版本条件，以便识别配置相关的发现异常。",
+      "source_ref": {
+        "artifact_id": "parent-spec",
+        "line": 36
+      },
+      "obligation_ids": [
+        "C04"
+      ]
+    },
+    {
+      "id": 13,
+      "text": "作为研究者，我希望在明确初始化前置条件下检查GUID唯一性，以便调查身份冲突而不泛化fork支持。",
+      "source_ref": {
+        "artifact_id": "parent-spec",
+        "line": 37
+      },
+      "obligation_ids": [
+        "C05"
+      ]
+    },
+    {
+      "id": 14,
+      "text": "作为研究者，我希望关联发现内部并发路径和实际触发时序，以便判断一次运行是否触及竞态窗口。",
+      "source_ref": {
+        "artifact_id": "parent-spec",
+        "line": 38
+      },
+      "obligation_ids": [
+        "C06"
+      ]
+    },
+    {
+      "id": 15,
+      "text": "作为研究者，我希望观察中断命中及恢复后的新发现活动，以便确认发现状态确实恢复。",
+      "source_ref": {
+        "artifact_id": "parent-spec",
+        "line": 39
+      },
+      "obligation_ids": [
+        "C07"
+      ]
+    },
+    {
+      "id": 16,
+      "text": "作为研究者，我希望对照独立内部、builtin和外部视图，以便发现投影不一致。",
+      "source_ref": {
+        "artifact_id": "parent-spec",
+        "line": 40
+      },
+      "obligation_ids": [
+        "C08"
+      ]
+    },
+    {
+      "id": 17,
+      "text": "作为研究者，我希望明确native、语言binding、CLI与ROS2路径，以便避免错误归因。",
+      "source_ref": {
+        "artifact_id": "parent-spec",
+        "line": 41
+      },
+      "obligation_ids": [
+        "C09",
+        "C10",
+        "C16"
+      ]
+    },
+    {
+      "id": 18,
+      "text": "作为研究者，我希望区分CFT配置成功、实际过滤和端点匹配，以便准确判断过滤行为。",
+      "source_ref": {
+        "artifact_id": "parent-spec",
+        "line": 42
+      },
+      "obligation_ids": [
+        "C14"
+      ]
+    },
+    {
+      "id": 19,
+      "text": "作为研究者，我希望保留QoS、类型、传输和交付的跨模块关联，以便按根因分类而不丢线索。",
+      "source_ref": {
+        "artifact_id": "parent-spec",
+        "line": 43
+      },
+      "obligation_ids": [
+        "C13",
+        "C15"
+      ]
+    },
+    {
+      "id": 20,
+      "text": "作为研究者，我希望在黑盒观察不足时使用源码插桩，以便优先保证缺陷发现质量。",
+      "source_ref": {
+        "artifact_id": "parent-spec",
+        "line": 44
+      },
+      "obligation_ids": [
+        "C03",
+        "C06",
+        "C08"
+      ]
+    },
+    {
+      "id": 21,
+      "text": "作为研究者，我希望每次插桩与二进制有独立来源记录，以便区分SUT问题与观察器问题。",
+      "source_ref": {
+        "artifact_id": "parent-spec",
+        "line": 45
+      },
+      "obligation_ids": [
+        "C06",
+        "C08",
+        "C16"
+      ]
+    },
+    {
+      "id": 22,
+      "text": "作为操作者，我希望正常测试全流程自动运行并保存证据，以便减少重复人工操作。",
+      "source_ref": {
+        "artifact_id": "parent-spec",
+        "line": 46
+      },
+      "obligation_ids": [
+        "C11",
+        "C18"
+      ]
+    },
+    {
+      "id": 23,
+      "text": "作为操作者，我希望所有异常和失败路径自动进入待查视图，以便不遗漏崩溃或超时线索。",
+      "source_ref": {
+        "artifact_id": "parent-spec",
+        "line": 47
+      },
+      "obligation_ids": [
+        "C17"
+      ]
+    },
+    {
+      "id": 24,
+      "text": "作为分析agent，我希望证据包包含输入、身份、时间线及缺失项，以便判断行为与归因。",
+      "source_ref": {
+        "artifact_id": "parent-spec",
+        "line": 48
+      },
+      "obligation_ids": [
+        "C01",
+        "C11",
+        "C17"
+      ]
+    },
+    {
+      "id": 25,
+      "text": "作为用户，我希望自行发起agent分析而无需先部署自动LLM平台，以便尽早使用工具。",
+      "source_ref": {
+        "artifact_id": "parent-spec",
+        "line": 49
+      },
+      "obligation_ids": [
+        "C17"
+      ]
+    },
+    {
+      "id": 26,
+      "text": "作为维护者，我希望工具问题形成有证据的修复交接，以便修复agent能重现并验证问题。",
+      "source_ref": {
+        "artifact_id": "parent-spec",
+        "line": 50
+      },
+      "obligation_ids": [
+        "C17"
+      ]
+    },
+    {
+      "id": 27,
+      "text": "作为用户，我希望收到真实候选的证据和结论，以便最终决定是否确认为缺陷。",
+      "source_ref": {
+        "artifact_id": "parent-spec",
+        "line": 51
+      },
+      "obligation_ids": [
+        "C17"
+      ]
+    },
+    {
+      "id": 28,
+      "text": "作为用户，我希望确认动作可追溯且不会被agent自行代填，以便维护计数可信度。",
+      "source_ref": {
+        "artifact_id": "parent-spec",
+        "line": 52
+      },
+      "obligation_ids": [
+        "C17"
+      ]
+    },
+    {
+      "id": 29,
+      "text": "作为研究者，我希望把复核结果结构化导入并生成派生报告，以便持续积累分析结论。",
+      "source_ref": {
+        "artifact_id": "parent-spec",
+        "line": 53
+      },
+      "obligation_ids": [
+        "C17"
+      ]
+    },
+    {
+      "id": 30,
+      "text": "作为研究者，我希望未知和归因冲突继续保留，以便补证后重新判断。",
+      "source_ref": {
+        "artifact_id": "parent-spec",
+        "line": 54
+      },
+      "obligation_ids": [
+        "C17"
+      ]
+    },
+    {
+      "id": 31,
+      "text": "作为研究者，我希望重放尝试关联原始异常且失败不删除原案，以便保留不稳定缺陷。",
+      "source_ref": {
+        "artifact_id": "parent-spec",
+        "line": 55
+      },
+      "obligation_ids": [
+        "C18"
+      ]
+    },
+    {
+      "id": 32,
+      "text": "作为研究者，我希望同根因的多个案例关联而不重复计数，以便准确评价独立发现能力。",
+      "source_ref": {
+        "artifact_id": "parent-spec",
+        "line": 56
+      },
+      "obligation_ids": [
+        "C17"
+      ]
+    },
+    {
+      "id": 33,
+      "text": "作为研究者，我希望区分历史复现、新发现及新旧未定，以便不拿已知问题抵扣新发现目标。",
+      "source_ref": {
+        "artifact_id": "parent-spec",
+        "line": 57
+      },
+      "obligation_ids": [
+        "C16",
+        "C17"
+      ]
+    },
+    {
+      "id": 34,
+      "text": "作为研究者，我希望在确认后逐例评估能力缺口，以便将agent经验接回工具。",
+      "source_ref": {
+        "artifact_id": "parent-spec",
+        "line": 58
+      },
+      "obligation_ids": [
+        "C17"
+      ]
+    },
+    {
+      "id": 35,
+      "text": "作为研究者，我希望模型变更经过缺陷与正常案例验证并版本化，以便降低误报及语义漂移。",
+      "source_ref": {
+        "artifact_id": "parent-spec",
+        "line": 59
+      },
+      "obligation_ids": [
+        "C01",
+        "C18"
+      ]
+    },
+    {
+      "id": 36,
+      "text": "作为研究者，我希望侧信道能力可渐进补充，以便插桩发现不会因黑盒能力未完成而停滞。",
+      "source_ref": {
+        "artifact_id": "parent-spec",
+        "line": 60
+      },
+      "obligation_ids": [
+        "C03",
+        "C06"
+      ]
+    },
+    {
+      "id": 37,
+      "text": "作为研究者，我希望区分修复提交包含关系与完整受影响版本范围，以便选择可靠的历史对照。",
+      "source_ref": {
+        "artifact_id": "parent-spec",
+        "line": 61
+      },
+      "obligation_ids": [
+        "C04",
+        "C16"
+      ]
+    },
+    {
+      "id": 38,
+      "text": "作为操作者，我希望冲突、预算结束或执行失败都有明确记录与清理结果，以便安全地继续后续实验。",
+      "source_ref": {
+        "artifact_id": "parent-spec",
+        "line": 62
+      },
+      "obligation_ids": [
+        "C07",
+        "C11",
+        "C18"
+      ]
+    },
+    {
+      "id": 39,
+      "text": "作为审查者，我希望源码变化后的证据失效和重跑义务清晰，以便不沿用旧seal证明新代码。",
+      "source_ref": {
+        "artifact_id": "parent-spec",
+        "line": 63
+      },
+      "obligation_ids": [
+        "C18"
+      ]
+    },
+    {
+      "id": 40,
+      "text": "作为审查者，我希望required基准、扩展能力与新发现分账，以便知道完整目标还差什么。",
+      "source_ref": {
+        "artifact_id": "parent-spec",
+        "line": 64
+      },
+      "obligation_ids": [
+        "C18"
+      ]
+    },
+    {
+      "id": 41,
+      "text": "作为研究者，我希望能解释零候选运行及未命中条件，以便调整探索而不伪造发现。",
+      "source_ref": {
+        "artifact_id": "parent-spec",
+        "line": 65
+      },
+      "obligation_ids": [
+        "C17",
+        "C18"
+      ]
+    },
+    {
+      "id": 42,
+      "text": "作为后续模块开发者，我希望本轮改善保持统一框架接口，以便未来S模块复用已有闭环。",
+      "source_ref": {
+        "artifact_id": "parent-spec",
+        "line": 66
+      },
+      "obligation_ids": [
+        "C18"
+      ]
+    }
+  ],
+  "required_baseline": {
+    "cell_count": 72,
+    "target_revisions": {
+      "discovery.late_endpoint": 0,
+      "discovery.late_join_delivery": 0,
+      "discovery.interruption_recovery": 0,
+      "builtin.discovery_projection_reconciliation": 0
+    },
+    "counting_unit": "required_matrix_cells; separate from cases, dimensions and stories"
+  },
+  "evidence_captures": [
+    {
+      "evidence_id": "retained-normal-episode-32759d8",
+      "source_ref": {
+        "artifact_id": "retained-evidence.json",
+        "json_pointer": ""
+      },
+      "record": {
+        "kind": "passive_retained_artifact_recheck_not_live_or_full_audit",
+        "report_path": "/home/wuyuqa/ros2-dds-fuzz-v2/results/main-review/s1-episode-rebuild-20261121/live/original/report.json",
+        "report_file_sha256": "d280659686a8adbdc8ad48aa33def4cc97a4ae06f2ebe2c69551cd7f9a84448d",
+        "source_manifest": {
+          "behavior_tree_sha256": "a2948340534d7dd713b83f9a24d35d331a791bc959be8fd34e9aa0731df23329",
+          "dirty_behavior_paths": [],
+          "head": "32759d89c2b6036b0314cb27e9b87e70bc0b3c7c",
+          "source_frozen": true,
+          "source_repo": "/home/wuyuqa/ros2-dds-fuzz-v2"
+        },
+        "run_id": "s1-episode-rebuild-32759d8-d104-20261121",
+        "target_id": "discovery.endpoint_topology.fuzz_v1",
+        "target_revision": 0,
+        "rmw": "rmw_cyclonedds_cpp",
+        "domain": 104,
+        "budget": {
+          "aborted": 0,
+          "actual": 1,
+          "attempted": 1,
+          "elapsed_sec": 17.110459240007913,
+          "executed": 1,
+          "generated": 1,
+          "interrupted": 0,
+          "max_inputs": 1,
+          "max_seconds": 180,
+          "planned": 1,
+          "selected": 1,
+          "unique_actual": 1,
+          "unique_inputs": 1,
+          "warmup_inputs": 10
+        },
+        "abort": null,
+        "oracle_verdict": "pass",
+        "candidate_eligible": false,
+        "raw_path": "/home/wuyuqa/ros2-dds-fuzz-v2/results/main-review/s1-episode-rebuild-20261121/live/original/cases/s1-episode-rebuild-32759d8-d104-20261121.0000.S1.topology.program/runtime/inner-runtime/raw.jsonl",
+        "raw_sha256": "be5348316111ebbab3cddbb17edfae9c7ec14bdefdae913d451d0604f26b51da",
+        "raw_matches": true,
+        "candidate_ledger_path": "/home/wuyuqa/ros2-dds-fuzz-v2/results/main-review/s1-episode-rebuild-20261121/live/original/candidate_ledger.json",
+        "candidate_ledger_matches": true,
+        "program": {
+          "actions": [
+            {
+              "action_id": "create_w1",
+              "depends_on": [],
+              "endpoint_id": "w0",
+              "generation": 1,
+              "op": "create",
+              "params": {}
+            },
+            {
+              "action_id": "create_r1",
+              "depends_on": [
+                "create_w1"
+              ],
+              "endpoint_id": "r0",
+              "generation": 1,
+              "op": "create",
+              "params": {}
+            },
+            {
+              "action_id": "matched_1",
+              "depends_on": [
+                "create_r1"
+              ],
+              "endpoint_id": null,
+              "generation": null,
+              "op": "barrier",
+              "params": {
+                "condition": "matched",
+                "endpoint_ids": [
+                  "w0",
+                  "r0"
+                ],
+                "timeout_sec": 5.0
+              }
+            },
+            {
+              "action_id": "publish_1",
+              "depends_on": [
+                "matched_1"
+              ],
+              "endpoint_id": "w0",
+              "generation": 1,
+              "op": "publish_batch",
+              "params": {
+                "count": 3,
+                "interval_sec": 0.01,
+                "payload": "continuous-episode",
+                "start_sequence": 0
+              }
+            },
+            {
+              "action_id": "delivered_1",
+              "depends_on": [
+                "publish_1"
+              ],
+              "endpoint_id": null,
+              "generation": null,
+              "op": "barrier",
+              "params": {
+                "condition": "delivery",
+                "endpoint_ids": [
+                  "w0",
+                  "r0"
+                ],
+                "timeout_sec": 5.0
+              }
+            },
+            {
+              "action_id": "checkpoint_1",
+              "depends_on": [
+                "delivered_1"
+              ],
+              "endpoint_id": null,
+              "generation": null,
+              "op": "snapshot",
+              "params": {
+                "label": "episode-1"
+              }
+            },
+            {
+              "action_id": "destroy_r1",
+              "depends_on": [
+                "checkpoint_1"
+              ],
+              "endpoint_id": "r0",
+              "generation": 1,
+              "op": "destroy",
+              "params": {}
+            },
+            {
+              "action_id": "destroy_w1",
+              "depends_on": [
+                "destroy_r1"
+              ],
+              "endpoint_id": "w0",
+              "generation": 1,
+              "op": "destroy",
+              "params": {}
+            },
+            {
+              "action_id": "recreate_w2",
+              "depends_on": [
+                "destroy_w1"
+              ],
+              "endpoint_id": "w0",
+              "generation": 2,
+              "op": "recreate",
+              "params": {}
+            },
+            {
+              "action_id": "recreate_r2",
+              "depends_on": [
+                "recreate_w2"
+              ],
+              "endpoint_id": "r0",
+              "generation": 2,
+              "op": "recreate",
+              "params": {}
+            },
+            {
+              "action_id": "matched_2",
+              "depends_on": [
+                "recreate_r2"
+              ],
+              "endpoint_id": null,
+              "generation": null,
+              "op": "barrier",
+              "params": {
+                "condition": "matched",
+                "endpoint_ids": [
+                  "w0",
+                  "r0"
+                ],
+                "timeout_sec": 5.0
+              }
+            },
+            {
+              "action_id": "publish_2",
+              "depends_on": [
+                "matched_2"
+              ],
+              "endpoint_id": "w0",
+              "generation": 2,
+              "op": "publish_batch",
+              "params": {
+                "count": 3,
+                "interval_sec": 0.01,
+                "payload": "continuous-episode",
+                "start_sequence": 0
+              }
+            },
+            {
+              "action_id": "delivered_2",
+              "depends_on": [
+                "publish_2"
+              ],
+              "endpoint_id": null,
+              "generation": null,
+              "op": "barrier",
+              "params": {
+                "condition": "delivery",
+                "endpoint_ids": [
+                  "w0",
+                  "r0"
+                ],
+                "timeout_sec": 5.0
+              }
+            },
+            {
+              "action_id": "checkpoint_2",
+              "depends_on": [
+                "delivered_2"
+              ],
+              "endpoint_id": null,
+              "generation": null,
+              "op": "snapshot",
+              "params": {
+                "label": "episode-2"
+              }
+            },
+            {
+              "action_id": "snapshot_added_0",
+              "depends_on": [],
+              "endpoint_id": null,
+              "generation": null,
+              "op": "snapshot",
+              "params": {
+                "label": "mutation"
+              }
+            }
+          ],
+          "budget": {
+            "max_actions": 50,
+            "max_batch_size": 3,
+            "max_endpoints": 2,
+            "max_generations": 2,
+            "max_readers": 1,
+            "max_timeout_sec": 5.0,
+            "max_total_samples": 6,
+            "max_writers": 1
+          },
+          "endpoints": [
+            {
+              "logical_id": "w0",
+              "participant_id": null,
+              "qos": {
+                "deadline_sec": "infinite",
+                "depth": 16,
+                "durability": "volatile",
+                "history": "keep_last",
+                "lease_duration_sec": "infinite",
+                "liveliness": "automatic",
+                "ownership": "shared",
+                "partitions": [],
+                "reliability": "reliable"
+              },
+              "role": "writer",
+              "topic": "/r2f/topology/episode",
+              "type_name": "std_msgs/msg/String",
+              "vendor": null
+            },
+            {
+              "logical_id": "r0",
+              "participant_id": null,
+              "qos": {
+                "deadline_sec": "infinite",
+                "depth": 16,
+                "durability": "volatile",
+                "history": "keep_last",
+                "lease_duration_sec": "infinite",
+                "liveliness": "automatic",
+                "ownership": "shared",
+                "partitions": [],
+                "reliability": "reliable"
+              },
+              "role": "reader",
+              "topic": "/r2f/topology/episode",
+              "type_name": "std_msgs/msg/String",
+              "vendor": null
+            }
+          ],
+          "environment": {
+            "backend_available": true,
+            "discovery_enabled": true,
+            "filter_support": null,
+            "filter_validity": null,
+            "transport_ready": true,
+            "type_matching": "exact_name"
+          },
+          "episode": {
+            "checkpoint_action_ids": [
+              "checkpoint_1",
+              "checkpoint_2"
+            ],
+            "max_seconds": 120.0,
+            "reset_action_ids": [
+              "recreate_w2",
+              "recreate_r2"
+            ],
+            "schema": "r2f.s1-topology-episode-config/v1"
+          },
+          "schema": "r2f.s1-topology-program/v1"
+        },
+        "limitations": [
+          "Reused prior inventory; no full results rescan or canonical audit rerun",
+          "Normal completed episode reconstruction is not sudden crash recovery or hidden DDS memory restoration"
+        ],
+        "candidate_ledger_file_sha256": "5e69f804d463d86eeb70b595fbc5687c2145898dcca296b3b565acb7acb51763",
+        "candidate_ledger_canonical_hash": "d12f668048b151335e9567294ba2965775ba4cb969226f4f2e5598e2dba683a8",
+        "candidate_counts": {
+          "natural_candidate_count": 0,
+          "confirmed_candidates": 0
+        },
+        "hash_check_note": "Ledger reference uses canonical JSON hash per exploratory_builder.py:325 and run_report.py:1431, not serialized file-byte hash; both hashes retained."
+      },
+      "scope": "source_captured_normal_episode_only",
+      "qualified_for_current_source": false,
+      "reuse_policy": "historical_only_requires_new_source_validation",
+      "obligation_ids": [
+        "C01",
+        "C18"
+      ],
+      "replay": {
+        "status": "not_in_capture",
+        "attempts": [],
+        "reason": "The supplied capture describes a normal two-generation episode, not an independently linked replay attempt; do not synthesize replay from its pass verdict."
+      }
+    }
+  ],
+  "execution_evidence": false,
+  "maturity_evidence": false,
+  "status_vocabulary": {
+    "model_input_only": "Declared model/input context only; no runtime qualification.",
+    "wired_pending_real_validation": "Code/adapter wiring described, applicable live contract not yet validated.",
+    "partial_real_validation": "Evidence supports only an explicitly bounded subset on its captured source.",
+    "declared_contract_complete": "All obligations of a named contract validated on its exact qualified source.",
+    "unsupported": "Explicit implementation rejection with a named reason; not inferred from missing observation.",
+    "not_applicable": "Requires a named source and scope adjudication; missing observation is insufficient.",
+    "unverified": "No current-source qualification; preserves unknown and remaining work."
+  },
+  "assessment_scope": {
+    "captured_assessment": "Verbatim historical research at source 32759d89c2b6036b0314cb27e9b87e70bc0b3c7c; wording such as current source means that capture, not the caller checkout.",
+    "current_source_status": "CP2 is a declaration crosswalk, not a runtime audit; unverified for every obligation.",
+    "C18_followup": "CP1 feedback identity/resume fix accepted by main at 753886cddfb857cc8cebd6a01fe51ee33056df1c (session dispatch). Historical assessment stays immutable; this is offline acceptance, not replay/seal completion."
+  },
+  "captured_artifact_validation": {
+    "count": 140,
+    "all_match": true,
+    "rechecked_here": false,
+    "source_ref": {
+      "artifact_id": "primary-artifact-validation.json",
+      "json_pointer": ""
+    },
+    "scope": "historical_artifact_hash_checks_not_a_full_canonical_or_runtime_audit"
+  },
+  "assessment_source_identity": {
+    "behavior_tree_sha256": "a2948340534d7dd713b83f9a24d35d331a791bc959be8fd34e9aa0731df23329",
+    "dirty_behavior_paths": [],
+    "head": "32759d89c2b6036b0314cb27e9b87e70bc0b3c7c",
+    "source_frozen": true,
+    "source_repo": "/home/wuyuqa/ros2-dds-fuzz-v2"
+  },
+  "case_relations": [
+    {
+      "case_ids": [
+        "OpenDDS/OpenDDS#5202",
+        "OpenDDS/OpenDDS#5221"
+      ],
+      "kind": "captured_related_fix_chain_not_confirmed_new_roots",
+      "independent_discovery_credit": 0,
+      "source_refs": [
+        {
+          "artifact_id": "case-matrix.json",
+          "json_pointer": "/cases/5"
+        },
+        {
+          "artifact_id": "case-matrix.json",
+          "json_pointer": "/cases/14"
+        }
+      ],
+      "basis": "Captured dispositions identify two fixes in the same reported issue chain; preserve both cases without counting independent discoveries."
+    }
+  ]
+}
