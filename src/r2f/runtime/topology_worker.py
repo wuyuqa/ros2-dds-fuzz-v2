@@ -1358,10 +1358,12 @@ def _worker_main(argv):
                 else:
                     # A named API absence is diagnostic, not an incomplete
                     # peer-list claim. Preserve it without declaring peer proof.
-                    peer_fields = {"native_peer_observation": observation,
-                                   "peer_observation_limitation": observation["reason"]}
+                    peer_fields = {"peer_observation_limitation": observation["reason"]}
+                # A changing interval cannot qualify a stable public count.
+                # Keep both actual samples even when no peer observer exists.
                 emit("match_snapshot", command_id=command_id,
-                     matched_count=count_after, public_count_before=count_before,
+                     matched_count=count_after if count_before == count_after else None,
+                     public_count_before=count_before, public_count_after=count_after,
                      **peer_fields,
                      endpoint_gid=local_gid, sampled_monotonic_ns=time.monotonic_ns(),
                      count_api="get_subscription_count" if kind == "writer"

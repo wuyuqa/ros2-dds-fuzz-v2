@@ -31,7 +31,7 @@ GIDS = {"writer": "1" * 32, "reader": "2" * 32}
 def snapshot_worker(monkeypatch):
     """Run the public worker entry with authored external API/pipe responses."""
     def launch(kind, *, rmw="rmw_fastrtps_cpp", extra_peer=False, count=1,
-               observer_case=None):
+               observer_case=None, count_after=None):
         names = ["rclpy", "rclpy.context", "rclpy.executors", "rclpy.node",
                  "rclpy.qos", "rclpy.duration", "rclpy.event_handler",
                  "std_msgs", "std_msgs.msg", "r2f.runtime.actual_qos",
@@ -73,21 +73,36 @@ def snapshot_worker(monkeypatch):
         modules["r2f.runtime.rmw_publish_observer"].PublishOccurrenceObserver = (
             lambda *_: SimpleNamespace(close=lambda: {"fixture": True}))
 
+        snapshot_reads = 0
+
+        def matched_count():
+            nonlocal snapshot_reads
+            if snapshot_reads:
+                snapshot_reads += 1
+            return count_after if count_after is not None and snapshot_reads > 2 else count
+
+        def commands(*_):
+            nonlocal snapshot_reads
+            snapshot_reads = 1
+            return b'{"command":"snapshot","command_id":1}\n{"command":"stop"}\n'
+
         class Node:
             def __init__(self, name, **_):
                 self.name = name
 
             def create_publisher(self, message_type, topic, qos, **_):
                 self.qos = qos
-                return SimpleNamespace(topic_name=topic, get_subscription_count=lambda: count)
+                return SimpleNamespace(topic_name=topic, get_subscription_count=matched_count)
 
             def create_subscription(self, message_type, topic, callback, qos, **_):
                 self.qos = qos
-                return SimpleNamespace(topic_name=topic, get_publisher_count=lambda: count)
+                return SimpleNamespace(topic_name=topic, get_publisher_count=matched_count)
 
             def infos(self, role):
                 info = SimpleNamespace(
-                    node_name=self.name if role == kind else "offline_peer",
+                    node_name=(self.name if role == kind else
+                               "r2f_topo_" + ("w0" if role == "writer" else "r0")
+                               + "_g1_" + ("a" if role == "writer" else "b") * 8),
                     node_namespace="/", topic_type="std_msgs/msg/String",
                     endpoint_gid=bytes.fromhex(GIDS[role]), qos_profile=self.qos)
                 rows = [info]
@@ -123,9 +138,11 @@ def snapshot_worker(monkeypatch):
             patch.setattr(sys, "argv", ["offline-worker", json.dumps(config), kind])
             patch.setattr(sys, "stdin", SimpleNamespace(fileno=lambda: 12345))
             patch.setattr("select.select", lambda *_: ([sys.stdin], [], []))
-            patch.setattr(worker.os, "read", lambda *_: (
-                b'{"command":"snapshot","command_id":1}\n{"command":"stop"}\n'))
+            patch.setattr(worker.os, "read", commands)
             patch.setattr(worker.os, "getpid", lambda: 101 if kind == "writer" else 102)
+            # Coherent cross-worker public graph names at the randomness boundary.
+            patch.setattr(worker.uuid, "uuid4", lambda: SimpleNamespace(
+                hex=("a" if kind == "writer" else "b") * 32))
             # No fixture may accidentally load ROS/vendor libraries.
             def no_native_load(*_, **__):
                 raise AssertionError("offline fixture must not load native libraries")
@@ -219,9 +236,10 @@ def test_blackbox_absence_keeps_named_diagnostic_and_qualified_snapshot_fallback
     for rows in (writer_rows, reader_rows):
         match = next(row for row in rows if row["event"] == "match_snapshot")
         assert match["peer_observation_limitation"] == UNAVAILABLE
-        assert match["native_peer_observation"] == {"complete": False, "reason": UNAVAILABLE}
+        assert (match["public_count_before"], match["public_count_after"], match["matched_count"]) == (1, 1, 1)
         assert all(key not in match for key in
-                   ("peer_gids_complete", "peer_proof_source", "matched_peer_gids"))
+                   ("native_peer_observation", "peer_gids_complete",
+                    "peer_proof_source", "matched_peer_gids"))
 
 
 @pytest.mark.parametrize("extra_peer", ["writer", "reader", "both"])
