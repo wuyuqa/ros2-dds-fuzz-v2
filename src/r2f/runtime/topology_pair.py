@@ -383,10 +383,25 @@ def _occurrence_pair_with_control(pair, receive, events):
     if len(writers) != 1:
         return pair
     writer = writers[0]
+    # Repeat-data callers have no receive boundary and retain their original
+    # whole-capture control contract.
+    receive_index = receive.get("event_index") if receive is not None else None
+    receive_ns = receive.get("monotonic_ns") if receive is not None else None
+    if receive is not None and (type(receive_index) is not int or type(receive_ns) is not int):
+        return pair
+
+    def strictly_after_sample(row, boundary):
+        return (boundary is not None
+                and type(row.get("event_index")) is int and row["event_index"] > boundary["event_index"]
+                and type(row.get("monotonic_ns")) is int and row["monotonic_ns"] > boundary["monotonic_ns"])
+
     controls = []
     for created in events:
         if (created.get("event") != "endpoint_created"
                 or worker_role_kind(created.get("role")) != "reader"
+                or receive is not None and (
+                    type(created.get("event_index")) is not int or created["event_index"] >= receive_index
+                    or type(created.get("monotonic_ns")) is not int or created["monotonic_ns"] > receive_ns)
                 or "initial_content_filter" not in created
                 or created["initial_content_filter"] is not None
                 or any(writer.get(k) is None or created.get(k) != writer[k]
@@ -394,17 +409,36 @@ def _occurrence_pair_with_control(pair, receive, events):
             continue
         same = lambda row: (row.get("logical_id") == created.get("logical_id")
                             and row.get("generation") == created.get("generation"))
+        # A later retirement/update cannot erase a historical unfiltered
+        # reader. Both raw order and clock must prove it happened later; an
+        # inconsistent or missing timestamp still prevents control selection.
         if any(same(row) and row.get("event") in {
                 "content_filter_dynamic_update", "endpoint_identity_transition",
                 "endpoint_destroyed", "topology_endpoint_destroyed"}
-               for row in events):
+               and not strictly_after_sample(row, receive) for row in events):
             continue
         controls.append(created)
     if len(controls) != 1:
         return pair
     control = controls[0]
-    return {**pair, "control": control["logical_id"],
-            "control_generation": control["generation"], "control_gid": control["endpoint_gid"]}
+    selected = {**pair, "control": control["logical_id"],
+                "control_generation": control["generation"], "control_gid": control["endpoint_gid"]}
+    changes = [row for row in events
+               if row.get("logical_id") == control.get("logical_id")
+               and row.get("generation") == control.get("generation")
+               and row.get("event") in {"content_filter_dynamic_update", "endpoint_identity_transition",
+                                        "endpoint_destroyed", "topology_endpoint_destroyed"}]
+    if receive is not None and changes:
+        # Only the full native verifier can identify the actual control sample.
+        # A change after the target but before that sample disqualifies control.
+        from .publish_occurrence import publish_occurrence_witness
+        witness, _ = publish_occurrence_witness(selected, receive, events)
+        if witness is not None and any(
+                not strictly_after_sample(row, events[witness["control_ref"]]) for row in changes):
+            return pair
+        # If authentication failed, let the caller retain the strict failure;
+        # never substitute a different sample or a weaker attribution path.
+    return selected
 
 
 def payload_delivery_witness(pair, receive, events):
