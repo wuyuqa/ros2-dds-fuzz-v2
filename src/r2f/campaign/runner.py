@@ -34,9 +34,20 @@ ISOLATED_RUNTIME = 'isolated_netns'
 RUNTIME_BOUNDARIES = (HOST_RUNTIME, ISOLATED_RUNTIME)
 
 
+def _validate_expected_source_manifest(source, expected_source_manifest):
+    """Bind a caller's optional pin to the measured, complete intake source."""
+    if expected_source_manifest is not None and source != expected_source_manifest:
+        raise ValueError("expected_source_manifest_mismatch")
+
+
 def plan_campaign(output_dir, *, repo=None, run_id=None, domain_id=173, seed=0,
-                  target_id=EXECUTION_ORDER[0], parameters=None):
-    """Build input capsules offline; planning never implies reached or executed."""
+                  target_id=EXECUTION_ORDER[0], parameters=None,
+                  expected_source_manifest=None):
+    """Build input capsules offline; planning never implies reached or executed.
+
+    An optional expected_source_manifest must equal the entire measured intake
+    source; a mismatch raises before any plan artifacts are written.
+    """
     repo = Path(repo or Path(__file__).resolve().parents[3]).resolve()
     output_dir = Path(output_dir).resolve()
     if output_dir.exists() and any(output_dir.iterdir()):
@@ -52,9 +63,11 @@ def plan_campaign(output_dir, *, repo=None, run_id=None, domain_id=173, seed=0,
     target = registry.get_target(target_id)
     services = registry.get_services(target_id)
     scope = json.loads((repo / "config/s1_scope.json").read_text())
+    source = source_manifest(repo)
+    _validate_expected_source_manifest(source, expected_source_manifest)
     manifest = {"schema_version": 1, "run_id": run_id, "target": target.to_dict(),
                 "catalog": module.to_dict(), "scope": scope, "rule": target.rule_contract,
-                "source_manifest": source_manifest(repo), "environment_mode": "ros_overlay",
+                "source_manifest": source, "environment_mode": "ros_overlay",
                 "execution_order": list(EXECUTION_ORDER), "requested_domain": domain_id,
                 "maturity_denominator_changed": False, "applicable_rmws_requested": list(target.rmw_applicability)}
     identity = identity_hashes(manifest)
@@ -1474,13 +1487,16 @@ def run_exploratory_cycle(output_dir, *, corpus, feedback, scheduler, profile, r
                           execute=False, repo=None, run_id=None, max_inputs=None,
                           domain_id=173, continuation=None, checkpoint_hook=None,
                           runtime_boundary=HOST_RUNTIME, feedback_aggregate=None,
-                          auto_replay=None, replay_runtime=None, recipe_releases=None):
+                          auto_replay=None, replay_runtime=None, recipe_releases=None,
+                          expected_source_manifest=None):
     """Run one bounded feedback-driven exploratory cycle.
 
     ``execute=False`` performs no runtime call: rows stay ``planned`` and no
     feedback is recorded.  ``execute=True`` requires a runtime callable; the
     carrier dispatches the plan-bearing v2 identity, so the runner passes the
     same single digest it wrote to the capsule and runtime config.
+    An optional expected_source_manifest pins the entire measured intake source;
+    it does not replace the existing frozen-source or later drift checks.
     auto_replay/replay_runtime use the same bounded policy as run_campaign,
     after both original report and terminal cycle have been sealed.
     """
@@ -1556,6 +1572,7 @@ def run_exploratory_cycle(output_dir, *, corpus, feedback, scheduler, profile, r
         raise ExploratoryCycleError("invalid run_id")
 
     source = source_manifest(repo)
+    _validate_expected_source_manifest(source, expected_source_manifest)
     registry = Registry()
     register_exploratory(registry, include_required=False,
                          runtime_capability=profile.get("runtime_capability"))
