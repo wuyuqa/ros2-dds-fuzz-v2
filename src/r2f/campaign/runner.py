@@ -13,7 +13,7 @@ from r2f.core.evidence import canonical_hash
 from r2f.core.replay import ReplayCapsule
 from r2f.modules.s1.module import register
 from r2f.modules.s1.targets import EXECUTION_ORDER
-from r2f.reports.candidate_report import candidate_ledger
+from r2f.reports.candidate_report import candidate_ledger, _write_immutable_json
 from r2f.reports.run_report import (
     audit_report, identity_hashes, report_digest, write_json,
     boundary_qualification_for_row, execution_boundary_qualification,
@@ -22,6 +22,8 @@ from .identity import runtime_config, semantic_input, source_manifest
 from .runtime_adapter import ingest_execution
 from .scheduler import first_slice_cells, control_references
 from .triage import attribute
+from .anomalies import (prepare_identity, finish_evidence, runtime_exception,
+                        persist_runtime_result, wrapper_failure, record_packaging_failure)
 
 # The normal host path stays the historical default.  `isolated_netns` is an
 # explicit host-side supervisor; it never turns an injected fixture into live
@@ -137,13 +139,14 @@ def _persist(output_dir, report):
         ledger["boundary_exclusions"] = boundary_exclusions
 
     ledger_path = output_dir / "candidate_ledger.json"
-    write_json(ledger_path, ledger)
+    _write_immutable_json(ledger_path, ledger)
     report.update(candidate_ledger_path=str(ledger_path), candidate_ledger_sha256=canonical_hash(ledger))
     report["report_sha256"] = report_digest(report)
     report_path = output_dir / "report.json"
-    write_json(report_path, report)
-    report["seal"] = audit_report(report_path)
-    write_json(report_path, report)
+    audit_input = output_dir / "report-audit-input.json"
+    _write_immutable_json(audit_input, report)
+    report["seal"] = audit_report(audit_input)
+    _write_immutable_json(report_path, report)
     lines = [f"# Campaign {report['run_id']}", "", f"Target: {report['target_id']} revision {report['target_revision']}",
              f"Per-target seal: {report['seal']['sealed']}", "Full S1 required denominator: 72; this report does not establish full S1 maturity.",
              f"Natural candidates: {ledger['natural_candidate_count']}; confirmed: {ledger['confirmed_candidates']}", "",
@@ -152,7 +155,8 @@ def _persist(output_dir, report):
     for row in report["rows"]:
         lines.append(f"| {row['cell_id']} | {row['execution_stage']} | {row['oracle_verdict']} | {row.get('abort_reason') or row.get('reason_code', '')} |")
     lines += ["", "Seal errors:"] + [f"- {error}" for error in report["seal"]["errors"]]
-    (output_dir / "report.md").write_text("\n".join(lines) + "\n")
+    with (output_dir / "report.md").open("x") as stream:
+        stream.write("\n".join(lines) + "\n")
     return report
 
 
@@ -276,6 +280,18 @@ def run_campaign(output_dir, *, runtime=None, execute=False,
         runtime, formal = _resolve_execution_runtime(runtime, runtime_boundary)
     report = plan_campaign(output_dir, **options)
     report.update(runtime_boundary=runtime_boundary, formal_runtime=formal)
+    intake_manifest = json.loads(Path(report["manifest_path"]).read_text())
+    intake_source = intake_manifest["source_manifest"]
+    intake_rule = intake_manifest["rule"]["primary_rule"]
+    for row in report["rows"]:
+        prepare_identity(output_dir, row, intake_source, identity=report["identity"], rule=intake_rule)
+
+    def finish():
+        def persist_report():
+            _persist(output_dir, report)
+            return output_dir / "report.json"
+        return finish_evidence(output_dir, report, persist_report, source=intake_source)
+
     # Execution switches are persisted separately from capsule/input identity.
     # Planned qualification is pending; it is NOT an execution admission veto.
     for planned in report["rows"]:
@@ -288,7 +304,7 @@ def run_campaign(output_dir, *, runtime=None, execute=False,
         if runtime_boundary == ISOLATED_RUNTIME:
             planned["boundary_qualification"] = execution_boundary_qualification(runtime_boundary)
     if not execute:
-        return _persist(output_dir, report)
+        return finish()
     manifest = json.loads(Path(report["manifest_path"]).read_text())
     repo = Path(manifest["source_manifest"]["source_repo"])
     source = manifest["source_manifest"]
@@ -298,7 +314,7 @@ def run_campaign(output_dir, *, runtime=None, execute=False,
                        or not source.get("behavior_tree_sha256"))):
         report["abort_reason"] = "source_behavior_not_tracked_and_clean_at_HEAD"
         report["runtime_boundary"] = runtime_boundary
-        return _persist(output_dir, report)
+        return finish()
     registry = Registry()
     register(registry)
     services = registry.get_services(report["target_id"])
@@ -321,12 +337,18 @@ def run_campaign(output_dir, *, runtime=None, execute=False,
             result = services.carrier.apply(scenario, capsule.input["effective_input"],
                                             execution={"config": config, "output_dir": runtime_dir, "runtime": runtime})
         except Exception as exc:
-            result = {"real_execution": False, "runtime_status": "tool_error", "reason": f"{type(exc).__name__}:{exc}"}
+            result = runtime_exception(exc)
         # Preserve the result, including failures. run_pair already writes it; this
         # also gives injected contract runners the same artifact boundary.
-        write_json(planned["runtime_result_path"], result)
-        execution = ingest_execution(scenario, config, result, capsule, services=services)
-        row = dict(planned, **execution)
+        try:
+            persist_runtime_result(planned["runtime_result_path"], result)
+            execution = ingest_execution(scenario, config, result, capsule, services=services)
+            row = dict(planned, **execution)
+            if result.get("runner_exception"):
+                row["runner_exception"] = result["runner_exception"]
+        except Exception as exc:
+            row = wrapper_failure(planned, exc)
+            result = runtime_exception(exc)
         row["actual_submitted_payload_sha256"] = canonical_hash(capsule.input["effective_input"]["final_input"])
         row["replay_status"] = "not_run"
         row["provenance"] = {"source_manifest": manifest["source_manifest"], "runtime_execution": row.get("runtime_execution_metadata"), "raw_sha256": row.get("raw_sha256"), "observation_path": "isolated_discovery_activity_and_public_pair" if report["target_id"] == EXECUTION_ORDER[2] else "independent_passive_sedp_and_public_graph" if report["target_id"] == EXECUTION_ORDER[3] else "public_rclpy_graph_and_message_info"}
@@ -336,8 +358,13 @@ def run_campaign(output_dir, *, runtime=None, execute=False,
                 capsule.record_execution(row)
             except ValueError as exc:
                 row["capsule_execution_error"] = str(exc)
-        write_json(planned["replay_path"], capsule.to_dict())
         report["rows"][index] = row
+        try:
+            write_json(planned["replay_path"], capsule.to_dict())
+        except Exception as exc:
+            record_packaging_failure(row, exc, planned["replay_path"])
+            report["abort_reason"] = "packaging_failure"
+            break
         qualification = execution_boundary_qualification(runtime_boundary, config=config,
                                                       result=result, row=row, formal_runtime=formal,
                                                       output_root=runtime_dir)
@@ -366,7 +393,7 @@ def run_campaign(output_dir, *, runtime=None, execute=False,
         row.update(controls_support_sut=passed and equal_payload, provenance_supports_sut=passed and equal_payload)
         if "oracle" in row:
             row.update(attribute(row, row.get("typed_facts", {}), row["oracle"]))
-    return _persist(output_dir, report)
+    return finish()
 
 
 
@@ -1320,13 +1347,12 @@ def _persist_topology_exploratory_report(output_dir, cycle, registry):
     ledger = exploratory_candidate_ledger(eligible)
     if exclusions:
         ledger["execution_exclusions"] = exclusions
-    _atomic_json(output_dir / "candidate_ledger.json", ledger)
+    _write_immutable_json(output_dir / "candidate_ledger.json", ledger)
     report.update(candidate_ledger_path="candidate_ledger.json", candidate_ledger_sha256=canonical_hash(ledger))
     report["report_sha256"] = exploratory_report_digest(report)
     path = output_dir / "report.json"
-    _atomic_json(path, report)
-    report["audit"] = audit_exploratory_report(path)
-    _atomic_json(path, report)
+    report["audit"] = audit_exploratory_report(path, report=report)
+    _write_immutable_json(path, report)
     return path
 
 
@@ -2050,17 +2076,27 @@ def run_exploratory_cycle(output_dir, *, corpus, feedback, scheduler, profile, r
         result["boundary_qualifications"] = {
             row["cell_id"]: row.get("boundary_qualification", execution_boundary_qualification(runtime_boundary))
             for row in rows}
-    _atomic_json(output_dir / "selection_log.json", scheduler.to_dict())
-    _atomic_json(output_dir / "feedback.json", feedback.to_dict())
-    _atomic_json(output_dir / "corpus.json", corpus.to_dict())
-    if (profile.get("runtime_capability") == TOPOLOGY_CAPABILITY
-            or set(profile["target_ids"]).issubset(_F1_CYCLE_TARGETS)):
-        result["report_path"] = str(_persist_exploratory_report(output_dir, result, registry))
-    if feedback_aggregate is not None:
-        result["feedback_aggregate"] = _terminal_feedback_aggregate(
-            feedback_aggregate, result, registry, output_dir=output_dir, repo=repo)
-    _atomic_json(output_dir / "cycle.json", result)
-    return result
+    for name, value in (("selection_log.json", scheduler.to_dict()),
+                        ("feedback.json", feedback.to_dict()), ("corpus.json", corpus.to_dict())):
+        try:
+            _atomic_json(output_dir / name, value)
+        except Exception as exc:
+            record_packaging_failure(result, exc, output_dir / name)
+    def persist_report():
+        if (profile.get("runtime_capability") == TOPOLOGY_CAPABILITY
+                or set(profile["target_ids"]).issubset(_F1_CYCLE_TARGETS)):
+            path = _persist_exploratory_report(output_dir, result, registry)
+            result["report_path"] = str(path)
+            return path
+
+    def persist_terminal():
+        if feedback_aggregate is not None:
+            result["feedback_aggregate"] = _terminal_feedback_aggregate(
+                feedback_aggregate, result, registry, output_dir=output_dir, repo=repo)
+        _write_immutable_json(output_dir / "cycle.json", result)
+
+    return finish_evidence(output_dir, result, persist_report, source=source,
+                           terminal=persist_terminal)
 
 
 def _build_case_plan(entry, target, contract, surface, parent, mutator_id,
@@ -2489,6 +2525,11 @@ def _generate_case(sequence, entry, target, contract, surface, parent, mutator_i
         if not execute:
             row.update(candidate_eligible=False, feedback_eligible=False, seal_eligible=False)
 
+    prepare_identity(output_dir, row, source,
+                     identity={"source_sha256": canonical_hash(source),
+                               "target_sha256": canonical_hash(target.to_dict()),
+                               "rule_sha256": canonical_hash(target.rule_contract)},
+                     rule=target.rule_contract.get("primary_rule"))
     _atomic_json(plan_path, plan.to_dict())
     _atomic_json(capsule_path, capsule.to_dict())
     _atomic_json(config_path, config)
@@ -2570,14 +2611,16 @@ def _generate_case(sequence, entry, target, contract, surface, parent, mutator_i
                        "output_dir": result_path.parent,
                        "runtime": runtime})
     except Exception as exc:
-        import traceback as _traceback
-        runtime_result = {"real_execution": False, "runtime_status": "tool_error",
-                          "reason": f"{type(exc).__name__}:{exc}",
-                          "evidence_origin": "injected_runtime",
-                          "tool_error_traceback": _traceback.format_exc()}
-    _atomic_json(result_path, runtime_result)
-    execution = ingest_execution(scenario, config, runtime_result, capsule, services=services)
-    row.update(execution)
+        runtime_result = runtime_exception(exc)
+    try:
+        persist_runtime_result(result_path, runtime_result)
+        execution = ingest_execution(scenario, config, runtime_result, capsule, services=services)
+        row.update(execution)
+        if runtime_result.get("runner_exception"):
+            row["runner_exception"] = runtime_result["runner_exception"]
+    except Exception as exc:
+        row.update(wrapper_failure(row, exc))
+        runtime_result = runtime_exception(exc)
     # Deterministic/input fields keep the plan identity; ingest cannot change them.
     row.update({
         "surface_id": surface.surface_id, "surface_ids": [surface.surface_id],
@@ -2606,7 +2649,13 @@ def _generate_case(sequence, entry, target, contract, surface, parent, mutator_i
             capsule.record_execution(row)
         except ValueError as exc:
             row["capsule_execution_error"] = str(exc)
-    _atomic_json(capsule_path, capsule.to_dict())
+    try:
+        _atomic_json(capsule_path, capsule.to_dict())
+    except Exception as exc:
+        record_packaging_failure(row, exc, capsule_path)
+        row.update(candidate_eligible=False, feedback_eligible=False, seal_eligible=False,
+                   corpus_offer={"accepted": False, "reason": "packaging_failure"})
+        return row
     if row.get("execution_stage") == "judged" and row.get("actual_run") is True:
         budget["executed"] += 1
 

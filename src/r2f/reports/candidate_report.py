@@ -566,3 +566,174 @@ def audit_projection(candidate):
     if item.get("non_replayable"):
         item["non_replayable"].pop("timestamp", None)
     return item
+
+
+def query_runner_evidence(output_dir):
+    """Verify derived runner attachments without granting execution or candidates.
+
+    The existing report/auditor remains the source of verdict and seal decisions.
+    Missing exports are named tool problems; changed referenced bytes are errors.
+    """
+    from r2f.core.evidence import raw_sha256
+    root = Path(output_dir).resolve()
+    packets, identities, errors, problems = [], [], [], []
+
+    def checked_path(ref):
+        if not isinstance(ref, dict) or not isinstance(ref.get('path'), str):
+            raise ValueError('runner_evidence_invalid_reference')
+        path = (root / ref['path']).resolve()
+        if not path.is_relative_to(root):
+            raise ValueError('runner_evidence_reference_outside_root')
+        if raw_sha256(path) != ref.get('sha256'):
+            raise ValueError('runner_evidence_hash_mismatch:' + ref['path'])
+        return path
+
+    def read_ref(ref):
+        data = json.loads(checked_path(ref).read_text())
+        if not isinstance(data, dict):
+            raise ValueError('runner_evidence_object_required')
+        return data
+
+    def bind_raw(raw, known):
+        if known.get('raw_path') is None and known.get('raw_sha256') is None:
+            return
+        if (raw.get('raw_path') is None or known.get('raw_path') is None
+                or (root / raw['raw_path']).resolve() != (root / known['raw_path']).resolve()
+                or raw.get('raw_sha256') != known.get('raw_sha256')):
+            raise ValueError('runner_evidence_raw_binding_mismatch')
+        checked_path({'path': known['raw_path'], 'sha256': known.get('raw_sha256')})
+
+    try:
+        try:
+            index = json.loads((root / 'evidence-index.json').read_text())
+        except OSError as exc:
+            problems.append({'kind': 'evidence_index_unavailable',
+                             'error_type': type(exc).__name__, 'detail': str(exc)})
+            raise
+        if not isinstance(index, dict) or index.get('schema_version') != 'r2f.runner-evidence-index/v1':
+            raise ValueError('runner_evidence_index_schema')
+        manifest = read_ref(index.get('manifest'))
+        source = index.get('source_manifest')
+        if not isinstance(source, dict) or source != manifest.get('source_manifest'):
+            raise ValueError('runner_evidence_source_mismatch')
+        if index.get('run_id') != manifest.get('run_id'):
+            raise ValueError('runner_evidence_run_mismatch')
+        problems = index['tool_problems']
+        if any(not isinstance(index.get(key), list)
+               for key in ('packets', 'identities', 'reports', 'tool_problems')):
+            raise ValueError('runner_evidence_index_shape')
+        by_cell = {}
+        for ref in index['identities']:
+            saved = read_ref(ref)
+            cell = saved.get('cell_id')
+            if (not isinstance(cell, str) or cell in by_cell or cell != ref.get('cell_id')
+                    or saved.get('run_id') != index['run_id']
+                    or saved.get('source_manifest') != source):
+                raise ValueError('runner_evidence_saved_identity_mismatch')
+            by_cell[cell] = (saved, ref)
+            identities.append(saved)
+        for ref in index['packets']:
+            packet = read_ref(ref)
+            if packet.get('schema_version') != REVIEW_PACKET_SCHEMA:
+                raise ValueError('runner_evidence_review_packet_schema')
+            saved = read_ref(packet.get('intake_identity'))
+            if (saved.get('source_manifest') != source
+                    or saved.get('run_id') != index['run_id']
+                    or saved.get('cell_id') != ref.get('cell_id')
+                    or packet.get('packet_id') != f"{saved['run_id']}:{saved['cell_id']}"):
+                raise ValueError('runner_evidence_identity_mismatch')
+            expected, identity_ref = by_cell[saved['cell_id']]
+            if (expected != saved or packet['intake_identity'] !=
+                    {key: identity_ref[key] for key in ('path', 'sha256')}):
+                raise ValueError('runner_evidence_identity_reference_mismatch')
+            identity = packet.get('identity')
+            if not isinstance(identity, dict):
+                raise ValueError('runner_evidence_packet_identity_shape')
+            if identity.get('source') != canonical_hash(source):
+                raise ValueError('runner_evidence_source_mismatch')
+            for key in ('target_id', 'target_revision'):
+                if identity.get(key) != saved.get(key):
+                    raise ValueError('runner_evidence_identity_mismatch:' + key)
+            for key in ('target_sha256', 'rule_sha256'):
+                if identity.get(key) != saved.get('identity', {}).get(key):
+                    raise ValueError('runner_evidence_definition_mismatch:' + key)
+            if (packet.get('input', {}).get('effective_input_sha256') != saved.get('effective_input_sha256')
+                    or identity.get('rule') != saved.get('rule_id')):
+                raise ValueError('runner_evidence_input_or_rule_mismatch')
+            diagnostic = packet.get('runner_diagnostic')
+            if not isinstance(diagnostic, dict) or not isinstance(diagnostic.get('artifacts'), list):
+                raise ValueError('runner_evidence_diagnostic_shape')
+            result_path = saved.get('planned_row', {}).get('runtime_result_path')
+            runtime_dir = (Path(result_path).resolve().parent
+                           if isinstance(result_path, str) else None)
+            runtime = None
+            for artifact in diagnostic['artifacts']:
+                artifact_path = checked_path(artifact)
+                if runtime_dir is None or not artifact_path.is_relative_to(runtime_dir):
+                    raise ValueError('runner_evidence_diagnostic_cell_mismatch')
+            # The sealed plan names the runtime result independently of the
+            # packet's artifact list, including when report export failed.
+            if runtime_dir is not None and Path(result_path).is_file():
+                try:
+                    runtime = json.loads(Path(result_path).read_text())
+                    if not isinstance(runtime, dict):
+                        raise ValueError('runner_evidence_runtime_shape')
+                except (OSError, ValueError) as exc:
+                    # A worker can exit while publishing its result. Retain
+                    # its hash-checked diagnostic, without qualifying a run.
+                    runtime = None
+                    errors.append('runner_evidence_runtime_unreadable:' + saved['cell_id'])
+                    problems.append({'kind': 'unreadable_runtime_result',
+                                     'cell_id': saved['cell_id'], 'path': result_path,
+                                     'error_type': type(exc).__name__, 'detail': str(exc)})
+            if runtime is not None:
+                for embedded in (runtime, runtime.get('execution_metadata'), runtime.get('execution')):
+                    if not isinstance(embedded, dict):
+                        continue
+                    for key in ('run_id', 'cell_id', 'target_id', 'target_revision',
+                                'rmw', 'arm', 'repeat', 'effective_input_sha256', 'rule_id'):
+                        if key in embedded and embedded[key] != saved.get(key):
+                            raise ValueError('runner_evidence_runtime_identity_mismatch:' + key)
+            raw = packet.get('raw')
+            if not isinstance(raw, dict):
+                raise ValueError('runner_evidence_raw_shape')
+            if raw.get('raw_path') is not None:
+                raw_path = checked_path({'path': raw['raw_path'], 'sha256': raw.get('raw_sha256')})
+                result_path = saved.get('planned_row', {}).get('runtime_result_path')
+                if (not isinstance(result_path, str)
+                        or not raw_path.is_relative_to(Path(result_path).resolve().parent)):
+                    raise ValueError('runner_evidence_raw_identity_mismatch')
+                if runtime is not None:
+                    bind_raw(raw, runtime)
+            packets.append(packet)
+        packets_by_cell = {p['packet_id']: p for p in packets}
+        for ref in index['reports']:
+            report = read_ref(ref)
+            if report.get('run_id') != index['run_id']:
+                raise ValueError('runner_evidence_report_identity_mismatch')
+            if 'source_manifest' in report and (not isinstance(report['source_manifest'], dict)
+                                                or report['source_manifest'] != source):
+                raise ValueError('runner_evidence_report_source_mismatch')
+            rows = report.get('rows')
+            if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+                raise ValueError('runner_evidence_report_rows_shape')
+            if {row.get('cell_id') for row in rows} != set(by_cell) or len(rows) != len(by_cell):
+                raise ValueError('runner_evidence_report_row_set_mismatch')
+            for row in rows:
+                saved = by_cell[row['cell_id']][0]
+                packet = packets_by_cell.get(f"{saved['run_id']}:{saved['cell_id']}")
+                if packet is not None:
+                    bind_raw(packet['raw'], row)
+                for key in ('run_id', 'cell_id', 'target_id', 'target_revision', 'rmw', 'arm',
+                            'repeat', 'effective_input_sha256'):
+                    if row.get(key) != saved.get(key):
+                        raise ValueError('runner_evidence_report_row_identity_mismatch:' + key)
+                if row.get('rule_id') is not None and row['rule_id'] != saved.get('rule_id'):
+                    raise ValueError('runner_evidence_report_row_identity_mismatch:rule_id')
+        return {'evidence_valid': not errors, 'errors': errors, 'run_id': index['run_id'],
+                'packets': packets, 'identities': identities,
+                'tool_problems': problems, 'reports': index['reports']}
+    except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
+        errors.append('runner_evidence_invalid:' + str(exc))
+        return {'evidence_valid': False, 'errors': errors, 'packets': packets,
+                'tool_problems': problems, 'identities': identities}
