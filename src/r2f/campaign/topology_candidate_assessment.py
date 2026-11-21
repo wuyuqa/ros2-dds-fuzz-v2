@@ -9,6 +9,7 @@ from r2f.core.candidate import _validate_observation_identity, topology_observat
 from r2f.core.evidence import canonical_hash
 from r2f.core.execution import validate_execution
 from r2f.core.oracle import attribute_responsibility
+from r2f.core.observation_status import observation_complete
 from r2f.core.replay import (_v2_execution_input, conformance_signature,
                              validate_replay_input)
 
@@ -177,11 +178,27 @@ def finalize_assessment(scenario, config, capsule, row, *, boundary, qualificati
         checks['concrete_anomaly_signature'] = conformance_signature(row) is not None
         assessment['final'] = _stage('runner_formal_qualification', checks, pending, binding)
         row['candidate_eligible'] = assessment['final']['qualified'] is True
+    # A healthy primary pass has no anomaly to admit. Retain every observation,
+    # input/raw/source and formal gate, excluding only candidate-specific checks.
+    facts, oracle = row.get('typed_facts') or {}, row.get('oracle') or {}
+    healthy_pass_evaluable = (
+        row.get('execution_stage') == 'judged' and row.get('oracle_verdict') == 'pass'
+        and oracle.get('verdict') == 'pass' and oracle.get('rule_id') == RULE
+        and oracle.get('rule_role') == 'primary' and oracle.get('forbidden_residuals') == []
+        and not facts.get('unknown_reasons') and observation_complete(row)
+        and not pending
+        and all(passed is True for name, passed in assessment['provider']['checks'].items()
+                if name not in ('primary_fail', 'typed_residuals'))
+        and all(passed is True for name, passed in upstream['checks'].items()
+                if name not in ('provider_known_checks', 'canonical_judged_fail',
+                                'provider_scoped_eligibility_declaration'))
+        and all(passed is True for name, passed in checks.items() if name != 'ingest_known_checks'))
     attribution = dict(row, environment_healthy=facts_value(row, 'environment_healthy'),
         preconditions_reached=facts_value(row, 'preconditions_reached'),
         identity_complete=upstream['checks'].get('raw_lineage_pair_proofs_valid') is True,
         window_complete=facts_value(row, 'observation_complete'),
-        expected_effect_evaluable=row['candidate_eligible'], expected_effect_set=scenario.target.expected_effect_set,
+        expected_effect_evaluable=row['candidate_eligible'] or healthy_pass_evaluable,
+        expected_effect_set=scenario.target.expected_effect_set,
         primary_rule_violated=row.get('oracle_verdict') == 'fail' and row['candidate_eligible'],
         controls_support_sut=False, provenance_supports_sut=False)
     original_reason = (capsule.execution or {}).get('reason_code')
