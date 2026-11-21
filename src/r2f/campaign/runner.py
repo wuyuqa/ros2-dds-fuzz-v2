@@ -266,11 +266,14 @@ def _resolve_execution_runtime(runtime=None, runtime_boundary=HOST_RUNTIME):
 
 
 def run_campaign(output_dir, *, runtime=None, execute=False,
-                 runtime_boundary=HOST_RUNTIME, **options):
+                 runtime_boundary=HOST_RUNTIME, auto_replay=None, replay_runtime=None, **options):
     """Sequential cells, never parallel campaigns. Default is offline plan only.
 
     The owner coordinates actual execution; execute=True is an explicit action.
     An injected runner is for contract testing and is not proof of ROS execution.
+    auto_replay declares output_dir, domain_ids and max_attempts; attempts run
+    after original evidence sealing. replay_runtime injection is offline-only.
+    query_runner_evidence exposes associations without revising this report.
     """
     output_dir = Path(output_dir).resolve()
     if runtime_boundary not in RUNTIME_BOUNDARIES:
@@ -290,7 +293,10 @@ def run_campaign(output_dir, *, runtime=None, execute=False,
         def persist_report():
             _persist(output_dir, report)
             return output_dir / "report.json"
-        return finish_evidence(output_dir, report, persist_report, source=intake_source)
+        return finish_evidence(output_dir, report, persist_report, source=intake_source,
+                               automatic_replay={"policy": auto_replay, "runtime": replay_runtime,
+                                                 "execute": execute, "runtime_boundary": runtime_boundary,
+                                                 "fixture_original": not formal})
 
     # Execution switches are persisted separately from capsule/input identity.
     # Planned qualification is pending; it is NOT an execution admission veto.
@@ -1467,13 +1473,16 @@ def _terminal_feedback_aggregate(path, cycle, registry, *, output_dir, repo):
 def run_exploratory_cycle(output_dir, *, corpus, feedback, scheduler, profile, runtime=None,
                           execute=False, repo=None, run_id=None, max_inputs=None,
                           domain_id=173, continuation=None, checkpoint_hook=None,
-                          runtime_boundary=HOST_RUNTIME, feedback_aggregate=None):
+                          runtime_boundary=HOST_RUNTIME, feedback_aggregate=None,
+                          auto_replay=None, replay_runtime=None):
     """Run one bounded feedback-driven exploratory cycle.
 
     ``execute=False`` performs no runtime call: rows stay ``planned`` and no
     feedback is recorded.  ``execute=True`` requires a runtime callable; the
     carrier dispatches the plan-bearing v2 identity, so the runner passes the
     same single digest it wrote to the capsule and runtime config.
+    auto_replay/replay_runtime use the same bounded policy as run_campaign,
+    after both original report and terminal cycle have been sealed.
     """
     if not isinstance(corpus, Corpus):
         raise ExploratoryCycleError("exploratory cycle requires a Corpus")
@@ -2096,7 +2105,10 @@ def run_exploratory_cycle(output_dir, *, corpus, feedback, scheduler, profile, r
         _write_immutable_json(output_dir / "cycle.json", result)
 
     return finish_evidence(output_dir, result, persist_report, source=source,
-                           terminal=persist_terminal)
+                           terminal=persist_terminal,
+                           automatic_replay={"policy": auto_replay, "runtime": replay_runtime,
+                                             "execute": execute, "runtime_boundary": runtime_boundary,
+                                             "fixture_original": not formal_runtime})
 
 
 def _build_case_plan(entry, target, contract, surface, parent, mutator_id,

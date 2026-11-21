@@ -7,7 +7,7 @@ from pathlib import Path
 
 from r2f.core.evidence import canonical_hash, raw_sha256
 from r2f.reports.candidate_report import (
-    _write_immutable_json, review_packet, write_review_packet,
+    _write_immutable_json, review_packet, write_review_packet, validate_runner_replay_capsule,
 )
 
 IDENTITY_KEYS = ('run_id', 'cell_id', 'target_id', 'target_revision', 'rmw', 'arm',
@@ -156,7 +156,7 @@ def collect_packets(root, record, *, source):
             exception = row.get('runner_exception')
             packet['runner_diagnostic'] = {
                 'kind': _kind(row, runtime), 'candidate_eligible': False,
-                'replay_status': 'not_run', 'replay_reason': 'automatic_replay_outside_cp2',
+                'replay_status': 'not_run', 'replay_reason': 'not_run_at_original_seal',
                 'execution_stage': row.get('execution_stage'),
                 'actual_run': None if exception else row.get('actual_run'),
                 'error': exception, 'artifacts': artifacts, 'runtime': runtime,
@@ -195,7 +195,7 @@ def collect_packets(root, record, *, source):
     return {'packets': packets, 'identities': identities, 'tool_problems': problems}
 
 
-def finish_evidence(root, record, persist, *, source, terminal=None):
+def finish_evidence(root, record, persist, *, source, terminal=None, automatic_replay=None):
     """Keep a last, immutable attachment index even if report packaging fails."""
     root = Path(root)
     intake = collect_packets(root, record, source=source)
@@ -231,4 +231,152 @@ def finish_evidence(root, record, persist, *, source, terminal=None):
         intake['tool_problems'].append({'kind': 'evidence_index_export_failure',
                                        'error_type': type(exc).__name__, 'detail': str(exc)})
         record['anomaly_intake'] = deepcopy(intake)
+    if automatic_replay is not None:
+        try:
+            automatic_replays(root, record, **automatic_replay)
+        except Exception as exc:
+            # Original packets/report/index are already published. Preserve the
+            # attachment failure separately, including any durable dispatches.
+            problem = {'kind': 'automatic_replay_attachment_failure',
+                       'run_id': record['run_id'], 'error_type': type(exc).__name__,
+                       'detail': str(exc)}
+            record['anomaly_intake']['tool_problems'].append(problem)
+            try:
+                _write_immutable_json(root / 'replay-failure.json', problem)
+            except OSError:
+                pass  # Existing dispatch requests remain queryable on export failure.
     return record
+
+
+def automatic_replays(root, record, *, policy, runtime, execute, runtime_boundary, fixture_original):
+    """Append associations to existing replay attempts; never revise original evidence.
+
+    A policy declares output_dir, max_attempts and domain_ids. Domains are requests,
+    not clearance: replay_cell and its canonical runtime retain all admission gates.
+    Injected runtime callables are exclusively offline fixture boundaries.
+    """
+    import uuid
+    from .replay import replay_cell
+    from r2f.reports.candidate_report import query_runner_evidence
+
+    root = Path(root).resolve()
+    originals = [reference(root, p) for p in sorted(root.rglob('*')) if p.is_file()]
+    original_query = query_runner_evidence(root)
+    entries, used = [], 0
+    valid_policy = isinstance(policy, dict)
+    budget = policy.get('max_attempts') if valid_policy else None
+    domains = policy.get('domain_ids') if valid_policy else None
+    output = policy.get('output_dir') if valid_policy else None
+
+    def unchanged():
+        return all((root / ref['path']).is_file()
+                   and raw_sha256(root / ref['path']) == ref['sha256'] for ref in originals)
+
+    for row in record['rows']:
+        entry = {'cell_id': row['cell_id'], 'status': 'not_run', 'candidate_eligible': False,
+                 'original_confirmed': False, 'internal_state_recovery': False}
+        reason = None
+        if not execute:
+            reason = 'original_execution_not_requested'
+        elif policy is None:
+            reason = 'automatic_replay_not_requested'
+        elif not valid_policy:
+            reason = 'replay_policy_invalid'
+        elif not original_query['evidence_valid']:
+            reason = 'original_evidence_invalid'
+        elif not (root / 'report.json').is_file():
+            reason = 'original_report_unavailable'
+        elif row.get('execution_stage') == 'planned':
+            reason = 'original_execution_unavailable'
+        elif row.get('arm') == 'negative' or row.get('campaign_kind') == 'negative':
+            reason = 'control_not_eligible_for_automatic_replay'
+        elif not row.get('replay_path') or not Path(row['replay_path']).is_file():
+            reason = 'original_capsule_unavailable'
+        elif type(budget) is not int or budget < 0:
+            reason = 'replay_budget_not_declared'
+        elif used >= budget:
+            reason = 'replay_budget_exhausted'
+        elif not isinstance(domains, list) or used >= len(domains):
+            reason = 'fresh_domain_not_configured'
+        elif domains[used] in domains[:used]:
+            reason = 'fresh_domain_reused'
+        elif not isinstance(output, str) or not output.strip():
+            reason = 'replay_output_not_configured'
+        elif fixture_original and runtime is None:
+            reason = 'fixture_replay_runtime_not_supplied'
+        elif not unchanged():
+            reason = 'original_artifact_changed'
+        if reason is not None:
+            entry['reason_code'] = reason
+            entries.append(entry)
+            continue
+
+        # Read sealed identity/report bytes, never infer identity from the path
+        # or the mutable in-memory row. Query independently repeats this check.
+        try:
+            saved, = [item for item in original_query['identities'] if item['cell_id'] == row['cell_id']]
+            original = json.loads((root / 'report.json').read_text())
+            original_row, = [item for item in original['rows'] if item['cell_id'] == row['cell_id']]
+            entry['capsule_binding'] = validate_runner_replay_capsule(row['replay_path'], saved, original_row)
+        except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
+            entry.update(reason_code=str(exc).split(':', 1)[0], detail=str(exc))
+            entries.append(entry)
+            continue
+
+        dispatch_id = 'replay-' + uuid.uuid4().hex
+        directory = root / 'replay-scheduling' / dispatch_id
+        destination = Path(output).resolve() / dispatch_id
+        request = {'dispatch_id': dispatch_id, 'run_id': record['run_id'],
+                   'cell_id': row['cell_id'], 'intake_identity': reference(root, identity_path(root, row['cell_id'])),
+                   'original_index': reference(root, root / 'evidence-index.json'),
+                   'capsule': reference(root, row['replay_path']),
+                   'output_dir': str(destination), 'domain_id': domains[used],
+                   'runtime_boundary': runtime_boundary, 'injected_runtime': runtime is not None,
+                   'max_attempts': budget, 'attempt_ordinal': used + 1}
+        # Durable dispatch request precedes reserve/preflight/runtime/packaging.
+        used += 1
+        try:
+            _write_immutable_json(directory / 'request.json', request)
+        except Exception as exc:
+            entry.update(reason_code='replay_request_export_failed', dispatch_id=dispatch_id,
+                         error_type=type(exc).__name__, detail=str(exc),
+                         requested_output_dir=str(destination))
+            entries.append(entry)
+            continue
+        entry.update(dispatch_id=dispatch_id, request=reference(root, directory / 'request.json'))
+        try:
+            if runtime is not None:
+                from .runner import _resolve_execution_runtime
+                _, formal = _resolve_execution_runtime(runtime, runtime_boundary)
+                if formal:
+                    raise ValueError('automatic replay callable injection is offline-only; canonical runtime uses runtime=None')
+            replay = replay_cell(row['replay_path'], output_dir=destination,
+                                 domain_id=request['domain_id'], runtime=runtime,
+                                 runtime_boundary=runtime_boundary)
+            path = Path(replay['report_path'])
+            entry.update(status=replay['status'], reason_code=replay.get('reason_code') or 'replay_completed',
+                         replay_report={'path': str(path), 'sha256': raw_sha256(path)},
+                         replay_attempt={'path': str(destination / 'attempt.json'),
+                                         'sha256': raw_sha256(destination / 'attempt.json')},
+                         real_ros_execution=replay.get('real_ros_execution', False),
+                         runtime_invoked=replay['runtime_invoked'],
+                         real_runtime_attempt=replay.get('real_runtime_attempt', False),
+                         qualification_errors=replay.get('qualification_errors', []))
+        except Exception as exc:
+            entry.update(status='scheduling_failed', reason_code='replay_dispatch_failed',
+                         error_type=type(exc).__name__, detail=str(exc), real_ros_execution=False)
+        entry['original_artifacts_unchanged'] = unchanged()
+        if not entry['original_artifacts_unchanged']:
+            entry.update(status='fail_artifact', reason_code='original_artifact_changed',
+                         real_ros_execution=False)
+        _write_immutable_json(directory / 'outcome.json', entry)
+        entry['outcome'] = reference(root, directory / 'outcome.json')
+        entries.append(entry)
+    summary = {'schema_version': 'r2f.runner-auto-replay/v1', 'run_id': record['run_id'],
+               'original_index': (reference(root, root / 'evidence-index.json')
+                                  if (root / 'evidence-index.json').is_file() else None),
+               'policy': deepcopy(policy),
+               'original_artifacts': originals, 'original_artifacts_unchanged': unchanged(),
+               'entries': entries}
+    summary['summary_sha256'] = canonical_hash(summary)
+    _write_immutable_json(root / 'replay-summary.json', summary)
