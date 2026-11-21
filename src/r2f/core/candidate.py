@@ -305,6 +305,81 @@ def _existing_reference(value, field):
     return os.path.abspath(value)
 
 
+def validate_review_evidence(evidence_refs):
+    """Use the same evidence-reference boundary at append and lifecycle intake."""
+    if not isinstance(evidence_refs, dict) or not evidence_refs:
+        raise ValueError("review requires source/raw/capsule evidence references")
+    unknown = set(evidence_refs) - REVIEW_EVIDENCE_KEYS
+    if unknown:
+        raise ValueError("review evidence has unknown references: " + ",".join(sorted(unknown)))
+    resolved = {}
+    for key in ("source", "raw", "capsule"):
+        value = evidence_refs.get(key)
+        nonempty(value, f"review.evidence_refs.{key}")
+        if not _SOURCE_REF.fullmatch(value):
+            raise ValueError(f"review evidence reference is not a path/commit: {key}")
+        resolved[key] = _existing_reference(value, key)
+    # Optional extra references must also point at real artefacts when they
+    # look like local paths; a bare label cannot stand in for evidence.
+    for key, value in evidence_refs.items():
+        if key in resolved:
+            continue
+        nonempty(value, f"review.evidence_refs.{key}")
+        if isinstance(value, str) and ("/" in value or os.sep in value):
+            resolved[key] = _existing_reference(value, key)
+    return resolved
+
+
+def validate_root_cause(root_cause, evidence_refs):
+    """Optional agent analysis, bound to the review's hashed evidence references."""
+    if root_cause is None:
+        return
+    if not isinstance(root_cause, dict) or set(root_cause) != {
+            "id", "novelty", "operation", "reason", "evidence_keys", "related_record_ids"}:
+        raise ValueError("root_cause_schema_invalid")
+    root = root_cause["id"]
+    if root is not None:
+        nonempty(root, "root_cause.id")
+    if root_cause["novelty"] not in ("new", "historical", "unknown"):
+        raise ValueError("root_cause_novelty_invalid")
+    if root_cause["operation"] not in ("assign", "merge", "split", "revoke"):
+        raise ValueError("root_cause_operation_invalid")
+    if root_cause["operation"] == "revoke" and root is not None:
+        raise ValueError("root_cause_revoke_requires_unresolved")
+    if root is None and root_cause["novelty"] != "unknown":
+        raise ValueError("root_cause_unresolved_novelty_invalid")
+    nonempty(root_cause["reason"], "root_cause.reason")
+    keys = root_cause["evidence_keys"]
+    if (not isinstance(keys, list) or not keys or any(
+            not isinstance(key, str) or key not in evidence_refs for key in keys)
+            or len(set(keys)) != len(keys)):
+        raise ValueError("root_cause_evidence_invalid")
+    related = root_cause["related_record_ids"]
+    if (not isinstance(related, list) or any(not isinstance(ref, str) or not ref.strip() for ref in related)
+            or len(set(related)) != len(related)):
+        raise ValueError("root_cause_relationship_invalid")
+
+
+def validate_tool_repair_handoff(handoff, attribution, evidence_refs):
+    """A tool handoff describes work; it grants no execution or confirmation."""
+    if handoff is None:
+        return
+    if (attribution != "tool" or not isinstance(handoff, dict) or set(handoff) != {
+            "location_basis", "trigger", "verification_requirements", "evidence_keys"}):
+        raise ValueError("tool_repair_handoff_schema_invalid")
+    for key in ("location_basis", "trigger"):
+        nonempty(handoff[key], "tool_repair_handoff." + key)
+    requirements = handoff["verification_requirements"]
+    if (not isinstance(requirements, list) or not requirements or any(
+            not isinstance(item, str) or not item.strip() for item in requirements)):
+        raise ValueError("tool_repair_verification_requirements_invalid")
+    keys = handoff["evidence_keys"]
+    if (not isinstance(keys, list) or not keys or any(
+            not isinstance(key, str) or key not in evidence_refs for key in keys)
+            or len(set(keys)) != len(keys)):
+        raise ValueError("tool_repair_evidence_invalid")
+
+
 HUMAN_ADJUDICATION_SCHEMA = "r2f.s1-human-adjudication/v1"
 
 
@@ -505,7 +580,7 @@ class CandidateLifecycle:
         return self
 
     def record_review(self, *, reviewer_id, conclusion, evidence_refs, independent_of=None,
-                      notes="", attribution=None):
+                      notes="", attribution=None, root_cause=None, tool_repair_handoff=None):
         """Append an independent review opinion.  This never confirms a candidate.
 
         ``conclusion`` is one of supported/rejected/needs_evidence.  A review
@@ -523,26 +598,7 @@ class CandidateLifecycle:
             raise ValueError("review.independent_of must be a list of identities")
         if reviewer_id in separations:
             raise ValueError("reviewer cannot review its own trigger chain/oracle work")
-        if not isinstance(evidence_refs, dict) or not evidence_refs:
-            raise ValueError("review requires source/raw/capsule evidence references")
-        unknown = set(evidence_refs) - REVIEW_EVIDENCE_KEYS
-        if unknown:
-            raise ValueError("review evidence has unknown references: " + ",".join(sorted(unknown)))
-        resolved = {}
-        for key in ("source", "raw", "capsule"):
-            value = evidence_refs.get(key)
-            nonempty(value, f"review.evidence_refs.{key}")
-            if not _SOURCE_REF.fullmatch(value):
-                raise ValueError(f"review evidence reference is not a path/commit: {key}")
-            resolved[key] = _existing_reference(value, key)
-        # Optional extra references must also point at real artefacts when they
-        # look like local paths; a bare label cannot stand in for evidence.
-        for key, value in evidence_refs.items():
-            if key in resolved:
-                continue
-            nonempty(value, f"review.evidence_refs.{key}")
-            if isinstance(value, str) and ("/" in value or os.sep in value):
-                resolved[key] = _existing_reference(value, key)
+        resolved = validate_review_evidence(evidence_refs)
         review = {"reviewer_id": reviewer_id, "conclusion": conclusion,
                   "evidence_refs": resolved,
                   "independent_of": list(separations),
@@ -552,7 +608,14 @@ class CandidateLifecycle:
             if attribution not in {"sut_candidate", "tool", "environment", "allowed", "unknown"}:
                 raise ValueError("invalid review attribution")
             review["attribution"] = attribution
+        if attribution is not None or root_cause is not None or tool_repair_handoff is not None:
             review["evidence_sha256"] = {key: raw_sha256(value) for key, value in resolved.items()}
+        validate_root_cause(root_cause, resolved)
+        validate_tool_repair_handoff(tool_repair_handoff, attribution, resolved)
+        if tool_repair_handoff is not None:
+            review["tool_repair_handoff"] = snapshot(tool_repair_handoff)
+        if root_cause is not None:
+            review["root_cause"] = snapshot(root_cause)
         self._reviews.append(review)
         self._audit("reviewed", review_id=review["review_id"], conclusion=conclusion,
                     reviewer_id=reviewer_id)

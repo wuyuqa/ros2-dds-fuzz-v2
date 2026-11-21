@@ -1824,6 +1824,21 @@ def _audit_exploratory_ledger(root, report, rows, errors, details, *, qualificat
     expected = exploratory_candidate_ledger(
         eligible_rows, reviews=report.get("review_records") or [],
         human_records=report.get("human_records") or [], human_authority=human_authority)
+    # CP3 is derived from the complete source-bound review/human histories.
+    # Legacy reports predate this optional projection; new analysis cannot shed
+    # the accounting field to bypass independent reconstruction.
+    accounting = expected["root_cause_accounting"]
+    has_accounting_analysis = any(isinstance(record, dict) and any(
+        key in record for key in ("root_cause", "tool_repair_handoff"))
+        for record in report.get("review_records") or [])
+    if ("root_cause_accounting" in ledger or has_accounting_analysis) and (
+            canonical_hash(ledger.get("root_cause_accounting")) != canonical_hash(accounting)):
+        errors.append("exploratory_ledger_mismatch:root_cause_accounting")
+    details["root_cause_accounting"] = accounting
+    for key in ("confirmed_root_causes", "independent_new_root_causes",
+                "historical_root_causes", "unknown_novelty_root_causes",
+                "unresolved_root_cause_cases"):
+        details[key] = accounting[key]
     if ledger.get("execution_exclusions", []) != exclusions:
         errors.append("topology_ledger_execution_exclusions_mismatch")
     if Counter(c.get("candidate_id") for c in ledger.get("candidates", [])) != Counter(

@@ -21,9 +21,11 @@ from pathlib import Path
 
 from r2f.core.candidate import (CandidateLifecycle, REVIEW_EVIDENCE_KEYS, topology_observation_identity,
                                 validate_human_history, validate_human_record, candidate_execution_identity,
-                                HUMAN_ADJUDICATION_SCHEMA)
+                                HUMAN_ADJUDICATION_SCHEMA, validate_root_cause, validate_tool_repair_handoff,
+                                validate_review_evidence)
 from r2f.core.evidence import canonical_hash, raw_sha256
 from r2f.core.oracle import TriageResult
+from r2f.reports.root_cause import current_review_projection, root_cause_accounting
 
 REVIEW_PACKET_SCHEMA = "r2f.s1-review-packet/v1"
 REVIEW_RECORD_SCHEMA = "r2f.s1-review-record/v1"
@@ -277,6 +279,23 @@ def exploratory_candidate_ledger(rows, reviews=None, *, human_records=None, huma
     reviews = list(reviews or [])
     candidates, failures, controls, review_errors = [], [], [], []
     originals = {f"{row.get('run_id')}:{row.get('cell_id')}": row for row in rows}
+    # Index claims before validation: even a rejected record can claim a later
+    # ID/predecessor. Accepted-prefix lookup makes qualification order-dependent.
+    claims_by_id = {}
+    def claimed_candidates(review):
+        affected = set()
+        if isinstance(review, dict):
+            if isinstance(review.get("candidate_id"), str):
+                affected.add(review["candidate_id"])
+            binding = review.get("execution_identity")
+            if isinstance(binding, dict):
+                bound_id = f"{binding.get('run_id')}:{binding.get('cell_id')}"
+                if bound_id in originals:
+                    affected.add(bound_id)
+        return affected
+    for review in reviews:
+        if isinstance(review, dict) and isinstance(review.get("record_id"), str):
+            claims_by_id.setdefault(review["record_id"], []).append(review)
     imported, by_id = [], {}
     for index, review in enumerate(reviews):
         candidate_id = review.get("candidate_id") if isinstance(review, dict) else None
@@ -293,15 +312,38 @@ def exploratory_candidate_ledger(rows, reviews=None, *, human_records=None, huma
             else:
                 problems.extend(_review_history_errors(review, imported))
         if problems:
-            review_errors.append({"index": index, "candidate_id": candidate_id,
-                                  "reason_code": "review_rejected", "detail": ",".join(problems)})
+            affected = claimed_candidates(review)
+            if isinstance(review, dict):
+                for key in ("record_id", "supersedes_record_id"):
+                    ref = review.get(key)
+                    for claim in claims_by_id.get(ref, []) if isinstance(ref, str) else []:
+                        affected.update(claimed_candidates(claim))
+            for affected_id in sorted(affected) if affected else [None]:
+                review_errors.append({"index": index, "candidate_id": affected_id,
+                                      "reason_code": "review_rejected", "detail": ",".join(problems)})
             continue
         imported.append(review)
         by_id[review["record_id"]] = review
+    invalid_review_candidates = {e["candidate_id"] for e in review_errors
+                                 if isinstance(e["candidate_id"], str)}
+    # Relationships depend on the complete referenced chain, never an accepted
+    # prefix. Rejection propagates only along explicit cross-case relationships.
+    while True:
+        dependent = {r["candidate_id"] for r in imported if any(
+            claimed_candidates(linked) & invalid_review_candidates
+            for ref in (r.get("root_cause") or {}).get("related_record_ids", [])
+            for linked in claims_by_id.get(ref, []))}
+        added = dependent - invalid_review_candidates
+        if not added:
+            break
+        invalid_review_candidates.update(added)
+        review_errors.extend({"candidate_id": candidate_id, "reason_code": "review_rejected",
+                              "detail": "root_cause_related_history_invalid"}
+                             for candidate_id in sorted(added))
     superseded = {r["supersedes_record_id"] for r in imported if r.get("supersedes_record_id")}
     by_candidate = {}
     for review in imported:
-        if review["record_id"] not in superseded:
+        if review["record_id"] not in superseded and review["candidate_id"] not in invalid_review_candidates:
             by_candidate.setdefault(review["candidate_id"], []).append(review)
     validated_human = []
     for index, record in enumerate(human_records):
@@ -370,7 +412,8 @@ def exploratory_candidate_ledger(rows, reviews=None, *, human_records=None, huma
         applied_reviews = []
         candidate_human = [(index, record) for index, record in validated_human
                            if record["candidate_id"] == candidate_id]
-        lifecycle_reviews = ([review for review in imported if review["candidate_id"] == candidate_id]
+        lifecycle_reviews = ([] if candidate_id in invalid_review_candidates else
+                             [review for review in imported if review["candidate_id"] == candidate_id]
                              if candidate_human else by_candidate.get(candidate_id, []))
         for review in lifecycle_reviews:
             problems = _review_errors(review, candidate_id)
@@ -385,7 +428,9 @@ def exploratory_candidate_ledger(rows, reviews=None, *, human_records=None, huma
                                         evidence_refs=review["evidence_refs"],
                                         independent_of=review.get("independent_of") or [],
                                         notes=review.get("notes", ""),
-                                        attribution=review.get("attribution"))
+                                        attribution=review.get("attribution"),
+                                        root_cause=review.get("root_cause"),
+                                        tool_repair_handoff=review.get("tool_repair_handoff"))
                 if review["record_id"] not in superseded:
                     applied_reviews.append(review)
             except ValueError as exc:
@@ -407,7 +452,10 @@ def exploratory_candidate_ledger(rows, reviews=None, *, human_records=None, huma
                 # adjudication with a valid independent review may.
                 confirmation_error = str(exc)
         human_qualification_error = None
-        if candidate_id in invalid_human_candidates:
+        if candidate_id in invalid_review_candidates:
+            human_qualification_error = "review_history_invalid"
+            invalid_human_candidates.add(candidate_id)
+        elif candidate_id in invalid_human_candidates:
             human_qualification_error = "human_history_invalid"
         elif candidate_human:
             try:
@@ -454,8 +502,13 @@ def exploratory_candidate_ledger(rows, reviews=None, *, human_records=None, huma
         entry["original_result"] = {key: original.get(key) for key in (
             "run_id", "cell_id", "oracle_verdict", "rule_id", "triage_disposition", "responsibility_layer",
             "reason_code", "raw_path", "raw_sha256")}
-        entry["analysis"] = {"current": snapshot_record(active[-1]) if active else None,
-                             "history": snapshot_record([r for r in imported if r["candidate_id"] == identity])}
+        entry["analysis"] = {**current_review_projection(active),
+                             "history": snapshot_record([
+                                 r for index, r in enumerate(reviews if identity in invalid_review_candidates else imported)
+                                 if isinstance(r, dict) and (r.get("candidate_id") == identity or
+                                     (identity in invalid_review_candidates and any(
+                                         e.get("index") == index and e["candidate_id"] == identity
+                                         for e in review_errors)))])}
         if identity in invalid_human_candidates:
             # Preserve rejected records and their suffix for audit/display only;
             # none of this chain has current human confirmation authority.
@@ -470,6 +523,7 @@ def exploratory_candidate_ledger(rows, reviews=None, *, human_records=None, huma
     return {
         "schema_version": 1,
         "campaign_kind": "exploratory",
+        "root_cause_accounting": root_cause_accounting([*candidates, *failures, *controls], originals),
         "candidates": candidates,
         "failures": failures,
         "controls": controls,
@@ -686,6 +740,12 @@ def _review_import_errors(record, original_row=None):
     if original_row is not None and original_row.get("replay_path") and (
             not isinstance(refs, dict) or refs.get("capsule") != original_row["replay_path"]):
         problems.append("review_capsule_identity_mismatch")
+    try:
+        resolved = validate_review_evidence(refs)
+        validate_root_cause(record.get("root_cause"), resolved)
+        validate_tool_repair_handoff(record.get("tool_repair_handoff"), record.get("attribution"), resolved)
+    except (ValueError, TypeError, OSError) as exc:
+        problems.append(str(exc))
     return problems
 
 
@@ -705,6 +765,30 @@ def _review_history_errors(record, previous):
             r["candidate_id"] == record["candidate_id"] and r["reviewer_id"] == record["reviewer_id"]
             for r in previous):
         return ["review_revision_requires_supersedes"]
+    cause = record.get("root_cause")
+    if cause is not None:
+        parent = next((r for r in previous if r["record_id"] == supersedes), {})
+        old_root = (parent.get("root_cause") or {}).get("id")
+        root, operation = cause["id"], cause["operation"]
+        related = [next((r for r in previous if r["record_id"] == ref), None)
+                   for ref in cause["related_record_ids"]]
+        if any(r is None for r in related):
+            return ["root_cause_related_record_unknown"]
+        if operation in {"merge", "split", "revoke"} and not old_root:
+            return ["root_cause_relationship_requires_predecessor"]
+        if operation in {"merge", "split"}:
+            if not root or root == old_root or not related:
+                return ["root_cause_relationship_invalid"]
+            related_roots = {(r.get("root_cause") or {}).get("id") for r in related}
+            if operation == "merge" and related_roots != {root}:
+                return ["root_cause_merge_destination_not_evidenced"]
+            if operation == "split" and (related_roots != {old_root} or any(
+                    (r.get("root_cause") or {}).get("id") == root for r in previous)):
+                return ["root_cause_split_requires_new_destination"]
+        if operation == "assign" and old_root and root != old_root:
+            return ["root_cause_change_requires_merge_split_or_revoke"]
+        if operation in {"assign", "revoke"} and related:
+            return ["root_cause_unexpected_relationship"]
     return []
 
 
