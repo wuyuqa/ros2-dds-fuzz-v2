@@ -1346,9 +1346,20 @@ def _worker_main(argv):
                             "schema": "r2f.fastdds-native-matched-peer-observation/v1",
                             "manifest_reference": instrumentation}
                 count_after = count_api()
-                peer_fields = _matched_peer_fields(
-                    observer, config["domain_id"], local_gid, kind,
-                    count_before, count_after, observation)
+                peer_observer_selected = (
+                    rmw_identifier == "rmw_cyclonedds_cpp"
+                    or (rmw_identifier == "rmw_fastrtps_cpp" and instrumentation is not None))
+                if peer_observer_selected:
+                    # Selection can fail before constructing an observer. Keep
+                    # those attempted captures incomplete, even if observer=None.
+                    peer_fields = _matched_peer_fields(
+                        observer, config["domain_id"], local_gid, kind,
+                        count_before, count_after, observation)
+                else:
+                    # A named API absence is diagnostic, not an incomplete
+                    # peer-list claim. Preserve it without declaring peer proof.
+                    peer_fields = {"native_peer_observation": observation,
+                                   "peer_observation_limitation": observation["reason"]}
                 emit("match_snapshot", command_id=command_id,
                      matched_count=count_after, public_count_before=count_before,
                      **peer_fields,
