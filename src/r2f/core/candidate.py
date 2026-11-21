@@ -4,10 +4,11 @@ import re
 import json
 import os
 from dataclasses import dataclass, field
+from datetime import datetime
 from enum import Enum
 
 from ._json import integer, nonempty, sha256_digest, snapshot
-from .evidence import canonical_hash, verify_raw
+from .evidence import canonical_hash, verify_raw, raw_sha256
 from .execution import validate_execution
 from .mutation import MutationReceipt
 from .oracle import TriageResult
@@ -304,6 +305,82 @@ def _existing_reference(value, field):
     return os.path.abspath(value)
 
 
+HUMAN_ADJUDICATION_SCHEMA = "r2f.s1-human-adjudication/v1"
+
+
+def candidate_execution_identity(row):
+    """Bind a decision to the exact original saved execution, not a projection."""
+    return {
+        **{key: row.get(key) for key in (
+            "run_id", "cell_id", "target_id", "target_revision", "rule_id", "rmw",
+            "effective_input_sha256", "raw_path", "raw_sha256")},
+        "source": row.get("source_identity") or row.get("source_manifest") or row.get("provenance"),
+        "execution_sha256": canonical_hash(row),
+    }
+
+
+def validate_human_record(record, original_row, *, human_authority=None):
+    """Integrity is not authentication. Only a trusted host verifier grants authority.
+
+    The verifier is supplied out of band by an authenticated human UI/instruction
+    adapter. Never obtain it from records, reports, or an agent's claimed identity.
+    There is intentionally no default verifier; offline fixtures supply their own.
+    """
+    if not isinstance(record, dict) or not isinstance(original_row, dict):
+        raise ValueError("human_record_or_original_invalid")
+    if record.get("schema_version") != HUMAN_ADJUDICATION_SCHEMA:
+        raise ValueError("human_schema_unknown")
+    for key in ("record_id", "human_id", "reason", "instruction_ref", "instruction_sha256"):
+        nonempty(record.get(key), "human_" + key)
+    if record.get("origin") not in {"human_operation", "user_instruction"}:
+        raise ValueError("human_origin_invalid")
+    if record.get("action") not in {"confirm", "revoke"}:
+        raise ValueError("human_action_invalid")
+    try:
+        when = datetime.fromisoformat(record["recorded_at"])
+        if when.utcoffset() is None:
+            raise ValueError("timezone required")
+    except (KeyError, ValueError, TypeError) as exc:
+        raise ValueError("human_recorded_at_invalid") from exc
+    if record.get("record_sha256") != canonical_hash({
+            k: v for k, v in record.items() if k != "record_sha256"}):
+        raise ValueError("human_record_digest_mismatch")
+    if (record.get("execution_identity") != candidate_execution_identity(original_row)
+            or record.get("candidate_id") != f"{original_row.get('run_id')}:{original_row.get('cell_id')}"):
+        raise ValueError("human_execution_identity_mismatch")
+    verify_raw(original_row.get("raw_path"), original_row.get("raw_sha256"))
+    verify_raw(record["instruction_ref"], record["instruction_sha256"])
+    try:
+        verified = callable(human_authority) and human_authority(snapshot(record)) is True
+    except Exception as exc:
+        raise ValueError("human_authority_unverified") from exc
+    if not verified:
+        raise ValueError("human_authority_unverified")
+    return True
+
+
+def validate_human_history(record, previous):
+    """Return False for an identical ID; reject conflicts, forks and silent edits."""
+    duplicate = next((r for r in previous if r["record_id"] == record["record_id"]), None)
+    if duplicate is not None:
+        if duplicate != record:
+            raise ValueError("human_record_id_conflict")
+        return False
+    history = [r for r in previous if r["candidate_id"] == record["candidate_id"]]
+    if history:
+        if record.get("supersedes_record_id") != history[-1]["record_id"]:
+            raise ValueError("human_revision_requires_current_supersedes")
+        nonempty(record.get("revision_reason"), "human_revision_reason")
+        if record["execution_identity"] != history[-1]["execution_identity"]:
+            raise ValueError("human_supersedes_execution_mismatch")
+        if datetime.fromisoformat(record["recorded_at"]) < datetime.fromisoformat(history[-1]["recorded_at"]):
+            raise ValueError("human_revision_time_precedes_parent")
+    elif (record.get("supersedes_record_id") is not None
+          or record.get("revision_reason") is not None or record["action"] != "confirm"):
+        raise ValueError("human_supersedes_identity_unknown")
+    return True
+
+
 class CandidateStatus(str, Enum):
     OBSERVED = "observed"
     ADMITTED = "admitted"
@@ -326,6 +403,9 @@ class CandidateLifecycle:
     _non_replayable: dict | None = field(default=None, init=False, repr=False)
     _blackbox_validation: str = field(default="not_run", init=False, repr=False)
     _reviews: list = field(default_factory=list, init=False, repr=False)
+    _human_records: list = field(default_factory=list, init=False, repr=False)
+    _human_original: dict | None = field(default=None, init=False, repr=False)
+    _human_authority: object = field(default=None, init=False, repr=False)
 
     def __post_init__(self):
         nonempty(self.candidate_id, "candidate_id")
@@ -425,7 +505,7 @@ class CandidateLifecycle:
         return self
 
     def record_review(self, *, reviewer_id, conclusion, evidence_refs, independent_of=None,
-                      notes=""):
+                      notes="", attribution=None):
         """Append an independent review opinion.  This never confirms a candidate.
 
         ``conclusion`` is one of supported/rejected/needs_evidence.  A review
@@ -468,6 +548,11 @@ class CandidateLifecycle:
                   "independent_of": list(separations),
                   "notes": notes, "reviewed_at": utc_now(),
                   "review_id": f"review-{len(self._reviews) + 1}"}
+        if attribution is not None:
+            if attribution not in {"sut_candidate", "tool", "environment", "allowed", "unknown"}:
+                raise ValueError("invalid review attribution")
+            review["attribution"] = attribution
+            review["evidence_sha256"] = {key: raw_sha256(value) for key, value in resolved.items()}
         self._reviews.append(review)
         self._audit("reviewed", review_id=review["review_id"], conclusion=conclusion,
                     reviewer_id=reviewer_id)
@@ -523,6 +608,97 @@ class CandidateLifecycle:
         self._audit("confirmed", **self._confirmation)
         return self
 
+    def _validate_human_binding(self, record, original):
+        if self.candidate_id != record["candidate_id"] or any(
+                self.evidence.get(key) != value for key, value in original.items()
+                if key not in {"timestamp", "candidate_source", "evidence_tier", "endpoint_identity"}):
+            raise ValueError("human_lifecycle_execution_mismatch")
+
+    def _validate_human_records(self, original, human_authority):
+        previous = []
+        for record in self._human_records:
+            validate_human_record(record, original, human_authority=human_authority)
+            self._validate_human_binding(record, original)
+            validate_human_history(record, previous)
+            previous.append(record)
+
+    def _human_supporting_review(self, record, *, historical=False):
+        reviewers = set()
+        for review in reversed(self._reviews):
+            if not historical and review["reviewer_id"] in reviewers:
+                continue
+            reviewers.add(review["reviewer_id"])
+            if (review["conclusion"] == "supported" and review.get("attribution") == "sut_candidate"
+                    and review["independent_of"] and review["reviewer_id"] != record["human_id"]
+                    and review["evidence_refs"]["raw"] == os.path.abspath(self.evidence["raw_path"])):
+                try:
+                    for key, ref in review["evidence_refs"].items():
+                        verify_raw(ref, review.get("evidence_sha256", {}).get(key))
+                except (OSError, ValueError, TypeError):
+                    continue
+                return True
+        return False
+
+    def _validate_human_execution(self, original):
+        self._validate_admission()
+        if (self.candidate_status not in {"triaged", "confirmed"} or not self._triage
+                or self._triage["responsibility_layer"] != "sut"
+                or self._triage["triage_disposition"] != "candidate"):
+            raise ValueError("human_confirmation_requires_sut_triage")
+        if (("candidate_eligible" in self.evidence and self.evidence["candidate_eligible"] is not True)
+                or original.get("candidate_source") == "control"
+                or self.evidence.get("oracle_verdict") != "fail"
+                or self.evidence.get("actual_run") is not True
+                or self.evidence.get("observer_complete") is not True
+                or self.evidence.get("tool_error") is not False
+                or self.evidence.get("observer_dropped") is not False):
+            raise ValueError("human_confirmation_requires_healthy_execution")
+
+    def restore_human_history(self, records, *, original_row, human_authority=None):
+        """Restore authenticated history without granting current confirmation.
+
+        Historical support permits retaining a withdrawn analysis. A new confirm
+        must still enter through record_human_adjudication's current-review gate.
+        """
+        if self._human_records:
+            raise ValueError("human_history_restore_requires_empty_history")
+        previous = []
+        for record in records:
+            validate_human_record(record, original_row, human_authority=human_authority)
+            self._validate_human_binding(record, original_row)
+            if validate_human_history(record, previous):
+                if record["action"] == "confirm" and not self._human_supporting_review(record, historical=True):
+                    raise ValueError("human_confirmation_requires_independent_supporting_review")
+                previous.append(snapshot(record))
+        self._validate_human_execution(original_row)
+        self._human_records = previous
+        self._human_original = snapshot(original_row)
+        self._human_authority = human_authority
+        for record in previous:
+            self._audit("human_history_restored", record_id=record["record_id"], action=record["action"])
+        return self
+
+    def record_human_adjudication(self, record, *, original_row=None, human_authority=None):
+        """Apply a separately authenticated human decision to this lifecycle."""
+        original = self.evidence if original_row is None else original_row
+        self._validate_human_records(original, human_authority)
+        validate_human_record(record, original, human_authority=human_authority)
+        self._validate_human_binding(record, original)
+        is_new = validate_human_history(record, self._human_records)
+        self._validate_human_execution(original)
+        if record["action"] == "confirm" and not self._human_supporting_review(record):
+            raise ValueError("human_confirmation_requires_independent_supporting_review")
+        if not is_new:
+            if record == self._human_records[-1]:
+                self.candidate_status = "confirmed" if record["action"] == "confirm" or self._confirmation else "triaged"
+            return self
+        self.candidate_status = "confirmed" if record["action"] == "confirm" or self._confirmation else "triaged"
+        self._human_original = snapshot(original)
+        self._human_authority = human_authority
+        self._human_records.append(snapshot(record))
+        self._audit("human_adjudicated", record_id=record["record_id"], action=record["action"])
+        return self
+
     def record_blackbox_validation(self, status):
         if status not in {"not_run", "pass", "fail", "inconclusive"}:
             raise ValueError("invalid blackbox_validation")
@@ -537,8 +713,13 @@ class CandidateLifecycle:
         if require_disposition and self.candidate_status in {"admitted", "triaged", "deferred", "confirmed"}:
             if not self._replay_attempts and not self._non_replayable:
                 raise ValueError("candidate requires a replay attempt or named non_replayable disposition")
+        self._validate_human_records(self._human_original, self._human_authority)
+        human_confirmed = bool(self._human_records and self._human_records[-1]["action"] == "confirm")
+        if human_confirmed:
+            self.record_human_adjudication(self._human_records[-1], original_row=self._human_original,
+                                           human_authority=self._human_authority)
         if self.candidate_status == "confirmed" and self.replay_status != "pass":
-            if not self._confirmation or not self._confirmation["confirmation_basis"]:
+            if not human_confirmed and (not self._confirmation or not self._confirmation["confirmation_basis"]):
                 raise ValueError("confirmed without replay requires named evidence basis")
         if require_review and self.candidate_status == "confirmed":
             if not self._independent_supporting_review():
@@ -554,4 +735,6 @@ class CandidateLifecycle:
                 "replay_attempts": snapshot(self._replay_attempts), "non_replayable": snapshot(self._non_replayable),
                 "blackbox_validation": self._blackbox_validation, "derived_labels": ["replay_unconfirmed"] if unconfirmed else [],
                 "reviews": snapshot(self._reviews),
+                "human_adjudication": {"current": snapshot(self._human_records[-1]) if self._human_records else None,
+                                       "history": snapshot(self._human_records)},
                 "history": snapshot(self._history), **snapshot(self._triage or {}), **snapshot(self._confirmation or {})}

@@ -19,7 +19,9 @@ import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
-from r2f.core.candidate import CandidateLifecycle, REVIEW_EVIDENCE_KEYS, topology_observation_identity
+from r2f.core.candidate import (CandidateLifecycle, REVIEW_EVIDENCE_KEYS, topology_observation_identity,
+                                validate_human_history, validate_human_record, candidate_execution_identity,
+                                HUMAN_ADJUDICATION_SCHEMA)
 from r2f.core.evidence import canonical_hash, raw_sha256
 from r2f.core.oracle import TriageResult
 
@@ -261,7 +263,7 @@ def _review_errors(review, candidate_id):
     return problems
 
 
-def exploratory_candidate_ledger(rows, reviews=None):
+def exploratory_candidate_ledger(rows, reviews=None, *, human_records=None, human_authority=None):
     """Ledger for exploratory runs.
 
     Natural candidates are only rows that were actually executed, judged
@@ -270,6 +272,8 @@ def exploratory_candidate_ledger(rows, reviews=None):
     dropped because admission or confirmation fails.
     """
     rows = list(rows)
+    human_records = list(human_records or [])
+    human_errors, applied_human = [], []
     reviews = list(reviews or [])
     candidates, failures, controls, review_errors = [], [], [], []
     originals = {f"{row.get('run_id')}:{row.get('cell_id')}": row for row in rows}
@@ -299,11 +303,25 @@ def exploratory_candidate_ledger(rows, reviews=None):
     for review in imported:
         if review["record_id"] not in superseded:
             by_candidate.setdefault(review["candidate_id"], []).append(review)
+    validated_human = []
+    for index, record in enumerate(human_records):
+        candidate_id = record.get("candidate_id") if isinstance(record, dict) else None
+        original = originals.get(candidate_id) if isinstance(candidate_id, str) else None
+        try:
+            validate_human_record(record, original, human_authority=human_authority)
+            if validate_human_history(record, [r for _, r in validated_human]):
+                validated_human.append((index, record))
+        except (ValueError, TypeError, KeyError, OSError) as exc:
+            human_errors.append({"index": index, "candidate_id": candidate_id, "detail": str(exc)})
+    # A rejected record invalidates its candidate's full chain for current
+    # qualification. Never restore an accepted prefix as a replacement decision.
+    invalid_human_candidates = {error["candidate_id"] for error in human_errors
+                                if isinstance(error["candidate_id"], str)}
     for row in rows:
         cell_id = row.get("cell_id")
         if row.get("arm") == "negative" or row.get("control_kind"):
             controls.append({
-                "cell_id": cell_id, "oracle_verdict": row.get("oracle_verdict"),
+                "run_id": row.get("run_id"), "cell_id": cell_id, "oracle_verdict": row.get("oracle_verdict"),
                 "arm": row.get("arm"), "kind": row.get("control_kind"),
                 "candidate_eligible": False, "reason_code": "control_observation",
                 "source": ("harness" if (row.get("arm") == "negative" or row.get("control_kind") == "fault")
@@ -317,18 +335,18 @@ def exploratory_candidate_ledger(rows, reviews=None):
             continue
         if row.get("tool_error") is True or row.get("runtime_status") == "tool_error":
             failures.append({key: row.get(key) for key in (
-                "cell_id", "execution_stage", "oracle_verdict", "abort_reason", "reason_code",
+                "run_id", "cell_id", "execution_stage", "oracle_verdict", "abort_reason", "reason_code",
                 "raw_path", "raw_sha256", "tool_error_detail")} | {"reason_code": "tool_error"})
             continue
         if row.get("observer_dropped") is True or row.get("observer_complete") is False:
             failures.append({key: row.get(key) for key in (
-                "cell_id", "execution_stage", "oracle_verdict", "abort_reason", "raw_path", "raw_sha256")}
+                "run_id", "cell_id", "execution_stage", "oracle_verdict", "abort_reason", "raw_path", "raw_sha256")}
                 | {"reason_code": "observer_incomplete"})
             continue
         if row.get("execution_stage") == "aborted" or row.get("oracle_verdict") in (
                 "unknown", "not_applicable") or row.get("execution_stage") != "judged":
             failures.append({key: row.get(key) for key in (
-                "cell_id", "execution_stage", "oracle_verdict", "abort_reason", "reason_code",
+                "run_id", "cell_id", "execution_stage", "oracle_verdict", "abort_reason", "reason_code",
                 "raw_path", "raw_sha256")})
             continue
         if row.get("oracle_verdict") != "fail":
@@ -337,7 +355,7 @@ def exploratory_candidate_ledger(rows, reviews=None):
         try:
             lifecycle = CandidateLifecycle(f"{row['run_id']}:{cell_id}", evidence)
         except (ValueError, KeyError) as exc:
-            failures.append({"cell_id": cell_id, "reason_code": "anomaly_without_minimum_observation_identity",
+            failures.append({"run_id": row.get("run_id"), "cell_id": cell_id, "reason_code": "anomaly_without_minimum_observation_identity",
                              "detail": str(exc), "raw_path": row.get("raw_path"),
                              "raw_sha256": row.get("raw_sha256")})
             continue
@@ -350,7 +368,11 @@ def exploratory_candidate_ledger(rows, reviews=None):
             admission_error = str(exc)
         candidate_id = lifecycle.candidate_id
         applied_reviews = []
-        for review in by_candidate.get(candidate_id, []):
+        candidate_human = [(index, record) for index, record in validated_human
+                           if record["candidate_id"] == candidate_id]
+        lifecycle_reviews = ([review for review in imported if review["candidate_id"] == candidate_id]
+                             if candidate_human else by_candidate.get(candidate_id, []))
+        for review in lifecycle_reviews:
             problems = _review_errors(review, candidate_id)
             if problems:
                 review_errors.append({"candidate_id": candidate_id,
@@ -362,8 +384,10 @@ def exploratory_candidate_ledger(rows, reviews=None):
                                         conclusion=review["conclusion"],
                                         evidence_refs=review["evidence_refs"],
                                         independent_of=review.get("independent_of") or [],
-                                        notes=review.get("notes", ""))
-                applied_reviews.append(review)
+                                        notes=review.get("notes", ""),
+                                        attribution=review.get("attribution"))
+                if review["record_id"] not in superseded:
+                    applied_reviews.append(review)
             except ValueError as exc:
                 review_errors.append({"candidate_id": candidate_id,
                                       "reason_code": "review_rejected", "detail": str(exc)})
@@ -382,6 +406,24 @@ def exploratory_candidate_ledger(rows, reviews=None):
                 # A supported review never confirms by itself; only an explicit
                 # adjudication with a valid independent review may.
                 confirmation_error = str(exc)
+        human_qualification_error = None
+        if candidate_id in invalid_human_candidates:
+            human_qualification_error = "human_history_invalid"
+        elif candidate_human:
+            try:
+                lifecycle.restore_human_history([record for _, record in candidate_human],
+                                                original_row=row, human_authority=human_authority)
+                applied_human.extend(record for _, record in candidate_human)
+                try:
+                    lifecycle.record_human_adjudication(candidate_human[-1][1], original_row=row,
+                                                        human_authority=human_authority)
+                except (ValueError, TypeError, KeyError, OSError) as exc:
+                    human_qualification_error = str(exc)
+            except (ValueError, TypeError, KeyError, OSError) as exc:
+                invalid_human_candidates.add(candidate_id)
+                human_qualification_error = "human_history_invalid"
+                for index, record in candidate_human:
+                    human_errors.append({"index": index, "candidate_id": candidate_id, "detail": str(exc)})
         review_status = "not_reviewed"
         if applied_reviews:
             last = applied_reviews[-1]
@@ -390,12 +432,39 @@ def exploratory_candidate_ledger(rows, reviews=None):
                              "needs_evidence": "needs_evidence"}[last["conclusion"]]
         if lifecycle.candidate_status == "confirmed":
             review_status = "confirmed_after_review"
-        entry = dict(lifecycle.to_dict(), cell_id=cell_id, observation_kind="primary",
+        entry = dict(lifecycle.to_dict(), run_id=row.get("run_id"), cell_id=cell_id, observation_kind="primary",
                      admission_error=admission_error, confirmation_error=confirmation_error,
                      review_status=review_status,
                      review_errors=[e["detail"] for e in review_errors if e["candidate_id"] == candidate_id],
                      **{key: row.get(key) for key in EXPLORATORY_INPUT_KEYS if key in row})
+        if human_qualification_error:
+            entry["human_qualification_error"] = human_qualification_error
         candidates.append(entry)
+    for index, record in validated_human:
+        if record not in applied_human and not any(e["index"] == index for e in human_errors):
+            human_errors.append({"index": index, "candidate_id": record["candidate_id"],
+                                 "detail": ("human_history_invalid" if record["candidate_id"]
+                                            in invalid_human_candidates else "human_candidate_not_eligible")})
+    applied_human.sort(key=lambda r: next(i for i, v in validated_human if v == r))
+    rows_by_execution = {(row.get("run_id"), row.get("cell_id")): row for row in rows}
+    for entry in [*candidates, *failures, *controls]:
+        original = rows_by_execution[(entry["run_id"], entry["cell_id"])]
+        identity = f"{original.get('run_id')}:{original.get('cell_id')}"
+        active = by_candidate.get(identity, [])
+        entry["original_result"] = {key: original.get(key) for key in (
+            "run_id", "cell_id", "oracle_verdict", "rule_id", "triage_disposition", "responsibility_layer",
+            "reason_code", "raw_path", "raw_sha256")}
+        entry["analysis"] = {"current": snapshot_record(active[-1]) if active else None,
+                             "history": snapshot_record([r for r in imported if r["candidate_id"] == identity])}
+        if identity in invalid_human_candidates:
+            # Preserve rejected records and their suffix for audit/display only;
+            # none of this chain has current human confirmation authority.
+            entry["human_adjudication"] = {
+                "current": None,
+                "history": snapshot_record([record for record in human_records
+                                            if isinstance(record, dict)
+                                            and record.get("candidate_id") == identity])}
+        entry.setdefault("human_adjudication", {"current": None, "history": []})
     natural = [c for c in candidates if c.get("responsibility_layer") == "sut"
                and c.get("triage_disposition") == "candidate"]
     return {
@@ -406,6 +475,12 @@ def exploratory_candidate_ledger(rows, reviews=None):
         "controls": controls,
         "review_errors": review_errors,
         "review_records": imported,
+        "human_adjudication_schema": HUMAN_ADJUDICATION_SCHEMA,
+        "human_records": applied_human,
+        "human_errors": human_errors,
+        "human_confirmed_candidates": sum(
+            (c["human_adjudication"]["current"] or {}).get("action") == "confirm"
+            and not c.get("human_qualification_error") for c in candidates),
         "confirmed_candidates": sum(c.get("candidate_status") == "confirmed" for c in candidates),
         "natural_candidate_count": len(natural),
         "tool_error_count": sum(1 for f in failures if f.get("reason_code") == "tool_error"),
@@ -544,14 +619,7 @@ def _review_record_digest(record):
 
 
 def _review_execution_identity(row):
-    """Bind analysis to the saved execution, including its original source."""
-    return {
-        **{key: row.get(key) for key in (
-            "run_id", "cell_id", "target_id", "target_revision", "rule_id", "rmw",
-            "effective_input_sha256", "raw_path", "raw_sha256")},
-        "source": row.get("source_identity") or row.get("source_manifest") or row.get("provenance"),
-        "execution_sha256": canonical_hash(row),
-    }
+    return candidate_execution_identity(row)
 
 
 def _review_import_errors(record, original_row=None):
@@ -671,30 +739,86 @@ def append_review_record(path, record, *, original_row=None):
             raise ValueError("review reference unavailable") from exc
     record.setdefault("record_id", "review-" + canonical_hash({
         k: v for k, v in record.items() if k not in {"record_sha256", "recorded_at", "record_id"}}))
+    def check(value, previous):
+        problems = _review_import_errors(value, original_row) + _review_history_errors(value, previous)
+        if problems:
+            raise ValueError("invalid review record: " + ",".join(problems))
+    return _append_bound_record(path, record, decode=_decode_review_records, check=check)
+
+
+def _append_bound_record(path, record, *, decode, check):
+    """Shared append-only transport; validation is always performed under lock."""
+    path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a+", encoding="utf-8") as stream:
         fcntl.flock(stream, fcntl.LOCK_EX)
         stream.seek(0)
-        existing = _decode_review_records(stream.read())
-        for previous in existing:
+        existing = decode(stream.read())
+        for index, previous in enumerate(existing):
             if previous["record_id"] == record["record_id"]:
                 record.setdefault("recorded_at", previous["recorded_at"])
                 record.setdefault("record_sha256", _review_record_digest(record))
-                problems = _review_import_errors(record, original_row)
-                if problems:
-                    raise ValueError("invalid review record: " + ",".join(problems))
+                check(record, existing[:index])
                 if record != previous:
-                    raise ValueError("review record ID conflict")
-                return previous
+                    raise ValueError("record ID conflict")
+                return snapshot_record(previous)
         record.setdefault("recorded_at", datetime.now(timezone.utc).isoformat())
         record.setdefault("record_sha256", _review_record_digest(record))
-        problems = _review_import_errors(record, original_row) + _review_history_errors(record, existing)
-        if problems:
-            raise ValueError("invalid review record: " + ",".join(problems))
+        check(record, existing)
         stream.write(json.dumps(record, sort_keys=True, allow_nan=False) + "\n")
         stream.flush()
         os.fsync(stream.fileno())
-        return record
+        return snapshot_record(record)
+
+
+def snapshot_record(record):
+    return json.loads(json.dumps(record, allow_nan=False))
+
+
+def _decode_human_records(text, *, original_rows, reviews, human_authority):
+    if text and not text.endswith("\n"):
+        raise ValueError("human log has an incomplete final line")
+    records = [json.loads(line) for line in text.splitlines() if line.strip()]
+    ledger = exploratory_candidate_ledger(original_rows, reviews=reviews, human_records=records,
+                                          human_authority=human_authority)
+    if ledger["human_errors"]:
+        raise ValueError("invalid human record: " + ";".join(e["detail"] for e in ledger["human_errors"]))
+    return ledger["human_records"]
+
+
+def append_human_record(path, record, *, original_rows, reviews=None, human_authority=None):
+    """Append a host-authenticated instruction; no strings/flags authenticate a human.
+
+    All original executions and independent review records must be supplied for
+    the log. Rechecking an existing ID also rechecks authority and eligibility.
+    """
+    if not isinstance(record, dict):
+        raise ValueError("human record must be an object")
+    rows, reviews = list(original_rows), list(reviews or [])
+    def decode(text):
+        return _decode_human_records(text, original_rows=rows, reviews=reviews,
+                                     human_authority=human_authority)
+    def check(value, previous):
+        decode("".join(json.dumps(r, allow_nan=False) + "\n" for r in [*previous, value]))
+        if value.get("action") == "confirm":
+            ledger = exploratory_candidate_ledger(rows, reviews=reviews,
+                human_records=[*previous, value], human_authority=human_authority)
+            candidate = next(c for c in ledger["candidates"] if c["candidate_id"] == value["candidate_id"])
+            if candidate.get("human_qualification_error"):
+                raise ValueError(candidate["human_qualification_error"])
+    # Unlike review analysis, human operations must carry an explicit ID and a
+    # digest attested by the host verifier. Do not synthesize a human instruction.
+    if not record.get("record_id") or not record.get("record_sha256"):
+        raise ValueError("human instruction requires explicit record ID and digest")
+    return _append_bound_record(path, snapshot_record(record), decode=decode, check=check)
+
+
+def read_human_records(path, *, original_rows, reviews=None, human_authority=None):
+    """Read with the same integrity, host authority and lifecycle gates as import."""
+    with Path(path).open(encoding="utf-8") as stream:
+        fcntl.flock(stream, fcntl.LOCK_SH)
+        return _decode_human_records(stream.read(), original_rows=list(original_rows),
+                                     reviews=reviews, human_authority=human_authority)
 
 
 def read_review_records(path, *, original_rows=None):

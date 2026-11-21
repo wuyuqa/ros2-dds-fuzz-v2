@@ -279,7 +279,7 @@ def _empty_required_result(errors):
             "maturity_scope": "per-target only; full S1 denominator remains 72"}
 
 
-def audit_report(report_path):
+def audit_report(report_path, *, human_authority=None):
     """Audit original evidence and query the existing S1 lineage in one result.
 
     The added projection is detached and never participates in report hashes or
@@ -300,7 +300,7 @@ def audit_report(report_path):
         if isinstance(rows, list) and any(not isinstance(row, dict) for row in rows):
             result = _empty_required_result(["report_artifact_error:rows must contain objects"])
         elif report.get("schema_version") == EXPLORATORY_SCHEMA or kind == "exploratory":
-            return audit_exploratory_report(path, report=report)
+            return audit_exploratory_report(path, report=report, human_authority=human_authority)
         elif kind not in SUPPORTED_CAMPAIGN_KINDS:
             result = _empty_required_result(["unknown_campaign_kind:" + repr(kind)])
         else:
@@ -1792,7 +1792,8 @@ def _audit_exploratory_controls(report, rows, errors):
         errors.append("control_execution_count_not_deduplicated")
 
 
-def _audit_exploratory_ledger(root, report, rows, errors, details, *, qualification_reuse=None):
+def _audit_exploratory_ledger(root, report, rows, errors, details, *, qualification_reuse=None,
+                              human_authority=None):
     from r2f.reports.candidate_report import exploratory_candidate_ledger, audit_projection
     ledger_path = _path(root, report.get("candidate_ledger_path"))
     ledger = json.loads(ledger_path.read_text())
@@ -1820,17 +1821,34 @@ def _audit_exploratory_ledger(root, report, rows, errors, details, *, qualificat
             continue
         _f1_adapter_artifact_qualification(root, row, report)
         eligible_rows.append(row)
-    expected = exploratory_candidate_ledger(eligible_rows, reviews=report.get("review_records") or [])
+    expected = exploratory_candidate_ledger(
+        eligible_rows, reviews=report.get("review_records") or [],
+        human_records=report.get("human_records") or [], human_authority=human_authority)
     if ledger.get("execution_exclusions", []) != exclusions:
         errors.append("topology_ledger_execution_exclusions_mismatch")
     if Counter(c.get("candidate_id") for c in ledger.get("candidates", [])) != Counter(
             c.get("candidate_id") for c in expected["candidates"]):
         errors.append("candidate_ledger_dropped_or_invented_anomaly")
+    human_schema = ledger.get("human_adjudication_schema")
+    if human_schema is not None and human_schema != expected["human_adjudication_schema"]:
+        errors.append("human_adjudication_schema_unknown")
+    if human_schema is None and (report.get("human_records") or any(
+            key in ledger for key in ("human_records", "human_errors", "human_confirmed_candidates"))
+            or any(any(key in entry for key in ("original_result", "analysis", "human_adjudication"))
+                   for key in ("candidates", "failures", "controls") for entry in ledger.get(key, []))):
+        errors.append("human_adjudication_schema_missing")
+    if human_schema is not None:
+        for key in ("failures", "controls"):
+            if ledger.get(key) != expected[key]:
+                errors.append("exploratory_ledger_mismatch:" + key)
     # Accepted reviews include superseded history; rejection details must also
     # match the rebuilt projection, even when the outer hashes are consistent.
     for key in ("natural_candidate_count", "confirmed_candidates", "tool_error_count",
                 "observer_incomplete_count", "control_count", "review_records", "review_errors"):
         if ledger.get(key) != expected.get(key):
+            errors.append("exploratory_ledger_mismatch:" + key)
+    for key, default in (("human_records", []), ("human_errors", []), ("human_confirmed_candidates", 0)):
+        if ledger.get(key, default) != expected[key]:
             errors.append("exploratory_ledger_mismatch:" + key)
     if ledger.get("natural_candidate_count") == 0 and not ledger.get("zero_candidate_explanation"):
         errors.append("zero_candidate_explanation_missing")
@@ -1847,7 +1865,19 @@ def _audit_exploratory_ledger(root, report, rows, errors, details, *, qualificat
     for candidate in ledger.get("candidates", []):
         match = next((c for c in expected["candidates"]
                       if c.get("candidate_id") == candidate.get("candidate_id")), None)
-        if match is None or audit_projection(candidate) != audit_projection(match):
+        actual_projection = audit_projection(candidate)
+        expected_projection = audit_projection(match) if match is not None else None
+        if human_schema is None and not report.get("human_records") and expected_projection is not None:
+            # CP1 reports predate these derived fields. Preserve their original
+            # contract; a legacy confirmation still grants no human confirmation.
+            for key in ("original_result", "analysis", "human_adjudication"):
+                expected_projection.pop(key, None)
+            if "run_id" not in actual_projection:
+                expected_projection.pop("run_id", None)
+            for review in expected_projection.get("reviews", []):
+                review.pop("attribution", None)
+                review.pop("evidence_sha256", None)
+        if match is None or actual_projection != expected_projection:
             errors.append("candidate_evidence_or_lifecycle_not_bound_to_verified_cell")
         evidence = candidate.get("evidence") or {}
         if evidence.get("arm") == "negative" or evidence.get("candidate_source") == "control":
@@ -1872,10 +1902,13 @@ def _audit_exploratory_ledger(root, report, rows, errors, details, *, qualificat
          "reason": failure["detail"]}
         for failure in expected["review_errors"]]
     details["accepted_reviews"] = len(expected["review_records"])
+    details["accepted_human_records"] = len(expected["human_records"])
+    details["rejected_human_records"] = expected["human_errors"]
+    details["human_confirmed_candidates"] = expected["human_confirmed_candidates"]
     details["candidate_ledger"] = ledger_path.name
 
 
-def audit_exploratory_report(report_path, *, report=None):
+def audit_exploratory_report(report_path, *, report=None, human_authority=None):
     """Keep producer and standalone audit queries on the same CP2 projection."""
     path = Path(report_path).resolve()
     if report is None:
@@ -1888,11 +1921,11 @@ def audit_exploratory_report(report_path, *, report=None):
         result = {"sealed": False, "evidence_valid": False,
                   "errors": ["report_artifact_error:rows must contain objects"]}
     else:
-        result = _audit_exploratory_report(path, report=report)
+        result = _audit_exploratory_report(path, report=report, human_authority=human_authority)
     return _with_s1_coverage(path, report if isinstance(report, dict) else {}, result)
 
 
-def _audit_exploratory_report(report_path, *, report=None):
+def _audit_exploratory_report(report_path, *, report=None, human_authority=None):
     """Audit an exploratory report without borrowing required maturity or seal.
 
     ``evidence_valid`` answers whether the report and its artefacts recompute;
@@ -1944,7 +1977,8 @@ def _audit_exploratory_report(report_path, *, report=None):
         _audit_exploratory_budget(report, rows, errors, root=root)
         _audit_exploratory_controls(report, rows, errors)
         _audit_exploratory_ledger(root, report, rows, errors, details,
-                                  qualification_reuse=qualification_reuse)
+                                  qualification_reuse=qualification_reuse,
+                                  human_authority=human_authority)
         coverage = []
         for row in valid:
             if row.get("execution_stage") != "judged" or row.get("actual_run") is not True:

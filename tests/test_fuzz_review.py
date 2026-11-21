@@ -224,6 +224,8 @@ class ReviewPacketContracts(unittest.TestCase):
         self.assertEqual(candidate["candidate_status"], "confirmed", candidate.get("confirmation_error"))
         self.assertEqual(candidate["review_status"], "confirmed_after_review")
         self.assertEqual(ledger["confirmed_candidates"], 1)
+        self.assertEqual(ledger["human_confirmed_candidates"], 0)
+        self.assertIsNone(candidate["human_adjudication"]["current"])
 
     def test_review_log_is_append_only_and_digest_checked(self):
         log = self.root / "reviews.jsonl"
@@ -329,6 +331,49 @@ class ReviewPacketContracts(unittest.TestCase):
         self.assertEqual(ledger["confirmed_candidates"], 0)
         self.assertNotEqual(ledger["candidates"][0]["review_status"], "confirmed_after_review")
         self.assertTrue(ledger["review_errors"])
+
+
+    def test_projection_uses_run_and_cell_for_candidates_failures_and_controls(self):
+        rows, reviews, expected = [], [], {}
+        base = self.row()
+        for run_id in ('audit-run', 'second-run'):
+            for kind in ('candidate', 'failure', 'control'):
+                cell_id = kind + '-1'
+                raw = self.root / (run_id + '-' + kind + '.jsonl')
+                raw.write_text(json.dumps({'offline': run_id, 'kind': kind}) + '\n')
+                from r2f.core.evidence import raw_sha256
+                row = dict(base, run_id=run_id, cell_id=cell_id, raw_path=str(raw),
+                           raw_sha256=raw_sha256(raw), reason_code=run_id + '-' + kind)
+                if kind == 'failure':
+                    row.update(tool_error=True, runtime_status='tool_error')
+                elif kind == 'control':
+                    row.update(control_kind='health', arm='baseline')
+                identity = run_id + ':' + cell_id
+                review = append_review_record(self.root / (run_id + '-' + kind + '-review.jsonl'), {
+                    'candidate_id': identity, 'record_id': identity, 'reviewer_id': 'independent-agent',
+                    'conclusion': 'supported', 'attribution': 'sut_candidate', 'reason': 'Offline fixture.',
+                    'evidence_refs': dict(self.refs(), raw=str(raw)), 'independent_of': ['trigger-author']},
+                    original_row=row)
+                rows.append(row)
+                reviews.append(review)
+                expected[identity] = (row, review)
+        for ordered_rows in (rows, list(reversed(rows))):
+            ledger = exploratory_candidate_ledger(ordered_rows, reviews=reviews)
+            self.assertFalse(ledger['review_errors'])
+            for bucket in ('candidates', 'failures', 'controls'):
+                self.assertEqual(len(ledger[bucket]), 2)
+                for entry in ledger[bucket]:
+                    identity = entry['run_id'] + ':' + entry['cell_id']
+                    row, review = expected[identity]
+                    self.assertEqual(entry['original_result']['run_id'], row['run_id'])
+                    self.assertEqual(entry['original_result']['cell_id'], row['cell_id'])
+                    self.assertEqual(entry['original_result']['raw_path'], row['raw_path'])
+                    self.assertEqual(entry['original_result']['raw_sha256'], row['raw_sha256'])
+                    self.assertEqual(entry['original_result']['reason_code'], row['reason_code'])
+                    self.assertEqual(entry['analysis'], {'current': review, 'history': [review]})
+                    if bucket == 'candidates':
+                        self.assertEqual(entry['candidate_id'], identity)
+                        self.assertEqual(entry['evidence']['raw_sha256'], row['raw_sha256'])
 
 
 if __name__ == "__main__":
