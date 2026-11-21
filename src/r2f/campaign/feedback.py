@@ -11,7 +11,7 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 import re
 
-from r2f.core.evidence import canonical_hash
+from r2f.core.evidence import canonical_hash, raw_sha256
 from r2f.core.observation_status import observation_complete, tool_error
 from r2f.core.state_signature import observation_edge
 
@@ -52,6 +52,17 @@ def feedback_identity(events):
                 "edge_id": e.get("edge_id"),
                 "complete": bool(e.get("coverage")),
                 "tool_error": bool(e.get("tool_error"))} for e in events]
+    # Optional scheduling metadata is bound without changing historical v1 bytes.
+    for member, event in zip(members, events):
+        attempt = event.get("recipe_attempt")
+        if attempt is not None:
+            member["recipe_attempt"] = {key: attempt[key] for key in
+                ("recipe_sha256", "attempt_kind", "submitted", "outcome")}
+        release = event.get("recipe_policy_release")
+        if release is not None:
+            member["recipe_policy_release"] = {"recipe_sha256": release["recipe_sha256"]}
+        # Full event hashes bind diagnostic paths/attempt ids separately. They
+        # must not perturb generation RNG across equivalent split/resumed runs.
     return canonical_hash({"schema": SCHEMA, "ordered_events": members})
 
 
@@ -75,6 +86,12 @@ class FeedbackLog:
             "edge_id": edge_id(record) if complete else None,
             "oracle_verdict": record.get("oracle_verdict"),
         }
+        if "recipe_attempt" in record:
+            event["recipe_attempt"] = deepcopy(record["recipe_attempt"])
+            if event["recipe_attempt"]["outcome"] == "healthy" and not event["complete"]:
+                event["recipe_attempt"]["outcome"] = "incomplete"
+            from .tool_failures import validate_policy_event
+            validate_policy_event(event)
         if event["edge_id"] is not None:
             fields = ("execution_stage", "actual_run", "workspace_executed", "surface_id",
                       "operation_family", "parameter_class", "boundary_class", "raw_path", "raw_sha256")
@@ -88,6 +105,38 @@ class FeedbackLog:
                                          for key in fact_fields if key in record["typed_facts"]}
             event["edge_provenance"] = {"schema": "r2f.s1-feedback-edge-provenance/v1",
                                         "observation": observation}
+        event["event_sha256"] = canonical_hash(event)
+        self.events.append(event)
+        return deepcopy(event)
+
+    def release_recipe(self, recipe, *, owner, reason, revalidation_basis):
+        """Append an explicit main/owner decision; never edit original failures.
+
+        The basis is a traceable evidence reference supplied by the named owner,
+        not execution proof or a user-confirmation claim.
+        """
+        from .tool_failures import submission_policy, validate_policy_event, RELEASE_SCHEMA
+        policy = submission_policy(self.events, recipe)
+        if policy["status"] != "isolated":
+            raise ValueError("release requires an attributed isolated recipe")
+        event = {"content_sha256": self.events[-1]["content_sha256"],
+                 "executed": False, "coverage": False, "complete": False,
+                 "tool_error": False, "surface_class": None, "edge_id": None,
+                 "oracle_verdict": None,
+                 "recipe_policy_release": {"schema": RELEASE_SCHEMA,
+                     "recipe": deepcopy(recipe), "recipe_sha256": policy["recipe_sha256"],
+                     "owner": owner, "reason": reason, "revalidation_basis": deepcopy(revalidation_basis),
+                     "isolating_event_sha256": policy["isolating_event_sha256"]}}
+        validate_policy_event(event)
+        from pathlib import Path
+        basis = event["recipe_policy_release"]["revalidation_basis"]
+        path = Path(basis["path"])
+        try:
+            valid = path.is_absolute() and path.is_file() and raw_sha256(path) == basis["sha256"]
+        except OSError:
+            valid = False
+        if not valid:
+            raise ValueError("recipe owner revalidation evidence missing or hash mismatch")
         event["event_sha256"] = canonical_hash(event)
         self.events.append(event)
         return deepcopy(event)
@@ -158,6 +207,11 @@ class FeedbackLog:
                     raise ValueError("feedback edge provenance mismatch")
             elif event.get("edge_provenance") is not None:
                 raise ValueError("edge provenance without an edge")
+        from .tool_failures import validate_policy_event
+        for event in events:
+            validate_policy_event(event)
+        from .tool_failures import validate_release_history
+        validate_release_history(events)
         log = cls.from_events(events)
         if data != log.to_dict():
             raise ValueError("feedback identity or summary mismatch")

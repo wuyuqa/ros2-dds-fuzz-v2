@@ -9,7 +9,7 @@ import os
 from copy import deepcopy
 
 from r2f.core import Registry, compile_scenario
-from r2f.core.evidence import canonical_hash
+from r2f.core.evidence import canonical_hash, raw_sha256
 from r2f.core.replay import ReplayCapsule
 from r2f.modules.s1.module import register
 from r2f.modules.s1.targets import EXECUTION_ORDER
@@ -1474,7 +1474,7 @@ def run_exploratory_cycle(output_dir, *, corpus, feedback, scheduler, profile, r
                           execute=False, repo=None, run_id=None, max_inputs=None,
                           domain_id=173, continuation=None, checkpoint_hook=None,
                           runtime_boundary=HOST_RUNTIME, feedback_aggregate=None,
-                          auto_replay=None, replay_runtime=None):
+                          auto_replay=None, replay_runtime=None, recipe_releases=None):
     """Run one bounded feedback-driven exploratory cycle.
 
     ``execute=False`` performs no runtime call: rows stay ``planned`` and no
@@ -1670,6 +1670,17 @@ def run_exploratory_cycle(output_dir, *, corpus, feedback, scheduler, profile, r
         _atomic_json(output_dir / "resume-origin-checkpoint.json", origin)
         resume_origin = {"path": "resume-origin-checkpoint.json",
                          "checkpoint_sha256": origin["checkpoint_sha256"]}
+
+    # Apply owner decisions only after validating the untouched resume origin.
+    # They are append-only feedback events, not an origin/identity exemption.
+    if recipe_releases is not None:
+        if not isinstance(recipe_releases, list):
+            raise ExploratoryCycleError("recipe releases must be a list of named owner decisions")
+        for release in recipe_releases:
+            if not isinstance(release, dict) or set(release) != {"recipe", "owner", "reason", "revalidation_basis"}:
+                raise ExploratoryCycleError("incomplete recipe owner release")
+            feedback.release_recipe(**release)
+        scheduler.advance_feedback(feedback)
 
     def update_elapsed():
         budget["elapsed_sec"] = elapsed_before + max(0.0, time.monotonic() - started)
@@ -1988,6 +1999,16 @@ def run_exploratory_cycle(output_dir, *, corpus, feedback, scheduler, profile, r
         last_state = {"planned": budget["planned"], "executed": budget["executed"],
                       "cell_id": row["cell_id"], "sequence": sequence,
                       "execution_stage": row["execution_stage"]}
+        attempt = row.get("recipe_attempt") or {}
+        if attempt.get("outcome") == "global_invalid":
+            reason = attempt["diagnostic"]["reason"]
+            abort = {"reason_code": (reason if reason == "source_repo_HEAD_or_behavior_tree_changed"
+                                     else "global_execution_invalidity"),
+                     "detail": reason, "after_row_index": len(rows) - 1}
+            stop_reason = abort["reason_code"]
+            manifest["abort"] = abort
+            _atomic_json(output_dir / "manifest.json", manifest)
+            break
         qualification = row.get("boundary_qualification", {})
         if execute and qualification.get("status") in {"unknown", "invalid"}:
             abort = {"reason_code": "execution_boundary_qualification_failed",
@@ -2529,6 +2550,13 @@ def _generate_case(sequence, entry, target, contract, surface, parent, mutator_i
         if "fastdds_peer_instrumentation" in config:
             row["fastdds_peer_instrumentation"] = deepcopy(config["fastdds_peer_instrumentation"])
 
+    if execute:
+        from .tool_failures import generation_recipe
+        row["generation_recipe"] = generation_recipe(
+            entry, target, plan, source=source, carrier=carrier, mutation_kind=mutation_kind,
+            runtime_boundary=runtime_boundary, profile=profile, sampling_kind=sampling_kind,
+            selection=selection, observation_mode=config.get("observation_mode", "black_box"))
+        row["recipe_tool_failure_policy"] = scheduler.recipe_submission_policy(row["generation_recipe"])
     config = _runtime_execution_config(
         config, execute=execute, runtime=runtime, runtime_boundary=runtime_boundary)
     qualification = execution_boundary_qualification(runtime_boundary, config=config)
@@ -2599,6 +2627,13 @@ def _generate_case(sequence, entry, target, contract, surface, parent, mutator_i
         budget["aborted"] += 1
         _atomic_json(row_path, row)
         return row
+    policy = row["recipe_tool_failure_policy"]
+    if not policy["submission_allowed"]:
+        reason = "recipe_tool_failure_isolated"
+        row.update(reason_code=reason, blocked_reason=reason, candidate_eligible=False,
+                   feedback_eligible=False, seal_eligible=False)
+        _atomic_json(row_path, row)
+        return row
     if submission_hook is not None:
         submission_hook(row, selection)
     # Snapshot persistence may itself take time or overlap a source edit.  The
@@ -2624,6 +2659,10 @@ def _generate_case(sequence, entry, target, contract, surface, parent, mutator_i
                        "runtime": runtime})
     except Exception as exc:
         runtime_result = runtime_exception(exc)
+    # Runtime-supplied validity flags cannot attest to the actual checkout.
+    # Latch this fence before any healthy receipt, coverage or admission; still
+    # persist and ingest the original result to retain its stage and raw facts.
+    post_runtime_source = source_manifest(repo)
     try:
         persist_runtime_result(result_path, runtime_result)
         execution = ingest_execution(scenario, config, runtime_result, capsule, services=services)
@@ -2632,7 +2671,15 @@ def _generate_case(sequence, entry, target, contract, surface, parent, mutator_i
             row["runner_exception"] = runtime_result["runner_exception"]
     except Exception as exc:
         row.update(wrapper_failure(row, exc))
-        runtime_result = runtime_exception(exc)
+        if not isinstance(runtime_result, dict):
+            runtime_result = runtime_exception(exc)
+        elif runtime_result.get("runner_exception"):
+            row["runner_exception"] = runtime_result["runner_exception"]
+    if post_runtime_source != source:
+        # Apply the latched failure after ingest/wrapper annotations: neither a
+        # successful result nor a persistence failure can hide source drift.
+        row.update(abort_reason="source_repo_HEAD_or_behavior_tree_changed",
+                   post_runtime_source_manifest=post_runtime_source)
     # Deterministic/input fields keep the plan identity; ingest cannot change them.
     row.update({
         "surface_id": surface.surface_id, "surface_ids": [surface.surface_id],
@@ -2649,6 +2696,23 @@ def _generate_case(sequence, entry, target, contract, surface, parent, mutator_i
         "evidence_origin": _evidence_origin(runtime_result, runtime=runtime,
                                             runtime_boundary=runtime_boundary),
     })
+    from .tool_failures import attempt_receipt
+    try:
+        result_reference = {"path": str(result_path), "sha256": raw_sha256(result_path),
+                            "basis": "persisted_file", "status": "available"}
+    except OSError as exc:
+        result_reference = {"path": str(result_path), "sha256": canonical_hash(runtime_result),
+                            "basis": "returned_value", "status": "unavailable", "error": str(exc)}
+    row["recipe_attempt"] = attempt_receipt(
+        row["generation_recipe"], row, runtime_result, result_reference)
+    global_invalid = row["recipe_attempt"]["outcome"] == "global_invalid"
+    if global_invalid:
+        # Preserve actual stage/raw facts, but never qualify globally invalid
+        # source/lock/observer evidence as coverage, novelty or a SUT candidate.
+        row.update(tool_error=True, reason_code="global_execution_invalidity",
+                   candidate_eligible=False, feedback_eligible=False, seal_eligible=False,
+                   evidence_errors=list(row.get("evidence_errors") or []) +
+                       [row["recipe_attempt"]["diagnostic"]["reason"]])
     if wide:
         row.update({"sampling_kind": sampling_kind,
                     "chain_depth": len(plan.operations),
@@ -2667,9 +2731,20 @@ def _generate_case(sequence, entry, target, contract, surface, parent, mutator_i
         record_packaging_failure(row, exc, capsule_path)
         row.update(candidate_eligible=False, feedback_eligible=False, seal_eligible=False,
                    corpus_offer={"accepted": False, "reason": "packaging_failure"})
+        if not global_invalid:
+            row["recipe_attempt"]["outcome"] = "tool_failure"
+        row["tool_error"] = True
+        feedback.record(row)
+        scheduler.advance_feedback(feedback)
         return row
     if row.get("execution_stage") == "judged" and row.get("actual_run") is True:
         budget["executed"] += 1
+    if global_invalid:
+        row["corpus_offer"] = {"accepted": False, "reason": "global_execution_invalidity"}
+        feedback.record(row)
+        scheduler.advance_feedback(feedback)
+        _atomic_json(row_path, row)
+        return row
 
     def persist_topology_candidate_assessment(boundary, formal):
         if not topology:
