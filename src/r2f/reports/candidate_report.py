@@ -14,6 +14,7 @@ candidate state machine.
 """
 import json
 import os
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -480,18 +481,31 @@ def review_packet(row, *, identity=None, chain=None):
     return packet
 
 
+def _write_immutable_json(path, value):
+    """Publish complete JSON atomically without replacing any directory entry."""
+    encoded = json.dumps(value, sort_keys=True, indent=2, allow_nan=False) + "\n"
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, name = tempfile.mkstemp(prefix="." + path.name + ".", dir=path.parent)
+    tmp = Path(name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            stream.write(encoded)
+            stream.flush()
+            os.fsync(stream.fileno())
+        # link() is an atomic create-if-absent operation. Unlike replace(), it
+        # cannot overwrite a competing publisher or even a dangling symlink.
+        os.link(tmp, path)
+    finally:
+        tmp.unlink()
+    return path
+
+
 def write_review_packet(path, packet):
     """Write one packet atomically; an existing packet is never overwritten."""
     if not isinstance(packet, dict) or packet.get("schema_version") != REVIEW_PACKET_SCHEMA:
         raise ValueError("invalid review packet schema")
-    path = Path(path)
-    if path.exists():
-        raise FileExistsError("review packet already exists")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(json.dumps(packet, sort_keys=True, indent=2, allow_nan=False) + "\n")
-    os.replace(tmp, path)
-    return path
+    return _write_immutable_json(path, packet)
 
 
 def _review_record_digest(record):
