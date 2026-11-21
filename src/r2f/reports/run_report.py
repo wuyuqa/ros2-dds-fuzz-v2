@@ -1826,8 +1826,10 @@ def _audit_exploratory_ledger(root, report, rows, errors, details, *, qualificat
     if Counter(c.get("candidate_id") for c in ledger.get("candidates", [])) != Counter(
             c.get("candidate_id") for c in expected["candidates"]):
         errors.append("candidate_ledger_dropped_or_invented_anomaly")
+    # Accepted reviews include superseded history; rejection details must also
+    # match the rebuilt projection, even when the outer hashes are consistent.
     for key in ("natural_candidate_count", "confirmed_candidates", "tool_error_count",
-                "observer_incomplete_count", "control_count"):
+                "observer_incomplete_count", "control_count", "review_records", "review_errors"):
         if ledger.get(key) != expected.get(key):
             errors.append("exploratory_ledger_mismatch:" + key)
     if ledger.get("natural_candidate_count") == 0 and not ledger.get("zero_candidate_explanation"):
@@ -1862,28 +1864,14 @@ def _audit_exploratory_ledger(root, report, rows, errors, details, *, qualificat
         if (control.get("arm") == "negative" or control.get("kind") == "fault") \
                 and control.get("source") != "harness":
             errors.append("negative_control_harness_provenance_lost")
-    # A malformed or unreferenced review is rejected by the reviewer gate.  It
-    # cannot raise a candidate's status, but its mere presence does not mean the
-    # report's own evidence chain is corrupt.
-    rejected = []
-    for index, review in enumerate(report.get("review_records") or []):
-        if not isinstance(review, dict):
-            rejected.append({"index": index, "reason": "review_record_not_an_object"})
-            continue
-        problems = []
-        if review.get("conclusion") not in {"supported", "rejected", "needs_evidence"}:
-            problems.append("review_conclusion_invalid")
-        if not isinstance(review.get("reviewer_id"), str) or not review["reviewer_id"].strip():
-            problems.append("review_without_reviewer")
-        if not isinstance(review.get("evidence_refs"), dict) or not review["evidence_refs"]:
-            problems.append("review_without_evidence_references")
-        if review.get("reviewer_id") in set(review.get("independent_of") or []):
-            problems.append("reviewer_not_independent")
-        if problems:
-            rejected.append({"index": index, "candidate_id": review.get("candidate_id"),
-                             "reason": ",".join(problems)})
-    details["rejected_reviews"] = rejected
-    details["accepted_reviews"] = len(report.get("review_records") or []) - len(rejected)
+    # Reuse the independently rebuilt CP1 projection, including binding/hash
+    # rejection reasons and ID deduplication. Review acceptance remains separate
+    # from report evidence validity and never grants candidate confirmation.
+    details["rejected_reviews"] = [
+        {"index": failure.get("index"), "candidate_id": failure["candidate_id"],
+         "reason": failure["detail"]}
+        for failure in expected["review_errors"]]
+    details["accepted_reviews"] = len(expected["review_records"])
     details["candidate_ledger"] = ledger_path.name
 
 

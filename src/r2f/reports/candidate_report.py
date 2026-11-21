@@ -12,18 +12,20 @@ Two report kinds share one lifecycle and one ledger implementation:
 Review packets are attachments to the candidate lifecycle, not a second
 candidate state machine.
 """
+import fcntl
 import json
 import os
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
-from r2f.core.candidate import CandidateLifecycle, topology_observation_identity
-from r2f.core.evidence import canonical_hash
+from r2f.core.candidate import CandidateLifecycle, REVIEW_EVIDENCE_KEYS, topology_observation_identity
+from r2f.core.evidence import canonical_hash, raw_sha256
 from r2f.core.oracle import TriageResult
 
 REVIEW_PACKET_SCHEMA = "r2f.s1-review-packet/v1"
 REVIEW_RECORD_SCHEMA = "r2f.s1-review-record/v1"
+REVIEW_ATTRIBUTIONS = frozenset({"sut_candidate", "tool", "environment", "allowed", "unknown"})
 REVIEW_CONCLUSIONS = frozenset({"supported", "rejected", "needs_evidence"})
 REVIEW_PACKET_KEYS = (
     "schema_version", "packet_id", "candidate_id", "identity", "parent", "input", "chain",
@@ -237,7 +239,7 @@ def _review_errors(review, candidate_id):
         problems.append("review_candidate_mismatch")
     if not isinstance(review.get("reviewer_id"), str) or not review["reviewer_id"].strip():
         problems.append("review_without_reviewer")
-    if review.get("conclusion") not in REVIEW_CONCLUSIONS:
+    if not isinstance(review.get("conclusion"), str) or review["conclusion"] not in REVIEW_CONCLUSIONS:
         problems.append("review_conclusion_invalid")
     refs = review.get("evidence_refs")
     if not isinstance(refs, dict) or not refs:
@@ -246,7 +248,15 @@ def _review_errors(review, candidate_id):
         for key in ("source", "raw", "capsule"):
             if not isinstance(refs.get(key), str) or not refs[key].strip():
                 problems.append("review_missing_reference:" + key)
-    if review.get("reviewer_id") in set(review.get("independent_of") or []):
+        if set(refs) - REVIEW_EVIDENCE_KEYS:
+            problems.append("review_reference_unknown")
+        if any(not isinstance(value, str) or not value.strip() for value in refs.values()):
+            problems.append("review_reference_invalid")
+    independent = review.get("independent_of", [])
+    if not isinstance(independent, list) or any(
+            not isinstance(item, str) or not item.strip() for item in independent):
+        problems.append("review_independence_invalid")
+    elif review.get("reviewer_id") in independent:
         problems.append("reviewer_not_independent")
     return problems
 
@@ -262,13 +272,33 @@ def exploratory_candidate_ledger(rows, reviews=None):
     rows = list(rows)
     reviews = list(reviews or [])
     candidates, failures, controls, review_errors = [], [], [], []
+    originals = {f"{row.get('run_id')}:{row.get('cell_id')}": row for row in rows}
+    imported, by_id = [], {}
+    for index, review in enumerate(reviews):
+        candidate_id = review.get("candidate_id") if isinstance(review, dict) else None
+        row = originals.get(candidate_id) if isinstance(candidate_id, str) else None
+        problems = _review_import_errors(review, row)
+        if row is None:
+            problems.append("review_original_execution_missing")
+        if not problems:
+            previous = by_id.get(review["record_id"])
+            if previous is not None:
+                if previous == review:
+                    continue
+                problems.append("review_record_id_conflict")
+            else:
+                problems.extend(_review_history_errors(review, imported))
+        if problems:
+            review_errors.append({"index": index, "candidate_id": candidate_id,
+                                  "reason_code": "review_rejected", "detail": ",".join(problems)})
+            continue
+        imported.append(review)
+        by_id[review["record_id"]] = review
+    superseded = {r["supersedes_record_id"] for r in imported if r.get("supersedes_record_id")}
     by_candidate = {}
-    for review in reviews:
-        if isinstance(review, dict) and review.get("candidate_id"):
+    for review in imported:
+        if review["record_id"] not in superseded:
             by_candidate.setdefault(review["candidate_id"], []).append(review)
-        else:
-            review_errors.append({"candidate_id": None, "reason_code": "review_without_candidate",
-                                  "detail": "review record has no candidate_id"})
     for row in rows:
         cell_id = row.get("cell_id")
         if row.get("arm") == "negative" or row.get("control_kind"):
@@ -375,6 +405,7 @@ def exploratory_candidate_ledger(rows, reviews=None):
         "failures": failures,
         "controls": controls,
         "review_errors": review_errors,
+        "review_records": imported,
         "confirmed_candidates": sum(c.get("candidate_status") == "confirmed" for c in candidates),
         "natural_candidate_count": len(natural),
         "tool_error_count": sum(1 for f in failures if f.get("reason_code") == "tool_error"),
@@ -512,40 +543,191 @@ def _review_record_digest(record):
     return canonical_hash({k: v for k, v in record.items() if k != "record_sha256"})
 
 
-def append_review_record(path, record):
-    """Append one immutable review decision to a review log.
+def _review_execution_identity(row):
+    """Bind analysis to the saved execution, including its original source."""
+    return {
+        **{key: row.get(key) for key in (
+            "run_id", "cell_id", "target_id", "target_revision", "rule_id", "rmw",
+            "effective_input_sha256", "raw_path", "raw_sha256")},
+        "source": row.get("source_identity") or row.get("source_manifest") or row.get("provenance"),
+        "execution_sha256": canonical_hash(row),
+    }
 
-    The log is a JSONL file; existing lines are never rewritten.  A record must
-    name the reviewer, the candidate, a conclusion and evidence references.
+
+def _review_import_errors(record, original_row=None):
+    """Check integrity and binding; a digest does not authenticate the reviewer."""
+    if not isinstance(record, dict):
+        return ["review_record_not_an_object"]
+    problems = _review_errors(record, record.get("candidate_id"))
+    if record.get("schema_version") != REVIEW_RECORD_SCHEMA:
+        problems.append("review_schema_unknown")
+    if not isinstance(record.get("attribution"), str) or record["attribution"] not in REVIEW_ATTRIBUTIONS:
+        problems.append("review_attribution_invalid")
+    if not isinstance(record.get("reason"), str) or not record["reason"].strip():
+        problems.append("review_reason_missing")
+    try:
+        recorded_at = datetime.fromisoformat(record["recorded_at"])
+        if recorded_at.utcoffset() is None:
+            raise ValueError("timezone required")
+    except (KeyError, TypeError, ValueError):
+        problems.append("review_recorded_at_invalid")
+    if not isinstance(record.get("record_id"), str) or not record["record_id"].strip():
+        problems.append("review_record_id_missing")
+    try:
+        if record.get("record_sha256") != _review_record_digest(record):
+            problems.append("review_record_digest_mismatch")
+    except (TypeError, ValueError):
+        problems.append("review_record_not_json")
+    identity = record.get("execution_identity")
+    if not isinstance(identity, dict) or not identity:
+        problems.append("review_execution_identity_missing")
+    else:
+        if record.get("candidate_id") != f"{identity.get('run_id')}:{identity.get('cell_id')}":
+            problems.append("review_candidate_identity_mismatch")
+        for key in ("run_id", "cell_id", "target_id", "rule_id", "rmw", "raw_path"):
+            if not isinstance(identity.get(key), str) or not identity[key].strip():
+                problems.append("review_execution_identity_missing:" + key)
+        for key in ("effective_input_sha256", "raw_sha256", "execution_sha256"):
+            value = identity.get(key)
+            if not isinstance(value, str) or len(value) != 64 or any(c not in "0123456789abcdef" for c in value):
+                problems.append("review_execution_identity_hash_invalid:" + key)
+        if type(identity.get("target_revision")) is not int or identity["target_revision"] < 0:
+            problems.append("review_execution_identity_revision_invalid")
+        if not isinstance(identity.get("source"), (str, dict)) or not identity["source"]:
+            problems.append("review_execution_identity_source_missing")
+    if original_row is not None and identity != _review_execution_identity(original_row):
+        problems.append("review_execution_identity_mismatch")
+    refs = record.get("evidence_refs")
+    hashes = record.get("evidence_sha256")
+    if not isinstance(hashes, dict):
+        problems.append("review_reference_hashes_missing")
+    elif isinstance(refs, dict):
+        if set(hashes) != set(refs):
+            problems.append("review_reference_hashes_mismatch")
+        for key in refs:
+            try:
+                actual = raw_sha256(refs[key])
+                if hashes.get(key) != actual:
+                    problems.append("review_reference_hash_mismatch:" + str(key))
+            except (OSError, KeyError, TypeError, ValueError):
+                problems.append("review_reference_unavailable:" + str(key))
+        if isinstance(identity, dict) and (
+                refs.get("raw") != identity.get("raw_path")
+                or hashes.get("raw") != identity.get("raw_sha256")):
+            problems.append("review_raw_identity_mismatch")
+    if original_row is not None and original_row.get("replay_path") and (
+            not isinstance(refs, dict) or refs.get("capsule") != original_row["replay_path"]):
+        problems.append("review_capsule_identity_mismatch")
+    return problems
+
+
+def _review_history_errors(record, previous):
+    """A revision points backwards within one execution; forks stay explicit."""
+    supersedes = record.get("supersedes_record_id")
+    if supersedes is not None:
+        reason = record.get("revision_reason")
+        if not isinstance(reason, str) or not reason.strip():
+            return ["review_revision_reason_missing"]
+        parent = next((r for r in previous if r["record_id"] == supersedes), None)
+        if parent is None or parent.get("execution_identity") != record.get("execution_identity"):
+            return ["review_supersedes_identity_unknown"]
+        if any(r.get("supersedes_record_id") == supersedes for r in previous):
+            return ["review_supersedes_already_replaced"]
+    elif record.get("revision_reason") is not None or any(
+            r["candidate_id"] == record["candidate_id"] and r["reviewer_id"] == record["reviewer_id"]
+            for r in previous):
+        return ["review_revision_requires_supersedes"]
+    return []
+
+
+def append_review_record(path, record, *, original_row=None):
+    """Append analysis against original_row without changing execution or confirmation.
+
+    New records receive schema/time, reference hashes and a deterministic ID.
+    Imported records retain their digest and must match the original saved row.
+    Revisions require supersedes_record_id and revision_reason; old bytes stay.
     """
     path = Path(path)
-    record = dict(record or {})
+    if not isinstance(record, dict):
+        raise ValueError("review record must be an object")
+    record = dict(record)
+    if "record_sha256" in record and record["record_sha256"] != _review_record_digest(record):
+        raise ValueError("review record digest mismatch")
+    if not isinstance(original_row, dict):
+        raise ValueError("review import requires original execution identity row")
     record.setdefault("schema_version", REVIEW_RECORD_SCHEMA)
-    record.setdefault("recorded_at", datetime.now(timezone.utc).isoformat())
+    record.setdefault("execution_identity", _review_execution_identity(original_row))
     problems = _review_errors(record, record.get("candidate_id"))
     if problems:
         raise ValueError("invalid review record: " + ",".join(problems))
     if not isinstance(record.get("candidate_id"), str) or not record["candidate_id"]:
         raise ValueError("review record requires a candidate_id")
-    record["record_sha256"] = _review_record_digest(record)
+    if "evidence_sha256" not in record:
+        try:
+            record["evidence_sha256"] = {
+                key: raw_sha256(record["evidence_refs"][key])
+                for key in record["evidence_refs"]}
+        except (OSError, KeyError, TypeError, ValueError) as exc:
+            raise ValueError("review reference unavailable") from exc
+    record.setdefault("record_id", "review-" + canonical_hash({
+        k: v for k, v in record.items() if k not in {"record_sha256", "recorded_at", "record_id"}}))
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as stream:
+    with path.open("a+", encoding="utf-8") as stream:
+        fcntl.flock(stream, fcntl.LOCK_EX)
+        stream.seek(0)
+        existing = _decode_review_records(stream.read())
+        for previous in existing:
+            if previous["record_id"] == record["record_id"]:
+                record.setdefault("recorded_at", previous["recorded_at"])
+                record.setdefault("record_sha256", _review_record_digest(record))
+                problems = _review_import_errors(record, original_row)
+                if problems:
+                    raise ValueError("invalid review record: " + ",".join(problems))
+                if record != previous:
+                    raise ValueError("review record ID conflict")
+                return previous
+        record.setdefault("recorded_at", datetime.now(timezone.utc).isoformat())
+        record.setdefault("record_sha256", _review_record_digest(record))
+        problems = _review_import_errors(record, original_row) + _review_history_errors(record, existing)
+        if problems:
+            raise ValueError("invalid review record: " + ",".join(problems))
         stream.write(json.dumps(record, sort_keys=True, allow_nan=False) + "\n")
-    return record
+        stream.flush()
+        os.fsync(stream.fileno())
+        return record
 
 
-def read_review_records(path):
-    """Read an append-only review log, verifying every recorded digest."""
+def read_review_records(path, *, original_rows=None):
+    """Verify log digests/references; supply original_rows to recheck execution binding."""
+    with Path(path).open(encoding="utf-8") as stream:
+        fcntl.flock(stream, fcntl.LOCK_SH)
+        return _decode_review_records(stream.read(), original_rows=original_rows)
+
+
+def _decode_review_records(text, *, original_rows=None):
+    if text and not text.endswith("\n"):
+        raise ValueError("review log has an incomplete final line")
     records = []
-    for line in Path(path).read_text().splitlines():
+    originals = {f"{row['run_id']}:{row['cell_id']}": row for row in original_rows or []}
+    for line in text.splitlines():
         if not line.strip():
             continue
         record = json.loads(line)
-        if record.get("record_sha256") != _review_record_digest(record):
-            raise ValueError("review record digest mismatch")
-        problems = _review_errors(record, record.get("candidate_id"))
+        original_row = (originals.get(record.get("candidate_id"))
+                        if isinstance(record, dict) and isinstance(record.get("candidate_id"), str)
+                        else None)
+        problems = _review_import_errors(record, original_row)
+        if not problems:
+            duplicate = next((r for r in records if r["record_id"] == record["record_id"]), None)
+            if duplicate is not None:
+                if record != duplicate:
+                    raise ValueError("review record ID conflict")
+                continue
+            problems += _review_history_errors(record, records)
         if problems:
             raise ValueError("invalid review record: " + ",".join(problems))
+        if original_rows is not None and original_row is None:
+            raise ValueError("review execution identity mismatch")
         records.append(record)
     return records
 
