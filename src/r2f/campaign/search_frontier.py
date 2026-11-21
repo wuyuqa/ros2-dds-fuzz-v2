@@ -124,7 +124,8 @@ def derived_record(parent, plan):
         validation = validate_program(plan.final_config["topology_program"])
         guard = validation["status"] != "valid" or validation["guard_disposition"] == "guard_violation"
         guard = guard or any(op.applicability_result.get("expected_disposition") == "expect_guard_reject" for op in plan.operations)
-        for key in ("surface_id", "mutator_id", "profile_id", "cycle_id", "runner_slice"):
+        for key in ("surface_id", "mutator_id", "profile_id", "cycle_id", "runner_slice",
+                    "boundary_class", "parameter_class"):
             if key in parent:
                 record[key] = deepcopy(parent[key])
         record.update(executable=not guard, case_kind="guard_negative" if guard else "derived_topology",
