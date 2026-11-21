@@ -41,9 +41,14 @@ def edge_id(record):
 
 
 def feedback_identity(events):
-    """Feedback order is an identity input; duplicate events remain ordered."""
+    """Bind ordered scheduler inputs separately from the full event hashes.
+
+    Events already store the canonical coverage class. Re-parsing them as raw
+    observations discards that class because surface_id/boundary_class are not
+    top-level event fields. Full event integrity is checked on restore.
+    """
     members = [{"content_sha256": e.get("content_sha256"),
-                "surface_class": list(surface_class(e)) if surface_class(e) else None,
+                "surface_class": e.get("surface_class"),
                 "edge_id": e.get("edge_id"),
                 "complete": bool(e.get("coverage")),
                 "tool_error": bool(e.get("tool_error"))} for e in events]
