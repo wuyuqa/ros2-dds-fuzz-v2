@@ -27,39 +27,30 @@ def repo_root():
     return Path(runner.__file__).resolve().parents[3]
 
 
-@pytest.fixture(scope='module')
-def terminal_models(tmp_path_factory):
-    root = tmp_path_factory.mktemp('model-terminal-module')
-    docs = {'guard': narrowed('filter.expr', 'S1.topology.filter', {'filter_variant': 'invalid'}),
-            'noop': chains_profile(2, classes={'two.same_slot'}, seed='topology.writer_only')}
-    source = dict(source_repo=str(repo_root()), head='a06c42aa86cdf0a95531ca998f29f2554991772a',
-                  behavior_tree_sha256='e465237dedbe8032c09168b45e532bee6bccb14a9878e53c928f36382bd3e0ff',
-                  source_frozen=True, dirty_behavior_paths=[])
-    for name, doc in docs.items():
-        out = root / name
+@pytest.fixture
+def model_case(tmp_path):
+    def generate(name):
+        docs = {'guard': narrowed('filter.expr', 'S1.topology.filter', {'filter_variant': 'invalid'}),
+                'noop': chains_profile(2, classes={'two.same_slot'}, seed='topology.writer_only')}
+        doc = docs[name]
+        root = tmp_path / name
+        # Offline source-observation fixture only; this does not certify the checkout as frozen.
+        source = dict(source_repo=str(repo_root()), head='a06c42aa86cdf0a95531ca998f29f2554991772a',
+                      behavior_tree_sha256='e465237dedbe8032c09168b45e532bee6bccb14a9878e53c928f36382bd3e0ff',
+                      source_frozen=True, dirty_behavior_paths=[])
         runtime = Mock(side_effect=AssertionError('runtime forbidden in pure model fixture'))
-        hook = make_checkpoint_hook(out, profile=doc, cycle_id='topology-authored', source_manifest=source)
+        hook = make_checkpoint_hook(root, profile=doc, cycle_id='topology-authored', source_manifest=source)
+        # Produce all bound artifacts at their final paths; never rewrite sealed bytes.
         with patch.object(runner, 'source_manifest', return_value=deepcopy(source)):
-            runner.run_exploratory_cycle(out, **fresh(doc), profile=doc, max_inputs=1,
+            runner.run_exploratory_cycle(root, **fresh(doc), profile=doc, max_inputs=1,
                                         checkpoint_hook=hook, execute=False, runtime=runtime,
                                         run_id='terminal-fixture-' + name, runtime_boundary='isolated_netns')
         runtime.assert_not_called()
-    return root
-
-
-@pytest.fixture
-def model_case(terminal_models, tmp_path):
-    def copy(name):
-        source = terminal_models / name
-        root = tmp_path / name
-        shutil.copytree(source, root)
-        for file in root.rglob('*.json'):
-            file.write_text(file.read_text().replace(str(source), str(root)))
-        c = read(root / 'checkpoint.json')
-        c['checkpoint_sha256'] = canonical_hash({k: v for k, v in c.items() if k != 'checkpoint_sha256'})
-        write(root / 'checkpoint.json', c)
-        return root, read(root / 'report.json')
-    return copy
+        report = read(root / 'report.json')
+        result = audit.audit_exploratory_report(root / 'report.json')
+        assert result['evidence_valid'], result['errors']
+        return root, report
+    return generate
 
 
 def check(root, report):
@@ -81,6 +72,31 @@ def test_generated_terminal_report_is_valid_but_never_execution(model_case, kind
     assert not result['sealed'] and not result['all_oracles_pass']
     assert row['actual_run'] is False and row['candidate_eligible'] is False and row['feedback_eligible'] is False
     assert read(root / 'candidate_ledger.json')['natural_candidate_count'] == 0
+
+
+def test_rewriting_sealed_fixture_paths_is_rejected_without_changing_original(model_case, tmp_path):
+    source, _ = model_case('guard')
+    original = {p.relative_to(source): p.read_bytes() for p in source.rglob('*') if p.is_file()}
+    root = tmp_path / 'rewritten-guard'
+    shutil.copytree(source, root)
+    # Reproduce the old fixture relocation, including its partial re-signing.
+    for file in root.rglob('*.json'):
+        file.write_text(file.read_text().replace(str(source), str(root)))
+    checkpoint = read(root / 'checkpoint.json')
+    checkpoint['checkpoint_sha256'] = canonical_hash({
+        k: v for k, v in checkpoint.items() if k != 'checkpoint_sha256'})
+    write(root / 'checkpoint.json', checkpoint)
+    result = check(root, read(root / 'report.json'))
+    assert not result['evidence_valid']
+    assert set(result['errors']) == {
+        's1_coverage:automatic_replay:runner_replay_invalid:reference_path_or_hash_mismatch:checkpoint.json',
+        's1_coverage:automatic_replay:indexed_report_hash_mismatch',
+    }
+    for attachment in ('replay-summary.json', 'evidence-index.json'):
+        assert (root / attachment).read_bytes() == original[Path(attachment)]
+    assert {p.relative_to(source): p.read_bytes() for p in source.rglob('*') if p.is_file()} == original
+    result = audit.audit_exploratory_report(source / 'report.json')
+    assert result['evidence_valid'], result['errors']
 
 
 @pytest.mark.parametrize('damage', ['plan', 'content', 'parent', 'reason', 'noop_reason', 'source',
