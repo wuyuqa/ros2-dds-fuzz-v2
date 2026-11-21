@@ -1,5 +1,7 @@
 """Offline raw-backed/report contracts; never starts ROS or grants live credit."""
 from copy import deepcopy
+from functools import partial
+import hashlib
 import json
 from pathlib import Path
 from unittest.mock import patch
@@ -76,8 +78,12 @@ def test_legacy_fresh_budget_contract_still_checks_actual_rows():
 
 
 @pytest.fixture
-def noop_report(tmp_path):
-    cycle = g01.run(tmp_path / 'g01', bfs=True, maximum=4, execute=False)
+def noop_report(tmp_path, request):
+    # CP1 freezes the runtime boundary in cycle-input: select it at generation.
+    boundary = getattr(request, 'param', 'host')
+    with patch.object(g01, 'run_exploratory_cycle',
+                      partial(g01.run_exploratory_cycle, runtime_boundary=boundary)):
+        cycle = g01.run(tmp_path / 'g01', bfs=True, maximum=4, execute=False)
     root = tmp_path / 'g01'
     report = json.loads((root / 'report.json').read_text())
     row = next(r for r in report['rows'] if r.get('rejected_mutation_plan'))
@@ -85,9 +91,10 @@ def noop_report(tmp_path):
     return root, report, row
 
 
+@pytest.mark.parametrize('noop_report', ['isolated_netns'], indirect=True)
 def test_g01_no_effective_proposal_is_audited_before_isolated_runtime_gate(noop_report):
     root, report, row = noop_report
-    report['runtime_boundary'] = 'isolated_netns'
+    assert report['runtime_boundary'] == 'isolated_netns'
     errors=[]
     with patch.object(reports, 'boundary_qualification_for_row', side_effect=AssertionError('no execution gate for certified input rejection')):
         assert reports._verify_exploratory_row(root,row,report,errors),errors
@@ -146,5 +153,17 @@ def test_noop_source_artifacts_cannot_jointly_forge_a_task(noop_report):
     original = deepcopy(row)
     original['binding'] = original.pop('generation_binding')
     (root / 'cases' / row['cell_id'] / 'row.json').write_text(json.dumps(original))
+    # CP1 also binds the producer row in the immutable-input snapshot. Forge
+    # all row copies and both snapshot hashes to reach the independent task gate.
+    provenance = report['proof_provenance']
+    frozen_path = root / provenance['cycle_path']
+    frozen = json.loads(frozen_path.read_text())
+    matching = [item for item in frozen['rows'] if item['cell_id'] == row['cell_id']]
+    assert len(matching) == 1
+    matching[0].clear()
+    matching[0].update(deepcopy(original))
+    frozen_path.write_text(json.dumps(frozen))
+    provenance['cycle_sha256'] = reports.canonical_hash(frozen)
+    provenance['cycle_file_sha256'] = hashlib.sha256(frozen_path.read_bytes()).hexdigest()
     with pytest.raises(ValueError, match='search_mismatch:task_id'):
         qualify_f1_artifacts(root, row, report)

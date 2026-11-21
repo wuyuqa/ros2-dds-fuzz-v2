@@ -280,24 +280,392 @@ def _empty_required_result(errors):
 
 
 def audit_report(report_path):
-    """Dispatch audits by campaign kind; the required 72/18 contract is unchanged.
+    """Audit original evidence and query the existing S1 lineage in one result.
 
-    Exploratory reports never borrow the required seal.  Unknown kinds are an
-    audit error rather than a silent fallback to the required matrix.
+    The added projection is detached and never participates in report hashes or
+    changes the per-target seal. Old reports need no new persisted fields.
     """
     path = Path(report_path).resolve()
+    report = {}
     try:
         report = json.loads(path.read_text())
+        if not isinstance(report, dict):
+            raise ValueError("report must be an object")
     except (OSError, ValueError) as exc:
-        return _empty_required_result(["report_artifact_error:" + str(exc)])
-    if not isinstance(report, dict):
-        return _empty_required_result(["report_artifact_error:report must be an object"])
-    kind = report.get("campaign_kind", "required")
-    if report.get("schema_version") == EXPLORATORY_SCHEMA or kind == "exploratory":
-        return audit_exploratory_report(path, report=report)
-    if kind not in SUPPORTED_CAMPAIGN_KINDS:
-        return _empty_required_result(["unknown_campaign_kind:" + repr(kind)])
-    return _audit_required_report(path, report)
+        report = {}
+        result = _empty_required_result(["report_artifact_error:" + str(exc)])
+    else:
+        kind = report.get("campaign_kind", "required")
+        rows = report.get("rows", [])
+        if isinstance(rows, list) and any(not isinstance(row, dict) for row in rows):
+            result = _empty_required_result(["report_artifact_error:rows must contain objects"])
+        elif report.get("schema_version") == EXPLORATORY_SCHEMA or kind == "exploratory":
+            return audit_exploratory_report(path, report=report)
+        elif kind not in SUPPORTED_CAMPAIGN_KINDS:
+            result = _empty_required_result(["unknown_campaign_kind:" + repr(kind)])
+        else:
+            result = _audit_required_report(path, report)
+    return _with_s1_coverage(path, report, result)
+
+
+def _with_s1_coverage(path, report, result):
+    try:
+        result["s1_coverage"] = _s1_coverage_fields(path, report, result)
+    except (OSError, ValueError, TypeError, KeyError) as exc:
+        result["s1_coverage"] = {"query_valid": False, "inventory_status": "unavailable",
+            "named_gaps": ["coverage_query_error:" + str(exc)],
+            "report_evidence": {"report_path": str(path), "source_current": False}}
+    if (result.get("sealed") is True
+            and not result["s1_coverage"]["report_evidence"]["source_current"]):
+        result["sealed"] = False
+        result["errors"].append("s1_coverage:source_not_current")
+    if not result["s1_coverage"]["query_valid"]:
+        result["sealed"] = False
+        if "evidence_valid" in result:
+            result["evidence_valid"] = False
+        result["errors"].extend("s1_coverage:" + error for error in result["s1_coverage"]["named_gaps"])
+    return result
+
+
+def _s1_coverage_fields(path, report, audit):
+    """Project the CP2 sidecar, without treating a target link as a proof."""
+    from r2f.modules.s1.catalog import coverage_lineage
+    from r2f.reports.candidate_report import query_automatic_replays
+
+    data = coverage_lineage()
+    query_errors = []
+    source = report.get("source_manifest")
+    if report.get("manifest_path"):
+        try:
+            manifest = json.loads(_path(path.parent, report["manifest_path"]).read_text())
+            source = manifest["source_manifest"]
+            if identity_hashes(manifest) != report.get("identity"):
+                raise ValueError("report_manifest_identity_mismatch")
+        except (OSError, ValueError, TypeError, KeyError) as exc:
+            query_errors.append("manifest:" + str(exc))
+    current = source_manifest(Path(__file__).resolve().parents[3])
+    source_current = (source == current and current.get("source_frozen") is True)
+    rows = []
+    report_rows = report.get("rows", [])
+    if not isinstance(report_rows, list):
+        query_errors.append("report_rows_not_a_list")
+        report_rows = []
+    for row in report_rows:
+        if not isinstance(row, dict):
+            query_errors.append("report_row_not_an_object")
+            continue
+        evidence = _s1_row_evidence(path.parent, row, source, data["model_bindings"])
+        _s1_execution_context(path.parent, row, report, audit, evidence, source_current)
+        rows.append(evidence)
+        query_errors.extend(str(row.get("cell_id")) + ":" + error for error in evidence["reference_errors"])
+    data["report_evidence"] = {"report_path": str(path), "run_id": report.get("run_id"),
+        "source_manifest": source, "current_source_manifest": current,
+        "source_current": source_current,
+        "evidence_audit_valid": not audit["errors"],
+        "named_gaps": [] if source_current else ["source_not_current"],
+        "audit_errors": list(audit["errors"]), "rows": rows}
+    replay_trace = {"status": "not_observed", "named_gaps": ["replay_disposition_not_observed"]}
+    if report.get("candidate_ledger_path") is not None:
+        try:
+            ledger_path = _path(path.parent, report["candidate_ledger_path"])
+            ledger = json.loads(ledger_path.read_text())
+            if canonical_hash(ledger) != report.get("candidate_ledger_sha256"):
+                raise ValueError("hash_mismatch")
+            if not isinstance(ledger, dict):
+                raise ValueError("ledger_not_an_object")
+            candidates = ledger.get("candidates")
+            if not isinstance(candidates, list):
+                raise ValueError("candidates_not_a_list")
+            dispositions = []
+            for index, candidate in enumerate(candidates):
+                if not isinstance(candidate, dict):
+                    raise ValueError("candidate_not_an_object:" + str(index))
+                attempts = candidate.get("replay_attempts", [])
+                if not isinstance(attempts, list):
+                    raise ValueError("replay_attempts_not_a_list:" + str(index))
+                for attempt in attempts:
+                    validate_replay_attempt(attempt)
+                dispositions.append({key: deepcopy(candidate.get(key)) for key in
+                    ("candidate_id", "cell_id", "replay_attempts", "non_replayable")})
+            replay_trace = {"status": "verified_ledger_reference", "path": str(ledger_path),
+                "sha256": report["candidate_ledger_sha256"], "dispositions": dispositions,
+                "limitation": "Existing replay dispositions; this query executes no replay."}
+        except (OSError, ValueError, TypeError, KeyError) as exc:
+            query_errors.append("replay_ledger:" + str(exc))
+            replay_trace = {"status": "invalid", "reason": str(exc)}
+    data["report_evidence"]["replay_trace"] = replay_trace
+    automatic = query_automatic_replays(path.parent)
+    if "attachment_valid" in automatic:
+        partial_requests = (automatic.get("attachment_valid") is False
+                            and automatic.get("reason_code") == "automatic_replay_attachment_failure"
+                            and not (path.parent / "replay-summary.json").exists())
+        try:
+            if (not isinstance(report.get("run_id"), str) or not report["run_id"]
+                    or (not partial_requests and automatic.get("run_id") != report["run_id"])):
+                raise ValueError("report_run_id_mismatch")
+            # Directory-level validation does not associate an attachment with
+            # this report. Bind it to the saved index and exact report bytes.
+            index_path = _path(path.parent, "evidence-index.json")
+            index_bytes = index_path.read_bytes()
+            index_ref = ({"path": "evidence-index.json",
+                          "sha256": hashlib.sha256(index_bytes).hexdigest()}
+                         if partial_requests else automatic.get("original_index"))
+            if (not isinstance(index_ref, dict)
+                    or _path(path.parent, index_ref.get("path")) != index_path
+                    or hashlib.sha256(index_bytes).hexdigest() != index_ref.get("sha256")):
+                raise ValueError("report_index_reference_mismatch")
+            index = json.loads(index_bytes)
+            if not isinstance(index, dict) or index.get("run_id") != report["run_id"]:
+                raise ValueError("report_run_id_mismatch")
+            if not isinstance(source, dict) or source != index.get("source_manifest"):
+                raise ValueError("report_source_mismatch")
+            cells = [row["cell_id"] for row in report_rows]
+            indexed_cells = [ref["cell_id"] for ref in index["identities"]]
+            if (len(cells) != len(set(cells)) or len(indexed_cells) != len(set(indexed_cells))
+                    or set(cells) != set(indexed_cells)):
+                raise ValueError("report_cell_set_mismatch")
+            members = [ref for ref in index["reports"] if isinstance(ref, dict)
+                       and isinstance(ref.get("path"), str)
+                       and (path.parent / ref["path"]).resolve() == path]
+            if len(members) != 1:
+                raise ValueError("report_not_indexed")
+            if hashlib.sha256(path.read_bytes()).hexdigest() != members[0].get("sha256"):
+                raise ValueError("indexed_report_hash_mismatch")
+            if partial_requests:
+                # Missing summary means unknown requests, not verified attempts.
+                # Attribute them only through the indexed original and intake.
+                if "failure" in automatic and (not isinstance(automatic["failure"], dict)
+                        or automatic["failure"].get("run_id") != report["run_id"]):
+                    raise ValueError("failure_run_id_mismatch")
+                identities = {ref["cell_id"]: ref for ref in index["identities"]}
+                for entry in automatic["entries"]:
+                    request_ref = entry["request"]
+                    request_path = _path(path.parent, request_ref["path"])
+                    expected = path.parent / "replay-scheduling" / entry["dispatch_id"] / "request.json"
+                    if (request_path != expected.resolve() or not request_path.is_relative_to(path.parent)
+                            or hashlib.sha256(request_path.read_bytes()).hexdigest() != request_ref["sha256"]):
+                        raise ValueError("request_reference_mismatch")
+                    request = json.loads(request_path.read_text())
+                    if not isinstance(request, dict) or request.get("run_id") != report["run_id"]:
+                        raise ValueError("request_run_id_mismatch")
+                    identity = identities.get(entry["cell_id"])
+                    if (identity is None or request.get("cell_id") != entry["cell_id"]
+                            or request.get("dispatch_id") != entry["dispatch_id"]
+                            or request.get("original_index") != index_ref
+                            or request.get("intake_identity") != {k: v for k, v in identity.items() if k != "cell_id"}):
+                        raise ValueError("request_identity_mismatch")
+                    identity_path = _path(path.parent, identity["path"])
+                    if (not identity_path.is_relative_to(path.parent)
+                            or hashlib.sha256(identity_path.read_bytes()).hexdigest() != identity["sha256"]):
+                        raise ValueError("request_intake_reference_mismatch")
+                    saved = json.loads(identity_path.read_text())
+                    if (not isinstance(saved, dict) or saved.get("run_id") != report["run_id"]
+                            or saved.get("cell_id") != entry["cell_id"]
+                            or saved.get("source_manifest") != source):
+                        raise ValueError("request_intake_identity_mismatch")
+        except (OSError, ValueError, TypeError, KeyError) as exc:
+            if partial_requests:
+                automatic = dict(automatic, status="nonassociated", entries=[],
+                    nonassociated_entries=automatic.get("entries", []), association_error=str(exc),
+                    errors=[*automatic.get("errors", []), str(exc)])
+            else:
+                automatic = {"status": "nonassociated", "attachment_valid": False, "entries": [],
+                    "reason_code": str(exc), "errors": [*automatic.get("errors", []), str(exc)]}
+    data["report_evidence"]["automatic_replay"] = automatic
+    query_errors.extend("automatic_replay:" + error for error in automatic.get("errors", []))
+    data["query_valid"] = not query_errors
+    data["named_gaps"] = query_errors
+    for row in data["obligations"]:
+        targets = {link["target_id"] for link in row["model_links"]}
+        row["supporting_execution_refs"] = [item["cell_id"] for item in rows
+                                              if item["target_id"] in targets]
+        row["named_gaps"] = list(row["remaining_obligations"])
+        related = [item for item in rows if item["target_id"] in targets]
+        qualified = any(item["current_execution_qualified"] for item in related)
+        row["capability_layers"] = {
+            "input": {"status": "model_input_only" if targets else "unverified",
+                      "target_ids": sorted(targets)},
+            "related_execution": {"status": "partial_real_validation" if qualified else "unverified",
+                                  "scope": "target_context_not_full_obligation_coverage"},
+            "semantic_contract": {"status": "unverified",
+                                  "reason": "obligation_specific_proof_missing"}}
+    obligations = {row["id"]: row for row in data["obligations"]}
+    for key, links in (("cases", "coverage_rows"), ("user_stories", "obligation_ids")):
+        for row in data[key]:
+            row["current_source_status"] = "unverified"
+            row["named_gaps"] = ["obligation_specific_proof_missing:" + cid for cid in row[links]]
+            row["supporting_execution_refs"] = sorted({ref for cid in row[links]
+                for ref in obligations[cid]["supporting_execution_refs"]})
+            row["supporting_evidence_refs"] = sorted({ref for cid in row[links]
+                for ref in obligations[cid]["evidence_refs"]})
+    cells = []
+    for target, revision in data["required_baseline"]["target_revisions"].items():
+        for cell in first_slice_cells(target):
+            if cell["arm"] == "negative" or cell["control_kind"]:
+                continue
+            supporting = [row for row in rows if row["target_id"] == target
+                          and row["cell_id"] == cell["cell_id"]]
+            complete = (audit.get("sealed") is True and source_current and not query_errors
+                        and len(supporting) == 1 and supporting[0]["current_execution_qualified"])
+            cells.append(dict(cell, target_revision=revision,
+                status="declared_contract_complete" if complete else "unverified",
+                supporting_execution_refs=[row["cell_id"] for row in supporting],
+                named_gaps=[] if complete else ["current_source_required_cell_not_qualified"]))
+    data["required_baseline"]["cells"] = cells
+    return data
+
+
+def _s1_execution_context(root, row, report, audit, evidence, source_current):
+    """Qualify related target execution, never the linked semantic obligations."""
+    if row.get("arm") == "negative" or row.get("control_kind"):
+        evidence["named_gaps"].append("control_not_semantic_coverage")
+        return
+    if (evidence["reference_errors"] or evidence["qualification"] in {"fixture", "tool_error"}
+            or row.get("actual_run") is not True or row.get("execution_stage") != "judged"):
+        return
+    if not source_current:
+        evidence["qualification"] = "historical_source"
+        evidence["named_gaps"].append("source_not_current")
+        return
+    if audit["errors"]:
+        evidence["named_gaps"].append("canonical_evidence_audit_failed")
+        return
+    if report.get("formal_runtime", report.get("runtime_formal")) is not True:
+        evidence["named_gaps"].append("formal_runtime_not_qualified")
+        return
+    try:
+        from r2f.modules.s1.topology_targets import TOPOLOGY_TARGET
+        if row["target_id"] == TOPOLOGY_TARGET:
+            proof = audit.get("topology_qualifications", {}).get(row["cell_id"])
+        else:
+            proof = _f1_adapter_artifact_qualification(root, row, report)
+            if proof is None and audit.get("sealed") is True:
+                from r2f.campaign.replay import _qualification, DEFAULT_RUNTIME, ISOLATED_RUNTIME
+                config = json.loads(_path(root, row["runtime_config_path"]).read_text())
+                result_path = _path(root, row["runtime_result_path"])
+                result = json.loads(result_path.read_text())
+                origin = ISOLATED_RUNTIME if report.get("runtime_boundary") == "isolated_netns" else DEFAULT_RUNTIME
+                proof = _qualification(origin, config, result, row, output_root=result_path.parent)
+        evidence["execution_qualification"] = proof
+        if proof and proof.get("real_ros_execution") is True:
+            evidence.update(current_execution_qualified=True, qualification="related_execution",
+                            status="partial_real_validation")
+            evidence["named_gaps"] = ["context_link_does_not_prove_semantic_obligation"]
+        else:
+            evidence["named_gaps"].extend((proof or {}).get("qualification_errors") or ["execution_qualification_missing"])
+    except (OSError, ValueError, TypeError, KeyError) as exc:
+        evidence["reference_errors"].append("execution_qualification:" + str(exc))
+        evidence["named_gaps"].append("execution_qualification:" + str(exc))
+
+
+def _s1_row_evidence(root, row, source, models):
+    """Reopen advertised references even when a fixture cannot pass seal gates."""
+    evidence = {key: deepcopy(row.get(key)) for key in (
+        "cell_id", "target_id", "target_revision", "rmw", "arm", "repeat",
+        "domain_id", "execution_stage", "actual_run", "rule_id",
+        "effective_input_sha256", "raw_path", "raw_sha256", "replay_path",
+        "precondition_receipts", "mutation_receipt", "typed_facts", "oracle_verdict",
+        "runtime_status", "reason_code", "abort_reason", "observation_receipts")}
+    errors = []
+    evidence.update(reference_errors=errors, named_gaps=[], current_execution_qualified=False,
+                    qualification="unverified", status="unverified")
+    model = models.get(row.get("target_id"))
+    if not model or row.get("target_revision") != model["target_revision"]:
+        errors.append("target_or_revision_not_in_current_model")
+    if model and row.get("rule_id") not in {None, *(ref["rule_id"] for ref in model["rule_lineage_refs"])}:
+        errors.append("rule_not_in_current_model")
+    evidence["raw"] = {"status": "not_observed"}
+    if row.get("raw_path") is not None:
+        try:
+            raw = _path(root, row["raw_path"])
+            verify_raw(raw, row.get("raw_sha256"))
+            evidence["raw"] = {"status": "verified", "path": str(raw), "sha256": row["raw_sha256"]}
+        except (OSError, ValueError, TypeError, KeyError) as exc:
+            evidence["raw"] = {"status": "invalid", "reason": str(exc)}
+            errors.append("raw:" + str(exc))
+    evidence["replay"] = {"status": "not_observed", "attempt_status": row.get("replay_status", "unknown")}
+    capsule_input = None
+    if row.get("replay_path") is not None:
+        try:
+            capsule_path = _path(root, row["replay_path"])
+            capsule = ReplayCapsule.from_dict(json.loads(capsule_path.read_text()))
+            for key in ("target_id", "target_revision", "rmw", "arm", "repeat", "effective_input_sha256"):
+                if capsule.input.get(key) != row.get(key):
+                    raise ValueError("capsule_row_identity_mismatch:" + key)
+            if capsule.input["source_manifest"] != source:
+                raise ValueError("capsule_source_identity_mismatch")
+            if model and canonical_hash(capsule.input["target"]) != model["manifest_sha256"]:
+                raise ValueError("capsule_target_manifest_mismatch")
+            evidence["replay"].update(status="verified_input_capsule", path=str(capsule_path),
+                sha256=hashlib.sha256(capsule_path.read_bytes()).hexdigest(),
+                execution_present=capsule.execution is not None,
+                limitation="input capsule is not an independent replay attempt")
+            capsule_input = capsule.input
+        except (OSError, ValueError, TypeError, KeyError) as exc:
+            evidence["replay"].update(status="invalid", reason=str(exc))
+            errors.append("replay:" + str(exc))
+    evidence["config"] = {"status": "not_observed"}
+    if row.get("runtime_config_path") is not None:
+        try:
+            config_path = _path(root, row["runtime_config_path"])
+            config = json.loads(config_path.read_text())
+            if not isinstance(config, dict):
+                raise ValueError("runtime config must be an object")
+            for key in ("run_id", "target_id", "target_revision", "rmw", "arm", "repeat", "domain_id",
+                        "effective_input_sha256"):
+                # Exploratory input-only rows need not carry execution domain.
+                if key == "domain_id" and key not in row and row.get("actual_run") is not True:
+                    continue
+                if config.get(key) != row.get(key):
+                    raise ValueError("config_row_identity_mismatch:" + key)
+            if config.get("source_manifest") != source:
+                raise ValueError("config_source_identity_mismatch")
+            if capsule_input is None:
+                raise ValueError("config_input_capsule_unverified")
+            # The validated persisted capsule binds its digest to actual input;
+            # compare saved config values without regenerating a plan or input.
+            effective = capsule_input["effective_input"]
+            for key in ("final_input", "input_layer_receipts"):
+                if canonical_hash(config.get(key)) != canonical_hash(effective[key]):
+                    raise ValueError("config_capsule_input_mismatch:" + key)
+            if ("effective_input" in config
+                    and canonical_hash(config["effective_input"]) != canonical_hash(effective)):
+                raise ValueError("config_capsule_input_mismatch:effective_input")
+            for key, value in effective["final_input"].items():
+                if canonical_hash(config.get(key)) != canonical_hash(value):
+                    raise ValueError("config_submitted_input_mismatch:" + key)
+            evidence["config"] = {"status": "verified", "path": str(config_path),
+                                  "sha256": hashlib.sha256(config_path.read_bytes()).hexdigest()}
+        except (OSError, ValueError, TypeError, KeyError) as exc:
+            evidence["config"] = {"status": "invalid", "reason": str(exc)}
+            errors.append("config:" + str(exc))
+    runtime = {}
+    if row.get("runtime_result_path") and row.get("execution_stage") != "planned":
+        try:
+            loaded = json.loads(_path(root, row["runtime_result_path"]).read_text())
+            if not isinstance(loaded, dict):
+                raise ValueError("runtime result must be an object")
+            runtime = loaded
+            if row.get("raw_path") and (runtime.get("raw_path") != row["raw_path"]
+                                       or runtime.get("raw_sha256") != row.get("raw_sha256")):
+                raise ValueError("runtime_raw_binding_mismatch")
+        except (OSError, ValueError, TypeError, KeyError) as exc:
+            errors.append("runtime:" + str(exc))
+    origin = runtime.get("evidence_origin", row.get("evidence_origin"))
+    evidence["evidence_origin"] = origin
+    if row.get("tool_error") is True or row.get("runtime_status") == "tool_error" or runtime.get("runtime_status") == "tool_error":
+        evidence["qualification"] = "tool_error"
+        evidence["named_gaps"].append("tool_error_not_sut_observation")
+    elif origin in {"fixture", "synthetic", "offline", "injected_runtime"}:
+        evidence.update(qualification="fixture", status="wired_pending_real_validation")
+        evidence["named_gaps"].append("offline_fixture_not_real_execution")
+    elif row.get("execution_stage") == "planned" and not row.get("actual_run"):
+        evidence.update(qualification="input_only", status="model_input_only")
+        evidence["named_gaps"].append("execution_not_run")
+    else:
+        evidence["named_gaps"].append("execution_not_qualified")
+    evidence["named_gaps"].extend(errors)
+    return evidence
 
 
 def _audit_required_report(report_path, report):
@@ -1520,6 +1888,23 @@ def _audit_exploratory_ledger(root, report, rows, errors, details, *, qualificat
 
 
 def audit_exploratory_report(report_path, *, report=None):
+    """Keep producer and standalone audit queries on the same CP2 projection."""
+    path = Path(report_path).resolve()
+    if report is None:
+        try:
+            report = json.loads(path.read_text())
+        except (OSError, ValueError):
+            report = {}
+    if (isinstance(report, dict) and isinstance(report.get("rows"), list)
+            and any(not isinstance(row, dict) for row in report["rows"])):
+        result = {"sealed": False, "evidence_valid": False,
+                  "errors": ["report_artifact_error:rows must contain objects"]}
+    else:
+        result = _audit_exploratory_report(path, report=report)
+    return _with_s1_coverage(path, report if isinstance(report, dict) else {}, result)
+
+
+def _audit_exploratory_report(report_path, *, report=None):
     """Audit an exploratory report without borrowing required maturity or seal.
 
     ``evidence_valid`` answers whether the report and its artefacts recompute;

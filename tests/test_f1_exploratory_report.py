@@ -301,6 +301,17 @@ def strip_adapter_markers(report):
     return report
 
 
+def _legacy_plan_fixture(tmp_path):
+    cycle, report = plan(tmp_path)
+    root = Path(cycle['report_path']).parent
+    # Only this private tmp_path fixture predates automatic replay attachments.
+    # Retain its canonical input artifacts, but no later summary/index/requests.
+    (root / 'replay-summary.json').unlink()
+    (root / 'evidence-index.json').unlink()
+    assert not (root / 'replay-scheduling').exists()
+    return cycle, strip_adapter_markers(report)
+
+
 @pytest.mark.parametrize('claim', ['actual', 'observed', 'judged'])
 def test_removing_all_new_markers_cannot_select_legacy_live_bypass(tmp_path, claim):
     from test_feedback_epoch_runner import adapter_runtime
@@ -339,8 +350,7 @@ def test_unmarked_legacy_f1_actual_without_canonical_layout_is_invalid(tmp_path)
 
 
 def test_unmarked_legacy_f1_plan_compatibility_never_grants_real_or_candidate(tmp_path):
-    cycle, report = plan(tmp_path)
-    report = strip_adapter_markers(report)
+    cycle, report = _legacy_plan_fixture(tmp_path)
     path = Path(cycle['report_path'])
     path.write_text(json.dumps(report))
     audit = audit_exploratory_report(path)
@@ -348,6 +358,31 @@ def test_unmarked_legacy_f1_plan_compatibility_never_grants_real_or_candidate(tm
     assert report['rows'][0]['actual_run'] is False
     assert report['rows'][0]['execution_stage'] == 'planned'
     assert load(path.parent / 'candidate_ledger.json')['natural_candidate_count'] == 0
+    evidence = audit['s1_coverage']['report_evidence']
+    assert evidence['rows'][0]['qualification'] == 'input_only'
+    assert evidence['rows'][0]['current_execution_qualified'] is False
+    automatic = evidence['automatic_replay']
+    assert automatic['status'] == 'not_run'
+    assert automatic['reason_code'] == 'automatic_replay_not_requested'
+    assert automatic['entries'] == []
+    assert audit['coverage_entries'] == 0
+    assert audit['sealed'] is False
+
+
+def test_unmarking_modern_f1_plan_invalidates_bound_replay_attachments(tmp_path):
+    cycle, report = plan(tmp_path)
+    path = Path(cycle['report_path'])
+    assert audit_exploratory_report(path)['evidence_valid']
+    original = path.read_bytes()
+    attachments = {path.parent / name: (path.parent / name).read_bytes()
+                   for name in ('replay-summary.json', 'evidence-index.json')}
+    path.write_text(json.dumps(strip_adapter_markers(report)))
+    audit = audit_exploratory_report(path)
+    assert not audit['evidence_valid'], audit
+    assert 's1_coverage:automatic_replay:runner_replay_invalid:reference_path_or_hash_mismatch:report.json' in audit['errors']
+    assert 's1_coverage:automatic_replay:indexed_report_hash_mismatch' in audit['errors']
+    assert path.read_bytes() != original
+    assert all(attachment.read_bytes() == content for attachment, content in attachments.items())
 
 
 @pytest.mark.parametrize('damage', ['model_shape', 'mutator_spec', 'artifact_shape'])
