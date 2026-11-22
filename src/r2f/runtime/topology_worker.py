@@ -855,6 +855,94 @@ class CycloneMatchedPeerObserver:
             raise ValueError("local_entity_domain_mismatch")
         return matches[0], sorted(edges)
 
+    def sample_ownership(self, domain, gid, kind):
+        """Supporting local ownership observation; never a sharing/control claim.
+
+        Handles are process-local diagnostics. The worker raw envelope binds the
+        copied GUIDs to logical/generation/process/run identity. Two equal bounded
+        samples cannot establish atomicity or participant lifecycle generation.
+        """
+        result = {"schema": "r2f.cyclone-participant-ownership/v1",
+                  "complete": False, "status": "unknown", "candidate_eligible": False,
+                  "domain_id": domain, "local_gid": gid, "role_kind": kind,
+                  "provenance": self.provenance,
+                  "started_monotonic_ns": time.monotonic_ns(),
+                  "ownership_api": "dds_get_participant+dds_get_parent",
+                  "lookup_api": "dds_lookup_participant+dds_get_children+dds_get_guid",
+                  "limitations": ["bounded_stable_samples_not_atomic_or_continuous",
+                                  "process_local_handles_not_lifecycle_generation",
+                                  "configured_participant_sharing_not_controlled"]}
+        try:
+            if (type(domain) is not int or not 0 <= domain < 2**32
+                    or not isinstance(gid, str) or re.fullmatch(r"[0-9a-f]{32}", gid) is None
+                    or gid == "0" * 32 or kind not in ("writer", "reader")):
+                raise ValueError("participant_ownership_input_identity_invalid")
+            # Optional symbols are bound here so their absence cannot disable
+            # the existing matched-peer/count observer.
+            for name in ("dds_get_parent", "dds_get_participant"):
+                function = getattr(self.lib, name, None)
+                if function is None:
+                    result["status"] = "unavailable"
+                    raise ValueError("participant_ownership_api_unavailable:" + name)
+                function.argtypes = [self.c.c_int32]
+                function.restype = self.c.c_int32
+
+            def capture():
+                local, inventory = self._locate(domain, gid)
+                edges = dict(inventory)
+                participant = self.lib.dds_get_participant(local)
+                if type(participant) is not int or participant <= 0:
+                    raise ValueError("participant_lookup_failed")
+                chain = [local]
+                while chain[-1] != participant:
+                    parent = self.lib.dds_get_parent(chain[-1])
+                    if (parent not in edges or chain[-1] not in edges[parent]
+                            or parent in chain or len(chain) >= self.MAX_ENTITIES):
+                        raise ValueError("participant_parent_chain_invalid")
+                    chain.append(parent)
+                if (local == participant or self.lib.dds_get_parent(participant) != 0
+                        or participant not in self._enumerate(self.lib.dds_lookup_participant, domain)):
+                    raise ValueError("participant_root_invalid")
+                identities = []
+                for handle, _ in inventory:
+                    observed_domain = self.c.c_uint32()
+                    if (self.lib.dds_get_domainid(handle, self.c.byref(observed_domain)) != 0
+                            or observed_domain.value != domain):
+                        raise ValueError("participant_inventory_domain_mismatch")
+                    guid = self.Guid()
+                    rc = self.lib.dds_get_guid(handle, self.c.byref(guid))
+                    # Public get_guid supports only participants/readers/writers.
+                    # Implicit publishers/subscribers (and topics) have no wire
+                    # GUID; retain the documented ILLEGAL_OPERATION explicitly.
+                    value = bytes(guid.v).hex() if rc == 0 else None
+                    if (rc not in (0, -12) or (rc == -12 and handle in (local, participant))
+                            or value == "0" * 32):
+                        raise ValueError("participant_inventory_guid_invalid_or_aliased")
+                    identities.append({"handle": handle, "gid": value,
+                                       "guid_return_code": rc,
+                                       "domain_id": observed_domain.value})
+                if next(row["gid"] for row in identities if row["handle"] == local) != gid:
+                    raise ValueError("participant_endpoint_guid_changed")
+                gids = [row["gid"] for row in identities if row["gid"] is not None]
+                if len(gids) != len(set(gids)):
+                    raise ValueError("participant_inventory_guid_invalid_or_aliased")
+                participant_gid = next(row["gid"] for row in identities
+                                       if row["handle"] == participant)
+                if not participant_gid or participant_gid == "0" * 32 or participant_gid == gid:
+                    raise ValueError("participant_guid_invalid")
+                return {"local_handle": local, "participant_handle": participant,
+                        "participant_gid": participant_gid, "parent_chain": chain,
+                        "entity_inventory": inventory, "entity_identities": identities}
+
+            first, second = capture(), capture()
+            if first != second:
+                raise ValueError("participant_ownership_inventory_changed")
+            result.update(first, complete=True, status="observed", stable_sample_count=2)
+        except (ValueError, TypeError, OSError, AttributeError, RuntimeError) as exc:
+            result.update(complete=False, reason=str(exc))
+        result["ended_monotonic_ns"] = time.monotonic_ns()
+        return result
+
     def sample(self, domain, gid, kind):
         began = time.monotonic_ns()
         result = {"schema": self.SCHEMA, "complete": False, "provenance": self.provenance,
@@ -1345,7 +1433,26 @@ def _worker_main(argv):
                         observation = {"complete": False, "reason": str(exc),
                             "schema": "r2f.fastdds-native-matched-peer-observation/v1",
                             "manifest_reference": instrumentation}
+                ownership = {"schema": "r2f.participant-ownership-unavailable/v1",
+                             "complete": False, "status": "unavailable",
+                             "candidate_eligible": False,
+                             "domain_id": config["domain_id"], "local_gid": local_gid,
+                             "role_kind": kind,
+                             "reason": "rmw_participant_ownership_observer_unavailable"}
+                if rmw_identifier == "rmw_cyclonedds_cpp":
+                    try:
+                        if observer is None:
+                            raise ValueError("cyclone_ownership_observer_unavailable:"
+                                             + str(observation.get("reason")))
+                        ownership = observer.sample_ownership(config["domain_id"], local_gid, kind)
+                    except (ValueError, TypeError, OSError, AttributeError, RuntimeError) as exc:
+                        ownership.update(status="unknown", reason=str(exc))
+                # Ownership is supporting diagnostic evidence, independent of
+                # matched-peer proof and the two canonical public count samples.
                 count_after = count_api()
+                emit("participant_ownership_snapshot", command_id=command_id,
+                     endpoint_gid=local_gid, supporting_diagnostic=True,
+                     candidate_eligible=False, participant_ownership_observation=ownership)
                 peer_observer_selected = (
                     rmw_identifier == "rmw_cyclonedds_cpp"
                     or (rmw_identifier == "rmw_fastrtps_cpp" and instrumentation is not None))
