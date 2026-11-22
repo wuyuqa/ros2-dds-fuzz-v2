@@ -279,15 +279,31 @@ def _resolve_execution_runtime(runtime=None, runtime_boundary=HOST_RUNTIME):
 
 
 def run_campaign(output_dir, *, runtime=None, execute=False,
-                 runtime_boundary=HOST_RUNTIME, auto_replay=None, replay_runtime=None, **options):
+                 runtime_boundary=HOST_RUNTIME, auto_replay=None, replay_runtime=None,
+                 max_executions=None, **options):
     """Sequential cells, never parallel campaigns. Default is offline plan only.
 
     The owner coordinates actual execution; execute=True is an explicit action.
     An injected runner is for contract testing and is not proof of ROS execution.
     auto_replay declares output_dir, domain_ids and max_attempts; attempts run
     after original evidence sealing. replay_runtime injection is offline-only.
+    max_executions optionally bounds original carrier dispatch attempts, including
+    failed/blocked attempts, in canonical order; the full plan remains intact.
+    It does not bound replay: an explicit budget conflicts with auto_replay,
+    whose separate policy may dispatch additional executions. None preserves
+    historical behavior. Planning never dispatches, even with a budget.
     query_runner_evidence exposes associations without revising this report.
     """
+    if max_executions is not None:
+        cell_count = len(first_slice_cells(options.get("target_id", EXECUTION_ORDER[0])))
+        if type(max_executions) is not int or not 1 <= max_executions <= cell_count:
+            raise ValueError(f"max_executions must be a positive int <= {cell_count}")
+        if auto_replay is not None:
+            raise ValueError("max_executions bounds originals only; auto_replay must be None")
+    # Reject malformed or target-inapplicable flags before planning writes files.
+    if "observe_participant_leases" in (options.get("parameters") or {}):
+        semantic_input("baseline", options["parameters"],
+                       target_id=options.get("target_id", EXECUTION_ORDER[0]))
     output_dir = Path(output_dir).resolve()
     if runtime_boundary not in RUNTIME_BOUNDARIES:
         raise ValueError('unsupported runtime_boundary: ' + repr(runtime_boundary))
@@ -296,6 +312,11 @@ def run_campaign(output_dir, *, runtime=None, execute=False,
         runtime, formal = _resolve_execution_runtime(runtime, runtime_boundary)
     report = plan_campaign(output_dir, **options)
     report.update(runtime_boundary=runtime_boundary, formal_runtime=formal)
+    if max_executions is not None:
+        report["execution_budget"] = {
+            "max_executions": max_executions,
+            "scope": "original_carrier_dispatch_attempts",
+            "attempts": 0, "stop_reason": "planning_only" if not execute else None}
     intake_manifest = json.loads(Path(report["manifest_path"]).read_text())
     intake_source = intake_manifest["source_manifest"]
     intake_rule = intake_manifest["rule"]["primary_rule"]
@@ -303,6 +324,11 @@ def run_campaign(output_dir, *, runtime=None, execute=False,
         prepare_identity(output_dir, row, intake_source, identity=report["identity"], rule=intake_rule)
 
     def finish():
+        if max_executions is not None and execute:
+            budget = report["execution_budget"]
+            budget["stop_reason"] = (report.get("abort_reason") or budget["stop_reason"]
+                                     or ("max_executions_reached" if budget["attempts"] >= max_executions
+                                         else "canonical_cells_exhausted"))
         def persist_report():
             _persist(output_dir, report)
             return output_dir / "report.json"
@@ -338,6 +364,9 @@ def run_campaign(output_dir, *, runtime=None, execute=False,
     register(registry)
     services = registry.get_services(report["target_id"])
     for index, planned in enumerate(report["rows"]):
+        if max_executions is not None and report["execution_budget"]["attempts"] >= max_executions:
+            report["execution_budget"]["stop_reason"] = "max_executions_reached"
+            break
         if source_manifest(repo) != manifest["source_manifest"]:
             report["abort_reason"] = "source_repo_HEAD_or_behavior_tree_changed"
             break
@@ -353,6 +382,8 @@ def run_campaign(output_dir, *, runtime=None, execute=False,
         try:
             if not services.carrier.accepts(scenario):
                 raise ValueError("registered carrier does not accept execution scenario")
+            if max_executions is not None:
+                report["execution_budget"]["attempts"] += 1
             result = services.carrier.apply(scenario, capsule.input["effective_input"],
                                             execution={"config": config, "output_dir": runtime_dir, "runtime": runtime})
         except Exception as exc:

@@ -125,9 +125,11 @@ def semantic_input(arm, parameters=None, *, target_id="discovery.late_endpoint")
     recovery = target_id == "discovery.interruption_recovery"
     discovery_defaults = {"drop_duration_sec": 3.0, "recovery_timeout_sec": 8.0, "counter_interval_sec": 0.25}
     if recovery:
-        supported |= set(discovery_defaults)
+        supported |= set(discovery_defaults) | {"observe_participant_leases"}
     if set(p) - supported:
         raise ValueError("unknown semantic parameter(s): " + ",".join(sorted(set(p) - supported)))
+    if "observe_participant_leases" in p and type(p["observe_participant_leases"]) is not bool:
+        raise ValueError("observe_participant_leases must be a bool")
     base_delay = p.get("baseline_reader_delay_sec", 0.02)
     result = {
         "topic": p.get("topic", "/r2f/s1/discovery_recovery" if recovery else "/r2f/s1/late_endpoint"), "message_type": "std_msgs/msg/String",
@@ -146,6 +148,9 @@ def semantic_input(arm, parameters=None, *, target_id="discovery.late_endpoint")
         raise ValueError("post_match_count requires an intermediate omission and a later sentinel")
     if recovery:
         result.update({key: p.get(key, default) for key, default in discovery_defaults.items()})
+        # Supporting advertisement observation only; omission preserves legacy identity.
+        if "observe_participant_leases" in p:
+            result["observe_participant_leases"] = p["observe_participant_leases"]
     reject_execution_identity(result)
     return result
 
