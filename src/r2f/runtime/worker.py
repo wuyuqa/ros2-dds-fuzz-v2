@@ -94,6 +94,47 @@ def g01_actual_endpoint_qos(config, endpoint, kind):
     return {'actual_endpoint_qos': read_public_endpoint_qos(endpoint, kind=kind)}
 
 
+def initialize_worker_context(rclpy, context, emit, *, environment=None, package_prefix=None,
+                              requested_rmw=None):
+    """Initialize this child through the profile-evidence seam and emit its receipt."""
+    from .profile_observation import initialize_with_profile_observation
+    if environment is None:
+        environment = dict(os.environ)
+    from collections.abc import Mapping
+    if not isinstance(environment, Mapping) or any(not isinstance(k, str) or not isinstance(v, str)
+                                                   for k, v in environment.items()):
+        raise TypeError('environment_must_be_string_mapping')
+    if not callable(emit):
+        raise TypeError('emit_must_be_callable')
+    if package_prefix is None:
+        def package_prefix(name):
+            from ament_index_python.packages import get_package_prefix
+            return get_package_prefix(name)
+    initialized = False
+
+    def initialize():
+        nonlocal initialized
+        rclpy.init(context=context)
+        initialized = True
+
+    try:
+        rmw, receipt = initialize_with_profile_observation(
+            environment=environment, requested_rmw=requested_rmw,
+            initialize=initialize,
+            rmw_identifier=rclpy.get_rmw_implementation_identifier,
+            package_prefix=package_prefix)
+        emit('profile_initialization_observation', rmw_identifier=rmw, observation=receipt)
+        return rmw
+    except BaseException:
+        if initialized:
+            try:
+                context.shutdown()
+            except BaseException:
+                # Preserve the observation/init failure as the child boundary error.
+                pass
+        raise
+
+
 def main():
     config = json.loads(sys.argv[1])
     role = sys.argv[2]
@@ -104,17 +145,10 @@ def main():
     from rclpy.node import Node
     from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPolicy
     from std_msgs.msg import String
-    context = Context()
-    rclpy.init(context=context)
-    rmw = rclpy.get_rmw_implementation_identifier()
     generation = uuid.uuid4().hex
     process_start_ticks = int(Path('/proc/self/stat').read_text().rsplit(')', 1)[1].split()[19])
     name = f'r2f_{role}_{generation[:12]}'
-    node = Node(name, context=context, enable_rosout=False, start_parameter_services=False)
-    executor = SingleThreadedExecutor(context=context)
-    executor.add_node(node)
-    receive_sequence = 0
-    local_gid = None
+    rmw = 'unknown'
 
     def emit(event, **fields):
         value = {'event': event, 'time_ns': time.time_ns(), 'monotonic_ns': time.monotonic_ns(),
@@ -124,6 +158,14 @@ def main():
         value.update(fields)
         print(json.dumps(value, sort_keys=True), flush=True)
         return value
+
+    context = Context()
+    rmw = initialize_worker_context(rclpy, context, emit, requested_rmw=config.get('rmw'))
+    node = Node(name, context=context, enable_rosout=False, start_parameter_services=False)
+    executor = SingleThreadedExecutor(context=context)
+    executor.add_node(node)
+    receive_sequence = 0
+    local_gid = None
 
     # Recreated reader/writer generations use explicit role aliases but the
     # same endpoint semantics and QoS contract as their base role.  Keep this
