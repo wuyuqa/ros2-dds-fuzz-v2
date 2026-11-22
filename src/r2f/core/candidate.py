@@ -12,7 +12,7 @@ from .evidence import canonical_hash, verify_raw, raw_sha256
 from .execution import validate_execution
 from .mutation import MutationReceipt
 from .oracle import TriageResult
-from .replay import ReplayStatus, conformance_signature, validate_replay_attempt
+from .replay import ReplayCapsule, ReplayStatus, conformance_signature, validate_replay_attempt
 from .state_machine import utc_now
 
 
@@ -363,6 +363,168 @@ def validate_root_cause(root_cause, evidence_refs):
 CAPABILITY_ASSESSMENT_SCHEMA = "r2f.s1-capability-assessment/v1"
 
 
+CAPABILITY_VALIDATION_SCHEMA = "r2f.s1-capability-validation/v1"
+
+
+def validate_capability_validation(validation, evidence_refs, *, original_ref, assessment,
+                                   task_review):
+    """CP2 recorded evaluation evidence, never implementation or human authority.
+
+    The evaluator's outputs are evidence, not re-executed model behavior. Fixture
+    and recorded evaluations are explicitly separated; CP3 reconnect is absent.
+    """
+    if validation is None:
+        return None
+
+    def shape(value, fields):
+        if not isinstance(value, dict) or set(value) != set(fields.split()):
+            raise ValueError("capability_validation_schema_invalid")
+
+    def read(ref):
+        shape(ref, "path sha256")
+        verify_raw(ref["path"], sha256_digest(ref["sha256"]))
+        with open(ref["path"], encoding="utf-8") as stream:
+            value = json.load(stream)
+        if not isinstance(value, dict):
+            raise ValueError("capability_validation_evidence_invalid")
+        return value
+
+    shape(validation, "schema_version task_ref original_ref evidence_key evidence_sha256")
+    if validation["schema_version"] != CAPABILITY_VALIDATION_SCHEMA:
+        raise ValueError("capability_validation_schema_unknown")
+    ref = validation["task_ref"]
+    shape(ref, "candidate_id review_record_id review_record_sha256 task_id")
+    for key in ref:
+        nonempty(ref[key], "capability_validation." + key)
+    if (not isinstance(task_review, dict)
+            or ref["review_record_id"] != task_review.get("record_id")
+            or ref["review_record_sha256"] != task_review.get("record_sha256")
+            or ref["review_record_sha256"] != canonical_hash({
+                k: v for k, v in task_review.items() if k != "record_sha256"})
+            or task_review.get("candidate_id") != ref["candidate_id"]
+            or task_review.get("execution_identity") != original_ref
+            or validation["original_ref"] != original_ref):
+        raise ValueError("capability_validation_task_review_mismatch")
+    parent_assessment = task_review.get("capability_assessment")
+    validate_capability_assessment(parent_assessment, task_review.get("evidence_refs", {}))
+    if (parent_assessment is None or assessment != parent_assessment
+            or ref["task_id"] not in {task["task_id"] for task in parent_assessment["proposed_tasks"]}):
+        raise ValueError("capability_validation_task_mismatch")
+    if (task_review["evidence_refs"].get("raw") != original_ref.get("raw_path")
+            or task_review.get("evidence_sha256", {}).get("raw") != original_ref.get("raw_sha256")):
+        raise ValueError("capability_validation_task_raw_identity_mismatch")
+    # The exact predecessor's evidence must remain available at every intake.
+    for key, path in validate_review_evidence(task_review.get("evidence_refs")).items():
+        verify_raw(path, (task_review.get("evidence_sha256") or {}).get(key))
+    if ref["candidate_id"] != f"{original_ref.get('run_id')}:{original_ref.get('cell_id')}":
+        raise ValueError("capability_validation_original_mismatch")
+    if validation["evidence_key"] != "control" or "control" not in evidence_refs:
+        raise ValueError("capability_validation_control_missing")
+    bundle = read({"path": evidence_refs["control"], "sha256": validation["evidence_sha256"]})
+    shape(bundle, "schema_version provenance task_ref original_ref models cases")
+    if (bundle["schema_version"] != "r2f.s1-capability-validation-evidence/v1"
+            or bundle["provenance"] not in ("fixture", "recorded_evaluation")
+            or bundle["task_ref"] != ref or bundle["original_ref"] != original_ref):
+        raise ValueError("capability_validation_evidence_binding_mismatch")
+    models = bundle["models"]
+    shape(models, "before after")
+    for model in models.values():
+        shape(model, "version path sha256 source")
+        nonempty(model["version"], "capability_validation.model_version")
+        _identity_members(model["source"], "capability_validation.model_source")
+        if not isinstance(model["source"], (str, dict)):
+            raise ValueError("capability_validation_model_source_invalid")
+        verify_raw(model["path"], sha256_digest(model["sha256"]))
+    if (models["before"]["version"] == models["after"]["version"]
+            or models["before"]["sha256"] == models["after"]["sha256"]
+            or models["before"]["source"] != original_ref["source"]):
+        raise ValueError("capability_validation_model_change_invalid")
+    cases = bundle["cases"]
+    if not isinstance(cases, list) or len(cases) < 3:
+        raise ValueError("capability_validation_defect_and_stable_normals_required")
+    normals, defects, seen, normal_input = 0, 0, set(), None
+    for case_ref in cases:
+        case = read(case_ref)
+        shape(case, "schema_version task_ref kind row models input_sha256 expected before after")
+        if (case["schema_version"] != "r2f.s1-capability-evaluation/v1"
+                or case["task_ref"] != ref or case["models"] != models):
+            raise ValueError("capability_validation_evaluation_binding_mismatch")
+        row = case["row"]
+        if not isinstance(row, dict):
+            raise ValueError("capability_validation_row_invalid")
+        if (type(row.get("target_revision")) is not int or row["target_revision"] < 0
+                or type(original_ref.get("target_revision")) is not int
+                or original_ref["target_revision"] < 0):
+            raise ValueError("capability_validation_revision_invalid")
+        validate_execution(row)
+        identity = candidate_execution_identity(row)
+        nonempty(identity["cell_id"], "capability_validation.cell_id")
+        sha256_digest(identity["effective_input_sha256"], "capability_validation.input_sha256")
+        verify_raw(identity["raw_path"], identity["raw_sha256"])
+        if (row.get("actual_run") is not True or row.get("execution_stage") != "judged"
+                or row.get("tool_error") is not False or row.get("observer_complete") is not True
+                or row.get("observer_dropped") is not False
+                or case["input_sha256"] != identity["effective_input_sha256"]
+                or any(identity[key] != original_ref[key] for key in
+                       ("target_id", "target_revision", "rule_id", "rmw", "source"))):
+            raise ValueError("capability_validation_unrelated_or_unhealthy_evaluation")
+        # Separate runs and raw artifacts are required; relabeling one receipt
+        # cannot manufacture stable controls.
+        tokens = [("execution", row.get("run_id"), row.get("cell_id")),
+                  ("raw_path", os.path.realpath(identity["raw_path"])),
+                  ("raw_sha256", identity["raw_sha256"])]
+        if any(token in seen for token in tokens):
+            raise ValueError("capability_validation_duplicate_evaluation")
+        seen.update(tokens)
+        if case["kind"] == "defect":
+            defects += 1
+            if (identity != original_ref or row.get("oracle_verdict") != "fail"
+                    or row.get("arm") != "mutated" or row.get("control_kind") is not None
+                    or canonical_hash(case["before"]) == canonical_hash(case["expected"])):
+                raise ValueError("capability_validation_defect_not_demonstrated")
+        elif case["kind"] == "normal":
+            normals += 1
+            if (row.get("oracle_verdict") != "pass" or row.get("arm") not in ("baseline", "transparent")
+                    or (row.get("control_kind") is not None
+                        and (type(row["control_kind"]) is not str
+                             or row["control_kind"] not in ("health", "transparency")))
+                    or canonical_hash(case["before"]) != canonical_hash(case["expected"])):
+                raise ValueError("capability_validation_normal_not_stable")
+            # A claimed digest alone cannot prove that repeats used the same
+            # submitted input. Reuse canonical capsule validation, then bind the
+            # row's actual config/receipts and identity to that validated input.
+            try:
+                nonempty(row.get("replay_path"), "normal input capsule path")
+                with open(row["replay_path"], encoding="utf-8") as stream:
+                    capsule = ReplayCapsule.from_dict(json.load(stream))
+                effective = capsule.input["effective_input"]
+                if (capsule.input["effective_input_sha256"] != case["input_sha256"]
+                        or canonical_hash(effective["source_manifest"]) != canonical_hash(identity["source"])
+                        or any(key not in row for key in ("final_input", "input_layer_receipts"))
+                        or any(canonical_hash(row[key]) != canonical_hash(value)
+                               for key, value in effective.items() if key in row)
+                        or ("target" in row and canonical_hash(row["target"]) != effective["target_sha256"])):
+                    raise ValueError("capsule differs from evaluated row")
+            except (OSError, ValueError, TypeError, KeyError, AttributeError) as exc:
+                raise ValueError("capability_validation_normal_input_unbound") from exc
+            signature = canonical_hash({"input": case["input_sha256"], "expected": case["expected"]})
+            if normal_input is not None and signature != normal_input:
+                raise ValueError("capability_validation_normal_input_conflict")
+            normal_input = signature
+        else:
+            raise ValueError("capability_validation_case_kind_invalid")
+        if canonical_hash(case["after"]) != canonical_hash(case["expected"]):
+            raise ValueError("capability_validation_proposed_model_failed")
+    if defects != 1 or normals < 2:
+        raise ValueError("capability_validation_defect_and_stable_normals_required")
+    return snapshot({"schema_version": CAPABILITY_VALIDATION_SCHEMA,
+                     "status": "fixture_validated" if bundle["provenance"] == "fixture" else "evidence_supported",
+                     "task_ref": ref, "original_ref": original_ref, "models": models,
+                     "provenance": bundle["provenance"], "normal_evaluations": normals,
+                     "defect_evaluations": defects, "evidence_sha256": validation["evidence_sha256"],
+                     "qualification": "mechanism_only", "implemented": False})
+
+
 def validate_capability_assessment(assessment, evidence_refs):
     """CP1 analysis only: proposed work bound to this review's hashed evidence.
 
@@ -655,7 +817,7 @@ class CandidateLifecycle:
 
     def record_review(self, *, reviewer_id, conclusion, evidence_refs, independent_of=None,
                       notes="", attribution=None, root_cause=None, tool_repair_handoff=None,
-                      capability_assessment=None):
+                      capability_assessment=None, capability_validation=None, capability_task_review=None):
         """Append an independent review opinion.  This never confirms a candidate.
 
         ``conclusion`` is one of supported/rejected/needs_evidence.  A review
@@ -684,12 +846,17 @@ class CandidateLifecycle:
                 raise ValueError("invalid review attribution")
             review["attribution"] = attribution
         if (attribution is not None or root_cause is not None or tool_repair_handoff is not None
-                or capability_assessment is not None):
+                or capability_assessment is not None or capability_validation is not None):
             review["evidence_sha256"] = {key: raw_sha256(value) for key, value in resolved.items()}
         validate_root_cause(root_cause, resolved)
         validate_capability_assessment(capability_assessment, resolved)
         if capability_assessment is not None:
             review["capability_assessment"] = snapshot(capability_assessment)
+        validate_capability_validation(capability_validation, resolved,
+                                       original_ref=candidate_execution_identity(self.evidence),
+                                       assessment=capability_assessment, task_review=capability_task_review)
+        if capability_validation is not None:
+            review["capability_validation"] = snapshot(capability_validation)
         validate_tool_repair_handoff(tool_repair_handoff, attribution, resolved)
         if tool_repair_handoff is not None:
             review["tool_repair_handoff"] = snapshot(tool_repair_handoff)

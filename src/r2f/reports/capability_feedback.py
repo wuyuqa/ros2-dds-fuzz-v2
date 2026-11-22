@@ -1,6 +1,7 @@
-"""CP1 view of canonical review records; no task store or lifecycle transitions."""
+"""CP1 assessment and CP2 evaluation views of canonical review records."""
 from r2f.core._json import snapshot
-from r2f.core.candidate import CAPABILITY_ASSESSMENT_SCHEMA, candidate_execution_identity
+from r2f.core.candidate import (CAPABILITY_ASSESSMENT_SCHEMA, candidate_execution_identity,
+                                validate_capability_validation)
 from r2f.core.evidence import canonical_hash
 
 
@@ -34,6 +35,16 @@ def capability_assessment_projection(entry, original, *, human_confirmed):
     for record in sorted(records, key=lambda record: record['record_id']):
         assessment = record['capability_assessment']
         refs = []
+        validation = record.get('capability_validation')
+        if validation is not None:
+            parent = next((r for r in analysis.get('history', [])
+                           if r['record_id'] == record.get('supersedes_record_id')), None)
+            # History lives on the analysis projection (including superseded records).
+            validation = validate_capability_validation(
+                validation, record['evidence_refs'], original_ref=original_ref,
+                assessment=assessment, task_review=parent)
+            validation.update(review_record_id=record['record_id'],
+                              review_record_sha256=record['record_sha256'])
         for proposed in assessment['proposed_tasks']:
             task_ref = {'candidate_id': candidate_id, 'review_record_id': record['record_id'],
                         'task_id': proposed['task_id']}
@@ -49,6 +60,11 @@ def capability_assessment_projection(entry, original, *, human_confirmed):
                                                       for key in proposed['evidence_keys']},
                                     'evidence_sha256': {key: record['evidence_sha256'][key]
                                                         for key in proposed['evidence_keys']}})
+        if validation is not None:
+            for task in result['tasks']:
+                if (task['review_record_id'] == record['record_id']
+                        and task['task_id'] == validation['task_ref']['task_id']):
+                    task['validation'] = snapshot(validation)
         result['reviews'].append({'record_id': record['record_id'],
                                   'record_sha256': record['record_sha256'],
                                   'evidence_refs': record['evidence_refs'],

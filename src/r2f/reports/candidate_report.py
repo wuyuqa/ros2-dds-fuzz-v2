@@ -22,7 +22,7 @@ from pathlib import Path
 from r2f.core.candidate import (CandidateLifecycle, REVIEW_EVIDENCE_KEYS, topology_observation_identity,
                                 validate_human_history, validate_human_record, candidate_execution_identity,
                                 HUMAN_ADJUDICATION_SCHEMA, validate_root_cause, validate_tool_repair_handoff,
-                                validate_review_evidence, validate_capability_assessment)
+                                validate_review_evidence, validate_capability_assessment, validate_capability_validation)
 from r2f.core.evidence import canonical_hash, raw_sha256
 from r2f.core.oracle import TriageResult
 from r2f.reports.root_cause import current_review_projection, root_cause_accounting
@@ -300,7 +300,7 @@ def exploratory_candidate_ledger(rows, reviews=None, *, human_records=None, huma
     for index, review in enumerate(reviews):
         candidate_id = review.get("candidate_id") if isinstance(review, dict) else None
         row = originals.get(candidate_id) if isinstance(candidate_id, str) else None
-        problems = _review_import_errors(review, row)
+        problems = _review_import_errors(review, row, previous=imported)
         if row is None:
             problems.append("review_original_execution_missing")
         if not problems:
@@ -431,7 +431,9 @@ def exploratory_candidate_ledger(rows, reviews=None, *, human_records=None, huma
                                         attribution=review.get("attribution"),
                                         root_cause=review.get("root_cause"),
                                         tool_repair_handoff=review.get("tool_repair_handoff"),
-                                        capability_assessment=review.get("capability_assessment"))
+                                        capability_assessment=review.get("capability_assessment"),
+                                        capability_validation=review.get("capability_validation"),
+                                        capability_task_review=by_id.get(review.get("supersedes_record_id")))
                 if review["record_id"] not in superseded:
                     applied_reviews.append(review)
             except ValueError as exc:
@@ -677,7 +679,7 @@ def _review_execution_identity(row):
     return candidate_execution_identity(row)
 
 
-def _review_import_errors(record, original_row=None):
+def _review_import_errors(record, original_row=None, *, previous=()):
     """Check integrity and binding; a digest does not authenticate the reviewer."""
     if not isinstance(record, dict):
         return ["review_record_not_an_object"]
@@ -745,6 +747,13 @@ def _review_import_errors(record, original_row=None):
         resolved = validate_review_evidence(refs)
         validate_root_cause(record.get("root_cause"), resolved)
         validate_capability_assessment(record.get("capability_assessment"), resolved)
+        validation = record.get("capability_validation")
+        if validation is not None:
+            if "implemented" in record or "implementation_status" in record:
+                raise ValueError("capability_validation_implementation_claim_forbidden")
+            parent = next((r for r in previous if r["record_id"] == record.get("supersedes_record_id")), None)
+            validate_capability_validation(validation, resolved, original_ref=identity,
+                                           assessment=record.get("capability_assessment"), task_review=parent)
         validate_tool_repair_handoff(record.get("tool_repair_handoff"), record.get("attribution"), resolved)
     except (ValueError, TypeError, OSError) as exc:
         problems.append(str(exc))
@@ -826,7 +835,7 @@ def append_review_record(path, record, *, original_row=None):
     record.setdefault("record_id", "review-" + canonical_hash({
         k: v for k, v in record.items() if k not in {"record_sha256", "recorded_at", "record_id"}}))
     def check(value, previous):
-        problems = _review_import_errors(value, original_row) + _review_history_errors(value, previous)
+        problems = _review_import_errors(value, original_row, previous=previous) + _review_history_errors(value, previous)
         if problems:
             raise ValueError("invalid review record: " + ",".join(problems))
     return _append_bound_record(path, record, decode=_decode_review_records, check=check)
@@ -926,7 +935,7 @@ def _decode_review_records(text, *, original_rows=None):
         original_row = (originals.get(record.get("candidate_id"))
                         if isinstance(record, dict) and isinstance(record.get("candidate_id"), str)
                         else None)
-        problems = _review_import_errors(record, original_row)
+        problems = _review_import_errors(record, original_row, previous=records)
         if not problems:
             duplicate = next((r for r in records if r["record_id"] == record["record_id"]), None)
             if duplicate is not None:
