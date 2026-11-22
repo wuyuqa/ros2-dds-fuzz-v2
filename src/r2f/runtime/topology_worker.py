@@ -856,7 +856,7 @@ class CycloneMatchedPeerObserver:
         return matches[0], sorted(edges)
 
     def _topic_kind_diagnostic(self, handle):
-        """Independent optional readbacks, never ownership or GUID authority.
+        """Independent typed readbacks; never a wire GUID or ownership relation.
 
         Cyclone 0.10.5 dds_topic.c pins DDS_KIND_TOPIC for these public APIs;
         dds.h defines a nonnegative return as full byte length (excluding NUL).
@@ -924,7 +924,7 @@ class CycloneMatchedPeerObserver:
         copied GUIDs to logical/generation/process/run identity. Two equal bounded
         samples cannot establish atomicity or participant lifecycle generation.
         """
-        result = {"schema": "r2f.cyclone-participant-ownership/v1",
+        result = {"schema": "r2f.cyclone-participant-ownership/v2",
                   "complete": False, "status": "unknown", "candidate_eligible": False,
                   "domain_id": domain, "local_gid": gid, "role_kind": kind,
                   "provenance": self.provenance,
@@ -1021,7 +1021,7 @@ class CycloneMatchedPeerObserver:
                                   "guid_return_code": None, "guid": None}
                     if handle == local:
                         diagnostic["known_labels"].append("local_endpoint")
-                    if handle == participant:
+                    if handle in root["lookup_participants"]:
                         diagnostic["known_labels"].append("participant")
                     diagnostics["entity_identities"].append(diagnostic)
                     topic = self._topic_kind_diagnostic(handle)
@@ -1037,26 +1037,39 @@ class CycloneMatchedPeerObserver:
                     guid = self.Guid()
                     rc = self.lib.dds_get_guid(handle, self.c.byref(guid))
                     diagnostic["guid_return_code"] = rc
-                    # Cyclone 0.10.5 also reads topic GUIDs (dds_entity.c),
-                    # potentially all zero. Preserve this strict GUID gate;
-                    # optional kind evidence never qualifies an identity.
+                    # Cyclone 0.10.5 dds_get_guid returns OK + zero m_guid
+                    # for topics. Only two complete typed public readbacks can
+                    # establish non-wire applicability, never a wire identity.
                     value = bytes(guid.v).hex() if rc == 0 else None
                     diagnostic["guid"] = value
-                    if (rc not in (0, -12) or (rc == -12 and handle in (local, participant))
-                            or value == "0" * 32):
+                    topic_applicable = (topic["kind"] == "topic" and handle != local
+                                        and handle not in root["lookup_participants"])
+                    if (rc not in (0, -12)
+                            or (rc == -12 and (handle == local or handle in root["lookup_participants"]))
+                            or (value == "0" * 32 and not topic_applicable)):
                         raise ValueError("participant_inventory_guid_invalid_or_aliased")
-                    identities.append({"handle": handle, "gid": value,
-                                       "guid_return_code": rc,
-                                       "domain_id": observed_domain.value})
+                    identity = {"handle": handle, "gid": value,
+                                "guid_return_code": rc, "domain_id": observed_domain.value,
+                                "guid_applicability": ("not_applicable_topic" if topic_applicable
+                                                       else "unavailable_illegal_operation" if rc == -12
+                                                       else "wire_guid")}
+                    if topic["kind"] == "topic":
+                        # Includes raw return codes/bounded buffers, so name,
+                        # type, kind and applicability must survive both captures.
+                        identity["topic_identity"] = topic
+                    identities.append(identity)
                 if next(row["gid"] for row in identities if row["handle"] == local) != gid:
                     raise ValueError("participant_endpoint_guid_changed")
-                gids = [row["gid"] for row in identities if row["gid"] is not None]
+                gids = [row["gid"] for row in identities if row["gid"] not in (None, "0" * 32)]
                 if len(gids) != len(set(gids)):
                     raise ValueError("participant_inventory_guid_invalid_or_aliased")
                 participant_gid = next(row["gid"] for row in identities
                                        if row["handle"] == participant)
                 if not participant_gid or participant_gid == "0" * 32 or participant_gid == gid:
                     raise ValueError("participant_guid_invalid")
+                if any("topic_identity" in row and row["guid_applicability"] != "not_applicable_topic"
+                       for row in identities):
+                    raise ValueError("participant_inventory_kind_conflict")
                 return {"local_handle": local, "participant_handle": participant,
                         "participant_gid": participant_gid, "parent_chain": chain,
                         "entity_inventory": inventory, "entity_identities": identities,

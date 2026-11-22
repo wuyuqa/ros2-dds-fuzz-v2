@@ -608,8 +608,9 @@ def topic_probe_symbols(native, name=b'offline_topic', type_name=b'offline::Type
     native.lib.dds_get_type_name = probe(type_name)
 
 
-def test_topic_api_evidence_precedes_zero_guid_rejection_without_qualification(native):
+def test_topic_name_alone_precedes_zero_guid_rejection_without_qualification(native):
     topic_probe_symbols(native)
+    del native.lib.dds_get_type_name
     original = native.lib.dds_get_guid
     def guid(handle, ptr):
         if handle == 20:
@@ -627,14 +628,13 @@ def test_topic_api_evidence_precedes_zero_guid_rejection_without_qualification(n
     assert [r['handle'] for r in capture['topic_kind_diagnostics']] == [10, 20]
     failed = capture['entity_identities'][-1]
     assert failed['guid_return_code'] == 0 and failed['guid'] == '0' * 32
-    assert failed['known_labels'] == ['topic']
+    assert failed['known_labels'] == []
     evidence = capture['topic_kind_diagnostics'][-1]
-    assert evidence['kind'] == 'topic'
+    assert evidence['kind'] == 'unknown'
     assert evidence['probes']['dds_get_name']['return_code'] == 13
     assert evidence['probes']['dds_get_name']['value'] == 'offline_topic'
-    assert evidence['probes']['dds_get_type_name']['return_code'] == 13
-    assert evidence['probes']['dds_get_type_name']['value'] == 'offline::Type'
-    assert all(p['status'] == 'observed' for p in evidence['probes'].values())
+    assert evidence['probes']['dds_get_type_name']['status'] == 'unavailable'
+    assert evidence['probes']['dds_get_type_name']['value'] is None
 
 
 @pytest.mark.parametrize('api', ['dds_get_name', 'dds_get_type_name'])
@@ -786,16 +786,21 @@ def test_optional_binding_failure_cannot_break_ownership_or_other_readback(nativ
     assert evidence['probes']['dds_get_type_name']['value'] == 'offline::Type'
 
 
-def test_optional_success_keeps_canonical_ownership_exactly_equal(native):
+def test_typed_topic_proof_changes_inventory_but_preserves_ownership_relation(native):
     before = native.sample_ownership(196, ENDPOINT, 'writer')
     topic_probe_symbols(native)
     after = native.sample_ownership(196, ENDPOINT, 'writer')
     for key in ('complete', 'status', 'candidate_eligible', 'local_handle',
                 'participant_handle', 'participant_gid', 'parent_chain',
-                'entity_inventory', 'entity_identities', 'participant_root_observation',
+                'entity_inventory', 'participant_root_observation',
                 'stable_sample_count', 'ownership_api', 'lookup_api'):
         assert after[key] == before[key]
+    assert before['entity_identities'][1]['guid_applicability'] == 'unavailable_illegal_operation'
+    assert after['entity_identities'][1]['guid_applicability'] == 'not_applicable_topic'
+    assert after['entity_identities'][1]['gid'] is None
+    assert after['entity_identities'][1]['guid_return_code'] == -12
     probe = after['inventory_diagnostics'][0]['topic_kind_diagnostics'][1]
+    assert after['entity_identities'][1]['topic_identity'] == probe
     assert probe['kind'] == 'topic'
     assert probe['probes']['dds_get_name']['buffer_hex'].startswith('6f66666c696e655f746f70696300')
 
@@ -874,3 +879,269 @@ def test_unprintable_optional_exception_preserves_ownership_outcome(
             assert probe['return_code'] is None
         other = 'dds_get_type_name' if api == 'dds_get_name' else 'dds_get_name'
         assert capture['topic_kind_diagnostics'][1]['probes'][other]['status'] == 'observed'
+
+@pytest.fixture
+def zero_topic(native):
+    """Offline typed API double: a leaf topic, separate from publisher 20."""
+    native.lib.children[10].append(40)
+    native.lib.children[40] = []
+    native.lib.parents[40] = 10
+    native.lib.domains[40] = 196
+    native.lib.guids[40] = '0' * 32
+    def probe(payload):
+        def read(handle, buffer, capacity):
+            if handle != 40:
+                return -12
+            buffer[:len(payload)] = payload
+            buffer[len(payload)] = b'\x00'
+            return len(payload)
+        return read
+    native.lib.dds_get_name = probe(b'rt/parameter_events')
+    native.lib.dds_get_type_name = probe(b'rcl_interfaces::msg::dds_::ParameterEvent_')
+    return native
+
+
+def test_typed_zero_topic_kept_in_canonical_inventory_with_nonwire_applicability(zero_topic):
+    receipt = zero_topic.sample_ownership(196, ENDPOINT, 'writer')
+    assert receipt['complete'] is True
+    assert receipt['schema'] == 'r2f.cyclone-participant-ownership/v2'
+    assert receipt['candidate_eligible'] is False
+    assert receipt['participant_gid'] == PARTICIPANT
+    assert receipt['stable_sample_count'] == 2
+    topic = next(r for r in receipt['entity_identities'] if r['handle'] == 40)
+    assert topic['gid'] == '0' * 32 and topic['guid_return_code'] == 0
+    assert topic['guid_applicability'] == 'not_applicable_topic'
+    assert topic['topic_identity']['kind'] == 'topic'
+    assert topic['topic_identity']['probes']['dds_get_name']['value'] == 'rt/parameter_events'
+    assert topic['topic_identity']['probes']['dds_get_type_name']['value'] == 'rcl_interfaces::msg::dds_::ParameterEvent_'
+    assert [r[0] for r in receipt['entity_inventory']] == [10, 20, 30, 40]
+    for capture in receipt['inventory_diagnostics']:
+        actual = next(r for r in capture['entity_identities'] if r['handle'] == 40)
+        assert actual['guid_return_code'] == 0 and actual['guid'] == '0' * 32
+        proof = next(r for r in capture['topic_kind_diagnostics'] if r['handle'] == 40)
+        assert topic['topic_identity'] == proof
+
+@pytest.mark.parametrize('api', ['dds_get_name', 'dds_get_type_name'])
+@pytest.mark.parametrize('damage', ['absent', 'unsupported', 'error', 'exception',
+                                    'empty', 'truncated', 'bad_utf8', 'bad_rc',
+                                    'embedded_nul', 'no_terminator'])
+def test_zero_topic_requires_both_complete_typed_readbacks(zero_topic, api, damage):
+    def broken(handle, buffer, capacity):
+        if damage == 'exception':
+            raise OSError('offline_topic_probe')
+        payload, rc = {
+            'unsupported': (b'bad\x00', -12), 'error': (b'bad\x00', -7),
+            'empty': (b'\x00', 0), 'truncated': (b'abc\x00', 256),
+            'bad_utf8': (b'\xff\x00', 1), 'bad_rc': (b'abc\x00', True),
+            'embedded_nul': (b'a\x00b\x00', 3), 'no_terminator': (b'abcd', 3),
+        }[damage]
+        buffer[:len(payload)] = payload
+        return rc
+    if damage == 'absent':
+        delattr(zero_topic.lib, api)
+    else:
+        setattr(zero_topic.lib, api, broken)
+    receipt = zero_topic.sample_ownership(196, ENDPOINT, 'reader')
+    assert receipt['complete'] is False and receipt['status'] == 'unknown'
+    assert receipt['reason'] == 'participant_inventory_guid_invalid_or_aliased'
+    assert 'participant_gid' not in receipt and receipt['candidate_eligible'] is False
+    actual = receipt['inventory_diagnostics'][0]['entity_identities'][-1]
+    assert actual['handle'] == 40 and actual['guid_return_code'] == 0
+    assert actual['guid'] == '0' * 32 and actual['known_labels'] == []
+
+
+@pytest.mark.parametrize('api', ['dds_get_name', 'dds_get_type_name'])
+@pytest.mark.parametrize('change', ['value', 'unsupported'])
+def test_topic_identity_and_kind_must_be_stable_across_captures(zero_topic, api, change):
+    original = getattr(zero_topic.lib, api)
+    calls = 0
+    def changing(handle, buffer, capacity):
+        nonlocal calls
+        if handle == 40:
+            calls += 1
+            if calls == 2:
+                if change == 'unsupported':
+                    return -12
+                buffer[:8] = b'changed\x00'
+                return 7
+        return original(handle, buffer, capacity)
+    setattr(zero_topic.lib, api, changing)
+    receipt = zero_topic.sample_ownership(196, ENDPOINT, 'reader')
+    assert receipt['complete'] is False and 'participant_gid' not in receipt
+    assert receipt['reason'] == ('participant_ownership_inventory_changed' if change == 'value'
+                                 else 'participant_inventory_guid_invalid_or_aliased')
+    assert len(receipt['inventory_diagnostics']) == 2
+    assert receipt['inventory_diagnostics'][-1]['failure_category'] == receipt['reason']
+
+
+@pytest.mark.parametrize('handle', [10, 30])
+@pytest.mark.parametrize('guid_case', ['valid', 'zero', 'error'])
+def test_typed_topic_conflicting_with_known_wire_entity_cannot_qualify(native, handle, guid_case):
+    def positive(entity, buffer, capacity):
+        if entity != handle:
+            return -12
+        buffer[:8] = b'offline\x00'
+        return 7
+    native.lib.dds_get_name = positive
+    native.lib.dds_get_type_name = positive
+    original = native.lib.dds_get_guid
+    calls = 0
+    def guid(entity, ptr):
+        nonlocal calls
+        if entity == handle:
+            calls += 1
+            if calls == 2 and guid_case != 'valid':
+                ptr._obj.v[:] = bytes(16)
+                return 0 if guid_case == 'zero' else -7
+        return original(entity, ptr)
+    native.lib.dds_get_guid = guid
+    receipt = native.sample_ownership(196, ENDPOINT, 'writer')
+    assert receipt['complete'] is False and receipt['candidate_eligible'] is False
+    assert 'participant_gid' not in receipt
+    assert receipt['reason'] == ('participant_inventory_kind_conflict' if guid_case == 'valid'
+                                 else 'participant_inventory_guid_invalid_or_aliased')
+    diagnostic = next(r for r in receipt['inventory_diagnostics'][0]['entity_identities']
+                      if r['handle'] == handle)
+    assert diagnostic['handle'] == handle
+    assert diagnostic['known_labels'] == (['participant', 'topic'] if handle == 10
+                                           else ['local_endpoint', 'topic'])
+
+
+@pytest.mark.parametrize('guid_case', ['zero', 'unsupported'])
+def test_other_enumerated_participant_cannot_be_relabelled_as_nonwire_topic(zero_topic, guid_case):
+    zero_topic.lib.roots.append(40)
+    zero_topic.lib.children[10].remove(40)
+    original = zero_topic.lib.dds_get_guid
+    def guid(handle, ptr):
+        if handle == 40 and guid_case == 'unsupported':
+            return -12
+        return original(handle, ptr)
+    zero_topic.lib.dds_get_guid = guid
+    receipt = zero_topic.sample_ownership(196, ENDPOINT, 'writer')
+    assert receipt['complete'] is False
+    assert receipt['reason'] == 'participant_inventory_guid_invalid_or_aliased'
+    assert receipt['inventory_diagnostics'][0]['entity_identities'][-1]['known_labels'] == ['participant', 'topic']
+
+
+@pytest.mark.parametrize('damage,reason', [
+    ('domain', 'participant_inventory_domain_mismatch'),
+    ('root', 'participant_root_invalid'),
+    ('guid_error', 'participant_inventory_guid_invalid_or_aliased'),
+    ('duplicate_nonzero', 'participant_inventory_guid_invalid_or_aliased'),
+])
+def test_topic_applicability_preserves_primary_gates(zero_topic, damage, reason):
+    if damage == 'domain':
+        zero_topic.lib.domains[40] = 197
+    elif damage == 'root':
+        zero_topic.lib.parents[10] = 10
+    elif damage == 'duplicate_nonzero':
+        # Participant GUID is read twice: zero/topic exemption cannot hide aliasing.
+        zero_topic.lib.guids[40] = PARTICIPANT
+    else:
+        original = zero_topic.lib.dds_get_guid
+        def guid(handle, ptr):
+            return -7 if handle == 40 else original(handle, ptr)
+        zero_topic.lib.dds_get_guid = guid
+    receipt = zero_topic.sample_ownership(196, ENDPOINT, 'reader')
+    assert receipt['complete'] is False and receipt['reason'] == reason
+    assert 'participant_gid' not in receipt and receipt['candidate_eligible'] is False
+
+
+@pytest.mark.parametrize('kind', ['writer', 'reader'])
+def test_worker_raw_keeps_typed_topic_applicability_supporting_only(
+        zero_topic, monkeypatch, worker_guards, snapshot_worker, kind):
+    zero_topic.lib.guids[30] = '1' * 32 if kind == 'writer' else '2' * 32
+    zero_topic.lib.dds_get_matched_subscription_data = lambda *args: None
+    zero_topic.lib.dds_get_matched_publication_data = lambda *args: None
+    monkeypatch.setattr(worker, 'CycloneMatchedPeerObserver', lambda: zero_topic)
+    rows = snapshot_worker(kind, rmw='rmw_cyclonedds_cpp', count=0)
+    raw = next(r for r in rows if r['event'] == 'participant_ownership_snapshot')
+    created = next(r for r in rows if r['event'] == 'endpoint_created')
+    for key in ('run_id', 'domain_id', 'logical_id', 'generation', 'pid', 'pgid',
+                'process_start_ticks', 'endpoint_generation', 'rmw_identifier'):
+        assert raw[key] == created[key]
+    assert raw['supporting_diagnostic'] is True and raw['candidate_eligible'] is False
+    receipt = raw['participant_ownership_observation']
+    assert receipt['complete'] is True and receipt['candidate_eligible'] is False
+    assert receipt['schema'] == 'r2f.cyclone-participant-ownership/v2'
+    topic = next(r for r in receipt['entity_identities'] if r['handle'] == 40)
+    assert topic['gid'] == '0' * 32 and topic['guid_return_code'] == 0
+    assert topic['guid_applicability'] == 'not_applicable_topic'
+    match = next(r for r in rows if r['event'] == 'match_snapshot')
+    assert match['matched_count'] == 0
+    assert any(r['event'] == 'command_done' and r['command_id'] == raw['command_id'] for r in rows)
+
+
+def test_multiple_zero_topics_are_retained_without_becoming_duplicate_wire_guids(zero_topic):
+    zero_topic.lib.children[10].append(50)
+    zero_topic.lib.children[50] = []
+    zero_topic.lib.parents[50] = 10
+    zero_topic.lib.domains[50] = 196
+    zero_topic.lib.guids[50] = '0' * 32
+    for api, payload in [('dds_get_name', b'ros_discovery_info'),
+                         ('dds_get_type_name', b'rmw_dds_common::msg::dds_::ParticipantEntitiesInfo_')]:
+        original = getattr(zero_topic.lib, api)
+        def read(handle, buffer, capacity, original=original, payload=payload):
+            if handle == 50:
+                buffer[:len(payload)] = payload
+                buffer[len(payload)] = b'\x00'
+                return len(payload)
+            return original(handle, buffer, capacity)
+        setattr(zero_topic.lib, api, read)
+    receipt = zero_topic.sample_ownership(196, ENDPOINT, 'reader')
+    assert receipt['complete'] is True
+    topics = [r for r in receipt['entity_identities'] if r['guid_applicability'] == 'not_applicable_topic']
+    assert [r['handle'] for r in topics] == [40, 50]
+    assert all(r['gid'] == '0' * 32 and r['guid_return_code'] == 0 for r in topics)
+    assert topics[1]['topic_identity']['probes']['dds_get_name']['value'] == 'ros_discovery_info'
+    assert receipt['participant_gid'] == PARTICIPANT and receipt['candidate_eligible'] is False
+
+
+@pytest.mark.parametrize('change', ['nonzero_guid', 'kind_lost_nonzero'])
+def test_topic_applicability_and_actual_guid_are_compared_between_captures(zero_topic, change):
+    if change == 'nonzero_guid':
+        original = zero_topic.lib.dds_get_guid
+        calls = 0
+        def guid(handle, ptr):
+            nonlocal calls
+            if handle == 40:
+                calls += 1
+                if calls == 4:
+                    ptr._obj.v[:] = bytes.fromhex('a' * 32)
+                    return 0
+            return original(handle, ptr)
+        zero_topic.lib.dds_get_guid = guid
+    else:
+        zero_topic.lib.guids[40] = 'a' * 32
+        original = zero_topic.lib.dds_get_type_name
+        calls = 0
+        def name(handle, buffer, capacity):
+            nonlocal calls
+            if handle == 40:
+                calls += 1
+                if calls == 2:
+                    return -12
+            return original(handle, buffer, capacity)
+        zero_topic.lib.dds_get_type_name = name
+    receipt = zero_topic.sample_ownership(196, ENDPOINT, 'reader')
+    assert receipt['complete'] is False
+    assert receipt['reason'] == 'participant_ownership_inventory_changed'
+    assert 'participant_gid' not in receipt and receipt['candidate_eligible'] is False
+
+
+def test_primary_guid_failure_precedes_conflicting_topic_label(native):
+    def positive(handle, buffer, capacity):
+        if handle != 10:
+            return -12
+        buffer[:8] = b'offline\x00'
+        return 7
+    native.lib.dds_get_name = positive
+    native.lib.dds_get_type_name = positive
+    original = native.lib.dds_get_guid
+    def failed(handle, ptr):
+        return -7 if handle == 20 else original(handle, ptr)
+    native.lib.dds_get_guid = failed
+    receipt = native.sample_ownership(196, ENDPOINT, 'writer')
+    assert receipt['complete'] is False
+    assert receipt['reason'] == 'participant_inventory_guid_invalid_or_aliased'
+    assert receipt['inventory_diagnostics'][0]['entity_identities'][0]['known_labels'] == ['participant', 'topic']
