@@ -85,15 +85,17 @@ class _ServiceDependency:
                 self._resolved = implementation()
             return self._resolved
 
-    def _invoke(self, *args):
+    def _invoke(self, *args, **kwargs):
         try:
             implementation = getattr(import_module(self.module), self.symbol)
         except (ImportError, AttributeError) as exc:
             raise ValueError("topology_service_dependency_unavailable:" + self.dependency) from exc
-        return getattr(implementation(), self.method)(*args)
+        return getattr(implementation(), self.method)(*args, **kwargs)
 
-    def produce(self, raw):
-        return self._invoke(raw)
+    def produce(self, raw, *, capture_source=None):
+        if capture_source is None:
+            return self._invoke(raw)
+        return self._invoke(raw, capture_source=capture_source)
 
     def evaluate(self, scenario, facts):
         return self._invoke(scenario, facts)

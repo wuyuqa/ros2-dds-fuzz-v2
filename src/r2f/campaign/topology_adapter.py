@@ -595,7 +595,7 @@ class _Audit:
                 "send_ref": self.ref(sent), "receive_ref": self.ref(event)}
 
 
-def _source_qualification(audit, *, before=None):
+def _source_qualification(audit, *, before=None, capture_source=None):
     """Reopen source and independently bind every producer phase to raw order.
 
     Admission uses only its own prefix. Final qualification additionally needs
@@ -607,7 +607,14 @@ def _source_qualification(audit, *, before=None):
         return False
     try:
         from .identity import source_manifest
-        _require(source == source_manifest(Path(source["source_repo"])), "source_changed")
+        if capture_source is None:
+            _require(source == source_manifest(Path(source["source_repo"])), "source_changed")
+        else:
+            # Explicit archival reconstruction validates the immutable capture,
+            # not the checkout that happened to occupy this path at capture time.
+            # Runtime callers use the default current-source measurement.
+            _require(isinstance(capture_source, dict) and source == capture_source,
+                     "saved_capture_source_mismatch")
         checks = [e for e in audit.events if e["event"] == "topology_source_checked"]
         if before is not None:
             checks = [e for e in checks if e["event_index"] < before["event_index"]
@@ -1354,7 +1361,7 @@ def _live_history_send_coverage(audit, windows, send, *, filter_decisions=()):
                       "received_sample_in_still_live_generation_historical_windows")}
 
 
-def facts_from_events(events, runtime, config):
+def facts_from_events(events, runtime, config, *, capture_source=None):
     """Produce typed facts from persisted raw. All missing evidence is explicit."""
     facts = {"schema": SCHEMA, "producer_id": TOPOLOGY_FACT_PRODUCER, "target_id": TOPOLOGY_TARGET,
              "environment_healthy": False, "process_healthy": False, "preconditions_reached": False,
@@ -1443,7 +1450,7 @@ def facts_from_events(events, runtime, config):
             if s["event_index"] not in current_window_sends and not _no_obligation_send_covered(a, empty_windows, s)
             and s["event_index"] not in covered_history]
         facts["application_audit"] = _application(a)
-        facts["source_provenance_qualified"] = _source_qualification(a)
+        facts["source_provenance_qualified"] = _source_qualification(a, capture_source=capture_source)
         facts["execution_evidence"] = not a.fixture
         env = [e for e in a.events if e["event"] == "environment_preflight"]
         locks = [e for e in a.events if e["event"] == "isolation_locks_acquired"]
@@ -1462,7 +1469,8 @@ def facts_from_events(events, runtime, config):
             from r2f.modules.s1.topology_targets import topology_target_declaration
             scenario = Scenario(topology_target_declaration(), config["rmw"], config["arm"],
                                 config.get("repeat", 0), mutation_plan=a.plan)
-            facts["canonical_step_receipts"] = canonical_receipts(scenario, runtime, events, config=config)
+            facts["canonical_step_receipts"] = canonical_receipts(
+                scenario, runtime, events, config=config, capture_source=capture_source)
             facts["preconditions_reached"] = len(facts["canonical_step_receipts"]) == len(scenario.state_steps)
         except (ValueError, KeyError, TypeError, OSError) as exc:
             facts["canonical_receipt_error"] = str(exc)
@@ -1502,7 +1510,7 @@ def facts_from_events(events, runtime, config):
     return facts
 
 
-def canonical_receipts(scenario, runtime, events, *, config=None):
+def canonical_receipts(scenario, runtime, events, *, config=None, capture_source=None):
     """Raw-backed core StepReceipts, with independently established requires.
 
     This does not advance execution stages. Fixtures can be audited, but cannot
@@ -1522,7 +1530,7 @@ def canonical_receipts(scenario, runtime, events, *, config=None):
     first = _one(a.events, "state_step_before", step_id="admit_topology")
     _chain(env, first)
     _chain(locks, first)
-    source_ok = _source_qualification(a, before=first)
+    source_ok = _source_qualification(a, before=first, capture_source=capture_source)
     state = {"environment_ok": env.get("ok") is True, "locks_held": bool(locks.get("locks")),
              "source_identity_ok": source_ok, "topology_capability_admitted": True}
     receipts = []
@@ -1568,8 +1576,11 @@ def canonical_receipts(scenario, runtime, events, *, config=None):
 class TopologyFactProducer:
     id = TOPOLOGY_FACT_PRODUCER
 
-    def produce(self, raw):
-        return facts_from_events(raw["events"], raw["runtime"], raw["config"])
+    def produce(self, raw, *, capture_source=None):
+        if capture_source is None:
+            return facts_from_events(raw["events"], raw["runtime"], raw["config"])
+        return facts_from_events(raw["events"], raw["runtime"], raw["config"],
+                                 capture_source=capture_source)
 
 
 # Spelled-out aliases retained for the registry handoff, not target aliases.
