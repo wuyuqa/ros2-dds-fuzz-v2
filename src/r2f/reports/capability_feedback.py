@@ -71,3 +71,25 @@ def capability_assessment_projection(entry, original, *, human_confirmed):
                                   'evidence_sha256': record['evidence_sha256'],
                                   'assessment': assessment, 'task_refs': refs})
     return snapshot(result)
+
+
+def capability_reconnect_projection(evaluation, evaluation_ref):
+    """Project actual oracle calls separately from still-pending activation.
+
+    A fixture cannot satisfy real feedback or blackbox followup. This checkpoint
+    grants no human or implementation authority, even for mechanism-only input.
+    """
+    return snapshot(dict(status='pending', evaluation_status=evaluation['status'],
+        qualification=evaluation['qualification'], implemented=False, human_confirmed=False,
+        new_execution=False, natural_candidates=0, required_denominator=72,
+        blackbox_supported=False,
+        pending_obligations=['actual_feedback_evidence', 'human_confirmation',
+                             'model_activation_review', 'sidechannel_to_blackbox_followup'],
+        observation_mode=evaluation['request']['original_row'].get('observation_mode', 'unknown'),
+        evaluation_ref=evaluation_ref, original_ref=evaluation['original_ref'],
+        capture_source=evaluation['capture_source'], evaluation_source=evaluation['evaluation_source'],
+        validation_review=evaluation['validation_review'], task_review=evaluation['task_review'],
+        task_ref=evaluation['task_ref'], task_assessment=evaluation['task_assessment'],
+        binding=evaluation['binding'],
+        selected_model_version=evaluation['selected_model_version'],
+        declared_models=evaluation['models']))

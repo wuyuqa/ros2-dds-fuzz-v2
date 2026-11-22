@@ -237,6 +237,8 @@ def _review_errors(review, candidate_id):
     problems = []
     if not isinstance(review, dict):
         return ["review_record_not_an_object"]
+    if {'capability_reconnect', 'reconnect_evaluation', 'evaluation_summary'} & set(review):
+        problems.append('reconnect_summary_requires_runner')
     if review.get("schema_version") not in (None, REVIEW_RECORD_SCHEMA):
         problems.append("review_schema_unknown")
     if review.get("candidate_id") not in (None, candidate_id):
@@ -1107,6 +1109,10 @@ def query_runner_evidence(output_dir):
                 if runtime is not None:
                     bind_raw(raw, runtime)
             packets.append(packet)
+        reconnect_only = manifest.get('interpretation') == 'offline_reinterpretation'
+        if reconnect_only and (manifest.get('new_execution') is not False
+                or index['identities'] or index['packets'] or len(index['reports']) != 1):
+            raise ValueError('reconnect_execution_claim_forbidden')
         packets_by_cell = {p['packet_id']: p for p in packets}
         for ref in index['reports']:
             report = read_ref(ref)
@@ -1115,6 +1121,15 @@ def query_runner_evidence(output_dir):
             if 'source_manifest' in report and (not isinstance(report['source_manifest'], dict)
                                                 or report['source_manifest'] != source):
                 raise ValueError('runner_evidence_report_source_mismatch')
+            if reconnect_only or 'capability_reconnect' in report:
+                if not reconnect_only:
+                    raise ValueError('reconnect_execution_claim_forbidden')
+                from r2f.reports.capability_reconnect import verify_review_reconnect
+                view = report['capability_reconnect']
+                evaluation = verify_review_reconnect(read_ref(view['evaluation_ref']))
+                expected = capability_reconnect_report(evaluation, view['evaluation_ref'])
+                if canonical_hash(report) != canonical_hash(expected):
+                    raise ValueError('reconnect_report_projection_mismatch')
             rows = report.get('rows')
             if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
                 raise ValueError('runner_evidence_report_rows_shape')
@@ -1325,3 +1340,13 @@ def query_automatic_replays(root, *, index=None):
     if not isinstance(summary, dict):
         summary = {'entries': []}
     return dict(summary, attachment_valid=not errors, errors=errors)
+
+
+def capability_reconnect_report(evaluation, evaluation_ref):
+    """Attach reevaluation to the existing zero-new-candidate ledger."""
+    from r2f.reports.capability_feedback import capability_reconnect_projection
+    report = exploratory_candidate_ledger([])
+    report.update(run_id=evaluation['original_ref']['run_id'], rows=[],
+                  source_manifest=evaluation['evaluation_source'],
+                  capability_reconnect=capability_reconnect_projection(evaluation, evaluation_ref))
+    return report

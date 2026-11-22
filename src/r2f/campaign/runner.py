@@ -2876,3 +2876,31 @@ def _generate_case(sequence, entry, target, contract, surface, parent, mutator_i
     scheduler.advance_feedback(feedback)
     _atomic_json(row_path, row)
     return row
+
+
+def reevaluate_capability(output_dir, *, review_log, validation_record_id, original_row, saved_cases):
+    """Publish immutable canonical saved-case oracle reevaluation attachments.
+
+    No runtime is acquired and no capture row is rerun or admitted as a new
+    candidate. Current registered code is measured; proposal version labels do
+    not choose code. Activation and real feedback remain pending.
+    """
+    from r2f.reports.capability_reconnect import evaluate_review_reconnect
+    from r2f.reports.candidate_report import _write_immutable_json, capability_reconnect_report
+
+    evaluation = evaluate_review_reconnect(review_log=review_log,
+        validation_record_id=validation_record_id, original_row=original_row, saved_cases=saved_cases)
+    root = Path(output_dir)
+    def publish(name, value):
+        path = _write_immutable_json(root / name, value)
+        return {'path': name, 'sha256': raw_sha256(path)}
+    evaluation_ref = publish('capability-reevaluation.json', evaluation)
+    report = capability_reconnect_report(evaluation, evaluation_ref)
+    report_ref = publish('candidate-report.json', report)
+    manifest_ref = publish('manifest.json', dict(run_id=report['run_id'],
+        source_manifest=evaluation['evaluation_source'], new_execution=False,
+        interpretation='offline_reinterpretation'))
+    publish('evidence-index.json', dict(schema_version='r2f.runner-evidence-index/v1',
+        run_id=report['run_id'], source_manifest=evaluation['evaluation_source'],
+        manifest=manifest_ref, reports=[report_ref], packets=[], identities=[], tool_problems=[]))
+    return report

@@ -158,3 +158,59 @@ def evaluate_reconnect(validation, *, evidence_refs, original_ref, assessment,
         artifact['status'] = 'evaluated'
     artifact['evaluation_sha256'] = canonical_hash(artifact)
     return snapshot(artifact)
+
+
+def evaluate_review_reconnect(*, review_log, validation_record_id, original_row, saved_cases):
+    """Resolve canonical review authority and select current registered code.
+
+    This is oracle-only reinterpretation, never activation or a new execution.
+    No caller-provided model loader, binding, version or verdict is accepted.
+    """
+    from r2f.core import Registry
+    from r2f.core.evidence import raw_sha256
+    from r2f.modules.s1.module import register
+    from r2f.reports.candidate_report import read_review_records
+
+    original_row, saved_cases = snapshot([original_row, saved_cases])
+    log_ref = {'path': str(Path(review_log).resolve()), 'sha256': raw_sha256(review_log)}
+    records = read_review_records(review_log, original_rows=[original_row])
+    review = next((r for r in records if r['record_id'] == validation_record_id), None)
+    if review is None or review.get('capability_validation') is None:
+        raise ValueError('reconnect_validation_review_missing')
+    if any(r.get('supersedes_record_id') == validation_record_id for r in records):
+        raise ValueError('reconnect_validation_review_superseded')
+    parent = next((r for r in records if r['record_id'] == review.get('supersedes_record_id')), None)
+    registry = Registry()
+    register(registry)
+    source = source_manifest(Path(__file__).resolve().parents[3])
+    artifact = evaluate_reconnect(review['capability_validation'],
+        evidence_refs=review['evidence_refs'], original_ref=candidate_execution_identity(original_row),
+        assessment=review.get('capability_assessment'), task_review=parent,
+        registry=registry, source=source, saved_cases=saved_cases)
+    verify_raw(log_ref['path'], log_ref['sha256'])
+    artifact.pop('evaluation_sha256')
+    artifact.update(request={'review_log': log_ref, 'validation_record_id': validation_record_id,
+                             'original_row': original_row, 'saved_cases': saved_cases},
+                    validation_review={'record_id': review['record_id'],
+                                       'record_sha256': review['record_sha256']},
+                    task_assessment=parent['capability_assessment'],
+                    task_review={'record_id': parent['record_id'],
+                                 'record_sha256': parent['record_sha256']},
+                    selected_model_version=artifact['binding_sha256'])
+    artifact['evaluation_sha256'] = canonical_hash(artifact)
+    return snapshot(artifact)
+
+
+def verify_review_reconnect(evaluation):
+    """Recompute current oracle evidence; content hashes are not authority."""
+    request = evaluation['request']
+    if set(request) != {'review_log', 'validation_record_id', 'original_row', 'saved_cases'}:
+        raise ValueError('reconnect_request_invalid')
+    log_ref = request['review_log']
+    verify_raw(log_ref['path'], log_ref['sha256'])
+    actual = evaluate_review_reconnect(review_log=log_ref['path'],
+        validation_record_id=request['validation_record_id'], original_row=request['original_row'],
+        saved_cases=request['saved_cases'])
+    if canonical_hash(actual) != canonical_hash(evaluation):
+        raise ValueError('reconnect_evaluation_mismatch')
+    return actual
