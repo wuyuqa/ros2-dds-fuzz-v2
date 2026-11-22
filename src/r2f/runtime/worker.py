@@ -25,7 +25,9 @@ def emit_snapshot(endpoint, role, command_id, endpoint_gid, graph, emit):
     count = getattr(endpoint, api)()
     emit('match_snapshot', command_id=command_id, matched_count=count,
          endpoint_gid=endpoint_gid, sampled_monotonic_ns=sampled_ns, count_api=api)
-    emit('graph_snapshot', command_id=command_id, **graph())
+    snapshot = graph()
+    emit('graph_snapshot', command_id=command_id, **snapshot,
+         time_ns=time.time_ns(), timestamp_clock='unix_ns_realtime')
 
 
 def extended_graph_qos(qos, enabled=False):

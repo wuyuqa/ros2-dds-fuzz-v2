@@ -354,6 +354,10 @@ def projection_graph_proof(events, config, observation, tokens):
     graph = observation['graph_snapshot']
     content = _json(graph['raw'])
     expected = {'source': 'ros_graph', 'captured_at_unix_ns': snapshots[roles[0]]['time_ns'], 'endpoints': []}
+    # These snapshots already passed command, chronology and worker binding.
+    if all(snapshots[role].get('timestamp_clock') == 'unix_ns_realtime'
+           and type(snapshots[role]['time_ns']) is int for role in roles):
+        expected['timestamp_clock'] = 'unix_ns_realtime'
     for key in ('publishers', 'subscriptions'):
         for item in snapshots[roles[0]][key]:
             gid = item['endpoint_gid']

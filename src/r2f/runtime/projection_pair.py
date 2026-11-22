@@ -306,6 +306,10 @@ def export_graph(proof, endpoints, topic, path, *, strict=True, include_schema_c
                    != set(writer_gids.values()) | set(reader_gids.values())):
         raise RuntimeError('projection_graph_ambiguous_endpoints')
     result = {'source': 'ros_graph', 'captured_at_unix_ns': graph['time_ns'], 'endpoints': entries}
+    # Qualify only declarations from every acknowledged observer, never config.
+    if all(proof[role]['graph'].get('timestamp_clock') == 'unix_ns_realtime'
+           and type(proof[role]['graph']['time_ns']) is int for role in roles):
+        result['timestamp_clock'] = 'unix_ns_realtime'
     if include_schema_check:
         from r2f.instrumentation.sedp_fields import discovery_layer_schema
         snapshot_times = {role: proof[role]['graph']['time_ns'] for role in roles}

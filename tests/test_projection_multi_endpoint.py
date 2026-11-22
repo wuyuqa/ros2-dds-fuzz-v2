@@ -527,3 +527,50 @@ class GraphSchemaExportCP1(unittest.TestCase):
         self.assertEqual(persisted['source'], 'ros_graph')
         self.assertEqual(persisted['captured_at_unix_ns'], 100)
         self.assertEqual(len(persisted['endpoints']), 2)
+
+
+class GraphClockExportContract(unittest.TestCase):
+    """Offline raw snapshots, including alias observers, use the default export."""
+
+    def test_default_export_binds_only_unanimous_well_typed_realtime_clocks(self):
+        from r2f.runtime.projection_pair import export_graph
+        roles = ('writer', 'reader', 'writer2')
+        endpoints = {role: {'endpoint_gid': ROLE_GUIDS[role]} for role in roles}
+        event = {
+            'time_ns': 100, 'timestamp_clock': 'unix_ns_realtime',
+            'publishers': [{'endpoint_gid': ROLE_GUIDS[role],
+                            'topic_type': 'std_msgs/msg/String', 'qos': dict(DEFAULT_QOS)}
+                           for role in ('writer', 'writer2')],
+            'subscriptions': [{'endpoint_gid': ROLE_GUIDS['reader'],
+                               'topic_type': 'std_msgs/msg/String', 'qos': dict(DEFAULT_QOS)}]}
+        proof = {role: {'graph': deepcopy(event)} for role in roles}
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp)/'graph.json'
+            result = export_graph(proof, endpoints, '/offline', path)
+            persisted = path.read_bytes()
+            self.assertEqual(json.loads(persisted)['timestamp_clock'], 'unix_ns_realtime')
+            self.assertEqual(result['raw']['sha256'], hashlib.sha256(persisted).hexdigest())
+            self.assertNotIn('schema_layers', result)
+            legacy = deepcopy(proof)
+            for row in legacy.values():
+                row['graph'].pop('timestamp_clock')
+            legacy_path = Path(temp)/'legacy.json'
+            old = export_graph(legacy, endpoints, '/offline', legacy_path)
+            legacy_bytes = legacy_path.read_bytes()
+            self.assertEqual(set(old), {'source', 'captured_at_unix_ns', 'endpoints', 'raw'})
+            for index, bad in enumerate((None, True, 1, [], {}, 'monotonic_ns', 'unix_ns_realtime ')):
+                with self.subTest(bad=bad):
+                    conflicting = deepcopy(proof)
+                    conflicting['writer2']['graph']['timestamp_clock'] = bad
+                    bad_path = Path(temp)/f'bad-{index}.json'
+                    result = export_graph(conflicting, endpoints, '/offline', bad_path)
+                    self.assertNotIn('timestamp_clock', result)
+                    self.assertEqual(bad_path.read_bytes(), legacy_bytes)
+            partial = deepcopy(proof)
+            partial['writer2']['graph'].pop('timestamp_clock')
+            self.assertNotIn('timestamp_clock', export_graph(partial, endpoints, '/offline', Path(temp)/'partial.json'))
+            for index, bad_time in enumerate((True, 100.0, '100', None)):
+                with self.subTest(bad_time=bad_time):
+                    invalid = deepcopy(proof)
+                    invalid['writer2']['graph']['time_ns'] = bad_time
+                    self.assertNotIn('timestamp_clock', export_graph(invalid, endpoints, '/offline', Path(temp)/f'time-{index}.json'))

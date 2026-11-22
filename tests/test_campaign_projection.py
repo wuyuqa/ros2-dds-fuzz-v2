@@ -12,13 +12,13 @@ from r2f.campaign.runtime_adapter import ingest_execution
 from r2f.campaign.triage import attribute
 from r2f.modules.s1.module import S1Module
 from r2f.core.oracle import validate_control
-from r2f.runtime.projection_pair import controlled_graph
+from r2f.runtime.projection_pair import controlled_graph, export_graph
 
 TARGET='builtin.discovery_projection_reconciliation'
 BASE=1700000000000000000
 
 
-def projection_fixture(root,arm='baseline'):
+def projection_fixture(root,arm='baseline', *, graph_clocks=None):
     scenario=compile_scenario(S1Module().targets[TARGET],'rmw_cyclonedds_cpp',arm,0)
     final=semantic_input(arm,target_id=TARGET)
     capsule=ReplayCapsule.from_scenario(scenario,source_manifest={'head':'offline'},final_input=final)
@@ -50,6 +50,8 @@ def projection_fixture(root,arm='baseline'):
     ready={}
     def observe():
         ready.update(status='ready',unix_ns=BASE+tick+1000,monotonic_ns=tick+1000)
+        if graph_clocks is not None:
+            ready['timestamp_clock']='kernel_SO_TIMESTAMPNS_realtime'
         return {'raw_event_ref':emit('discovery_observer_ready',ready=ready,receipt=ready)['event_index'],'ready':ready}
     step('observer_ready',['namespace_ready'],observe)
     mutation={k:arm=='mutated' for k in ('planned','submitted','carrier_admitted','configured','applied','hit','effect_observed')}
@@ -77,6 +79,7 @@ def projection_fixture(root,arm='baseline'):
         request=emit('graph_snapshot_requested',role,command_id=i+1,requested_monotonic_ns=tick+1000)
         match=emit('match_snapshot',role,command_id=i+1,endpoint_gid=ids[role],sampled_monotonic_ns=tick+1000,matched_count=0,count_api='get_subscription_count' if role=='writer' else 'get_publisher_count')
         graph=emit('graph_snapshot',role,command_id=i+1,
+                   **({'timestamp_clock':graph_clocks[role]} if graph_clocks is not None and role in graph_clocks else {}),
                    publishers=[{'endpoint_gid':ids['writer'],'topic_type':config['message_type'],'qos':deepcopy(config['qos'])}],
                    subscriptions=[{'endpoint_gid':ids['reader'],'topic_type':config['message_type'],'qos':deepcopy(config['qos'])}])
         ack=emit('command_done',role,command_id=i+1)
@@ -84,7 +87,11 @@ def projection_fixture(root,arm='baseline'):
         proofs.append({'role':role,'command_id':i+1,'request_index':request['event_index'],'match_index':match['event_index'],'snapshot_index':graph['event_index'],'ack_index':ack['event_index']})
     graphval={'source':'ros_graph','captured_at_unix_ns':graphs['writer']['time_ns'],'endpoints':[
         {'endpoint_gid':ids[r],'role':r,'topic':'/test','topic_type':config['message_type'],'qos':deepcopy(config['qos'])} for r in ('writer','reader')]}
-    graph={**deepcopy(graphval),'raw':jsonraw(root/'graph.json',graphval)}
+    if graph_clocks is None:
+        graph={**deepcopy(graphval),'raw':jsonraw(root/'graph.json',graphval)}
+    else:
+        graph=export_graph({role:{'graph':value} for role,value in graphs.items()},
+                           endpoints, config['topic'], root/'graph.json')
     export=emit('projection_graph_exported',graph_snapshot=graph,graph_receipts=proofs)
     window={'start_ns':begin['time_ns'],'end_ns':export['time_ns']}
     emit('window_close',window='endpoint_creation',**window)
@@ -190,3 +197,82 @@ class ProjectionPipeline(unittest.TestCase):
 
 
 if __name__=='__main__':unittest.main()
+
+
+class GraphClockIngestionContract(unittest.TestCase):
+    """Hash-bound offline fixtures exercise the public adapter, never a live run."""
+
+    def test_raw_backed_clock_chain_qualifies_through_ingest_execution(self):
+        for arm in ('baseline', 'transparent', 'mutated', 'negative'):
+            with self.subTest(arm=arm), tempfile.TemporaryDirectory() as temp:
+                s, c, r, cap = projection_fixture(Path(temp), arm, graph_clocks={
+                    'writer': 'unix_ns_realtime', 'reader': 'unix_ns_realtime'})
+                row = ingest_execution(s, c, r, cap)
+                self.assertEqual(row['execution_stage'], 'judged', row.get('abort_reason'))
+                self.assertEqual(row['oracle_verdict'], 'fail' if arm == 'negative' else 'pass')
+                schema = row['typed_facts']['original_projection']['schema_check']
+                self.assertEqual(schema['source_qualification']['timing']['status'], 'qualified')
+                self.assertFalse(schema['all_layer_obligations_closed'])
+                self.assertTrue(schema['endpoint_observations'])
+                self.assertTrue(all(type(e['graph_minus_wire_ns']) is int
+                                    for e in schema['endpoint_observations']))
+                self.assertEqual(cap.input['source_manifest'], {'head': 'offline'})
+                if arm == 'negative':
+                    self.assertTrue(validate_control(dict(row, control_kind='fault')))
+                    self.assertEqual(attribute(row, row['typed_facts'], row['oracle'])['responsibility_layer'], 'harness')
+                    self.assertNotIn('mutation_applied', [h['execution_stage'] for h in row['stage_history']])
+                    from r2f.core.candidate import CandidateLifecycle
+                    evidence = dict(row, timestamp='2026-11-23T00:00:00+08:00',
+                                    endpoint_identity='/'.join(row['typed_facts'][role]['id']
+                                                               for role in ('writer', 'reader')),
+                                    candidate_source='blackbox', evidence_tier='blackbox',
+                                    provenance={'offline_fixture_only': True})
+                    candidate = CandidateLifecycle('offline-clock-negative', evidence)
+                    with self.assertRaisesRegex(ValueError, 'control rows cannot enter SUT candidates'):
+                        candidate.admit()
+
+    def test_legacy_missing_malformed_and_conflicting_clocks_remain_unknown(self):
+        clocks = [None, {}, {'writer': 'unix_ns_realtime'}]
+        clocks += [{'writer': 'unix_ns_realtime', 'reader': bad}
+                   for bad in (None, True, 1, [], {}, 'monotonic_ns', 'unix_ns_realtime ')]
+        for declared in clocks:
+            with self.subTest(clocks=declared), tempfile.TemporaryDirectory() as temp:
+                s, c, r, cap = projection_fixture(Path(temp), graph_clocks=declared)
+                row = ingest_execution(s, c, r, cap)
+                self.assertEqual(row['execution_stage'], 'judged', row.get('abort_reason'))
+                self.assertEqual(row['oracle_verdict'], 'pass')
+                self.assertNotIn('timestamp_clock', r['discovery_projection']['graph_snapshot'])
+                schema = row['typed_facts']['original_projection']['schema_check']
+                self.assertEqual(schema['source_qualification']['timing']['status'], 'unknown')
+                self.assertTrue(all(e['graph_minus_wire_ns'] is None
+                                    for e in schema['endpoint_observations']))
+
+    def test_export_only_clock_raw_tamper_and_extra_fields_are_rejected(self):
+        for mode in ('export_only', 'raw_tamper', 'rehashed_conflict', 'extra_field'):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as temp:
+                clocks = None if mode == 'export_only' else {
+                    'writer': 'unix_ns_realtime', 'reader': 'unix_ns_realtime'}
+                s, c, r, cap = projection_fixture(Path(temp), graph_clocks=clocks)
+                graph = r['discovery_projection']['graph_snapshot']
+                if mode in ('export_only', 'extra_field'):
+                    graph['timestamp_clock' if mode == 'export_only' else 'unbound_clock_note'] = 'unix_ns_realtime'
+                    value = {k: v for k, v in graph.items() if k != 'raw'}
+                    graph['raw'] = jsonraw(Path(graph['raw']['path']), value)
+                    for e in r['events']:
+                        if e['event'] in ('projection_observation', 'projection_graph_exported'):
+                            e['graph_snapshot'] = deepcopy(graph)
+                else:
+                    snapshots = [e for e in r['events'] if e['event'] == 'graph_snapshot']
+                    snapshots[-1]['timestamp_clock'] = 'monotonic_ns'
+                raw = hashed(Path(r['raw_path']), b''.join(
+                    json.dumps(e).encode()+b'\n' for e in r['events']))
+                if mode != 'raw_tamper':
+                    r['raw_sha256'] = raw['sha256']
+                    for binding in r['discovery_projection']['endpoint_bindings']:
+                        for key in ('begin_raw_ref', 'return_raw_ref'):
+                            binding[key]['sha256'] = raw['sha256']
+                row = ingest_execution(s, c, r, cap)
+                self.assertEqual(row['execution_stage'], 'aborted', mode)
+                self.assertEqual(row['oracle_verdict'], 'unknown', mode)
+                if mode != 'raw_tamper':
+                    self.assertIn('independent graph JSON not reproduced', row['abort_reason'])
