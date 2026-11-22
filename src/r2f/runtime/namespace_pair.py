@@ -154,6 +154,10 @@ def normalize_discovery_config(config):
         sum(w['trigger_offset_sec'] + w['drop_duration_sec'] + w['restore_interval_sec']
             for w in c['runtime_windows'])
         + c['recovery_timeout_sec'] * len(c['runtime_windows']))
+    observe_leases = c.get('observe_participant_leases', False)
+    if type(observe_leases) is not bool:
+        raise ValueError('invalid_observe_participant_leases')
+    c['observe_participant_leases'] = observe_leases
     c['observe_extended_qos'] = True
     return c
 
@@ -2100,6 +2104,73 @@ def _run_post_restore_delivery(c, emit, pool, events, pause):
             'close_event_index': closing.get('namespace_event_index')}
 
 
+def _participant_lease_json_shape_valid(value):
+    """Bound optional JSON before encoding, leaving event-envelope headroom."""
+    pending = [(value, 0)]
+    visited = 0
+    while pending:
+        item, depth = pending.pop()
+        visited += 1
+        if depth > 32 or visited > 100000:
+            return False
+        if type(item) in (dict, list):
+            if len(item) + len(pending) + visited > 100000:
+                return False
+            if type(item) is dict and any(type(key) is not str for key in item):
+                return False
+            children = item.values() if type(item) is dict else item
+            pending.extend((child, depth + 1) for child in children)
+        elif type(item) not in (str, int, float, bool, type(None)):
+            return False
+    return True
+
+
+def _participant_lease_duration_valid(lease):
+    """Check all supplied duration representations, including parser rounding."""
+    infinite = lease.get('infinite', False)
+    ns = lease.get('nanoseconds')
+    numerator = lease.get('exact_seconds_numerator')
+    denominator = lease.get('exact_seconds_denominator')
+    rational = 'exact_seconds_numerator' in lease or 'exact_seconds_denominator' in lease
+    wire = 'seconds' in lease or 'second_word' in lease
+    seconds, word = lease.get('seconds'), lease.get('second_word')
+    policy = lease.get('nanoseconds_policy', 'exact_only_no_vendor_rounding_assumed')
+    encoding = lease.get('encoding', 'seconds_fraction_2pow32')
+    if (type(infinite) is not bool
+            or (ns is not None and (type(ns) is not int or not 0 <= ns <= (1 << 31) * 10**9))
+            or (rational and (type(numerator) is not int or numerator < 0
+                or type(denominator) is not int or denominator <= 0
+                or numerator >= (1 << 31) * denominator))
+            or (wire and (type(seconds) is not int or not 0 <= seconds < (1 << 31)
+                or type(word) is not int or not 0 <= word < (1 << 32)))
+            or policy not in ('nearest_ns', 'floor_ns', 'exact_only_no_vendor_rounding_assumed')
+            or encoding not in ('seconds_fraction_2pow32', 'integral_seconds_only_unambiguous')):
+        return False
+    if infinite:
+        return (ns is None and not rational
+                and (not wire or (seconds, word) == (0x7fffffff, 0xffffffff)))
+    if wire:
+        if ((seconds, word) == (0x7fffffff, 0xffffffff)
+                or (encoding == 'integral_seconds_only_unambiguous' and word != 0)):
+            return False
+        wire_numerator = (seconds << 32) + word
+        if rational and numerator * (1 << 32) != wire_numerator * denominator:
+            return False
+        numerator, denominator = wire_numerator, 1 << 32
+        rational = True
+    if not rational:
+        return ns is not None and 'nanoseconds_policy' not in lease
+    if 'nanoseconds' not in lease:
+        return True
+    quotient, remainder = divmod(numerator * 10**9, denominator)
+    if policy == 'nearest_ns':
+        return ns == quotient + (2 * remainder >= denominator)
+    if policy == 'floor_ns':
+        return ns == quotient
+    # The parser leaves nanoseconds null for nonintegral exact fractions.
+    return ns == (quotient if remainder == 0 else None)
+
+
 def _body(request, owner_channel):
     if request['config']['target_id'] in ('builtin.discovery_projection_reconciliation',
                                           'builtin.discovery_projection_reconciliation.fuzz_v1'):
@@ -2176,10 +2247,91 @@ def _body(request, owner_channel):
     def activity(since_ns, label, after_monotonic_ns=None):
         value = observer.snapshot_activity(since_ns=since_ns,
                     participant_prefixes=[endpoints[role]['endpoint_gid'][:24] for role in ('writer', 'reader')])
-        return emit('discovery_activity_observation', window=label, activity=value,
+        activity_event = emit('discovery_activity_observation', window=label, activity=value,
                     activity_observed=activity_is_pair_observed(value, after_monotonic_ns=after_monotonic_ns),
                     after_monotonic_ns=after_monotonic_ns,
                     clock_guard_ns=CLOCK_GUARD_NS if str(label).startswith('post_restore') else 0)
+        if c.get('observe_participant_leases', False):
+            # Prefixes only select captured advertisements, not ownership,
+            # generation, remote expiry or recovery. Keep activity gates intact.
+            leases = {'status': 'unknown',
+                      'reasons': ['participant_lease_snapshot_api_unavailable']}
+            try:
+                snapshot_leases = getattr(observer, 'snapshot_participant_leases', None)
+                if callable(snapshot_leases):
+                    leases = snapshot_leases(since_ns=since_ns,
+                        participant_prefixes=[endpoints[role]['endpoint_gid'][:24] for role in ('writer', 'reader')],
+                        field_policy=None)
+                    # Reject deep/wide/cyclic or non-JSON shapes before encoding.
+                    # The copy detaches observer state; the small depth bound
+                    # leaves headroom when emit adds the production envelope.
+                    try:
+                        if not _participant_lease_json_shape_valid(leases):
+                            raise ValueError('participant_lease_snapshot_shape_limit')
+                        leases = json.loads(json.dumps(leases, sort_keys=True, allow_nan=False))
+                    except (TypeError, ValueError, OverflowError, RecursionError):
+                        leases = None
+                    valid = isinstance(leases, dict) and leases.get('status') in ('observed', 'unknown')
+                    if valid:
+                        reasons = leases.get('reasons')
+                        observations = leases.get('observations', [])
+                        valid = (isinstance(reasons, list)
+                                 and all(isinstance(reason, str) and reason.strip() for reason in reasons)
+                                 and isinstance(observations, list)
+                                 and all(isinstance(item, dict) for item in observations))
+                        if leases['status'] == 'observed':
+                            raw = leases.get('raw')
+                            valid = (valid and not reasons and bool(observations)
+                                     and isinstance(raw, dict)
+                                     and isinstance(raw.get('path'), str) and bool(raw['path'].strip())
+                                     and isinstance(raw.get('sha256'), str) and len(raw['sha256']) == 64
+                                     and all(ch in '0123456789abcdefABCDEF' for ch in raw['sha256'])
+                                     and leases.get('missing_participant_prefixes', []) == []
+                                     and leases.get('window_buffer_retained', True) is True)
+                            if valid:
+                                for item in observations:
+                                    guid = item.get('participant_guid')
+                                    lease = item.get('lease')
+                                    if (item.get('status') != 'observed' or item.get('reasons') != []
+                                            or not isinstance(guid, str) or len(guid) != 32
+                                            or any(ch not in '0123456789abcdefABCDEF' for ch in guid)
+                                            or not guid.lower().endswith('000001c1')
+                                            or item.get('source_guid_prefix') != guid[:24]
+                                            or not isinstance(item.get('raw_ref'), dict) or not item['raw_ref']
+                                            or not isinstance(lease, dict) or lease.get('status') != 'observed'
+                                            or lease.get('reason') or lease.get('reasons')
+                                            or not _participant_lease_duration_valid(lease)):
+                                        valid = False
+                                        break
+                                wanted = {endpoints[role]['endpoint_gid'][:24] for role in ('writer', 'reader')}
+                                valid = valid and wanted <= {item.get('source_guid_prefix') for item in observations}
+                        else:
+                            valid = valid and bool(reasons)
+                    if not valid:
+                        leases = {'status': 'unknown',
+                                  'reasons': ['participant_lease_snapshot_invalid_result']}
+            except Exception as exc:
+                # Only this optional bounded observer read is contained. The
+                # original activity read/emission and all main failures propagate.
+                # Exception formatting is optional too: even a broken __str__
+                # must not escape this boundary. BaseException is caught only
+                # during formatting, never around the observer or raw emit.
+                try:
+                    error_type = str.__getitem__(type.__getattribute__(type(exc), '__name__'), slice(0, 128))
+                except BaseException:
+                    error_type = 'Exception'
+                try:
+                    error = str.__getitem__(str(exc), slice(0, 512))
+                except BaseException:
+                    error = 'optional_exception_detail_unavailable'
+                leases = {'status': 'unknown', 'reasons': ['participant_lease_snapshot_error'],
+                          'error_type': error_type, 'error': error}
+            emit('participant_lease_observation', window=label, receipt_kind='supporting',
+                 activity_event_ref=activity_event['raw_event_ref'], participant_leases=leases,
+                 status=leases['status'], observation_only=True, candidate_eligible=False,
+                 ownership_status='unknown_separate_ownership_evidence_required',
+                 no_remote_expiry_proof=True, lifecycle_generation_missing=True)
+        return activity_event
     try:
         proof = validate_host_leases(request)
         if not same_source(request['source'], execution_chain_identity()):
