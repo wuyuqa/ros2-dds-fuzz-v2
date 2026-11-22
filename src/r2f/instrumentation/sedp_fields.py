@@ -195,3 +195,30 @@ def semantic_duration(value):
             and isinstance(denominator, int) and not isinstance(denominator, bool) and denominator > 0):
         return Fraction(numerator, denominator)
     return None
+
+
+def discovery_layer_schema():
+    """Applicability of the current passive SEDP/public endpoint graph seam.
+
+    Participant prefixes and endpoint-derived topic names are supporting facts,
+    not independent participant or DCPSTopic builtin observations.
+    """
+    return {
+        'participant': {
+            'status': 'unavailable_api',
+            'required_fields': ['participant_guid', 'lease_duration'],
+            'fields': {'participant_guid': 'unavailable_api',
+                       'lease_duration': 'unavailable_api'},
+            'basis': 'public endpoint graph does not expose participant builtin data'},
+        'endpoint': {
+            'status': 'field_comparison', 'required_fields': list(BASELINE_FIELDS),
+            'fields': {**{name: 'required' for name in BASELINE_FIELDS},
+                       'history': 'not_applicable_by_endpoint_schema',
+                       'depth': 'not_applicable_by_endpoint_schema'},
+            'basis': 'D014 endpoint schema; absent required values remain unknown'},
+        'topic': {
+            'status': 'endpoint_derived_only',
+            'required_fields': ['topic', 'type', 'history', 'depth'],
+            'fields': {'topic': 'endpoint_derived_only', 'type': 'endpoint_derived_only',
+                       'history': 'unavailable_api', 'depth': 'unavailable_api'},
+            'basis': 'endpoint topic/type are not an independent DCPSTopic observation'}}

@@ -269,13 +269,15 @@ def _graph_violations(event, writer_gids, reader_gids):
     return reasons
 
 
-def export_graph(proof, endpoints, topic, path, *, strict=True):
+def export_graph(proof, endpoints, topic, path, *, strict=True, include_schema_check=False):
     """Export one actual public graph projection for every configured role.
 
     ``strict`` retains the historical pair contract (raise on disagreement).
     The multi-endpoint path sets it false: a missing or extra endpoint is a S1
     projection fact to be judged, not a reason to discard the observation.
     """
+    # CP1 opt-in artifacts are offline schema material until the adapter contract
+    # explicitly supports them; keep the canonical raw reproduction guard intact.
     roles = tuple(endpoints)
     if not roles or set(proof) != set(roles):
         raise RuntimeError('projection_graph_role_set_differs')
@@ -304,6 +306,20 @@ def export_graph(proof, endpoints, topic, path, *, strict=True):
                    != set(writer_gids.values()) | set(reader_gids.values())):
         raise RuntimeError('projection_graph_ambiguous_endpoints')
     result = {'source': 'ros_graph', 'captured_at_unix_ns': graph['time_ns'], 'endpoints': entries}
+    if include_schema_check:
+        from r2f.instrumentation.sedp_fields import discovery_layer_schema
+        snapshot_times = {role: proof[role]['graph']['time_ns'] for role in roles}
+        valid_times = all(isinstance(t, int) and not isinstance(t, bool)
+                          for t in snapshot_times.values())
+        compatible_clocks = all(proof[role]['graph'].get('timestamp_clock') == 'unix_ns_realtime'
+                                for role in roles)
+        qualified = valid_times and compatible_clocks
+        result.update(schema_layers=discovery_layer_schema(),
+                      observer_timing_status='qualified' if qualified else 'unknown',
+                      observer_timing_reasons=([] if qualified else ['observer_clock_or_timestamp_unverified']),
+                      observer_snapshot_times_unix_ns=snapshot_times,
+                      observer_snapshot_spread_ns=(max(snapshot_times.values()) - min(snapshot_times.values())
+                                                   if qualified else None))
     result['raw'] = write_artifact(path, result)
     return result
 

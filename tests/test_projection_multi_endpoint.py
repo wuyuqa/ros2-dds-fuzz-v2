@@ -499,3 +499,31 @@ class ProjectionGoldenLegacy(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class GraphSchemaExportCP1(unittest.TestCase):
+    """Simulated worker snapshots exercise the public export artifact boundary."""
+
+    def test_export_preserves_each_observer_time_without_claiming_builtin_layers(self):
+        from r2f.runtime.projection_pair import export_graph
+        endpoints = {role: {'endpoint_gid': ROLE_GUIDS[role]} for role in ('writer', 'reader')}
+        event = {
+            'time_ns': 100,
+            'publishers': [{'endpoint_gid': ROLE_GUIDS['writer'],
+                            'topic_type': 'std_msgs/msg/String', 'qos': dict(DEFAULT_QOS)}],
+            'subscriptions': [{'endpoint_gid': ROLE_GUIDS['reader'],
+                               'topic_type': 'std_msgs/msg/String', 'qos': dict(DEFAULT_QOS)}]}
+        proof = {role: {'graph': deepcopy(event)} for role in endpoints}
+        proof['reader']['graph']['time_ns'] = 145
+        with tempfile.TemporaryDirectory() as temp:
+            result = export_graph(proof, endpoints, '/offline', Path(temp)/'graph.json',
+                                  include_schema_check=True)
+            persisted = json.loads(Path(result['raw']['path']).read_text())
+        self.assertEqual(persisted['schema_layers']['participant']['status'], 'unavailable_api')
+        self.assertEqual(persisted['schema_layers']['topic']['status'], 'endpoint_derived_only')
+        self.assertEqual(persisted['observer_snapshot_times_unix_ns'], {'writer': 100, 'reader': 145})
+        self.assertIsNone(persisted['observer_snapshot_spread_ns'])
+        self.assertEqual(persisted['observer_timing_status'], 'unknown')
+        self.assertEqual(persisted['source'], 'ros_graph')
+        self.assertEqual(persisted['captured_at_unix_ns'], 100)
+        self.assertEqual(len(persisted['endpoints']), 2)

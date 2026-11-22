@@ -394,3 +394,216 @@ class SedpProjectionContracts(unittest.TestCase):
         self.assertIsNone(check_offered_requested(offered,requested)['compatible'])
         requested['durability']={'status':'observed','value':'PERSISTENT'}
         self.assertFalse(check_offered_requested(offered,requested)['compatible'])
+
+
+class IndependentSourceSchemaCP1(unittest.TestCase):
+    """Simulated wire/graph inputs; offline contracts, never live evidence."""
+
+    def test_layers_applicability_and_time_gap_are_explicit(self):
+        with tempfile.TemporaryDirectory() as temp:
+            result = reconcile(fixture(Path(temp)))
+        schema = result['schema_check']
+        self.assertEqual(schema['layers']['participant']['status'], 'unavailable_api')
+        self.assertEqual(schema['layers']['topic']['status'], 'endpoint_derived_only')
+        self.assertEqual(schema['layers']['endpoint']['required_fields'], list(BASELINE_FIELDS))
+        self.assertEqual(schema['layers']['endpoint']['fields']['depth'],
+                         'not_applicable_by_endpoint_schema')
+        self.assertFalse(schema['all_layer_obligations_closed'])
+        timing = schema['endpoint_observations'][0]
+        self.assertIsNone(timing['graph_minus_wire_ns'])
+        self.assertEqual(timing['timing_status'], 'unknown')
+        self.assertEqual(timing['endpoint_guid'], GUID)
+        self.assertEqual(timing['wire_unix_ns'], BASE+120)
+        self.assertEqual(timing['graph_unix_ns'], BASE+140)
+        self.assertIn('raw_ref', timing)
+
+    def test_graph_label_cannot_be_used_as_independent_wire(self):
+        with tempfile.TemporaryDirectory() as temp:
+            parts = fixture(Path(temp))
+            parts[0]['independent_source'] = 'ros_graph'
+            result = reconcile(parts)
+        self.assertEqual(result['comparison_status'], 'unknown')
+        self.assertFalse(result['schema_check']['independent_sources_established'])
+
+    def test_tampered_events_never_become_schema_observations(self):
+        with tempfile.TemporaryDirectory() as temp:
+            parts = fixture(Path(temp))
+            parts[0]['events'][0]['unix_ns'] += 1
+            result = reconcile(parts)
+        self.assertFalse(result['schema_check']['independent_sources_established'])
+        self.assertEqual(result['schema_check']['endpoint_observations'], [])
+
+
+class SourceQualificationRepair(unittest.TestCase):
+    """Simulated inputs; public annotation must retain evidence limitations."""
+
+    def test_reported_wire_identity_must_be_the_validated_capture(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            parts = fixture(root)
+            parts[0]['raw'] = jsonraw(root/'unrelated.json', {'unrelated': True})
+            result = reconcile(parts)
+        self.assertFalse(result['schema_check']['independent_sources_established'])
+        self.assertEqual(result['schema_check']['source_qualification']['identity']['status'], 'unknown')
+        self.assertEqual(result['schema_check']['endpoint_observations'], [])
+
+    def test_structural_failures_do_not_establish_sources(self):
+        for mode in ('container', 'row', 'truncated'):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                parts = fixture(root)
+                if mode == 'truncated':
+                    receipt = parts[0]['capture_receipt']
+                    receipt['raw'] = hashed(root/'wire.pcap', pcap([(BASE+120, packet(plist()))])+b'X')
+                    receipt['receipt_raw'] = jsonraw(root/'capture.json', {k:v for k,v in receipt.items() if k!='receipt_raw'})
+                    parts = (parse_sedp_capture(receipt), *parts[1:])
+                else:
+                    parts[1]['endpoints'] = {} if mode == 'container' else [123]
+                    parts[1]['raw'] = jsonraw(root/'graph.json', {k:v for k,v in parts[1].items() if k!='raw'})
+                result = reconcile(parts)
+                self.assertFalse(result['schema_check']['independent_sources_established'])
+                self.assertEqual(result['schema_check']['source_qualification']['structure']['status'], 'unknown')
+                self.assertEqual(result['schema_check']['endpoint_observations'], [])
+
+    def test_malformed_ready_preserves_canonical_unknown_and_inputs(self):
+        from r2f.instrumentation.sedp_projection import reconcile_discovery_projection as canonical
+        for ready in (None, [], [1], 42, 'bad', False):
+            with self.subTest(ready=ready), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                parts = fixture(root)
+                receipt = parts[0]['capture_receipt']
+                receipt['ready'] = ready
+                receipt['receipt_raw'] = jsonraw(root/'capture.json', {
+                    k: v for k, v in receipt.items() if k != 'receipt_raw'})
+                parts = (parse_sedp_capture(receipt), *parts[1:])
+                before = copy.deepcopy(parts)
+                expected = canonical(parts[0], parts[1], endpoint_bindings=parts[2],
+                                     observation_window=parts[3])
+                self.assertEqual(expected['comparison_status'], 'unknown')
+                actual = reconcile(parts)
+                schema = actual.pop('schema_check')
+                self.assertEqual(actual, expected)
+                self.assertEqual(parts, before)
+                timing = schema['source_qualification']['timing']
+                self.assertEqual(timing['status'], 'unknown')
+                self.assertIn('capture_ready_mapping_required', timing['reasons'])
+                self.assertIsNone(timing['wire_clock'])
+                self.assertFalse(schema['all_layer_obligations_closed'])
+                self.assertTrue(all(row['graph_minus_wire_ns'] is None
+                                    for row in schema['endpoint_observations']))
+
+    def test_receipt_times_require_exact_integer_nanoseconds(self):
+        from r2f.instrumentation.sedp_projection import reconcile_discovery_projection as canonical
+        for field, value in (('ready', True), ('ready', False),
+                             ('ready', float(BASE+100)), ('close', float(BASE+160)),
+                             ('close', True), ('close', False)):
+            with self.subTest(field=field, value=value), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                parts = fixture(root)
+                receipt = parts[0]['capture_receipt']
+                receipt['ready']['timestamp_clock'] = 'kernel_SO_TIMESTAMPNS_realtime'
+                point = receipt['ready'] if field == 'ready' else receipt
+                point['unix_ns'] = value
+                rebind_capture(parts, root)
+                parts[1]['timestamp_clock'] = 'unix_ns_realtime'
+                parts[1]['raw'] = jsonraw(root/'graph.json',
+                    {k: v for k, v in parts[1].items() if k != 'raw'})
+                before = copy.deepcopy(parts)
+                result = reconcile(parts)
+                schema = result.pop('schema_check')
+                self.assertEqual(result, canonical(parts[0], parts[1],
+                    endpoint_bindings=parts[2], observation_window=parts[3]))
+                self.assertEqual(parts, before)
+                self.assertFalse(schema['all_layer_obligations_closed'])
+                timing = schema['source_qualification']['timing']
+                self.assertEqual(timing['status'], 'unknown')
+                self.assertIn('capture_receipt_time_type_invalid', timing['reasons'])
+                self.assertTrue(schema['endpoint_observations'])
+                for row in schema['endpoint_observations']:
+                    self.assertIsNone(row['graph_minus_wire_ns'])
+                    self.assertEqual(row['timing_status'], 'unknown')
+                    self.assertEqual(row['timing_reasons'], timing['reasons'])
+
+    def test_drain_receipt_time_types_remain_required_for_qualification(self):
+        from r2f.instrumentation.sedp_projection import reconcile_discovery_projection as canonical
+        paths = [('complete_through_unix_ns',), ('monotonic_ns',),
+                 ('drain', 'cutoff_unix_ns'), ('drain', 'deadline_monotonic_ns')]
+        for point in (('drain', 'request'), ('drain', 'empty_confirmed'),
+                      ('drain', 'empty_statistics', 'sampled'), ('drain', 'ended')):
+            paths.extend(point + (clock,) for clock in ('unix_ns', 'monotonic_ns'))
+        for path in (None, *paths):
+            for kind in (('valid',) if path is None else ('bool_true', 'bool_false', 'float')):
+                with self.subTest(path=path, kind=kind), tempfile.TemporaryDirectory() as temp:
+                    root = Path(temp)
+                    parts = with_drain(fixture(root), root)
+                    receipt = parts[0]['capture_receipt']
+                    receipt['ready']['timestamp_clock'] = 'kernel_SO_TIMESTAMPNS_realtime'
+                    if path is not None:
+                        point = receipt
+                        for key in path[:-1]:
+                            point = point[key]
+                        point[path[-1]] = (float(point[path[-1]]) if kind == 'float'
+                                          else kind == 'bool_true')
+                    rebind_capture(parts, root)
+                    parts[1]['timestamp_clock'] = 'unix_ns_realtime'
+                    parts[1]['raw'] = jsonraw(root/'graph.json',
+                        {k: v for k, v in parts[1].items() if k != 'raw'})
+                    before = copy.deepcopy(parts)
+                    result = reconcile(parts)
+                    schema = result.pop('schema_check')
+                    self.assertEqual(result, canonical(parts[0], parts[1],
+                        endpoint_bindings=parts[2], observation_window=parts[3]))
+                    self.assertEqual(parts, before)
+                    self.assertFalse(schema['all_layer_obligations_closed'])
+                    timing = schema['source_qualification']['timing']
+                    self.assertEqual(timing['status'], 'qualified' if path is None else 'unknown')
+                    if path is not None:
+                        self.assertIn('observation_window_or_capture_coverage_not_established',
+                                      timing['reasons'])
+                    self.assertTrue(schema['endpoint_observations'])
+                    for row in schema['endpoint_observations']:
+                        self.assertEqual(row['graph_minus_wire_ns'], 20 if path is None else None)
+                        self.assertEqual(row['timing_status'], timing['status'])
+                        self.assertEqual(row['timing_reasons'], timing['reasons'])
+
+    def test_clock_and_window_qualify_each_delta(self):
+        for mode in ('missing', 'monotonic', 'graph_clock_missing', 'bad_window', 'valid', 'latest'):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                parts = fixture(root, records=[(BASE+120, packet(plist())),
+                                               (BASE+135, packet(plist(), sequence=2))]) if mode == 'latest' else fixture(root)
+                receipt = parts[0]['capture_receipt']
+                if mode != 'missing':
+                    receipt['ready']['timestamp_clock'] = ('monotonic_ns' if mode == 'monotonic'
+                                                           else 'kernel_SO_TIMESTAMPNS_realtime')
+                    receipt['receipt_raw'] = jsonraw(root/'capture.json', {k:v for k,v in receipt.items() if k!='receipt_raw'})
+                if mode != 'graph_clock_missing':
+                    parts[1]['timestamp_clock'] = 'unix_ns_realtime'
+                parts[1]['raw'] = jsonraw(root/'graph.json', {k:v for k,v in parts[1].items() if k!='raw'})
+                if mode == 'bad_window': parts[3]['end_ns'] = BASE+130
+                result = reconcile(parts)
+                row = result['schema_check']['endpoint_observations'][0]
+                self.assertEqual(row['graph_minus_wire_ns'], (5 if mode == 'latest' else 20) if mode in ('valid', 'latest') else None)
+                self.assertEqual(row['timing_status'], 'qualified' if mode in ('valid', 'latest') else 'unknown')
+                self.assertEqual(row['timing_reasons'], result['schema_check']['source_qualification']['timing']['reasons'])
+
+    def test_annotation_preserves_canonical_output_and_inputs(self):
+        from r2f.instrumentation.sedp_projection import reconcile_discovery_projection as canonical
+        with tempfile.TemporaryDirectory() as temp:
+            parts = fixture(Path(temp))
+            before = copy.deepcopy(parts)
+            actual = reconcile(parts)
+            expected = canonical(parts[0], parts[1], endpoint_bindings=parts[2], observation_window=parts[3])
+        actual.pop('schema_check')
+        self.assertEqual(actual, expected)
+        self.assertEqual(parts, before)
+
+    def test_unknown_qos_does_not_invalidate_source_identity(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            parts = fixture(root)
+            parts[1]['endpoints'][0]['qos'].pop('reliability')
+            parts[1]['raw'] = jsonraw(root/'graph.json', {k:v for k,v in parts[1].items() if k!='raw'})
+            result = reconcile(parts)
+        self.assertTrue(result['schema_check']['independent_sources_established'])
+        self.assertEqual(result['comparison_status'], 'unknown')
