@@ -360,6 +360,80 @@ def validate_root_cause(root_cause, evidence_refs):
         raise ValueError("root_cause_relationship_invalid")
 
 
+CAPABILITY_ASSESSMENT_SCHEMA = "r2f.s1-capability-assessment/v1"
+
+
+def validate_capability_assessment(assessment, evidence_refs):
+    """CP1 analysis only: proposed work bound to this review's hashed evidence.
+
+    Execution/candidate/human authority is checked by the existing intake. This
+    payload cannot grant it or claim implemented model or blackbox capabilities.
+    """
+    if assessment is None:
+        return
+    if not isinstance(assessment, dict) or set(assessment) != {
+            "schema_version", "original_capabilities", "agent_analysis_steps",
+            "proposed_tasks", "observation_limits", "blackbox_followup"}:
+        raise ValueError("capability_assessment_schema_invalid")
+    if assessment["schema_version"] != CAPABILITY_ASSESSMENT_SCHEMA:
+        raise ValueError("capability_assessment_schema_unknown")
+
+    def texts(values, field, *, required=False):
+        if (not isinstance(values, list) or (required and not values)
+                or any(not isinstance(value, str) or not value.strip() for value in values)
+                or len(set(values)) != len(values)):
+            raise ValueError("capability_" + field + "_invalid")
+
+    def claim(value, fields):
+        if not isinstance(value, dict) or set(value) != fields:
+            raise ValueError("capability_claim_schema_invalid")
+        nonempty(value["description"], "capability.description")
+        keys = value["evidence_keys"]
+        texts(keys, "evidence", required=True)
+        if any(key not in evidence_refs for key in keys):
+            raise ValueError("capability_evidence_unbound")
+
+    original = assessment["original_capabilities"]
+    if not isinstance(original, dict) or set(original) != {"triggering", "observation", "facts"}:
+        raise ValueError("capability_original_schema_invalid")
+    for kind, claims in original.items():
+        if not isinstance(claims, list) or (kind != "facts" and not claims):
+            raise ValueError("capability_original_claims_invalid")
+        for value in claims:
+            claim(value, {"description", "evidence_keys"})
+    steps = assessment["agent_analysis_steps"]
+    if not isinstance(steps, list):
+        raise ValueError("capability_agent_steps_invalid")
+    step_ids = []
+    for step in steps:
+        claim(step, {"step_id", "description", "evidence_keys"})
+        step_ids.append(step["step_id"])
+    texts(step_ids, "agent_step_ids")
+    tasks = assessment["proposed_tasks"]
+    if not isinstance(tasks, list):
+        raise ValueError("capability_tasks_invalid")
+    task_ids = []
+    for task in tasks:
+        claim(task, {"task_id", "kind", "status", "description", "evidence_keys",
+                     "agent_step_ids", "verification_requirements"})
+        task_ids.append(task["task_id"])
+        if task["kind"] not in ("seed", "mutation", "state", "fact", "rule", "sidechannel"):
+            raise ValueError("capability_task_kind_invalid")
+        if task["status"] not in ("proposed", "pending"):
+            raise ValueError("capability_task_cp1_status_invalid")
+        texts(task["agent_step_ids"], "task_agent_steps")
+        if any(ref not in step_ids for ref in task["agent_step_ids"]):
+            raise ValueError("capability_agent_step_unbound")
+        texts(task["verification_requirements"], "verification_requirements", required=True)
+    texts(task_ids, "task_ids")
+    texts(assessment["observation_limits"], "observation_limits")
+    blackbox = assessment["blackbox_followup"]
+    if (not isinstance(blackbox, dict) or set(blackbox) != {"status", "reason"}
+            or blackbox["status"] not in ("pending", "unknown", "not_required")):
+        raise ValueError("capability_blackbox_followup_invalid")
+    nonempty(blackbox["reason"], "capability.blackbox_followup.reason")
+
+
 def validate_tool_repair_handoff(handoff, attribution, evidence_refs):
     """A tool handoff describes work; it grants no execution or confirmation."""
     if handoff is None:
@@ -580,7 +654,8 @@ class CandidateLifecycle:
         return self
 
     def record_review(self, *, reviewer_id, conclusion, evidence_refs, independent_of=None,
-                      notes="", attribution=None, root_cause=None, tool_repair_handoff=None):
+                      notes="", attribution=None, root_cause=None, tool_repair_handoff=None,
+                      capability_assessment=None):
         """Append an independent review opinion.  This never confirms a candidate.
 
         ``conclusion`` is one of supported/rejected/needs_evidence.  A review
@@ -608,9 +683,13 @@ class CandidateLifecycle:
             if attribution not in {"sut_candidate", "tool", "environment", "allowed", "unknown"}:
                 raise ValueError("invalid review attribution")
             review["attribution"] = attribution
-        if attribution is not None or root_cause is not None or tool_repair_handoff is not None:
+        if (attribution is not None or root_cause is not None or tool_repair_handoff is not None
+                or capability_assessment is not None):
             review["evidence_sha256"] = {key: raw_sha256(value) for key, value in resolved.items()}
         validate_root_cause(root_cause, resolved)
+        validate_capability_assessment(capability_assessment, resolved)
+        if capability_assessment is not None:
+            review["capability_assessment"] = snapshot(capability_assessment)
         validate_tool_repair_handoff(tool_repair_handoff, attribution, resolved)
         if tool_repair_handoff is not None:
             review["tool_repair_handoff"] = snapshot(tool_repair_handoff)

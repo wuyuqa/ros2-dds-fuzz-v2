@@ -3,6 +3,8 @@ from r2f.core._json import snapshot
 from r2f.core.candidate import candidate_execution_identity
 from r2f.core.evidence import canonical_hash
 
+from r2f.reports.capability_feedback import capability_assessment_projection
+
 ACCOUNTING_SCHEMA = 'r2f.s1-root-cause-accounting/v1'
 
 
@@ -50,6 +52,12 @@ def root_cause_accounting(entries, originals):
                 'review_record_ids': sorted(record['record_id'] for record in supporting),
                 'human_confirmed': qualified, 'root_cause_id': root,
                 'novelty': novelty}
+        # Optional extension: legacy records/digests and historical projections
+        # without capability analysis retain their exact shape.
+        if any(isinstance(record, dict) and record.get('capability_assessment') is not None
+               for record in projection.get('history', [])):
+            case['capability_assessment'] = capability_assessment_projection(
+                entry, originals[case['candidate_id']], human_confirmed=qualified)
         cases.append(case)
         attributes = {record.get('attribution', 'unknown') for record in opinions}
         attribution = (next(iter(attributes)) if len(attributes) == 1 else None) or (

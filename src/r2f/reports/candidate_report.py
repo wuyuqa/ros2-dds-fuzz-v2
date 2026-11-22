@@ -22,7 +22,7 @@ from pathlib import Path
 from r2f.core.candidate import (CandidateLifecycle, REVIEW_EVIDENCE_KEYS, topology_observation_identity,
                                 validate_human_history, validate_human_record, candidate_execution_identity,
                                 HUMAN_ADJUDICATION_SCHEMA, validate_root_cause, validate_tool_repair_handoff,
-                                validate_review_evidence)
+                                validate_review_evidence, validate_capability_assessment)
 from r2f.core.evidence import canonical_hash, raw_sha256
 from r2f.core.oracle import TriageResult
 from r2f.reports.root_cause import current_review_projection, root_cause_accounting
@@ -430,7 +430,8 @@ def exploratory_candidate_ledger(rows, reviews=None, *, human_records=None, huma
                                         notes=review.get("notes", ""),
                                         attribution=review.get("attribution"),
                                         root_cause=review.get("root_cause"),
-                                        tool_repair_handoff=review.get("tool_repair_handoff"))
+                                        tool_repair_handoff=review.get("tool_repair_handoff"),
+                                        capability_assessment=review.get("capability_assessment"))
                 if review["record_id"] not in superseded:
                     applied_reviews.append(review)
             except ValueError as exc:
@@ -743,6 +744,7 @@ def _review_import_errors(record, original_row=None):
     try:
         resolved = validate_review_evidence(refs)
         validate_root_cause(record.get("root_cause"), resolved)
+        validate_capability_assessment(record.get("capability_assessment"), resolved)
         validate_tool_repair_handoff(record.get("tool_repair_handoff"), record.get("attribution"), resolved)
     except (ValueError, TypeError, OSError) as exc:
         problems.append(str(exc))
