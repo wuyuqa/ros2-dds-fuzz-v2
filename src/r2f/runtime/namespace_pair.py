@@ -2383,6 +2383,8 @@ def _body(request, owner_channel):
             emit('window_close', window='discovery_interruption', active_drop=active, mutation_receipt=dict(receipt))
             # Paired clocks are captured AFTER verified deletion, or the explicit neutral boundary.
             restore_wall_ns, restore_mono_ns = time.time_ns(), time.monotonic_ns()
+            # The shared final graph uses this branch's captured restore boundary.
+            final_restore_mono_ns = restore_mono_ns
             boundary = emit('discovery_restore_boundary', restored=restored if active else None, neutral=not active,
                             drop_was_installed=active, drop_installed=False, post_restore_unix_ns=restore_wall_ns,
                             post_restore_monotonic_ns=restore_mono_ns, clock_guard_ns=CLOCK_GUARD_NS,
