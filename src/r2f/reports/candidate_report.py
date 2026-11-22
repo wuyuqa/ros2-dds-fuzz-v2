@@ -971,7 +971,7 @@ def audit_projection(candidate):
     return item
 
 
-def query_runner_evidence(output_dir):
+def query_runner_evidence(output_dir, *, human_authority=None):
     """Verify derived runner attachments without granting execution or candidates.
 
     The existing report/auditor remains the source of verdict and seal decisions.
@@ -1126,7 +1126,8 @@ def query_runner_evidence(output_dir):
                     raise ValueError('reconnect_execution_claim_forbidden')
                 from r2f.reports.capability_reconnect import verify_review_reconnect
                 view = report['capability_reconnect']
-                evaluation = verify_review_reconnect(read_ref(view['evaluation_ref']))
+                evaluation = verify_review_reconnect(read_ref(view['evaluation_ref']),
+                                                     human_authority=human_authority)
                 expected = capability_reconnect_report(evaluation, view['evaluation_ref'])
                 if canonical_hash(report) != canonical_hash(expected):
                     raise ValueError('reconnect_report_projection_mismatch')

@@ -2878,18 +2878,21 @@ def _generate_case(sequence, entry, target, contract, surface, parent, mutator_i
     return row
 
 
-def reevaluate_capability(output_dir, *, review_log, validation_record_id, original_row, saved_cases):
+def reevaluate_capability(output_dir, *, review_log, validation_record_id, original_row, saved_cases,
+                          human_log=None, human_authority=None):
     """Publish immutable canonical saved-case oracle reevaluation attachments.
 
     No runtime is acquired and no capture row is rerun or admitted as a new
     candidate. Current registered code is measured; proposal version labels do
-    not choose code. Activation and real feedback remain pending.
+    not choose code. Optional host authority derives implementation qualification;
+    fixture evidence never qualifies as real feedback.
     """
     from r2f.reports.capability_reconnect import evaluate_review_reconnect
     from r2f.reports.candidate_report import _write_immutable_json, capability_reconnect_report
 
     evaluation = evaluate_review_reconnect(review_log=review_log,
-        validation_record_id=validation_record_id, original_row=original_row, saved_cases=saved_cases)
+        validation_record_id=validation_record_id, original_row=original_row, saved_cases=saved_cases,
+        human_log=human_log, human_authority=human_authority)
     root = Path(output_dir)
     def publish(name, value):
         path = _write_immutable_json(root / name, value)

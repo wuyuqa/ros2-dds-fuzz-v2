@@ -74,17 +74,18 @@ def capability_assessment_projection(entry, original, *, human_confirmed):
 
 
 def capability_reconnect_projection(evaluation, evaluation_ref):
-    """Project actual oracle calls separately from still-pending activation.
-
-    A fixture cannot satisfy real feedback or blackbox followup. This checkpoint
-    grants no human or implementation authority, even for mechanism-only input.
-    """
-    return snapshot(dict(status='pending', evaluation_status=evaluation['status'],
-        qualification=evaluation['qualification'], implemented=False, human_confirmed=False,
+    """Project derived implementation separately from execution and blackbox support."""
+    activation = evaluation['activation']
+    implementation_pending = activation['pending_obligations']
+    return snapshot(dict(status='implemented' if activation['implemented'] else 'pending',
+        evaluation_status=evaluation['status'], qualification=evaluation['qualification'],
+        activation_status=activation['status'], implemented=activation['implemented'],
+        human_confirmed=activation['human_confirmed'], human_record_id=activation['human_record_id'],
+        human_record_refs=evaluation['human_record_refs'],
+        implementation_pending_obligations=implementation_pending,
         new_execution=False, natural_candidates=0, required_denominator=72,
         blackbox_supported=False,
-        pending_obligations=['actual_feedback_evidence', 'human_confirmation',
-                             'model_activation_review', 'sidechannel_to_blackbox_followup'],
+        pending_obligations=[*implementation_pending, 'sidechannel_to_blackbox_followup'],
         observation_mode=evaluation['request']['original_row'].get('observation_mode', 'unknown'),
         evaluation_ref=evaluation_ref, original_ref=evaluation['original_ref'],
         capture_source=evaluation['capture_source'], evaluation_source=evaluation['evaluation_source'],

@@ -1,10 +1,11 @@
-"""Detached CP3 oracle-only saved-case reevaluation, with no activation authority.
+"""Saved-case oracle reevaluation and derived review/host implementation qualification.
 
 CP2 remains the authority for task, before/expected and independent controls.
 This boundary actually calls a registry-pinned oracle on canonical raw-rebuilt
 facts. It neither imports a proposal path nor executes the recorded old model.
 """
 import json
+import re
 from pathlib import Path
 
 from r2f.campaign.identity import source_manifest
@@ -160,16 +161,81 @@ def evaluate_reconnect(validation, *, evidence_refs, original_ref, assessment,
     return snapshot(artifact)
 
 
-def evaluate_review_reconnect(*, review_log, validation_record_id, original_row, saved_cases):
+def _frozen_source(source):
+    # Captures must carry the existing behavior-source identity, not just a label.
+    return (isinstance(source, dict) and source.get('source_frozen') is True
+            and source.get('dirty_behavior_paths') == []
+            and isinstance(source.get('source_repo'), str) and bool(source['source_repo'])
+            and isinstance(source.get('head'), str)
+            and re.fullmatch('[0-9a-f]{40}', source['head']) is not None
+            and isinstance(source.get('behavior_tree_sha256'), str)
+            and re.fullmatch('[0-9a-f]{64}', source['behavior_tree_sha256']) is not None)
+
+
+def _implementation_qualification(artifact, ledger, review):
+    """Derive implementation from existing review/human authority, never JSON flags.
+
+    CP2's current independent validation review is the improvement review. There
+    is no second approval lifecycle. Blackbox obligations do not gate this result.
+    """
+    pending = []
+    fixture = artifact['qualification'] == 'fixture'
+    evaluated = artifact['status'] == 'evaluated'
+    task = next(t for t in artifact['task_assessment']['proposed_tasks']
+                if t['task_id'] == artifact['task_ref']['task_id'])
+    # This reconnect binds/evaluates the oracle, not a seed, carrier or sidechannel.
+    if task['kind'] != 'rule':
+        pending.append('unsupported_model_task_kind')
+    if fixture:
+        pending.append('actual_feedback_evidence')
+    if not evaluated:
+        pending.append('actual_oracle_validation')
+    if not _frozen_source(artifact['evaluation_source']):
+        pending.append('evaluation_source_not_frozen')
+    if not _frozen_source(artifact['capture_source']):
+        pending.append('capture_source_not_qualified')
+    candidate = next((c for c in ledger['candidates']
+                      if c['candidate_id'] == review['candidate_id']), {})
+    analysis = candidate.get('analysis') or {}
+    current = analysis.get('current')
+    opinions = analysis.get('current_opinions', [current] if current else [])
+    current_review = (not ledger['review_errors'] and current is not None
+        and any(r['record_id'] == review['record_id']
+                and r['record_sha256'] == review['record_sha256'] for r in opinions)
+        and all(r['conclusion'] == 'supported' and r['attribution'] == 'sut_candidate'
+                for r in opinions) and bool(review['independent_of']))
+    if not current_review:
+        pending.append('current_independent_validation_review')
+    human = (candidate.get('human_adjudication') or {}).get('current') or {}
+    authenticated = (not ledger['human_errors'] and not candidate.get('human_qualification_error')
+                     and candidate.get('candidate_status') == 'confirmed'
+                     and not candidate.get('admission_error')
+                     and human.get('action') == 'confirm'
+                     and human.get('human_id') != review['reviewer_id'])
+    human_confirmed = bool(not fixture and _frozen_source(artifact['capture_source'])
+                           and current_review and authenticated)
+    if not human_confirmed:
+        pending.append('human_confirmation')
+    implemented = not pending
+    return dict(status=('implemented' if implemented else
+                        'fixture_validated' if fixture and evaluated else 'pending'),
+                implemented=implemented, human_confirmed=human_confirmed,
+                human_record_id=human.get('record_id') if human_confirmed else None,
+                pending_obligations=pending)
+
+
+def evaluate_review_reconnect(*, review_log, validation_record_id, original_row, saved_cases,
+                              human_log=None, human_authority=None):
     """Resolve canonical review authority and select current registered code.
 
-    This is oracle-only reinterpretation, never activation or a new execution.
+    Implementation qualification is derived; this never creates a new execution.
     No caller-provided model loader, binding, version or verdict is accepted.
     """
     from r2f.core import Registry
     from r2f.core.evidence import raw_sha256
     from r2f.modules.s1.module import register
-    from r2f.reports.candidate_report import read_review_records
+    from r2f.reports.candidate_report import (
+        read_review_records, read_human_records, exploratory_candidate_ledger)
 
     original_row, saved_cases = snapshot([original_row, saved_cases])
     log_ref = {'path': str(Path(review_log).resolve()), 'sha256': raw_sha256(review_log)}
@@ -180,6 +246,11 @@ def evaluate_review_reconnect(*, review_log, validation_record_id, original_row,
     if any(r.get('supersedes_record_id') == validation_record_id for r in records):
         raise ValueError('reconnect_validation_review_superseded')
     parent = next((r for r in records if r['record_id'] == review.get('supersedes_record_id')), None)
+    human_ref, human_records = None, []
+    if human_log is not None:
+        human_ref = {'path': str(Path(human_log).resolve()), 'sha256': raw_sha256(human_log)}
+        human_records = read_human_records(human_log, original_rows=[original_row],
+            reviews=records, human_authority=human_authority)
     registry = Registry()
     register(registry)
     source = source_manifest(Path(__file__).resolve().parents[3])
@@ -197,20 +268,43 @@ def evaluate_review_reconnect(*, review_log, validation_record_id, original_row,
                     task_review={'record_id': parent['record_id'],
                                  'record_sha256': parent['record_sha256']},
                     selected_model_version=artifact['binding_sha256'])
+    # Reopen host policy/signatures and lifecycle history after the oracle calls.
+    # Log hashes bind bytes; they do not authenticate the caller's current trust.
+    if human_ref is not None:
+        human_records = read_human_records(human_ref['path'], original_rows=[original_row],
+            reviews=records, human_authority=human_authority)
+    ledger = exploratory_candidate_ledger([original_row], reviews=records,
+        human_records=human_records, human_authority=human_authority)
+    verify_raw(log_ref['path'], log_ref['sha256'])
+    artifact['activation'] = _implementation_qualification(artifact, ledger, review)
+    artifact['implemented'] = artifact['activation']['implemented']
+    artifact['human_record_refs'] = [
+        {'record_id': r['record_id'], 'record_sha256': r['record_sha256']} for r in human_records]
+    if human_ref is not None:
+        verify_raw(human_ref['path'], human_ref['sha256'])
+        artifact['request']['human_log'] = human_ref
     artifact['evaluation_sha256'] = canonical_hash(artifact)
     return snapshot(artifact)
 
 
-def verify_review_reconnect(evaluation):
+def verify_review_reconnect(evaluation, *, human_authority=None):
     """Recompute current oracle evidence; content hashes are not authority."""
     request = evaluation['request']
-    if set(request) != {'review_log', 'validation_record_id', 'original_row', 'saved_cases'}:
+    required = {'review_log', 'validation_record_id', 'original_row', 'saved_cases'}
+    if set(request) not in (required, required | {'human_log'}):
         raise ValueError('reconnect_request_invalid')
     log_ref = request['review_log']
     verify_raw(log_ref['path'], log_ref['sha256'])
+    human_ref = request.get('human_log')
+    if human_ref is not None:
+        if not isinstance(human_ref, dict) or set(human_ref) != {'path', 'sha256'}:
+            raise ValueError('reconnect_human_log_reference_invalid')
+        verify_raw(human_ref['path'], human_ref['sha256'])
     actual = evaluate_review_reconnect(review_log=log_ref['path'],
         validation_record_id=request['validation_record_id'], original_row=request['original_row'],
-        saved_cases=request['saved_cases'])
+        saved_cases=request['saved_cases'],
+        human_log=human_ref['path'] if human_ref is not None else None,
+        human_authority=human_authority)
     if canonical_hash(actual) != canonical_hash(evaluation):
         raise ValueError('reconnect_evaluation_mismatch')
     return actual
