@@ -105,6 +105,62 @@ class CapabilityValidation(unittest.TestCase):
         self.assertEqual(Path(self.row['raw_path']).read_bytes(), raw)
         self.assertTrue(self.case.log.read_bytes().startswith(prefix))
 
+    def test_frozen_model_source_keeps_known_empty_dirty_paths_at_public_review(self):
+        # Explicit schema fixture, not evidence of an actual frozen execution.
+        source = dict(source_repo='/OFFLINE-FIXTURE/source', head='1' * 40,
+                      behavior_tree_sha256='2' * 64, source_frozen=True,
+                      dirty_behavior_paths=[])
+        self.models['after']['source'] = source
+        record = self.append()
+        readback = reports.read_review_records(self.case.log, original_rows=[self.row])
+        self.assertEqual(readback[-1], record)
+        self.assertEqual(self.models['after']['source'], source)
+        ledger = self.case.ledger(reviews=readback)
+        assessment = ledger['root_cause_accounting']['cases'][0]['capability_assessment']
+        task = next(t for t in assessment['tasks'] if t['task_id'] == 'rule-gap')
+        self.assertFalse(task['implemented'])
+        self.assertFalse(assessment['human_confirmed'])
+
+    def test_frozen_model_source_exception_rejects_incomplete_and_empty_identities(self):
+        source = dict(source_repo='/OFFLINE-FIXTURE/source', head='1' * 40,
+                      behavior_tree_sha256='2' * 64, source_frozen=True,
+                      dirty_behavior_paths=[])
+        malformed = [None, {}, '', dict(source, head=None), dict(source, head='short'),
+                     dict(source, behavior_tree_sha256='not-a-digest'),
+                     dict(source, source_repo=''), dict(source, source_frozen=1),
+                     dict(source, source_frozen=False), dict(source, dirty_behavior_paths=None),
+                     dict(source, arbitrary_identity={})]
+        for missing in ('source_repo', 'head', 'behavior_tree_sha256', 'source_frozen'):
+            malformed.append({key: value for key, value in source.items() if key != missing})
+        aliased = dict(source)
+        aliased['dirty_paths'] = aliased.pop('dirty_behavior_paths')
+        malformed.append(aliased)
+        before = self.case.log.read_bytes()
+        legacy_source = self.models['after']['source']
+        for replacement in malformed:
+            with self.subTest(source=replacement):
+                self.models['after']['source'] = replacement
+                with self.assertRaises(ValueError):
+                    self.append()
+                self.assertEqual(self.case.log.read_bytes(), before)
+        # Legacy noncanonical provenance remains readable at the same public seam.
+        self.models['after']['source'] = legacy_source
+        record = self.append()
+        self.assertEqual(reports.read_review_records(
+            self.case.log, original_rows=[self.row])[-1], record)
+
+    def test_frozen_source_allowance_does_not_apply_to_observation_identities(self):
+        from r2f.core.candidate import CandidateLifecycle
+        source = dict(source_repo='/OFFLINE-FIXTURE/source', head='1' * 40,
+                      behavior_tree_sha256='2' * 64, source_frozen=True,
+                      dirty_behavior_paths=[])
+        for field in ('endpoint_identity', 'instrumentation_identity'):
+            with self.subTest(field=field):
+                row = copy.deepcopy(self.row)
+                row[field] = source
+                with self.assertRaisesRegex(ValueError, 'empty identity container'):
+                    CandidateLifecycle(self.parent['candidate_id'], row)
+
     def test_rejects_suggestions_only_implementation_claim_at_canonical_and_core_boundaries(self):
         from r2f.core.candidate import CandidateLifecycle
         value = self.proposal()

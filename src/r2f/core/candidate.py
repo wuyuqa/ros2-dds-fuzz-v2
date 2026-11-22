@@ -30,6 +30,26 @@ def _identity_members(value, field):
             _identity_members(member, f"{field}.{key}")
 
 
+def _model_source_members(value, field):
+    """A canonical frozen source has a known empty dirty-path collection."""
+    frozen_fields = {"source_repo", "head", "behavior_tree_sha256",
+                     "source_frozen", "dirty_behavior_paths"}
+    canonical_frozen = (
+        isinstance(value, dict) and set(value) == frozen_fields
+        and value["source_frozen"] is True and value["dirty_behavior_paths"] == []
+        and isinstance(value["source_repo"], str) and bool(value["source_repo"].strip())
+        and isinstance(value["head"], str)
+        and re.fullmatch("[0-9a-f]{40}", value["head"]) is not None
+        and isinstance(value["behavior_tree_sha256"], str)
+        and re.fullmatch("[0-9a-f]{64}", value["behavior_tree_sha256"]) is not None)
+    if canonical_frozen:
+        # Preserve the original dict for exact source hashing and qualification.
+        _identity_members({key: member for key, member in value.items()
+                           if key != "dirty_behavior_paths"}, field)
+    else:
+        _identity_members(value, field)
+
+
 def _endpoint_pair(value, field):
     if not isinstance(value, dict) or not {"writer", "reader"}.issubset(value):
         raise ValueError(f"{field} requires writer and reader identity records")
@@ -431,7 +451,7 @@ def validate_capability_validation(validation, evidence_refs, *, original_ref, a
     for model in models.values():
         shape(model, "version path sha256 source")
         nonempty(model["version"], "capability_validation.model_version")
-        _identity_members(model["source"], "capability_validation.model_source")
+        _model_source_members(model["source"], "capability_validation.model_source")
         if not isinstance(model["source"], (str, dict)):
             raise ValueError("capability_validation_model_source_invalid")
         verify_raw(model["path"], sha256_digest(model["sha256"]))

@@ -36,6 +36,39 @@ class ReconnectQualification(unittest.TestCase):
         self.assertEqual(report['natural_candidate_count'], 0)
         self.assertTrue(reports.query_runner_evidence(self.output)['evidence_valid'])
 
+    def test_publication_preserves_measured_source_without_fixture_qualification(self):
+        report = self.run_saved()
+        evaluation = json.loads((self.output / 'capability-reevaluation.json').read_text())
+        self.assertEqual(evaluation['evaluation_source'], self.fixture.source)
+        self.assertEqual(evaluation['models']['after']['source'], self.fixture.source)
+        self.assertEqual([r['after']['verdict'] for r in evaluation['call_receipts']],
+                         ['fail', 'pass', 'pass'])
+        self.assertTrue(all(r['oracle_called'] for r in evaluation['call_receipts']))
+        view = report['capability_reconnect']
+        self.assertFalse(view['implemented'])
+        self.assertFalse(view['human_confirmed'])
+        self.assertFalse(view['new_execution'])
+        self.assertEqual(view['qualification'], 'fixture')
+        if not self.fixture.source['source_frozen']:
+            self.assertIn('evaluation_source_not_frozen', view['implementation_pending_obligations'])
+        self.assertEqual(report['candidates'], [])
+        self.assertTrue(reports.query_runner_evidence(self.output)['evidence_valid'])
+
+    def test_public_runner_still_rejects_rebound_model_source(self):
+        f = self.fixture
+        # A different representation is not the exact currently measured identity.
+        f.cp.models['after']['source'] = dict(f.source, head='0' * 40)
+        proposal = f.cp.proposal()
+        saved_inputs = list(f.saved.values())
+        f.saved = {ref['sha256']: inputs for ref, inputs in zip(f.cp.bundle['cases'], saved_inputs)}
+        rebound_log = f.root / 'rebound-source-reviews.jsonl'
+        rebound_log.write_text(json.dumps(f.cp.parent) + '\n')
+        record = reports.append_review_record(rebound_log, proposal, original_row=f.cp.row)
+        with self.assertRaisesRegex(ValueError, 'unbound_model_artifact'):
+            runner.reevaluate_capability(self.output, review_log=rebound_log,
+                validation_record_id=record['record_id'], original_row=f.cp.row, saved_cases=f.saved)
+        self.assertFalse(self.output.exists())
+
     def signed_confirmation(self):
         # Ephemeral offline signing fixture; never a real user or runtime decision.
         host = signed_host.SignedHostFixture('runTest')
