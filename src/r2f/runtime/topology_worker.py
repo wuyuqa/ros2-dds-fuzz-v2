@@ -855,6 +855,68 @@ class CycloneMatchedPeerObserver:
             raise ValueError("local_entity_domain_mismatch")
         return matches[0], sorted(edges)
 
+    def _topic_kind_diagnostic(self, handle):
+        """Independent optional readbacks, never ownership or GUID authority.
+
+        Cyclone 0.10.5 dds_topic.c pins DDS_KIND_TOPIC for these public APIs;
+        dds.h defines a nonnegative return as full byte length (excluding NUL).
+        One fixed buffer/call per symbol bounds copying, including error output.
+        """
+        capacity = 256
+        evidence = {"handle": handle, "kind": "unknown", "probes": {}}
+        for name in ("dds_get_name", "dds_get_type_name"):
+            probe = {"return_code": None, "status": "unavailable",
+                     "capacity_bytes": capacity, "buffer_hex": None, "value": None}
+            evidence["probes"][name] = probe
+            buffer = None
+            try:
+                function = getattr(self.lib, name, None)
+                if function is None:
+                    probe["error"] = "optional_symbol_absent"
+                    continue
+                # Lazy binding keeps optional symbols out of matched/count setup.
+                function.argtypes = [self.c.c_int32, self.c.POINTER(self.c.c_char),
+                                     self.c.c_size_t]
+                function.restype = self.c.c_int32
+                buffer = self.c.create_string_buffer(b"\xff" * capacity, capacity)
+                rc = function(handle, buffer, capacity)
+                probe["return_code"] = rc
+                raw = bytes(buffer)
+                probe["buffer_hex"] = raw.hex()
+                if type(rc) is not int:
+                    probe.update(status="malformed", error="return_code_not_integer")
+                elif rc == -12:
+                    probe.update(status="unsupported", error="illegal_operation")
+                elif rc < 0:
+                    probe.update(status="error", error="api_error")
+                elif rc >= capacity:
+                    probe.update(status="truncated", error="reported_length_exceeds_buffer")
+                elif raw[rc] != 0 or b"\x00" in raw[:rc]:
+                    probe.update(status="malformed", error="length_or_terminator_mismatch")
+                elif rc == 0:
+                    probe.update(status="malformed", error="empty_name")
+                else:
+                    try:
+                        probe["value"] = raw[:rc].decode("utf-8", errors="strict")
+                        probe["status"] = "observed"
+                    except UnicodeDecodeError:
+                        probe.update(status="malformed", error="invalid_utf8")
+            except Exception as exc:
+                # Optional observation must not replace a primary inventory error.
+                try:
+                    detail = str(exc)[:256]
+                except BaseException:
+                    # Exception formatting is untrusted diagnostic work, even
+                    # if __str__ raises outside the usual Exception hierarchy.
+                    detail = "<exception_text_unavailable>"
+                probe.update(status="error", error="optional_probe_exception",
+                             exception_type=type(exc).__name__, detail=detail)
+                if buffer is not None:
+                    probe["buffer_hex"] = bytes(buffer).hex()
+        if all(p["status"] == "observed" for p in evidence["probes"].values()):
+            evidence["kind"] = "topic"
+        return evidence
+
     def sample_ownership(self, domain, gid, kind):
         """Supporting local ownership observation; never a sharing/control claim.
 
@@ -949,7 +1011,8 @@ class CycloneMatchedPeerObserver:
                         ancestors.append(ancestor)
                 # Retain attempted reads before validation can fail. These are
                 # supporting diagnostics, not successful ownership fields.
-                diagnostics = {"entity_inventory": inventory, "entity_identities": []}
+                diagnostics = {"entity_inventory": inventory, "entity_identities": [],
+                               "topic_kind_diagnostics": []}
                 result.setdefault("inventory_diagnostics", []).append(diagnostics)
                 identities = []
                 for handle, _ in inventory:
@@ -961,6 +1024,10 @@ class CycloneMatchedPeerObserver:
                     if handle == participant:
                         diagnostic["known_labels"].append("participant")
                     diagnostics["entity_identities"].append(diagnostic)
+                    topic = self._topic_kind_diagnostic(handle)
+                    diagnostics["topic_kind_diagnostics"].append(topic)
+                    if topic["kind"] == "topic":
+                        diagnostic["known_labels"].append("topic")
                     observed_domain = self.c.c_uint32()
                     domain_rc = self.lib.dds_get_domainid(handle, self.c.byref(observed_domain))
                     diagnostic["domain_return_code"] = domain_rc
@@ -970,9 +1037,9 @@ class CycloneMatchedPeerObserver:
                     guid = self.Guid()
                     rc = self.lib.dds_get_guid(handle, self.c.byref(guid))
                     diagnostic["guid_return_code"] = rc
-                    # Public get_guid supports only participants/readers/writers.
-                    # Implicit publishers/subscribers (and topics) have no wire
-                    # GUID; retain the documented ILLEGAL_OPERATION explicitly.
+                    # Cyclone 0.10.5 also reads topic GUIDs (dds_entity.c),
+                    # potentially all zero. Preserve this strict GUID gate;
+                    # optional kind evidence never qualifies an identity.
                     value = bytes(guid.v).hex() if rc == 0 else None
                     diagnostic["guid"] = value
                     if (rc not in (0, -12) or (rc == -12 and handle in (local, participant))

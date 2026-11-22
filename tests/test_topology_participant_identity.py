@@ -590,3 +590,287 @@ def test_failed_inventory_diagnostics_survive_worker_raw_envelope(
     assert 'participant_gid' not in receipt and 'participant_handle' not in receipt
     assert any(row['event'] == 'command_done' and row['command_id'] == raw['command_id']
                for row in rows)
+
+
+def topic_probe_symbols(native, name=b'offline_topic', type_name=b'offline::Type'):
+    """Authored public API readbacks; no native library or DDS execution."""
+    def probe(payload):
+        def read(handle, buffer, capacity):
+            if handle != 20:
+                buffer[0] = b'\x00'
+                return -12
+            copied = payload[:capacity - 1]
+            buffer[:len(copied)] = copied
+            buffer[len(copied)] = b'\x00'
+            return len(payload)
+        return read
+    native.lib.dds_get_name = probe(name)
+    native.lib.dds_get_type_name = probe(type_name)
+
+
+def test_topic_api_evidence_precedes_zero_guid_rejection_without_qualification(native):
+    topic_probe_symbols(native)
+    original = native.lib.dds_get_guid
+    def guid(handle, ptr):
+        if handle == 20:
+            ptr._obj.v[:] = bytes(16)
+            return 0
+        return original(handle, ptr)
+    native.lib.dds_get_guid = guid
+    receipt = native.sample_ownership(196, ENDPOINT, 'writer')
+    assert receipt['status'] == 'unknown' and receipt['complete'] is False
+    assert receipt['candidate_eligible'] is False
+    assert receipt['reason'] == 'participant_inventory_guid_invalid_or_aliased'
+    assert 'participant_gid' not in receipt and 'participant_handle' not in receipt
+    capture = receipt['inventory_diagnostics'][0]
+    assert capture['failure_category'] == receipt['reason']
+    assert [r['handle'] for r in capture['topic_kind_diagnostics']] == [10, 20]
+    failed = capture['entity_identities'][-1]
+    assert failed['guid_return_code'] == 0 and failed['guid'] == '0' * 32
+    assert failed['known_labels'] == ['topic']
+    evidence = capture['topic_kind_diagnostics'][-1]
+    assert evidence['kind'] == 'topic'
+    assert evidence['probes']['dds_get_name']['return_code'] == 13
+    assert evidence['probes']['dds_get_name']['value'] == 'offline_topic'
+    assert evidence['probes']['dds_get_type_name']['return_code'] == 13
+    assert evidence['probes']['dds_get_type_name']['value'] == 'offline::Type'
+    assert all(p['status'] == 'observed' for p in evidence['probes'].values())
+
+
+@pytest.mark.parametrize('api', ['dds_get_name', 'dds_get_type_name'])
+def test_unsupported_topic_probe_is_explicit_and_other_probe_survives(native, api):
+    topic_probe_symbols(native)
+    def unsupported(handle, buffer, capacity):
+        buffer[:4] = b'bad\x00'
+        return -12
+    setattr(native.lib, api, unsupported)
+    receipt = native.sample_ownership(196, ENDPOINT, 'writer')
+    assert receipt['complete'] is True and receipt['candidate_eligible'] is False
+    evidence = receipt['inventory_diagnostics'][0]['topic_kind_diagnostics'][1]
+    assert evidence['kind'] == 'unknown'
+    probe = evidence['probes'][api]
+    assert probe['status'] == 'unsupported'
+    assert probe['return_code'] == -12 and probe['value'] is None
+    assert probe['buffer_hex'].startswith('62616400')
+    other = 'dds_get_type_name' if api == 'dds_get_name' else 'dds_get_name'
+    assert evidence['probes'][other]['status'] == 'observed'
+
+
+@pytest.mark.parametrize('api', ['dds_get_name', 'dds_get_type_name'])
+@pytest.mark.parametrize('case,status,error,rc', [
+    ('absent', 'unavailable', 'optional_symbol_absent', None),
+    ('error', 'error', 'api_error', -7),
+    ('exception', 'error', 'optional_probe_exception', None),
+    ('truncated', 'truncated', 'reported_length_exceeds_buffer', 400),
+    ('boundary', 'truncated', 'reported_length_exceeds_buffer', 256),
+    ('invalid_utf8', 'malformed', 'invalid_utf8', 1),
+    ('no_terminator', 'malformed', 'length_or_terminator_mismatch', 3),
+    ('embedded_nul', 'malformed', 'length_or_terminator_mismatch', 3),
+    ('empty', 'malformed', 'empty_name', 0),
+    ('bad_rc', 'malformed', 'return_code_not_integer', True),
+])
+def test_optional_topic_probe_failures_are_bounded_independent_and_non_authoritative(
+        native, api, case, status, error, rc):
+    topic_probe_symbols(native)
+    def damaged(handle, buffer, capacity):
+        if case == 'exception':
+            buffer[:4] = b'bad\x00'
+            raise OSError('offline_probe_failure')
+        payload = {'invalid_utf8': b'\xff\x00', 'no_terminator': b'abcX',
+                   'embedded_nul': b'a\x00b\x00', 'empty': b'\x00'}.get(case, b'bad\x00')
+        buffer[:len(payload)] = payload
+        return rc
+    if case == 'absent':
+        delattr(native.lib, api)
+    else:
+        setattr(native.lib, api, damaged)
+    receipt = native.sample_ownership(196, ENDPOINT, 'writer')
+    assert receipt['complete'] is True and receipt['participant_gid'] == PARTICIPANT
+    assert receipt['candidate_eligible'] is False
+    assert len(receipt['inventory_diagnostics']) == 2
+    for capture in receipt['inventory_diagnostics']:
+        assert len(capture['topic_kind_diagnostics']) == 3
+        evidence = capture['topic_kind_diagnostics'][1]
+        assert evidence['kind'] == 'unknown'
+        assert capture['entity_identities'][1]['known_labels'] == []
+        probe = evidence['probes'][api]
+        assert probe['status'] == status and probe['error'] == error
+        assert probe['return_code'] == rc and probe['value'] is None
+        assert probe['capacity_bytes'] == 256
+        if case == 'absent':
+            assert probe['buffer_hex'] is None
+        else:
+            assert len(bytes.fromhex(probe['buffer_hex'])) == 256
+        other = 'dds_get_type_name' if api == 'dds_get_name' else 'dds_get_name'
+        assert evidence['probes'][other]['status'] == 'observed'
+
+
+@pytest.mark.parametrize('guid_case', ['zero', 'error', 'changed_nonzero'])
+def test_topic_observation_never_qualifies_invalid_local_endpoint_guid(native, guid_case):
+    topic_probe_symbols(native)
+    original = native.lib.dds_get_guid
+    reads = 0
+    def read(handle, ptr):
+        nonlocal reads
+        if handle == 30:
+            reads += 1
+            if reads == 2:
+                ptr._obj.v[:] = bytes.fromhex('0' * 32 if guid_case == 'zero' else 'b' * 32)
+                return -7 if guid_case == 'error' else 0
+        return original(handle, ptr)
+    native.lib.dds_get_guid = read
+    receipt = native.sample_ownership(196, ENDPOINT, 'writer')
+    assert receipt['complete'] is False and receipt['status'] == 'unknown'
+    assert receipt['candidate_eligible'] is False and 'participant_gid' not in receipt
+    expected = ('participant_endpoint_guid_changed' if guid_case == 'changed_nonzero'
+                else 'participant_inventory_guid_invalid_or_aliased')
+    assert receipt['reason'] == expected
+    capture = receipt['inventory_diagnostics'][0]
+    assert capture['failure_category'] == expected
+    assert [r['handle'] for r in capture['topic_kind_diagnostics']] == [10, 20, 30]
+
+
+def test_absent_topic_symbols_preserve_matched_peer_observer(native):
+    native.lib.dds_get_matched_subscription_data = lambda *args: None
+    receipt = native.sample(196, ENDPOINT, 'writer')
+    assert receipt['complete'] is True
+    assert receipt['matched_peer_gids'] == []
+
+
+@pytest.mark.parametrize('kind', ['writer', 'reader'])
+def test_topic_diagnostic_survives_primary_guid_exception_in_worker_raw(
+        native, monkeypatch, worker_guards, snapshot_worker, kind):
+    topic_probe_symbols(native)
+    native.lib.guids[30] = '1' * 32 if kind == 'writer' else '2' * 32
+    original = native.lib.dds_get_guid
+    name_probe = native.lib.dds_get_name
+    probed = set()
+    def name_read(handle, buffer, capacity):
+        probed.add(handle)
+        return name_probe(handle, buffer, capacity)
+    native.lib.dds_get_name = name_read
+    def read(handle, ptr):
+        if handle == 20 and handle in probed:
+            raise OSError('offline_primary_guid_failure')
+        return original(handle, ptr)
+    native.lib.dds_get_guid = read
+    native.lib.dds_get_matched_subscription_data = lambda *args: None
+    native.lib.dds_get_matched_publication_data = lambda *args: None
+    monkeypatch.setattr(worker, 'CycloneMatchedPeerObserver', lambda: native)
+    rows = snapshot_worker(kind, rmw='rmw_cyclonedds_cpp', count=0)
+    raw = next(row for row in rows if row['event'] == 'participant_ownership_snapshot')
+    receipt = raw['participant_ownership_observation']
+    assert receipt['reason'] == 'offline_primary_guid_failure'
+    assert receipt['status'] == 'unknown' and receipt['complete'] is False
+    assert raw['candidate_eligible'] is False and receipt['candidate_eligible'] is False
+    assert 'participant_gid' not in receipt
+    capture = receipt['inventory_diagnostics'][0]
+    assert capture['topic_kind_diagnostics'][-1]['kind'] == 'topic'
+    assert capture['entity_identities'][-1]['guid_return_code'] is None
+    assert capture['failure_category'] == 'offline_primary_guid_failure'
+    assert any(row['event'] == 'command_done' for row in rows)
+
+
+def test_optional_binding_failure_cannot_break_ownership_or_other_readback(native):
+    topic_probe_symbols(native)
+    class Unbindable:
+        def __setattr__(self, name, value):
+            raise RuntimeError('offline_binding_failure')
+    native.lib.dds_get_name = Unbindable()
+    receipt = native.sample_ownership(196, ENDPOINT, 'writer')
+    assert receipt['complete'] is True
+    evidence = receipt['inventory_diagnostics'][0]['topic_kind_diagnostics'][1]
+    assert evidence['kind'] == 'unknown'
+    assert evidence['probes']['dds_get_name']['error'] == 'optional_probe_exception'
+    assert evidence['probes']['dds_get_name']['return_code'] is None
+    assert evidence['probes']['dds_get_type_name']['value'] == 'offline::Type'
+
+
+def test_optional_success_keeps_canonical_ownership_exactly_equal(native):
+    before = native.sample_ownership(196, ENDPOINT, 'writer')
+    topic_probe_symbols(native)
+    after = native.sample_ownership(196, ENDPOINT, 'writer')
+    for key in ('complete', 'status', 'candidate_eligible', 'local_handle',
+                'participant_handle', 'participant_gid', 'parent_chain',
+                'entity_inventory', 'entity_identities', 'participant_root_observation',
+                'stable_sample_count', 'ownership_api', 'lookup_api'):
+        assert after[key] == before[key]
+    probe = after['inventory_diagnostics'][0]['topic_kind_diagnostics'][1]
+    assert probe['kind'] == 'topic'
+    assert probe['probes']['dds_get_name']['buffer_hex'].startswith('6f66666c696e655f746f70696300')
+
+
+def test_domain_failure_retains_kind_probes_before_primary_validation(native):
+    topic_probe_symbols(native)
+    native.lib.domains[20] = 197
+    receipt = native.sample_ownership(196, ENDPOINT, 'writer')
+    assert receipt['complete'] is False and receipt['status'] == 'unknown'
+    assert receipt['reason'] == 'participant_inventory_domain_mismatch'
+    capture = receipt['inventory_diagnostics'][0]
+    assert capture['topic_kind_diagnostics'][-1]['kind'] == 'topic'
+    assert capture['entity_identities'][-1]['guid_return_code'] is None
+    assert capture['failure_category'] == receipt['reason']
+
+
+def test_full_bounded_utf8_copy_is_retained_without_guid_gate_change(native):
+    topic_probe_symbols(native, name=b'a' * 255, type_name='offline::类型'.encode('utf-8'))
+    receipt = native.sample_ownership(196, ENDPOINT, 'writer')
+    assert receipt['complete'] is True
+    evidence = receipt['inventory_diagnostics'][0]['topic_kind_diagnostics'][1]
+    assert evidence['kind'] == 'topic'
+    name = evidence['probes']['dds_get_name']
+    assert name['return_code'] == 255 and name['value'] == 'a' * 255
+    assert name['buffer_hex'] == '61' * 255 + '00'
+    typename = evidence['probes']['dds_get_type_name']
+    assert typename['return_code'] == 15 and typename['value'] == 'offline::类型'
+    assert receipt['participant_gid'] == PARTICIPANT and receipt['candidate_eligible'] is False
+
+
+@pytest.mark.parametrize('formatting_error', [RuntimeError, KeyboardInterrupt])
+@pytest.mark.parametrize('guid_failure', [False, True])
+@pytest.mark.parametrize('api', ['dds_get_name', 'dds_get_type_name'])
+def test_unprintable_optional_exception_preserves_ownership_outcome(
+        native, api, guid_failure, formatting_error):
+    topic_probe_symbols(native)
+    class UnprintableProbeError(Exception):
+        def __str__(self):
+            raise formatting_error('offline_exception_formatting_failed')
+    def broken(handle, buffer, capacity):
+        buffer[:4] = b'bad\x00'
+        raise UnprintableProbeError()
+    setattr(native.lib, api, broken)
+    if guid_failure:
+        original = native.lib.dds_get_guid
+        def zero(handle, ptr):
+            if handle == 20:
+                ptr._obj.v[:] = bytes(16)
+                return 0
+            return original(handle, ptr)
+        native.lib.dds_get_guid = zero
+    receipt = native.sample_ownership(196, ENDPOINT, 'writer')
+    if guid_failure:
+        assert receipt['reason'] == 'participant_inventory_guid_invalid_or_aliased'
+        assert receipt['complete'] is False and receipt['status'] == 'unknown'
+        assert 'participant_gid' not in receipt
+        capture = receipt['inventory_diagnostics'][0]
+        assert capture['failure_category'] == receipt['reason']
+        assert capture['entity_identities'][-1]['guid_return_code'] == 0
+        assert capture['entity_identities'][-1]['guid'] == '0' * 32
+    else:
+        assert receipt['complete'] is True and receipt['status'] == 'observed'
+        assert receipt['participant_gid'] == PARTICIPANT
+        assert receipt['stable_sample_count'] == 2
+    assert receipt['candidate_eligible'] is False
+    for capture in receipt['inventory_diagnostics']:
+        for evidence in capture['topic_kind_diagnostics']:
+            assert evidence['kind'] == 'unknown'
+            probe = evidence['probes'][api]
+            assert probe['error'] == 'optional_probe_exception'
+            assert probe['exception_type'] == 'UnprintableProbeError'
+            assert probe['detail'] == '<exception_text_unavailable>'
+            assert len(probe['detail']) <= 256
+            assert probe['buffer_hex'].startswith('62616400')
+            assert len(bytes.fromhex(probe['buffer_hex'])) == 256
+            assert probe['return_code'] is None
+        other = 'dds_get_type_name' if api == 'dds_get_name' else 'dds_get_name'
+        assert capture['topic_kind_diagnostics'][1]['probes'][other]['status'] == 'observed'
