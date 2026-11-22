@@ -1,6 +1,7 @@
 """Dedicated topology services; validation never regenerates a mutation plan."""
 from copy import deepcopy
 from importlib import import_module
+from threading import Lock
 
 from r2f.core import ExecutionServices, canonical_hash
 from r2f.core.evidence import INPUT_SCHEMA_V2
@@ -59,9 +60,30 @@ class TopologyMutationProvider:
 
 class _ServiceDependency:
     """Resolve the independent owner implementation lazily, never synthesize pass."""
-    def __init__(self, module, symbol, method):
+    def __init__(self, module, symbol, method, *, callable_dependencies=()):
         self.module, self.symbol, self.method = module, symbol, method
         self.dependency = module + "." + symbol
+        self._resolved = None
+        self._resolve_lock = Lock()
+        self.callable_dependencies = tuple(callable_dependencies)
+
+    @property
+    def binding_dependency(self):
+        """Explicit import slot for metadata binding, never execution evidence."""
+        return {"module": self.module, "symbol": self.symbol, "method": self.method,
+                "callable_dependencies": [{"module": module, "symbol": symbol}
+                                          for module, symbol in self.callable_dependencies]}
+
+    def resolve(self):
+        """Instantiate once for explicit binding; legacy calls remain lazy."""
+        with self._resolve_lock:
+            if self._resolved is None:
+                try:
+                    implementation = getattr(import_module(self.module), self.symbol)
+                except (ImportError, AttributeError) as exc:
+                    raise ValueError("topology_service_dependency_unavailable:" + self.dependency) from exc
+                self._resolved = implementation()
+            return self._resolved
 
     def _invoke(self, *args):
         try:
@@ -95,5 +117,8 @@ def topology_service_bindings(targets):
 
     return {TOPOLOGY_TARGET: ExecutionServices(
         TopologyMutationProvider(targets), TopologyCarrier(targets, TOPOLOGY_CARRIER),
-        _ServiceDependency("r2f.campaign.topology_adapter", "TopologyFactProducer", "produce"),
-        _ServiceDependency("r2f.modules.s1.topology_oracles", "TopologyOracle", "evaluate"))}
+        _ServiceDependency("r2f.campaign.topology_adapter", "TopologyFactProducer", "produce",
+                           callable_dependencies=(("r2f.campaign.topology_adapter", "facts_from_events"),)),
+        _ServiceDependency("r2f.modules.s1.topology_oracles", "TopologyOracle", "evaluate",
+                           callable_dependencies=(("r2f.modules.s1.topology_oracles", "resolve_evaluator"),
+                                                  ("r2f.modules.s1.topology_oracles", "evaluate_topology"))))}

@@ -72,6 +72,15 @@ class Registry:
             raise ValueError("target has no execution services: " + target_id)
         return self._services[target_id]
 
+    def bind_services(self, target_id):
+        """Pin inspectable real services and measure detached metadata only.
+
+        Does not replace get_services(), execute a service, or grant any
+        execution, candidate, implementation or human-confirmation authority.
+        """
+        from .service_binding import ServiceBinding
+        return ServiceBinding(self, target_id)
+
     def get_rule_lineage(self, target_id, rule_id):
         """Dispatch provenance to the registered owner; never search other modules.
 
