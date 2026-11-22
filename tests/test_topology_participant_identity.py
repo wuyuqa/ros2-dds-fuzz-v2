@@ -437,3 +437,156 @@ def test_unverified_positive_roots_remain_unknown_and_supporting(native, damage)
         assert root['parent_participant_return'] == -9
     if damage == 'ancestor_error':
         assert root['parent_ancestry'][-1] == [99, -9]
+
+@pytest.mark.parametrize('failure', ['zero', 'error', 'duplicate'])
+def test_failed_inventory_retains_bounded_handle_guid_diagnostics(native, failure):
+    original = native.lib.dds_get_guid
+    participant_reads = 0
+    def read(handle, ptr):
+        nonlocal participant_reads
+        if handle == 10:
+            participant_reads += 1
+            if participant_reads == 2:
+                if failure == 'error':
+                    return -7  # output buffer deliberately left untouched
+                ptr._obj.v[:] = bytes.fromhex('0' * 32 if failure == 'zero' else ENDPOINT)
+                return 0
+        return original(handle, ptr)
+    native.lib.dds_get_guid = read
+
+    receipt = native.sample_ownership(196, ENDPOINT, 'writer')
+
+    assert receipt['complete'] is False
+    assert receipt['candidate_eligible'] is False
+    assert receipt['reason'] == 'participant_inventory_guid_invalid_or_aliased'
+    assert 'participant_gid' not in receipt
+    assert 'local_handle' not in receipt and 'participant_handle' not in receipt
+    assert len(receipt['inventory_diagnostics']) == 1
+    capture = receipt['inventory_diagnostics'][0]
+    assert capture['entity_inventory'] == [[10, [20]], [20, [30]], [30, []]]
+    assert len(capture['entity_identities']) <= native.MAX_ENTITIES
+    failed = next(row for row in capture['entity_identities'] if row['handle'] == 10)
+    assert failed['guid_return_code'] == (-7 if failure == 'error' else 0)
+    assert failed['guid'] == (None if failure == 'error' else
+                              '0' * 32 if failure == 'zero' else ENDPOINT)
+    assert failed['observed_domain_id'] == 196
+    assert failed['domain_return_code'] == 0
+    assert capture['failure_category'] == 'participant_inventory_guid_invalid_or_aliased'
+    assert failed['known_labels'] == ['participant']
+
+@pytest.mark.parametrize('capture_number', [1, 2])
+@pytest.mark.parametrize('failure', ['zero', 'error', 'duplicate'])
+def test_unknown_inventory_handle_preserves_only_observed_values(native, capture_number, failure):
+    original = native.lib.dds_get_guid
+    reads = 0
+    def read(handle, ptr):
+        nonlocal reads
+        if handle == 20:
+            reads += 1
+            # Each capture locates first, then independently reads the inventory.
+            if reads == capture_number * 2:
+                ptr._obj.v[:] = bytes.fromhex(PARTICIPANT if failure == 'duplicate' else '0' * 32)
+                return -7 if failure == 'error' else 0
+        return original(handle, ptr)
+    native.lib.dds_get_guid = read
+    receipt = native.sample_ownership(196, ENDPOINT, 'reader')
+    assert receipt['complete'] is False and receipt['candidate_eligible'] is False
+    assert receipt['reason'] == 'participant_inventory_guid_invalid_or_aliased'
+    assert not {'participant_gid', 'participant_handle', 'local_handle', 'entity_identities',
+                'entity_inventory', 'parent_chain', 'participant_root_observation'} & receipt.keys()
+    captures = receipt['inventory_diagnostics']
+    assert len(captures) == capture_number
+    assert all(len(row['entity_identities']) <= native.MAX_ENTITIES for row in captures)
+    assert captures[-1]['failure_category'] == receipt['reason']
+    diagnostic = captures[-1]['entity_identities'][1]
+    assert diagnostic == dict(handle=20, known_labels=[], domain_return_code=0,
+                             observed_domain_id=196, guid_return_code=-7 if failure == 'error' else 0,
+                             guid=None if failure == 'error' else
+                             PARTICIPANT if failure == 'duplicate' else '0' * 32)
+    if capture_number == 2:
+        assert 'failure_category' not in captures[0]
+        assert captures[0]['entity_identities'][1]['guid_return_code'] == -12
+        assert captures[0]['entity_identities'][1]['guid'] is None
+
+
+@pytest.mark.parametrize('domain_rc,observed_domain', [(-9, 196), (0, 197)])
+def test_inventory_domain_failure_retains_rc_and_safe_observation(native, domain_rc, observed_domain):
+    original = native.lib.dds_get_domainid
+    def read(handle, ptr):
+        if handle == 20:
+            ptr._obj.value = observed_domain
+            return domain_rc
+        return original(handle, ptr)
+    native.lib.dds_get_domainid = read
+    receipt = native.sample_ownership(196, ENDPOINT, 'writer')
+    assert receipt['complete'] is False and receipt['candidate_eligible'] is False
+    assert receipt['reason'] == 'participant_inventory_domain_mismatch'
+    capture = receipt['inventory_diagnostics'][0]
+    assert capture['failure_category'] == receipt['reason']
+    assert capture['entity_identities'][-1] == dict(
+        handle=20, known_labels=[], domain_return_code=domain_rc,
+        observed_domain_id=observed_domain if domain_rc == 0 else None,
+        guid_return_code=None, guid=None)
+    assert 'participant_gid' not in receipt
+
+
+def test_capture_diagnostics_reach_exact_entity_bound_without_changing_success(native):
+    native.MAX_ENTITIES = 3
+    receipt = native.sample_ownership(196, ENDPOINT, 'writer')
+    assert receipt['complete'] is True
+    assert receipt['candidate_eligible'] is False
+    assert len(receipt['inventory_diagnostics']) == 2
+    for capture in receipt['inventory_diagnostics']:
+        assert len(capture['entity_identities']) == native.MAX_ENTITIES
+        assert 'failure_category' not in capture
+        assert capture['entity_identities'][0]['known_labels'] == ['participant']
+        assert capture['entity_identities'][2]['known_labels'] == ['local_endpoint']
+
+
+def test_inventory_api_exception_is_retained_without_fabricated_guid(native):
+    original = native.lib.dds_get_guid
+    reads = 0
+    def read(handle, ptr):
+        nonlocal reads
+        if handle == 20:
+            reads += 1
+            if reads == 2:
+                raise OSError('fixture_inventory_guid_read_failed')
+        return original(handle, ptr)
+    native.lib.dds_get_guid = read
+    receipt = native.sample_ownership(196, ENDPOINT, 'writer')
+    assert receipt['complete'] is False and receipt['candidate_eligible'] is False
+    assert receipt['reason'] == 'fixture_inventory_guid_read_failed'
+    capture = receipt['inventory_diagnostics'][0]
+    assert capture['failure_category'] == receipt['reason']
+    assert capture['entity_identities'][-1]['guid_return_code'] is None
+    assert capture['entity_identities'][-1]['guid'] is None
+    assert 'participant_gid' not in receipt
+
+
+@pytest.mark.parametrize('kind', ['writer', 'reader'])
+def test_failed_inventory_diagnostics_survive_worker_raw_envelope(
+        native, monkeypatch, worker_guards, snapshot_worker, kind):
+    native.lib.guids[30] = '1' * 32 if kind == 'writer' else '2' * 32
+    original = native.lib.dds_get_guid
+    def read(handle, ptr):
+        if handle == 20:
+            ptr._obj.v[:] = bytes.fromhex('f' * 32)  # error output is never evidence
+            return -7
+        return original(handle, ptr)
+    native.lib.dds_get_guid = read
+    native.lib.dds_get_matched_subscription_data = lambda *args: None
+    native.lib.dds_get_matched_publication_data = lambda *args: None
+    monkeypatch.setattr(worker, 'CycloneMatchedPeerObserver', lambda: native)
+    rows = snapshot_worker(kind, rmw='rmw_cyclonedds_cpp', count=0)
+    raw = next(row for row in rows if row['event'] == 'participant_ownership_snapshot')
+    receipt = raw['participant_ownership_observation']
+    assert raw['candidate_eligible'] is False and raw['supporting_diagnostic'] is True
+    assert receipt['complete'] is False and receipt['candidate_eligible'] is False
+    assert receipt['reason'] == 'participant_inventory_guid_invalid_or_aliased'
+    assert receipt['inventory_diagnostics'][0]['entity_identities'][-1] == dict(
+        handle=20, known_labels=[], domain_return_code=0, observed_domain_id=196,
+        guid_return_code=-7, guid=None)
+    assert 'participant_gid' not in receipt and 'participant_handle' not in receipt
+    assert any(row['event'] == 'command_done' and row['command_id'] == raw['command_id']
+               for row in rows)

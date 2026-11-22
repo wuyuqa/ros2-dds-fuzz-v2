@@ -947,18 +947,34 @@ class CycloneMatchedPeerObserver:
                                 or len(ancestors) >= self.MAX_ENTITIES):
                             raise ValueError("participant_root_invalid")
                         ancestors.append(ancestor)
+                # Retain attempted reads before validation can fail. These are
+                # supporting diagnostics, not successful ownership fields.
+                diagnostics = {"entity_inventory": inventory, "entity_identities": []}
+                result.setdefault("inventory_diagnostics", []).append(diagnostics)
                 identities = []
                 for handle, _ in inventory:
+                    diagnostic = {"handle": handle, "known_labels": [],
+                                  "domain_return_code": None, "observed_domain_id": None,
+                                  "guid_return_code": None, "guid": None}
+                    if handle == local:
+                        diagnostic["known_labels"].append("local_endpoint")
+                    if handle == participant:
+                        diagnostic["known_labels"].append("participant")
+                    diagnostics["entity_identities"].append(diagnostic)
                     observed_domain = self.c.c_uint32()
-                    if (self.lib.dds_get_domainid(handle, self.c.byref(observed_domain)) != 0
-                            or observed_domain.value != domain):
+                    domain_rc = self.lib.dds_get_domainid(handle, self.c.byref(observed_domain))
+                    diagnostic["domain_return_code"] = domain_rc
+                    diagnostic["observed_domain_id"] = observed_domain.value if domain_rc == 0 else None
+                    if domain_rc != 0 or observed_domain.value != domain:
                         raise ValueError("participant_inventory_domain_mismatch")
                     guid = self.Guid()
                     rc = self.lib.dds_get_guid(handle, self.c.byref(guid))
+                    diagnostic["guid_return_code"] = rc
                     # Public get_guid supports only participants/readers/writers.
                     # Implicit publishers/subscribers (and topics) have no wire
                     # GUID; retain the documented ILLEGAL_OPERATION explicitly.
                     value = bytes(guid.v).hex() if rc == 0 else None
+                    diagnostic["guid"] = value
                     if (rc not in (0, -12) or (rc == -12 and handle in (local, participant))
                             or value == "0" * 32):
                         raise ValueError("participant_inventory_guid_invalid_or_aliased")
@@ -984,6 +1000,8 @@ class CycloneMatchedPeerObserver:
                 raise ValueError("participant_ownership_inventory_changed")
             result.update(first, complete=True, status="observed", stable_sample_count=2)
         except (ValueError, TypeError, OSError, AttributeError, RuntimeError) as exc:
+            if result.get("inventory_diagnostics"):
+                result["inventory_diagnostics"][-1]["failure_category"] = str(exc)
             result.update(complete=False, reason=str(exc))
         result["ended_monotonic_ns"] = time.monotonic_ns()
         return result
