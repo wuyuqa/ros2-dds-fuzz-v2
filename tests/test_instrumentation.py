@@ -101,7 +101,8 @@ class InstrumentationContracts(unittest.TestCase):
             normalize_guid('node_name')
 
     def test_missing_process_provenance_is_unknown(self):
-        result = capture_process_provenance(999999999)
+        with tempfile.TemporaryDirectory() as directory:
+            result = capture_process_provenance(999999999, proc_root=Path(directory))
         self.assertFalse(result['vendor_loaded'])
         self.assertTrue(result['unknown'])
 
@@ -201,6 +202,167 @@ class FurtherInstrumentationContracts(unittest.TestCase):
             result = reconcile_projection([graph], graph, **kwargs)
             self.assertEqual(result['verdict'], 'unknown')
             self.assertIn('vendor_process_provenance_unverified', result['unknown_fields'])
+
+
+
+class AdoptedConfigContracts(unittest.TestCase):
+    def test_config_tracing_requires_explicit_opt_in(self):
+        with tempfile.TemporaryDirectory() as directory:
+            default = build_trace_config(Path(directory) / 'default.log', domain_id=174)
+            config = build_trace_config(Path(directory) / 'adopted.log', domain_id=174,
+                                        observe_adopted_config=True)
+            self.assertEqual(default.categories, ('discovery', 'plist'))
+            self.assertEqual(config.categories, ('discovery', 'plist', 'config'))
+            self.assertEqual(ET.fromstring(config.xml).findtext('Domain/Tracing/Category'),
+                             'discovery,plist,config')
+
+    # Derived from pinned config.c cfg_note/print_configitems/pf_int64_unit,
+    # NOT a captured vendor trace or parser acceptance sample.
+    CONFIG_LINES = ('1794670000.123456 [174] main: config: Domain/General/Transport/#text: udp {0}\n'
+                    '1794670000.123457 [174] main: config: Domain/Discovery/SPDPInterval/#text: 2 s {0,1}\n')
+
+    def collect_offline(self, directory, raw, *, alter=None, enabled=True):
+        config = build_trace_config(Path(directory) / 'adopted.log', domain_id=174,
+                                    observe_adopted_config=enabled)
+        path = Path(config.output_file)
+        path.write_bytes(raw.encode() if isinstance(raw, str) else raw)
+        stat = path.stat()
+        proof = {'scope': 'observed_process', 'offline_fixture': True, 'pid': 910001,
+                 'process_start_ticks': '9100010', 'process_identity_stable': True,
+                 'vendor_loaded': True, 'config_matches': True, 'domain_matches': True,
+                 'rmw_matches': True, 'trace_fd_attached': True, 'trace_fd': '7',
+                 'trace_inode': stat.st_ino, 'trace_device': stat.st_dev,
+                 'selected_environment': {'CYCLONEDDS_URI': config.xml,
+                     'ROS_DOMAIN_ID': '174', 'RMW_IMPLEMENTATION': 'rmw_cyclonedds_cpp'},
+                 'loaded_libraries': [{'mapped_path': '/offline/' + name, 'sha256': 'a' * 64,
+                                       'identity_verified': True}
+                                      for name in ('libddsc.so.0', 'librmw_cyclonedds_cpp.so')]}
+        processes = [proof]
+        if alter:
+            alter(proof, processes)
+        return collect_trace(config, processes=processes, control_task={'status': 'not_run'})
+
+    def test_config_numeric_tokens_require_canonical_ascii_vendor_grammar(self):
+        for token in ('1٢ s', '1２ s', '00 s', '01 s', '+1 s', '1e2 s'):
+            with self.subTest(token=token), tempfile.TemporaryDirectory() as directory:
+                settings = self.collect_offline(directory, self.CONFIG_LINES.replace('2 s', token))['adopted_domain_settings']
+                field = settings['fields']['spdp_interval']
+                self.assertEqual(field['status'], 'unknown')
+                self.assertIsNone(field['value'])
+                self.assertEqual(field['references'][0]['original_token'], token)
+        for mask in ('{0,١}', '{0,01}', '{00}', '{٠}', '{0,1,02}'):
+            with self.subTest(mask=mask), tempfile.TemporaryDirectory() as directory:
+                result = self.collect_offline(directory, self.CONFIG_LINES.replace('{0,1}', mask))
+                field = result['adopted_domain_settings']['fields']['spdp_interval']
+                self.assertEqual(field['status'], 'unknown')
+                self.assertIsNone(field['value'])
+                self.assertEqual(len(field['references']), 1)
+                self.assertIsNone(field['references'][0]['source_indices'])
+                self.assertEqual(result['events'], [])
+                self.assertEqual(result['candidate_status'], 'none')
+
+    def test_configuration_projections_are_detached_json_values(self):
+        with tempfile.TemporaryDirectory() as directory:
+            original = self.collect_offline(directory, self.CONFIG_LINES)
+            expected = json.loads(json.dumps(original['adopted_domain_settings']))
+            original['adopted_domain_settings']['source_reference']['files']['offline_mutation'] = 'changed'
+            with tempfile.TemporaryDirectory() as later_directory:
+                later = self.collect_offline(later_directory, self.CONFIG_LINES)
+            self.assertEqual(later['adopted_domain_settings']['source_reference'], expected['source_reference'])
+            original['processes'][0]['loaded_libraries'][0]['sha256'] = 'changed'
+            self.assertEqual(original['adopted_domain_settings']['binding'], expected['binding'])
+            original['adopted_domain_settings']['binding']['loaded_libraries'][1]['sha256'] = 'changed-back'
+            self.assertEqual(original['processes'][0]['loaded_libraries'][1]['sha256'], 'a' * 64)
+            self.assertEqual(json.loads(json.dumps(later['adopted_domain_settings'])), later['adopted_domain_settings'])
+
+    def test_selected_config_has_exact_refs_and_separate_sedp_events(self):
+        with tempfile.TemporaryDirectory() as directory:
+            raw = self.CONFIG_LINES + LINE
+            result = self.collect_offline(directory, raw)
+            settings = result['adopted_domain_settings']
+            field = settings['fields']['spdp_interval']
+            self.assertEqual(field['status'], 'observed')
+            self.assertEqual(field['value'], 2000000000)
+            self.assertEqual(field['unit'], 'ns')
+            ref = field['references'][0]
+            self.assertEqual(ref['line_number'], 2)
+            self.assertEqual(ref['byte_offset'], len(self.CONFIG_LINES.splitlines(True)[0]))
+            self.assertEqual(ref['byte_length'], len(self.CONFIG_LINES.splitlines(True)[1]))
+            self.assertEqual(ref['original_token'], '2 s')
+            self.assertEqual(ref['source_indices'], [0, 1])
+            self.assertEqual(ref['raw_sha256'], hashlib.sha256(raw.encode()).hexdigest())
+            chunk = raw.encode()[ref['byte_offset']:ref['byte_offset'] + ref['byte_length']]
+            self.assertEqual(ref['raw_line_sha256'], hashlib.sha256(chunk).hexdigest())
+            self.assertEqual(settings['fields']['transport']['value'], 'udp')
+            self.assertEqual(len(result['events']), 1)
+            self.assertEqual(settings['semantic_effect'], 'unknown')
+            self.assertEqual(settings['parser_acceptance'], 'pending_real_trace')
+            self.assertEqual(settings['binding']['process_start_ticks'], '9100010')
+            self.assertEqual(result['candidate_status'], 'none')
+
+    def test_source_derived_bad_and_partial_config_never_falls_back(self):
+        cases = {
+            'missing': ('', ('transport', 'spdp_interval')),
+            'wrong_domain': (self.CONFIG_LINES.replace('[174]', '[175]'), ('transport', 'spdp_interval')),
+            'duplicate_same': (self.CONFIG_LINES * 2, ('transport', 'spdp_interval')),
+            'duplicate_conflict': (self.CONFIG_LINES + self.CONFIG_LINES.replace('2 s', '1 s'),
+                                   ('transport', 'spdp_interval')),
+            'truncated': (self.CONFIG_LINES.rstrip('\n'), ('transport', 'spdp_interval')),
+            'duration_inf': (self.CONFIG_LINES.replace('2 s', 'inf'), ('spdp_interval',)),
+            'duration_overflow': (self.CONFIG_LINES.replace('2 s', '9223372036854775808 ns'), ('spdp_interval',)),
+            'duration_decimal': (self.CONFIG_LINES.replace('2 s', '1.5 s'), ('spdp_interval',)),
+            'duration_negative': (self.CONFIG_LINES.replace('2 s', '-1 s'), ('spdp_interval',)),
+            'duration_unit': (self.CONFIG_LINES.replace('2 s', '2 seconds'), ('spdp_interval',)),
+            'duration_range': (self.CONFIG_LINES.replace('2 s', '3601 s'), ('spdp_interval',)),
+            'bad_source_index': (self.CONFIG_LINES.replace('{0,1}', '{0,32}'), ('spdp_interval',)),
+            'transport_unknown': (self.CONFIG_LINES.replace(': udp ', ': unicorn '), ('transport',)),
+            'no_header': (self.CONFIG_LINES.replace('1794670000.123457 [174] main: ', ''), ('spdp_interval',)),
+            'wrong_path': (self.CONFIG_LINES.replace('Domain/Discovery/', 'CycloneDDS/Domain/Discovery/'), ('spdp_interval',)),
+            'multiple_threads': (self.CONFIG_LINES.replace('123457 [174] main:', '123457 [174] other:'),
+                                 ('transport', 'spdp_interval')),
+        }
+        for label, (raw, unknown) in cases.items():
+            with self.subTest(offline_fixture=label), tempfile.TemporaryDirectory() as directory:
+                result = self.collect_offline(directory, raw)['adopted_domain_settings']
+                for name, field in result['fields'].items():
+                    self.assertEqual(field['status'], 'unknown' if name in unknown else 'observed')
+                    if name in unknown:
+                        self.assertIsNone(field['value'])
+
+    def test_duration_units_use_logged_values_only_and_parse_is_bounded(self):
+        for token, ns in (('1 ns', 1), ('2 us', 2000), ('3 ms', 3000000),
+                          ('2 min', 120000000000), ('1 hr', 3600000000000), ('0 s', 0)):
+            with self.subTest(token=token), tempfile.TemporaryDirectory() as directory:
+                settings = self.collect_offline(directory, self.CONFIG_LINES.replace('2 s', token))['adopted_domain_settings']
+                self.assertEqual(settings['fields']['spdp_interval']['value'], ns)
+        for raw in (b'x' * (8 * 1024 * 1024 + 1), b'\n' * 32769,
+                    self.CONFIG_LINES.replace('2 s', '2' * 4100 + ' s').encode()):
+            with tempfile.TemporaryDirectory() as directory:
+                fields = self.collect_offline(directory, raw)['adopted_domain_settings']['fields']
+                self.assertTrue(all(f['status'] == 'unknown' for f in fields.values()))
+
+    def test_config_process_binding_rejects_ambiguous_or_incomplete_proof(self):
+        def extra(proof, processes):
+            processes.append(dict(proof, pid=910002, config_matches=False))
+        cases = [lambda p, ps: p.update(process_start_ticks=None),
+                 lambda p, ps: p.update(trace_device=-1), lambda p, ps: p.update(trace_inode=-1),
+                 lambda p, ps: p.update(scope='loader_probe_only'),
+                 lambda p, ps: p.update(process_identity_stable=False),
+                 lambda p, ps: p['selected_environment'].update(CYCLONEDDS_URI='<other/>'),
+                 lambda p, ps: p['loaded_libraries'][0].update(identity_verified=False),
+                 lambda p, ps: p['loaded_libraries'][0].update(sha256=None),
+                 lambda p, ps: p.update(loaded_libraries=None),
+                 lambda p, ps: p['loaded_libraries'][0].update(mapped_path=None), extra]
+        for alter in cases:
+            with self.subTest(offline_fixture=cases.index(alter)), tempfile.TemporaryDirectory() as directory:
+                settings = self.collect_offline(directory, self.CONFIG_LINES, alter=alter)['adopted_domain_settings']
+                self.assertIsNone(settings['binding'])
+                self.assertTrue(all(f['status'] == 'unknown' and f['value'] is None
+                                    for f in settings['fields'].values()))
+        with tempfile.TemporaryDirectory() as directory:
+            result = self.collect_offline(directory, self.CONFIG_LINES, enabled=False)
+            self.assertNotIn('adopted_domain_settings', result)
+            self.assertEqual(result['events'], [])
 
 
 if __name__ == '__main__':

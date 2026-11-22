@@ -695,5 +695,224 @@ class ObservationContracts(unittest.TestCase):
             self.assertEqual(Path(summary['artifact']['raw_path']).read_bytes(), raw)
 
 
+
+class AdoptedConfigBridgeContracts(unittest.TestCase):
+    """Offline source-derived config syntax; no real vendor parser acceptance."""
+    CONFIG_LINES = ('1794670000.123456 [174] main: config: Domain/General/Transport/#text: udp {0}\n'
+                    '1794670000.123457 [174] main: config: Domain/Discovery/SPDPInterval/#text: 2 s {0,1}\n')
+
+    def prepared_pair(self, directory, **overrides):
+        pair = PairFixture(directory, overrides={'observe_adopted_config': True, **overrides})
+        self.addCleanup(pair.close)
+        return pair
+
+    def ready(self, pair):
+        result = pair.ready()
+        for trace in pair.ctx.trace_configs.values():
+            path = Path(trace.output_file)
+            path.write_text(self.CONFIG_LINES + path.read_text())
+        return result
+
+    def test_nonobject_capture_is_named_unknown_and_summary_is_finalized(self):
+        for payload in ('[]', 'null', '42', '"offline-scalar"', 'true'):
+            with self.subTest(payload=payload), tempfile.TemporaryDirectory() as directory:
+                pair = self.prepared_pair(directory)
+                result = self.ready(pair)
+                Path(pair.ctx.workers['writer']['artifact']['raw_path']).write_text(payload)
+                summary = pair.ctx.collect(result)
+                adopted = summary['adopted_domain_settings']['roles']['writer']
+                self.assertEqual(adopted['status'], 'unknown')
+                self.assertIn('process_capture_not_object', adopted['binding_unknowns'])
+                self.assertIsNone(adopted['endpoint_binding'])
+                self.assertTrue(all(f['value'] is None for f in adopted['fields'].values()))
+                self.assertEqual(summary['intake'], [])
+                stored = json.loads(Path(summary['artifact']['raw_path']).read_text())
+                self.assertEqual(stored['adopted_domain_settings'], summary['adopted_domain_settings'])
+
+    def test_optin_projects_three_layers_through_existing_summary_json(self):
+        with tempfile.TemporaryDirectory() as directory:
+            pair = self.prepared_pair(directory)
+            result = self.ready(pair)
+            original = deepcopy(result)
+            summary = pair.ctx.collect(result)
+            self.assertEqual(summary['status'], 'completed', summary['unknown_fields'])
+            self.assertEqual(result, original)
+            self.assertEqual(summary['semantic_effect'], 'unknown')
+            for role in ('writer', 'reader'):
+                presented = summary['presented_configuration'][role]
+                self.assertEqual(presented['scope'], 'parent_prepared')
+                self.assertEqual(presented['trace_xml_sha256'], pair.ctx.trace_configs[role].sha256)
+                self.assertEqual(presented['non_tracing_sha256'], pair.ctx.profiles[role]['non_tracing_sha256'])
+                adopted = summary['adopted_domain_settings']['roles'][role]
+                self.assertEqual(adopted['fields']['spdp_interval']['value'], 2000000000)
+                self.assertEqual(adopted['endpoint_binding']['endpoint_guid'], GUIDS[role])
+                self.assertEqual(adopted['endpoint_binding']['endpoint_generation'], role + '-generation')
+                self.assertEqual(adopted['endpoint_binding']['runtime_raw_sha256'], result['raw_sha256'])
+                self.assertIn('config', pair.ctx.trace_configs[role].categories)
+            stored = json.loads(Path(summary['artifact']['raw_path']).read_text())
+            self.assertEqual(stored['adopted_domain_settings'], summary['adopted_domain_settings'])
+            self.assertEqual(summary['intake'], [])
+            self.assertEqual(summary['target_maturity'], 'not_evaluated')
+            plain = PairFixture(Path(directory) / 'plain')
+            self.addCleanup(plain.close)
+            self.assertEqual(pair.ctx.execution_input, plain.ctx.execution_input)
+            self.assertEqual(pair.ctx.profiles, plain.ctx.profiles)
+            plain_summary = plain.ctx.collect(plain.ready())
+            self.assertEqual(plain_summary['adopted_domain_settings']['status'], 'not_run')
+
+    def test_config_only_is_observation_and_never_sedp_or_candidate_authority(self):
+        with tempfile.TemporaryDirectory() as directory:
+            pair = self.prepared_pair(directory)
+            result = self.ready(pair)
+            for trace in pair.ctx.trace_configs.values():
+                Path(trace.output_file).write_text(self.CONFIG_LINES)
+            summary = pair.ctx.collect(result)
+            self.assertEqual(summary['verdict'], 'unknown')
+            self.assertTrue(all(not trace['events'] for trace in summary['traces']))
+            self.assertEqual(summary['intake'], [])
+            self.assertEqual(summary['adopted_domain_settings']['roles']['writer']['fields']['transport']['status'], 'observed')
+
+    def test_adoption_rejects_mutated_capture_identity_or_raw_bindings(self):
+        cases = ('start_ticks', 'pid', 'generation', 'mapped_elf_hash', 'capture_bytes',
+                 'runtime_raw', 'runtime_source', 'trace_replaced', 'applied_uri', 'prepared_projection')
+        for case in cases:
+            with self.subTest(offline_fixture=case), tempfile.TemporaryDirectory() as directory:
+                pair = self.prepared_pair(directory)
+                result = self.ready(pair)
+                worker = pair.ctx.workers['writer']
+                if case == 'start_ticks':
+                    worker['process']['process_start_ticks'] = 'other-lifetime'
+                elif case == 'pid':
+                    worker['process']['pid'] += 10
+                elif case == 'generation':
+                    worker['endpoint_event']['endpoint_generation'] = 'other-generation'
+                elif case == 'mapped_elf_hash':
+                    # Matching upstream tag/header must not mask changed captured ELF.
+                    worker['process']['loaded_libraries'][0]['sha256'] = 'f' * 64
+                elif case == 'capture_bytes':
+                    Path(worker['artifact']['raw_path']).write_text('{}')
+                elif case == 'runtime_raw':
+                    Path(result['raw_path']).write_text('{}\n')
+                elif case == 'runtime_source':
+                    result['execution']['source_after']['head'] = 'other-source'
+                elif case == 'trace_replaced':
+                    trace = Path(pair.ctx.trace_configs['writer'].output_file)
+                    replacement = trace.with_suffix('.replacement')
+                    replacement.write_bytes(trace.read_bytes())
+                    replacement.replace(trace)
+                elif case == 'applied_uri':
+                    worker['process']['selected_environment']['CYCLONEDDS_URI'] = '<other/>'
+                else:
+                    pair.ctx.profiles['writer']['non_tracing_sha256'] = 'f' * 64
+                summary = pair.ctx.collect(result)
+                adopted = summary['adopted_domain_settings']['roles']['writer']
+                self.assertEqual(adopted['status'], 'unknown', case)
+                self.assertIsNone(adopted['endpoint_binding'], case)
+                self.assertTrue(all(f['value'] is None for f in adopted['fields'].values()), case)
+                self.assertEqual(summary['intake'], [])
+
+    def test_source_drift_and_observation_category_absence_stay_unknown(self):
+        with tempfile.TemporaryDirectory() as directory:
+            pair = self.prepared_pair(directory)
+            result = self.ready(pair)
+            with patch.object(bridge, '_observer_sources', return_value={'offline_fixture': 'changed'}):
+                summary = pair.ctx.collect(result)
+            self.assertEqual(summary['adopted_domain_settings']['status'], 'unknown')
+            self.assertIn('observer_source_changed', summary['unknown_fields'])
+        with tempfile.TemporaryDirectory() as directory:
+            pair = self.prepared_pair(directory)
+            summary = pair.ctx.collect(pair.ready())
+            adopted = summary['adopted_domain_settings']['roles']['writer']
+            self.assertEqual(adopted['status'], 'unknown')
+            self.assertTrue(all(f['reason'] == 'missing' for f in adopted['fields'].values()))
+            # An optional config gap does not rewrite the SEDP oracle.
+            self.assertEqual(summary['verdict'], 'pass')
+            self.assertEqual(summary['intake'], [])
+
+    def test_fastdds_is_explicitly_unsupported_and_blackbox_cannot_enable_cyclone_trace(self):
+        with tempfile.TemporaryDirectory() as directory:
+            pair = PairFixture(directory, mode='blackbox',
+                               overrides={'rmw': FASTDDS_RMW, 'observe_adopted_config': True})
+            self.addCleanup(pair.close)
+            summary = pair.ctx.collect(pair.ready())
+            self.assertEqual(summary['adopted_domain_settings']['status'], 'unsupported')
+            self.assertEqual(summary['adopted_domain_settings']['fastdds']['execution'], 'not_run')
+            self.assertEqual(summary['adopted_domain_settings']['roles'], {})
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(ValueError, 'requires instrumentation'):
+                bridge.prepare(dict(config('blackbox'), observe_adopted_config=True), directory, {})
+        for value in ('true', 1, None):
+            with self.subTest(value=value), tempfile.TemporaryDirectory() as directory:
+                with self.assertRaisesRegex(ValueError, 'must be boolean'):
+                    bridge.prepare(dict(config(), observe_adopted_config=value), directory, {})
+
+    def test_offline_writable_raw_fd_boundary_disqualifies_adoption(self):
+        with tempfile.TemporaryDirectory() as directory:
+            pair = self.prepared_pair(directory)
+            result = self.ready(pair)
+            fd = Path(directory) / 'offline-fd' / '7'
+            fd.parent.mkdir()
+            fd.symlink_to(result['raw_path'])
+            iterdir, read_text = Path.iterdir, Path.read_text
+
+            def fixture_fds(path):
+                return iter([fd]) if str(path) == '/proc/self/fd' else iterdir(path)
+
+            def fixture_flags(path, *args, **kwargs):
+                if str(path) == '/proc/self/fdinfo/7':
+                    return 'flags:\t01\n'
+                return read_text(path, *args, **kwargs)
+
+            # Explicit proc read-boundary fixture. Never enumerates real /proc.
+            with patch.object(Path, 'iterdir', fixture_fds), patch.object(Path, 'read_text', fixture_flags):
+                summary = pair.ctx.collect(result)
+            self.assertTrue(any('still open for writing' in e for e in summary['unknown_fields']))
+            self.assertEqual(summary['adopted_domain_settings']['status'], 'unknown')
+            self.assertEqual(summary['intake'], [])
+
+    def test_vendor_fields_do_not_fall_back_to_presented_xml_or_make_a_config_oracle(self):
+        for token in ('1 s', None):
+            with self.subTest(offline_fixture=token), tempfile.TemporaryDirectory() as directory:
+                pair = self.prepared_pair(directory)
+                result = self.ready(pair)
+                for trace in pair.ctx.trace_configs.values():
+                    path = Path(trace.output_file)
+                    text = path.read_text().replace('2 s', token or 'invalid')
+                    path.write_text(text)
+                summary = pair.ctx.collect(result)
+                field = summary['adopted_domain_settings']['roles']['writer']['fields']['spdp_interval']
+                self.assertEqual(field['value'], 1000000000 if token else None)
+                self.assertEqual(field['status'], 'observed' if token else 'unknown')
+                self.assertEqual(summary['verdict'], 'pass')
+                self.assertEqual(summary['semantic_effect'], 'unknown')
+                self.assertEqual(summary['intake'], [])
+
+    def test_raw_changed_after_initial_close_check_or_trace_read_stays_unknown(self):
+        for victim in ('runtime', 'trace'):
+            with self.subTest(offline_fixture=victim), tempfile.TemporaryDirectory() as directory:
+                pair = self.prepared_pair(directory)
+                result = self.ready(pair)
+                original_read = bridge._read
+                changed = False
+
+                def racing_read(path):
+                    nonlocal changed
+                    data = original_read(path)
+                    trigger = (str(path) == result['raw_path'] if victim == 'runtime'
+                               else str(path) == pair.ctx.prepared['raw_path'])
+                    if trigger and not changed:
+                        changed = True
+                        target = (Path(result['raw_path']) if victim == 'runtime' else
+                                  Path(pair.ctx.trace_configs['writer'].output_file))
+                        target.write_bytes(b'OFFLINE changed after capture\n')
+                    return data
+
+                with patch.object(bridge, '_read', racing_read):
+                    summary = pair.ctx.collect(result)
+                self.assertTrue(changed)
+                self.assertEqual(summary['adopted_domain_settings']['roles']['writer']['status'], 'unknown')
+                self.assertEqual(summary['intake'], [])
+
+
 if __name__ == '__main__':
     unittest.main()
