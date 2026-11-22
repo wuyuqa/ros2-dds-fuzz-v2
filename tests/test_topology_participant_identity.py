@@ -131,8 +131,14 @@ def worker_guards(monkeypatch):
 
 
 @pytest.mark.parametrize('kind', ['writer', 'reader'])
+@pytest.mark.parametrize('root_form', ['nil', 'domain'])
 def test_worker_emits_ownership_with_current_envelope_without_changing_counts(
-        native, monkeypatch, worker_guards, snapshot_worker, kind):
+        native, monkeypatch, worker_guards, snapshot_worker, kind, root_form):
+    if root_form == 'domain':
+        native.lib.parents.update({10: 90, 90: 99, 99: 0})
+        native.lib.children[90] = [10]
+        native.lib.domains[90] = 196
+        native.lib.dds_get_participant = lambda handle: 0 if handle in (90, 99) else 10
     gid = '1' * 32 if kind == 'writer' else '2' * 32
     native.lib.guids[30] = gid
     native.lib.dds_get_matched_subscription_data = lambda *args: None
@@ -232,9 +238,10 @@ def test_changed_inventory_between_samples_is_unknown(native):
     original = native.lib.dds_get_participant
     def raced(handle):
         nonlocal calls
-        calls += 1
-        if calls == 2:
-            native.lib.guids[10] = 'd' * 32
+        if handle == 30:  # change between endpoint captures, not root self-checks
+            calls += 1
+            if calls == 2:
+                native.lib.guids[10] = 'd' * 32
         return original(handle)
     native.lib.dds_get_participant = raced
     receipt = native.sample_ownership(196, ENDPOINT, 'writer')
@@ -316,3 +323,117 @@ def test_equal_guid_prefix_cannot_replace_missing_ownership_api(native):
     receipt = native.sample_ownership(196, ENDPOINT, 'writer')
     assert receipt['complete'] is False
     assert 'participant_gid' not in receipt
+
+
+def test_pinned_0105_domain_parent_is_corroborated_without_becoming_participant(native):
+    # Pinned 0.10.5 dds_participant.c:152 attaches participant to domain.
+    # dds_entity.c:577/605/1243 exposes these relations through public APIs.
+    native.lib.parents.update({10: 90, 90: 99, 99: 0})
+    native.lib.children[90] = [10]
+    native.lib.domains[90] = 196
+    native.lib.dds_get_participant = lambda handle: 0 if handle in (90, 99) else 10
+    receipt = native.sample_ownership(196, ENDPOINT, 'writer')
+    assert receipt.get('reason') is None
+    assert receipt['complete'] is True, receipt
+    assert receipt['participant_handle'] == 10
+    assert receipt['participant_gid'] == PARTICIPANT
+    assert receipt['parent_chain'] == [30, 20, 10]
+    assert receipt['candidate_eligible'] is False
+    assert receipt['root_diagnostics'][0]['participant_parent_return'] == 90
+    assert receipt['root_diagnostics'][0]['parent_domain_id'] == 196
+    assert receipt['root_diagnostics'][0]['parent_participant_return'] == 0
+
+
+def test_failed_root_children_api_retains_actual_error_return(native):
+    native.lib.parents[10] = 90
+    native.lib.domains[90] = 196
+    native.lib.dds_get_participant = lambda handle: 0 if handle == 90 else 10
+    original = native.lib.dds_get_children
+    native.lib.dds_get_children = lambda handle, array, size: (
+        -9 if handle == 90 else original(handle, array, size))
+    receipt = native.sample_ownership(196, ENDPOINT, 'writer')
+    assert receipt['complete'] is False
+    assert 'participant_gid' not in receipt
+    assert receipt['reason'] == 'native_enumeration_error_or_capacity_exceeded'
+    root = receipt['root_diagnostics'][0]
+    assert root['participant_parent_return'] == 90
+    assert root['parent_domain_return_code'] == 0
+    assert root['parent_children_queries'] == [{'capacity': 512, 'return_code': -9}]
+
+
+@pytest.mark.parametrize('damage', [
+    'negative_parent', 'self_parent', 'endpoint_parent', 'publisher_parent',
+    'foreign_domain', 'domain_api_error', 'parent_has_participant',
+    'parent_participant_error', 'missing_reverse_child', 'parent_cycle',
+    'ancestor_cycle', 'ancestor_endpoint', 'ancestor_error', 'ancestry_capacity',
+    'participant_not_self', 'root_lookup_lost', 'duplicate_parent_children',
+    'root_changed_between_samples',
+])
+def test_unverified_positive_roots_remain_unknown_and_supporting(native, damage):
+    lib = native.lib
+    lib.parents.update({10: 90, 90: 99, 99: 0})
+    lib.children[90] = [10]
+    lib.domains[90] = 196
+    lib.dds_get_participant = lambda handle: 0 if handle in (90, 99) else 10
+    if damage == 'negative_parent': lib.parents[10] = -9
+    elif damage == 'self_parent': lib.parents[10] = 10
+    elif damage == 'endpoint_parent': lib.parents[10] = 30
+    elif damage == 'publisher_parent': lib.parents[10] = 20
+    elif damage == 'foreign_domain': lib.domains[90] = 197
+    elif damage == 'domain_api_error':
+        original = lib.dds_get_domainid
+        lib.dds_get_domainid = lambda handle, ptr: -9 if handle == 90 else original(handle, ptr)
+    elif damage in ('parent_has_participant', 'parent_participant_error'):
+        lib.dds_get_participant = lambda handle: (
+            (40 if damage == 'parent_has_participant' else -9) if handle == 90 else 10)
+    elif damage == 'missing_reverse_child': lib.children[90] = []
+    elif damage == 'duplicate_parent_children': lib.children[90] = [10, 10]
+    elif damage == 'parent_cycle': lib.parents[90] = 90
+    elif damage == 'ancestor_cycle': lib.parents[99] = 90
+    elif damage == 'ancestor_endpoint': lib.parents[99] = 30
+    elif damage == 'ancestor_error': lib.parents[99] = -9
+    elif damage == 'ancestry_capacity':
+        for handle in range(99, 99 + native.MAX_ENTITIES):
+            lib.parents[handle] = handle + 1
+    elif damage == 'participant_not_self':
+        lib.dds_get_participant = lambda handle: 40 if handle == 10 else 10
+    elif damage == 'root_lookup_lost':
+        calls = 0
+        original = lib.dds_lookup_participant
+        def lookup(*args):
+            nonlocal calls
+            calls += 1
+            return 0 if calls > 1 else original(*args)
+        lib.dds_lookup_participant = lookup
+    elif damage == 'root_changed_between_samples':
+        calls = 0
+        original = lib.dds_get_parent
+        def parent(handle):
+            nonlocal calls
+            if handle == 10:
+                calls += 1
+                if calls == 2:
+                    return 0  # both root forms valid individually, unstable together
+            return original(handle)
+        lib.dds_get_parent = parent
+    receipt = native.sample_ownership(196, ENDPOINT, 'reader')
+    assert receipt['complete'] is False
+    assert receipt['status'] == 'unknown'
+    assert receipt['candidate_eligible'] is False
+    assert 'participant_gid' not in receipt
+    assert receipt['reason'] == {
+        'duplicate_parent_children': 'native_handles_invalid_or_aliased',
+        'root_changed_between_samples': 'participant_ownership_inventory_changed',
+    }.get(damage, 'participant_root_invalid')
+    root = receipt['root_diagnostics'][0]
+    assert root['participant_parent_return'] == {
+        'negative_parent': -9, 'self_parent': 10, 'endpoint_parent': 30,
+        'publisher_parent': 20,
+    }.get(damage, 90)
+    if damage == 'domain_api_error':
+        assert root['parent_domain_return_code'] == -9
+        assert root['parent_domain_id'] is None
+    if damage == 'parent_participant_error':
+        assert root['parent_participant_return'] == -9
+    if damage == 'ancestor_error':
+        assert root['parent_ancestry'][-1] == [99, -9]

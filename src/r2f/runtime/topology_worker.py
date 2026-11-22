@@ -900,9 +900,53 @@ class CycloneMatchedPeerObserver:
                             or parent in chain or len(chain) >= self.MAX_ENTITIES):
                         raise ValueError("participant_parent_chain_invalid")
                     chain.append(parent)
-                if (local == participant or self.lib.dds_get_parent(participant) != 0
-                        or participant not in self._enumerate(self.lib.dds_lookup_participant, domain)):
+                # Keep each attempt, including failed API values, in the raw
+                # supporting receipt. Never promote these diagnostics to proof.
+                root = {"participant_handle": participant}
+                result.setdefault("root_diagnostics", []).append(root)
+                root["participant_parent_return"] = self.lib.dds_get_parent(participant)
+                root["participant_self_return"] = self.lib.dds_get_participant(participant)
+                root["lookup_participants"] = self._enumerate(self.lib.dds_lookup_participant, domain)
+                parent = root["participant_parent_return"]
+                if (local == participant or root["participant_self_return"] != participant
+                        or participant not in root["lookup_participants"]
+                        or type(parent) is not int or parent < 0):
                     raise ValueError("participant_root_invalid")
+                # dds.h documents NIL; pinned Cyclone 0.10.5 attaches the
+                # participant to its domain entity instead (dds_participant.c).
+                # Corroborate a positive parent using public relations, without
+                # treating the domain handle as a participant or wire identity.
+                if parent > 0:
+                    if parent in edges:
+                        raise ValueError("participant_root_invalid")
+                    parent_domain = self.c.c_uint32()
+                    rc = self.lib.dds_get_domainid(parent, self.c.byref(parent_domain))
+                    root["parent_domain_return_code"] = rc
+                    root["parent_domain_id"] = parent_domain.value if rc == 0 else None
+                    root["parent_participant_return"] = self.lib.dds_get_participant(parent)
+                    root["parent_children_queries"] = []
+                    def read_children(handle, array, capacity):
+                        value = self.lib.dds_get_children(handle, array, capacity)
+                        root["parent_children_queries"].append(
+                            {"capacity": capacity, "return_code": value})
+                        return value
+                    root["parent_children"] = self._enumerate(read_children, parent)
+                    if (rc != 0 or parent_domain.value != domain
+                            or root["parent_participant_return"] != 0
+                            or participant not in root["parent_children"]):
+                        raise ValueError("participant_root_invalid")
+                    # A domain may itself have a library parent. Bound and
+                    # retain the ancestry, rejecting loops and endpoint aliases.
+                    ancestors = [parent]
+                    root["parent_ancestry"] = []
+                    while ancestors[-1] != 0:
+                        ancestor = self.lib.dds_get_parent(ancestors[-1])
+                        root["parent_ancestry"].append([ancestors[-1], ancestor])
+                        if (type(ancestor) is not int or ancestor < 0
+                                or ancestor in edges or ancestor in ancestors
+                                or len(ancestors) >= self.MAX_ENTITIES):
+                            raise ValueError("participant_root_invalid")
+                        ancestors.append(ancestor)
                 identities = []
                 for handle, _ in inventory:
                     observed_domain = self.c.c_uint32()
@@ -932,7 +976,8 @@ class CycloneMatchedPeerObserver:
                     raise ValueError("participant_guid_invalid")
                 return {"local_handle": local, "participant_handle": participant,
                         "participant_gid": participant_gid, "parent_chain": chain,
-                        "entity_inventory": inventory, "entity_identities": identities}
+                        "entity_inventory": inventory, "entity_identities": identities,
+                        "participant_root_observation": root}
 
             first, second = capture(), capture()
             if first != second:
