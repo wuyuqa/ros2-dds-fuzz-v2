@@ -1393,12 +1393,11 @@ def run_pair(config: dict, output_dir: Path, *, topology_backend=None) -> dict:
                      observation_api='get_publishers_info_by_topic/get_subscriptions_info_by_topic',
                      binding_event_ref=binding_event_index)
             if active_mutation:
-                # A submitted mutation is not automatically a hit.  P01's zero
-                # delay is a legitimate boundary input but has no observable timing
-                # effect; record it as no_effect instead of fabricating hit=True.
+                # Required and exploratory late joiners use the same timing
+                # evidence.  Zero configured delay has no mutation effect even
+                # when worker startup produces a positive observed interval.
                 timing_hit = (c.get('mutation_kind') != 'late_joiner'
-                              or bool(c.get('fuzz_surfaces'))
-                              and (delay > 0.0 and actual_delay > 0))
+                              or (delay > 0.0 and actual_delay > 0))
                 receipt.update(applied=True, hit=timing_hit, effect_observed=timing_hit)
                 emit('mutation_effect' if timing_hit else 'mutation_no_effect',
                      effect_id='reader_created_after_writer', mutation_receipt=dict(receipt),
