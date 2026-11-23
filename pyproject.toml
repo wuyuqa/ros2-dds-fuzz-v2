@@ -14,3 +14,11 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 "r2f.modules.s1" = ["s1_coverage.json", "seed_lineage.json"]
+
+[project.optional-dependencies]
+test = ["pytest>=7.4,<10"]
+
+[tool.pytest.ini_options]
+minversion = "7.4"
+testpaths = ["tests"]
+pythonpath = ["src", "tests"]

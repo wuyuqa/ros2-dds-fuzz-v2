@@ -202,7 +202,11 @@ def test_carrier_exception_is_one_zero_actual_attempt(tmp_path):
     row = assert_accounting(result, False)
     assert len(calls) == 1 and returned == []
     runtime = json.loads(Path(row["runtime_result_path"]).read_text())
-    assert runtime["real_execution"] is False
+    # A raised carrier gives no evidence of actual execution. Keep this unknown
+    # while the confirmed accounting above remains attempted=1, actual=0.
+    assert runtime["real_execution"] is None
+    assert runtime["runner_exception"]["kind"] == "tool_failure"
+    assert runtime["runner_exception"]["error_type"] == "RuntimeError"
     assert runtime["runtime_status"] == "tool_error"
     assert "injected carrier failure" in runtime["reason"]
     assert row["oracle_verdict"] == "unknown"

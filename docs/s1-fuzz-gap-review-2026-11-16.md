@@ -1,3 +1,5 @@
+> **当前导航（2026-11-23）**：先读 [S1 接续入口](s1-current.md)。本页保留原规格/工程决定/历史截面；下文“当前”、旧 source、owner、GO 和待批准边界均按其记录日期解释。用户确认的 #6 完整 S1 规格覆盖旧 MAIN-only／公共 API 正常互操作执行限制，不能据此缩小范围；历史通过不迁移到新 source。修改前全文及 dirty 内容见 [逐字节归档](history/issue26-before-2026-11-23/INDEX.md)。
+
 # S1 fuzz 能力源码核查与收窄建议
 
 > **详细派工版（待批准）**：当前开工依据以 [S1 变异面扩展实施计划](/home/wuyuqa/ros2-dds-fuzz-v2/docs/s1-fuzz-expansion-implementation-plan-2026-11-16.md) 为准；本页保留源码核查／长期背景，不是另一个并行实施任务。
