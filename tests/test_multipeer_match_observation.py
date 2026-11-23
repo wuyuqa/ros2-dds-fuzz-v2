@@ -291,9 +291,35 @@ def test_negative_lists_are_snapshot_absence_not_disappearance_or_candidate():
     assert not value['candidate_eligible']
 
 
-def test_unverified_c_header_abi_cannot_reach_dlopen_or_native_calls(monkeypatch):
+def _offline_abi_inputs(monkeypatch, tmp_path):
+    """Temporary identity bytes, never a native library or installed C ABI proof."""
     from pathlib import Path
-    library=Path('/opt/ros/jazzy/lib/x86_64-linux-gnu/libddsc.so.0.10.5').resolve()
+    library = Path('/opt/ros/jazzy/lib/x86_64-linux-gnu/libddsc.so.0.10.5').resolve()
+    header = Path('/opt/ros/jazzy/include/CycloneDDS/dds/dds.h')
+    inputs = {}
+    for index, name in enumerate([str(library), *CycloneMatchedPeerObserver.VERIFIED_C_HEADERS]):
+        target = tmp_path / str(index)
+        target.write_bytes(('offline ABI identity fixture:' + name).encode())
+        inputs[name] = target
+    read_bytes, stat = Path.read_bytes, Path.stat
+    header_hashes = {name: hashlib.sha256(inputs[name].read_bytes()).hexdigest()
+                     for name in CycloneMatchedPeerObserver.VERIFIED_C_HEADERS}
+    library_hash = hashlib.sha256(inputs[str(library)].read_bytes()).hexdigest()
+    def fixture_bytes(path):
+        return read_bytes(inputs.get(str(path), path))
+    def fixture_stat(path, *args, **kwargs):
+        return stat(inputs.get(str(path), path), *args, **kwargs)
+    monkeypatch.setattr(Path, 'read_bytes', fixture_bytes)
+    monkeypatch.setattr(Path, 'stat', fixture_stat)
+    monkeypatch.setattr(CycloneMatchedPeerObserver, 'VERIFIED_C_HEADERS', header_hashes)
+    monkeypatch.setattr(CycloneMatchedPeerObserver, 'VERIFIED_C_ABIS', ((
+        header_hashes[str(header)], library_hash, (64, 0, 16, 32, 40, 48, 56)),))
+    return library
+
+
+def test_unverified_c_header_abi_cannot_reach_dlopen_or_native_calls(monkeypatch, tmp_path):
+    from pathlib import Path
+    library=_offline_abi_inputs(monkeypatch, tmp_path)
     original=Path.read_text
     import os
     stat=library.stat()
@@ -329,11 +355,11 @@ def test_fastdds_has_named_unknown_not_a_cyclone_peer_proof():
     assert fields['peer_observation_limitation']=='rmw_has_no_public_peer_observer'
 
 
-def _mapped_constructor(monkeypatch, *, extra_map='', changed_header=False, changed_library=False):
+def _mapped_constructor(monkeypatch, tmp_path, *, extra_map='', changed_header=False, changed_library=False):
     from pathlib import Path
     import os
     from types import SimpleNamespace
-    library=Path('/opt/ros/jazzy/lib/x86_64-linux-gnu/libddsc.so.0.10.5').resolve()
+    library=_offline_abi_inputs(monkeypatch, tmp_path)
     stat=library.stat()
     mapping=f'0-1 r-xp 00000000 {os.major(stat.st_dev):x}:{os.minor(stat.st_dev):x} {stat.st_ino} {library}\n'
     read_text,read_bytes=Path.read_text,Path.read_bytes
@@ -360,8 +386,8 @@ def _mapped_constructor(monkeypatch, *, extra_map='', changed_header=False, chan
     return calls
 
 
-def test_all_ctypes_fields_match_main_supplied_compiled_C_probe(monkeypatch):
-    calls=_mapped_constructor(monkeypatch)
+def test_ctypes_fixture_layout_matches_pinned_C_probe_metadata(monkeypatch, tmp_path):
+    calls=_mapped_constructor(monkeypatch, tmp_path)
     obj=CycloneMatchedPeerObserver()
     assert c.sizeof(obj.Endpoint)==64
     assert {name:getattr(obj.Endpoint,name).offset for name in (
@@ -373,11 +399,11 @@ def test_all_ctypes_fields_match_main_supplied_compiled_C_probe(monkeypatch):
 
 
 @pytest.mark.parametrize('fault',['second_library','second_instance','changed_header','changed_library'])
-def test_supported_layout_does_not_waive_loaded_instance_and_fingerprint_gate(monkeypatch,fault):
+def test_supported_layout_does_not_waive_loaded_instance_and_fingerprint_gate(monkeypatch, tmp_path, fault):
     extra_map=''
     if fault=='second_library':extra_map='2-3 r-xp 00000000 00:00 1 /elsewhere/libddsc.so.0.10.5\n'
     if fault=='second_instance':extra_map='SAME_MAPPING'
-    calls=_mapped_constructor(monkeypatch,extra_map=extra_map,changed_header=fault=='changed_header',
+    calls=_mapped_constructor(monkeypatch, tmp_path, extra_map=extra_map,changed_header=fault=='changed_header',
                               changed_library=fault=='changed_library')
     with pytest.raises(ValueError):CycloneMatchedPeerObserver()
     assert calls==[]
