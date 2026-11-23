@@ -158,6 +158,7 @@ class InitialFilterBinding(unittest.TestCase):
                 configs.append(config)
                 self.process = SimpleNamespace(pid=424242)
                 self.events = [{'event': 'endpoint_created', 'pid': 424242, 'pgid': 424242,
+                                'logical_id': config['logical_id'],
                                 'endpoint_gid': 'aa11', 'endpoint_generation': 'fake-generation',
                                 'process_start_ticks': 17, 'fixture': True, 'real_ros': False,
                                 'candidate_eligible': False}]
