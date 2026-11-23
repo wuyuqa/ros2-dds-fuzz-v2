@@ -641,7 +641,11 @@ def audit_topology_application(plan, input_layer_receipts, runtime):
         expected_source_phases = ["before_preflight", "after_preflight", "before_presteps"] + ["before_action:" + a["action_id"] for a in program["actions"]] + ["after_actions", "after_cleanup"]
         source_phases_complete = [e.get("phase") for e in sources] == expected_source_phases
         from .topology_pair import _execution_workers
-        workers = _execution_workers(events, path)
+        workers = _execution_workers(events, path, program)
+        from .participant_groups import enabled, project_lineage
+        grouped = enabled(program)
+        if grouped:
+            project_lineage(program, events, path)  # exact raw-bound opt-in only
         worker_provenance = bool(created_workers) and all(
             e.get("backend") == ROS_BACKEND and e.get("real_ros") is True
             and _worker_configuration_proven(e, program)
@@ -649,7 +653,8 @@ def audit_topology_application(plan, input_layer_receipts, runtime):
             and e.get("rmw_identifier") in {"rmw_cyclonedds_cpp", "rmw_fastrtps_cpp"}
             and all(e.get(k) is not None for k in ("pid", "process_start_ticks", "endpoint_generation", "endpoint_gid"))
             for e in created_workers) and all(
-                not w["unknowns"] and w["fresh_process"] and w["separate_context"]
+                not w["unknowns"] and w["fresh_process"]
+                and (w.get('group_context_owned') is True if grouped else w['separate_context'])
                 and w["returncode"] == 0 and w["closed"] for w in workers)
         ready = {"environment_ok": len(environments) == 1 and environments[0].get("ok") is True,
                  "locks_held": len(locks) == 1 and len(locks[0].get("locks", [])) == 3,

@@ -533,6 +533,31 @@ class _Projection:
                 if _gid(event[field]) != _gid(current["endpoint_gid"]):
                     raise ValueError("delivery_window_incarnation_mismatch:" + field)
 
+    def _group_termination(self, token, boundary):
+        """Consume the same closed group lineage as runtime and saved captures."""
+        from r2f.runtime.topology_pair import group_termination_rows
+        try:
+            return group_termination_rows(self.program, self.events, self.path, (token,), boundary)
+        except (ValueError, TypeError, KeyError, IndexError):
+            return None
+
+    def _termination_rows(self, token, boundary):
+        from r2f.runtime.participant_groups import enabled
+        if enabled(self.program):
+            proof = self._group_termination(token, boundary)
+            if proof is None:
+                raise ValueError("group_process_exit_or_endpoint_cleanup_unbound")
+            return list(proof)
+        exits = [e for e in self.events if e.get("event") == "topology_worker_exit"
+                 and e.get("logical_id") == token.get("logical_id")
+                 and e.get("generation") == token.get("generation")]
+        fields = ("generation", "endpoint_gid", "pid", "process_start_ticks", "endpoint_generation")
+        if (len(exits) != 1 or exits[0].get("returncode") != 0
+                or any(exits[0].get(k) != token.get(k) for k in fields)
+                or exits[0]["event_index"] <= boundary["event_index"]):
+            raise ValueError("no_sends_generation_end_not_identity_bound")
+        return [exits[0]]
+
     def no_sends(self, w, r, boundary):
         """Independently reconstruct the committed inventory, never trust a label.
 
@@ -579,6 +604,7 @@ class _Projection:
             raise ValueError("no_sends_action_inventory_mismatch")
         fields = ("logical_id", "generation", "endpoint_gid", "pid", "process_start_ticks", "endpoint_generation")
         chains = {}
+        terminations = []
         for token in (w, r):
             history = [e for e in prefix if e.get("logical_id") == token["logical_id"]
                        and e["event"] in {"endpoint_created", "endpoint_destroyed", "topology_endpoint_destroyed", "topology_generation_retired"}]
@@ -589,16 +615,15 @@ class _Projection:
             if any(any(row.get(k) != token[k] for k in fields if k != "endpoint_gid") for row in chain):
                 raise ValueError("no_sends_snapshot_identity_incomplete")
             self.chain_order([token, seal, *chain, claim, boundary])
-            exits = [e for e in self.events if e["event"] == "topology_worker_exit"
-                     and e.get("logical_id") == token["logical_id"]]
-            if (len(exits) != 1 or exits[0].get("returncode") != 0
-                    or any(exits[0].get(k) != token[k] for k in fields)
-                    or exits[0]["event_index"] <= boundary["event_index"]):
-                raise ValueError("no_sends_generation_end_not_identity_bound")
+            terminations.extend(self._termination_rows(token, boundary))
         ends = [e for e in self.events if e["event"] == "runtime_end"]
         if (len(ends) != 1 or ends[0].get("cleanup_complete") is not True
                 or ends[0].get("status") != "executed" or ends[0]["event_index"] <= boundary["event_index"]):
             raise ValueError("no_sends_complete_runtime_end_missing")
+        if ends[0] != self.events[-1]:
+            raise ValueError("no_sends_runtime_end_not_final")
+        for termination in terminations:
+            self.chain_order([boundary, termination, ends[0]])
         for e in self.events:
             if e["event"] in {"runtime_abort", "worker_error", "worker_command_error", "topology_backend_blocked"}:
                 raise ValueError("no_sends_raw_worker_or_runtime_error")
@@ -628,7 +653,9 @@ class _Projection:
         return "no_obligation", [w, r, seal, claim, *chains[w["logical_id"]], *chains[r["logical_id"]]], {
             "expected": [], "received": [], "missing": [], "applicability_kind": "not_applicable_no_sends",
             "no_sends_ref": self.ref(claim), "inventory_end_ref": self.ref(seal),
-            "inventory_sha256": digest, "generation_scope": expected["scope"]}
+            "inventory_sha256": digest, "generation_scope": expected["scope"],
+            "termination_refs": [self.ref(e) for _, e in sorted({e["event_index"]: e for e in terminations}.items())],
+            "termination_runtime_end_ref": self.ref(ends[0])}
 
     def _native_send_evidence(self, send, boundary):
         """Declared scopes must verify even when no reader received this send."""
@@ -748,12 +775,8 @@ class _Projection:
             if any(any(e.get(k) != token[k] for k in fields if k != "endpoint_gid") for e in chain):
                 raise ValueError("recreated_no_sends_snapshot_identity")
             self.chain_order([token,seal,*chain,claim,boundary])
-            exits = [e for e in self.events if e["event"] == "topology_worker_exit"
-                     and e.get("logical_id") == token["logical_id"] and e.get("generation") == token["generation"]]
-            if (len(exits) != 1 or exits[0].get("returncode") != 0 or any(exits[0].get(k) != token[k] for k in fields)):
-                raise ValueError("recreated_no_sends_cleanup_identity")
-            self.chain_order([boundary,exits[0]])
-            current_exits.append(exits[0])
+            exits = self._termination_rows(token, boundary)
+            current_exits.extend(exits)
         ends = [e for e in self.events if e["event"] == "runtime_end"]
         if len(ends) != 1 or ends[0].get("cleanup_complete") is not True or ends[0].get("status") != "executed":
             raise ValueError("recreated_no_sends_runtime_end")

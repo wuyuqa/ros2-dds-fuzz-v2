@@ -450,8 +450,14 @@ def _saved_topology_capture(row, runtime, submitted, scenario, source):
         return canonical_hash(a) == canonical_hash(b)
 
     metadata = runtime.get("execution_metadata", {})
+    # Only the sealed program can select the group contract, never metadata.
+    program = submitted["effective_input"]["final_input"].get("topology_program")
+    from r2f.runtime.participant_groups import enabled, project_lineage
+    group_control = enabled(program)
+    schema = "r2f.topology-execution-metadata/v2" if group_control else "r2f.topology-execution-metadata/v1"
     require(runtime.get("schema") == "r2f.topology-run-facts/v1"
-            and metadata.get("schema") == "r2f.topology-execution-metadata/v1",
+            and metadata.get("schema") == schema
+            and (group_control or "participant_groups" not in metadata),
             "unsupported_capture_schema")
     require(runtime.get("real_execution") is True and runtime.get("fixture") is False
             and runtime.get("runtime_status") == "completed"
@@ -577,7 +583,12 @@ def _saved_topology_capture(row, runtime, submitted, scenario, source):
             "namespace_cleanup_incomplete")
     workers = metadata.get("workers")
     require(isinstance(workers, list) and bool(workers), "workers_missing")
-    projected = _execution_workers(events, row["raw_path"])
+    if group_control:
+        lineage = project_lineage(program, events, row["raw_path"], config=request["config"])
+        require(same(metadata.get("participant_groups"), lineage), "group_raw_lineage_mismatch")
+        projected = lineage["workers"]
+    else:
+        projected = _execution_workers(events, row["raw_path"], program)
     bare = []
     for worker in workers:
         require(worker.get("pid_namespace") == scope
@@ -588,11 +599,16 @@ def _saved_topology_capture(row, runtime, submitted, scenario, source):
                 and type(worker.get("returncode")) is int and worker["returncode"] == 0
                 and worker.get("closed") is True and worker.get("real_ros") is True
                 and worker.get("fixture") is False and worker.get("fresh_process") is True
-                and worker.get("separate_context") is True and worker.get("unknowns") == []
+                and (worker.get("group_context_owned") is True if group_control
+                     else worker.get("separate_context") is True)
+                and worker.get("unknowns") == []
                 and same(worker.get("domain_id"), metadata["domain_id"])
                 and worker.get("rmw_identifier") == metadata["rmw"], "worker_identity_mismatch")
-        matches = [b for b in bindings if all(same(b.get(k), worker.get(k)) for k in
-                   ("logical_id", "generation", "endpoint_gid", "endpoint_generation", "pid", "process_start_ticks"))]
+        keys = ("logical_id", "generation", "endpoint_gid", "endpoint_generation", "pid", "process_start_ticks")
+        if group_control:
+            keys += ("group_id", "worker_instance_id", "context_instance_id")
+        matches = [b for b in bindings if all(same(b.get(k), worker.get(k)) for k in keys)
+                   and (not group_control or b.get("lineage_schema") == lineage["schema"])]
         require(len(matches) == 1 and same(matches[0].get("namespaces"), binding["outer"]["namespaces"]),
                 "worker_process_binding_mismatch")
         bare.append({k: v for k, v in worker.items() if k not in ("pid_namespace", "pid_interpretation")})

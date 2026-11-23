@@ -592,6 +592,24 @@ def _topology_worker_errors(config, result):
     PID/PGID values are compared only inside their recorded runtime scope. The
     isolated helper binds that scope; no inner identifier is treated as a host PID.
     """
+    from r2f.runtime.participant_groups import enabled, project_lineage
+    if enabled(config.get('topology_program')):
+        try:
+            expected = project_lineage(config['topology_program'], result.get('events') or [],
+                                       result.get('raw_path'), config=config)
+            metadata = result.get('execution_metadata') or {}
+            if (metadata.get('schema') != 'r2f.topology-execution-metadata/v2'
+                    or metadata.get('participant_groups') != expected
+                    or metadata.get('workers') != expected['workers']):
+                raise ValueError('group_metadata_raw_projection_mismatch')
+            if any(w['unknowns'] or not w['real_ros'] for w in expected['workers']):
+                raise ValueError('group_fixture_not_actual_worker')
+            return []
+        except (ValueError, KeyError, TypeError, IndexError) as exc:
+            return ['topology_group_lineage_invalid:' + str(exc)]
+    if ((result.get('execution_metadata') or {}).get('schema') == 'r2f.topology-execution-metadata/v2'
+            or 'participant_groups' in (result.get('execution_metadata') or {})):
+        return ['topology_group_metadata_without_sealed_opt_in']
     from r2f.runtime.endpoint_incarnation import endpoint_identity_at
 
     errors, seen, identities, gids = [], set(), set(), set()

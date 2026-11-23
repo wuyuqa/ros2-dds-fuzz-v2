@@ -487,11 +487,14 @@ def _audit_worker_cleanup(executor, node, context, emit, *, endpoint_creation_re
         except BaseException as exc:
             audit_errors.append(exc)
 
-    actions = [("executor", executor.shutdown)]
+    actions = [("executor", executor.shutdown)] if executor is not None else []
     take_bridge = getattr(executor, "take_bridge", None)
     if take_bridge is not None:
         actions.append(("message_info_bridge", take_bridge.close))
-    actions.extend((("node", node.destroy_node), ("context", context.shutdown)))
+    if node is not None:
+        actions.append(("node", node.destroy_node))
+    if context is not None:
+        actions.append(("context", context.shutdown))
     for name, action in actions:
         try:
             result = action()
@@ -917,6 +920,46 @@ class CycloneMatchedPeerObserver:
             evidence["kind"] = "topic"
         return evidence
 
+    def sample_roots(self, domain):
+        """Enumerate all roots, including auxiliaries; no configured-count fill."""
+        result = {'domain_id': domain, 'complete': False, 'roots': [],
+                  'count': None, 'provenance': self.provenance}
+        try:
+            handles = self._enumerate(self.lib.dds_lookup_participant, domain)
+            for name in ('dds_get_parent', 'dds_get_participant'):
+                fn = getattr(self.lib, name)
+                fn.argtypes = [self.c.c_int32]
+                fn.restype = self.c.c_int32
+            for h in handles:
+                row = {'participant_handle': h, 'participant_gid': self._guid(h)}
+                result['roots'].append(row)
+                observed = self.c.c_uint32()
+                rc = self.lib.dds_get_domainid(h, self.c.byref(observed))
+                parent = self.lib.dds_get_parent(h)
+                row.update(domain_return_code=rc, domain_id=observed.value if rc == 0 else None,
+                           participant_self_return=self.lib.dds_get_participant(h), parent=parent)
+                valid_parent = type(parent) is int and parent == 0
+                if type(parent) is int and parent > 0 and parent not in handles:
+                    pd = self.c.c_uint32()
+                    prc = self.lib.dds_get_domainid(parent, self.c.byref(pd))
+                    row.update(parent_domain_return_code=prc,
+                               parent_domain_id=pd.value if prc == 0 else None,
+                               parent_participant_return=self.lib.dds_get_participant(parent),
+                               parent_children=self._enumerate(self.lib.dds_get_children, parent))
+                    valid_parent = (prc == 0 and pd.value == domain
+                                    and row['parent_participant_return'] == 0 and h in row['parent_children'])
+                gid = row['participant_gid']
+                row['valid'] = (rc == 0 and observed.value == domain and row['participant_self_return'] == h
+                                and isinstance(gid, str) and re.fullmatch(r'[0-9a-f]{32}', gid) is not None
+                                and gid != '0' * 32 and valid_parent)
+            result['count'] = len(result['roots'])
+            result['complete'] = (bool(handles) and all(r['valid'] for r in result['roots'])
+                and len({r['participant_gid'] for r in result['roots']}) == len(handles)
+                and handles == self._enumerate(self.lib.dds_lookup_participant, domain))
+        except (ValueError, TypeError, OSError, AttributeError, RuntimeError) as exc:
+            result['reason'] = str(exc)
+        return result
+
     def sample_ownership(self, domain, gid, kind):
         """Supporting local ownership observation; never a sharing/control claim.
 
@@ -1240,7 +1283,28 @@ def _drain_filter_decisions(observer, emit, *, final=False):
     return stats
 
 
-def _worker_main(argv):
+def _drive_endpoint_session(session_factory):
+    """Preserve the legacy blocking entry; expose sessions only to the group owner."""
+    from functools import wraps
+    @wraps(session_factory)
+    def run(argv, group_owner=None):
+        if group_owner is not None:
+            return session_factory(argv, group_owner)
+        if len(argv) == 3 and 'participant_control' in json.loads(argv[1]):
+            return _group_worker_main(argv)
+        session = session_factory(argv)
+        try:
+            next(session)
+        except StopIteration as done:
+            return done.value
+        finally:
+            session.close()
+        raise TopologyBackendError('legacy_session_unexpected_yield')
+    return run
+
+
+@_drive_endpoint_session
+def _worker_main(argv, group_owner=None):
     """Child entry point: one endpoint generation, strict JSONL on stdout."""
     if len(argv) != 3:
         print(json.dumps({"event": "worker_error", "error": "usage: config_json role"}))
@@ -1266,42 +1330,53 @@ def _worker_main(argv):
     from rclpy.qos import QoSProfile
     from std_msgs.msg import String
 
-    context = Context()
-    rclpy.init(context=context)
-    rmw_identifier = rclpy.get_rmw_implementation_identifier()
-    if instrumentation is not None and rmw_identifier != "rmw_fastrtps_cpp":
-        raise TopologyBackendError("instrumented_worker_rmw_mismatch")
-    vendor_identity = (verify_vendor_mapping(instrumentation)
-                       if rmw_identifier == "rmw_fastrtps_cpp" else None)
-    try:
-        observed_domain_id = context.get_domain_id()
-    except (AttributeError, RuntimeError, TypeError):
-        observed_domain_id = None
-    start_ticks = int(Path("/proc/self/stat").read_text().rsplit(")", 1)[1].split()[19])
-    node_token = uuid.uuid4().hex
-    node_name = f"r2f_topo_{config['logical_id']}_g{config['generation']}_{node_token[:8]}"
-    node = Node(node_name, context=context, enable_rosout=False, start_parameter_services=False)
-    take_capability = {"status": "unavailable", "reason": "unsupported_rmw_identifier",
-                       "original_rclpy_dict_provided_gid": False}
-    if kind == "reader" and rmw_identifier == "rmw_fastrtps_cpp":
-        from .rcl_take_bridge import make_full_info_executor, BridgeUnavailable
+    if group_owner is None:
+        context = Context()
+        rclpy.init(context=context)
+        rmw_identifier = rclpy.get_rmw_implementation_identifier()
+        if instrumentation is not None and rmw_identifier != "rmw_fastrtps_cpp":
+            raise TopologyBackendError("instrumented_worker_rmw_mismatch")
+        vendor_identity = (verify_vendor_mapping(instrumentation)
+                           if rmw_identifier == "rmw_fastrtps_cpp" else None)
         try:
-            executor = make_full_info_executor(context=context, rmw_identifier=rmw_identifier,
-                **({"instrumentation": instrumentation} if instrumentation is not None else {}))
-            take_capability = {"status": "observed", "reason": None,
-                               "observation_basis": "single_take_owner_public_rcl_api",
-                               "original_rclpy_dict_provided_gid": False,
-                               "abi": executor.take_bridge.abi_receipt}
-        except BridgeUnavailable as exc:
-            if instrumentation is not None:
-                raise TopologyBackendError("instrumented_take_bridge_unavailable:" + str(exc)) from exc
-            # Explicitly keep the stock path if this pinned public ABI is absent.
-            # Its callback still has unavailable GID; no second consumer is added.
+            observed_domain_id = context.get_domain_id()
+        except (AttributeError, RuntimeError, TypeError):
+            observed_domain_id = None
+        start_ticks = int(Path("/proc/self/stat").read_text().rsplit(")", 1)[1].split()[19])
+        node_token = uuid.uuid4().hex
+        node_name = f"r2f_topo_{config['logical_id']}_g{config['generation']}_{node_token[:8]}"
+        node = Node(node_name, context=context, enable_rosout=False, start_parameter_services=False)
+        take_capability = {"status": "unavailable", "reason": "unsupported_rmw_identifier",
+                           "original_rclpy_dict_provided_gid": False}
+        if kind == "reader" and rmw_identifier == "rmw_fastrtps_cpp":
+            from .rcl_take_bridge import make_full_info_executor, BridgeUnavailable
+            try:
+                executor = make_full_info_executor(context=context, rmw_identifier=rmw_identifier,
+                    **({"instrumentation": instrumentation} if instrumentation is not None else {}))
+                take_capability = {"status": "observed", "reason": None,
+                                   "observation_basis": "single_take_owner_public_rcl_api",
+                                   "original_rclpy_dict_provided_gid": False,
+                                   "abi": executor.take_bridge.abi_receipt}
+            except BridgeUnavailable as exc:
+                if instrumentation is not None:
+                    raise TopologyBackendError("instrumented_take_bridge_unavailable:" + str(exc)) from exc
+                # Explicitly keep the stock path if this pinned public ABI is absent.
+                # Its callback still has unavailable GID; no second consumer is added.
+                executor = SingleThreadedExecutor(context=context)
+                take_capability = dict(exc.capability_receipt)
+        else:
             executor = SingleThreadedExecutor(context=context)
-            take_capability = dict(exc.capability_receipt)
+        executor.add_node(node)
     else:
-        executor = SingleThreadedExecutor(context=context)
-    executor.add_node(node)
+        context, node, executor = (group_owner[k] for k in ('context', 'node', 'executor'))
+        rmw_identifier = group_owner['rmw_identifier']
+        observed_domain_id = group_owner['observed_domain_id']
+        start_ticks = group_owner['process_start_ticks']
+        node_name = group_owner['node_name']
+        node_token = uuid.uuid4().hex
+        take_capability = {'status': 'unavailable', 'reason': 'cyclone_public_message_info',
+                           'original_rclpy_dict_provided_gid': False}
+        vendor_identity = None
     local_gid = None
     native_peer_observer = None
     filter_decision_observer = None
@@ -1325,6 +1400,9 @@ def _worker_main(argv):
             "observation_mode": config.get("observation_mode", "blackbox"),
             "topic": config["topic"], "message_type": config["type_name"],
         }
+        if group_owner is not None:
+            value.update({k: config[k] for k in ('group_id', 'worker_instance_id', 'context_instance_id')})
+            value['worker_role'] = role
         value.update(fields)
         print(json.dumps(value, sort_keys=True), flush=True)
         return value
@@ -1488,6 +1566,15 @@ def _worker_main(argv):
                 endpoint, rmw_identifier, config["domain_id"], local_gid,
                 instrumentation=instrumentation)
         emit("graph_snapshot", **initial_graph)
+        if group_owner is not None:
+            group_owner['emit']('endpoint_group_bound', endpoint={
+                'logical_id': config['logical_id'], 'generation': config['generation'],
+                'endpoint_generation': endpoint_generation, 'endpoint_gid': local_gid,
+                'worker_role': role})
+            group_owner['sessions'][config['logical_id']]['token'] = {
+                'logical_id': config['logical_id'], 'generation': config['generation'],
+                'endpoint_generation': endpoint_generation, 'endpoint_gid': local_gid,
+                'worker_role': role, 'kind': kind}
 
         pending_publish = None
         stdin_buffer = b""
@@ -1508,7 +1595,12 @@ def _worker_main(argv):
             if now - last_graph_ns > 500_000_000:
                 emit("graph_snapshot", **graph())
                 last_graph_ns = now
-            if sys.stdin is not None and selectors_for_stdin():
+            if group_owner is not None:
+                command = yield
+                if command is None:
+                    continue
+                queue.append(json.dumps(command).encode())
+            elif sys.stdin is not None and selectors_for_stdin():
                 chunk = os.read(sys.stdin.fileno(), 65536)
                 if not chunk:
                     break
@@ -1714,15 +1806,176 @@ def _worker_main(argv):
         # The same cleanup auditor owns executor -> take bridge -> node ->
         # context teardown, so secondary close/telemetry errors cannot mask
         # an original worker failure or skip remaining resource cleanup.
-        _audit_worker_cleanup(executor, node, context, emit,
-                              endpoint_creation_returned=endpoint_creation_returned,
-                              primary_error=primary_error, close_error=close_error)
+        if group_owner is None:
+            _audit_worker_cleanup(executor, node, context, emit,
+                                  endpoint_creation_returned=endpoint_creation_returned,
+                                  primary_error=primary_error, close_error=close_error)
+        else:
+            cleanup_error = None
+            if endpoint_creation_returned:
+                try:
+                    ok = (node.destroy_publisher(endpoint) if kind == 'writer'
+                          else node.destroy_subscription(endpoint))
+                    if ok is False:
+                        raise TopologyBackendError('group_endpoint_cleanup_returned_false')
+                    emit('endpoint_destroyed', endpoint_gid=local_gid, cleanup_status='closed')
+                except BaseException as exc:
+                    cleanup_error = exc
+                    emit('endpoint_destroyed', endpoint_gid=local_gid, cleanup_status='unknown', error=str(exc))
+            if (primary_error is None or isinstance(primary_error, GeneratorExit)) and (close_error is not None or cleanup_error is not None):
+                raise close_error or cleanup_error
+
     return 0
 
 
 def selectors_for_stdin():
     import select
     return select.select([sys.stdin], [], [], 0)[0]
+
+
+def _group_worker_main(argv):
+    """The existing endpoint implementation, cooperatively addressed by one owner."""
+    from .participant_groups import CONTROL, LINK_KEYS
+    config = json.loads(argv[1])
+    if (config.get('participant_control') != CONTROL
+            or config.get('rmw') != 'rmw_cyclonedds_cpp'
+            or config.get('observation_mode', 'blackbox') != 'blackbox'):
+        raise TopologyBackendError('group_worker_admission_invalid')
+    members = {e['logical_id']: e for e in config['group_members']}
+    if (not 1 <= len(members) <= 2 or len(members) != len(config['group_members'])
+            or any(e['participant_id'] != config['group_id'] for e in members.values())):
+        raise TopologyBackendError('group_worker_members_invalid')
+    import rclpy
+    from rclpy.context import Context
+    from rclpy.node import Node
+    from rclpy.executors import SingleThreadedExecutor
+    context = node = executor = None
+    sessions, errors = {}, []
+    ticks = int(Path('/proc/self/stat').read_text().rsplit(')', 1)[1].split()[19])
+    rmw = observed_domain = None
+    def emit(event, **fields):
+        row = {'event': event, 'pid': os.getpid(), 'pgid': os.getpgrp(),
+               'process_start_ticks': ticks, 'run_id': config['run_id'],
+               'domain_id': config['domain_id'], 'observed_domain_id': observed_domain,
+               'rmw_identifier': rmw, 'time_ns': time.time_ns(),
+               'monotonic_ns': time.monotonic_ns(),
+               'monotonic_clock_identity': _monotonic_clock_identity(),
+               **{k: config[k] for k in LINK_KEYS}, **fields}
+        print(json.dumps(row, sort_keys=True), flush=True)
+        return row
+    try:
+        context = Context()
+        rclpy.init(context=context)
+        rmw = rclpy.get_rmw_implementation_identifier()
+        observed_domain = context.get_domain_id()
+        if rmw != 'rmw_cyclonedds_cpp' or observed_domain != config['domain_id']:
+            raise TopologyBackendError('group_context_observed_rmw_domain_mismatch')
+        emit('group_context_created', api='rclpy.context.Context+rclpy.init', ros_context_created=True)
+        node_name = 'r2f_group_' + uuid.uuid4().hex[:16]
+        node = Node(node_name, context=context, enable_rosout=False, start_parameter_services=False)
+        executor = SingleThreadedExecutor(context=context)
+        executor.add_node(node)
+        owner = dict(context=context, node=node, executor=executor, rmw_identifier=rmw,
+                     observed_domain_id=observed_domain, process_start_ticks=ticks,
+                     node_name=node_name, emit=emit, sessions=sessions)
+        emit('group_worker_ready', node_name=node_name)
+        buffer = b''
+        serial = 0
+        while True:
+            executor.spin_once(timeout_sec=0.01)
+            if not selectors_for_stdin():
+                continue
+            chunk = os.read(sys.stdin.fileno(), 65536)
+            if not chunk:
+                break
+            buffer += chunk
+            while b'\n' in buffer:
+                line, buffer = buffer.split(b'\n', 1)
+                command = json.loads(line)
+                cid = command.get('command_id')
+                if type(cid) is not int or cid != serial + 1:
+                    raise TopologyBackendError('group_command_serial_invalid')
+                serial = cid
+                op = command.get('command')
+                if op == 'stop':
+                    emit('command_done', command='stop', command_id=cid)
+                    return 0
+                eid = command.get('logical_id')
+                if eid not in members or command.get('generation') != 1:
+                    raise TopologyBackendError('group_command_address_invalid')
+                if op == 'create_endpoint':
+                    if eid in sessions or command.get('worker_role') != members[eid]['role']:
+                        raise TopologyBackendError('group_create_reused_or_wrong_role')
+                    spec = members[eid]
+                    prepared = endpoint_expressibility(spec, config)
+                    cfg = {**config, **spec, 'generation': 1, 'qos': prepared['public_qos']}
+                    session = _worker_main([argv[0], json.dumps(cfg), command['worker_role']], owner)
+                    sessions[eid] = {'session': session}
+                    next(session)  # exactly this endpoint, never another declaration
+                    token = sessions[eid]['token']
+                    emit('command_done', command=op, command_id=cid, **token)
+                elif op == 'group_snapshot':
+                    token = sessions.get(eid, {}).get('token')
+                    if token is None or command.get('endpoint_generation') != token['endpoint_generation']:
+                        raise TopologyBackendError('group_snapshot_address_invalid')
+                    capture = _capture_group_ownership(config, sessions)
+                    emit('participant_group_snapshot', command_id=cid,
+                         supporting_diagnostic=True, candidate_eligible=False, **capture, **token)
+                    emit('command_done', command=op, command_id=cid, **token)
+                else:
+                    token = sessions.get(eid, {}).get('token')
+                    if (op not in {'snapshot', 'publish_batch'} or token is None
+                            or command.get('endpoint_generation') != token['endpoint_generation']):
+                        raise TopologyBackendError('group_command_target_or_operation_invalid')
+                    sessions[eid]['session'].send(command)
+    finally:
+        # Close every acquired session even if another close fails. The owner
+        # tears down executor/node/context once, including partial create errors.
+        for item in sessions.values():
+            try:
+                item['session'].close()
+            except BaseException as exc:
+                errors.append(type(exc).__name__ + ':' + str(exc))
+        primary = sys.exc_info()[1]
+        def audit_emit(event, **fields):
+            return emit(event, **fields)
+        try:
+            outcomes = _audit_worker_cleanup(executor, node, context, audit_emit,
+                                  endpoint_creation_returned=bool(sessions), primary_error=primary)
+            if any(v['status'] != 'returned' for v in outcomes.values()):
+                errors.append('group_owner_cleanup_unverified')
+        except BaseException as exc:
+            errors.append(type(exc).__name__ + ':' + str(exc))
+        emit('group_context_shutdown', closed=not errors, errors=errors)
+        if primary is None and errors:
+            raise TopologyBackendError('group_cleanup_failed:' + repr(errors))
+
+
+def _capture_group_ownership(config, sessions):
+    """Serial stable local roots plus double-sampled unchanged ownership v2."""
+    from .participant_groups import OBSERVATION_SCHEMA
+    result = {'schema': OBSERVATION_SCHEMA, 'requested_grouping': config['group_id'],
+              'qualification_scope': 'owned_Cyclone_process_local_roots_serial_not_atomic',
+              'ros_context_application_observed': True, 'endpoint_ownership_observed': False,
+              'local_root_inventory_complete': False, 'group_relation_observed': False,
+              'roots_before': None, 'roots_after': None, 'endpoints': [],
+              'actual_local_root_count': None, 'unknown_reasons': []}
+    try:
+        observer = CycloneMatchedPeerObserver()
+        result['roots_before'] = observer.sample_roots(config['domain_id'])
+        for item in sessions.values():
+            token = item['token']
+            samples = [observer.sample_ownership(config['domain_id'], token['endpoint_gid'], token['kind'])
+                       for _ in range(2)]
+            result['endpoints'].append({**token, 'samples': samples})
+        result['roots_after'] = observer.sample_roots(config['domain_id'])
+        from .participant_groups import qualify_observation
+        result.update(qualify_observation(result, [v['token'] for v in sessions.values()]))
+    except (ValueError, TypeError, OSError, AttributeError, RuntimeError) as exc:
+        result['capture_error'] = str(exc)
+    from .participant_groups import qualify_observation
+    result.update(qualify_observation(result, [v['token'] for v in sessions.values() if 'token' in v]))
+    return result
 
 
 def worker_main():  # console/module entry used by RosTopologyBackend
@@ -1792,6 +2045,11 @@ class _EndpointProcess:
             "worker_role": self.role, "worker_generation": self.config["generation"],
             "stderr_path": str(stderr_path),
         }
+        if 'participant_control' in self.config:
+            self.metadata = {k: self.metadata[k] for k in ('pid', 'pgid', 'fresh_process', 'stderr_path')}
+            self.metadata.update({k: self.config[k] for k in ('group_id', 'worker_instance_id', 'context_instance_id')})
+            self.metadata['process_start_ticks'] = int(Path(f'/proc/{self.process.pid}/stat').read_text().rsplit(')', 1)[1].split()[19])
+            self.metadata['separate_context'] = False
         self.emit("process_started", **self.metadata)
         return self.metadata
 
@@ -1805,11 +2063,25 @@ class _EndpointProcess:
                 raise ValueError("concurrent pgid mismatch")
             if event.get("pid") not in (None, self.process.pid):
                 raise ValueError("pid mismatch")
+            grouped = 'participant_control' in self.config
+            if grouped and (event.get('pid') != self.process.pid
+                            or event.get('pgid') != self.process.pid
+                            or event.get('process_start_ticks') != self.metadata.get('process_start_ticks')):
+                raise ValueError('group process identity mismatch')
             event["pid"] = self.process.pid
             event["pgid"] = self.process.pid
-            event["worker_role"] = self.role
-            event["worker_generation"] = self.config["generation"]
-            if kind == "endpoint_created":
+            if grouped:
+                if any(event.get(k) != self.config[k] for k in ('group_id', 'worker_instance_id', 'context_instance_id')):
+                    raise ValueError('group process/context identity mismatch')
+                eid = event.get('logical_id')
+                if eid is not None:
+                    specs = [e for e in self.config['group_members'] if e['logical_id'] == eid]
+                    if len(specs) != 1 or event.get('worker_role', event.get('role')) != specs[0]['role']:
+                        raise ValueError('group endpoint role mismatch')
+            else:
+                event["worker_role"] = self.role
+                event["worker_generation"] = self.config["generation"]
+            if kind == "endpoint_created" and not grouped:
                 self.metadata.update({k: deepcopy(event.get(k)) for k in
                     ("logical_id", "generation", "endpoint_gid", "endpoint_generation", "process_start_ticks",
                      "rmw_identifier", "domain_id", "observed_domain_id", "domain_observation_source")})
@@ -1841,20 +2113,32 @@ class _EndpointProcess:
         self.command_serial += 1
         command_id = self.command_serial
         payload = {"command": command, "command_id": command_id, **fields}
+        if 'participant_control' in self.config:
+            self.emit('group_command_requested', command=command, command_id=command_id,
+                      **{k: self.metadata[k] for k in ('pid', 'pgid', 'process_start_ticks', 'group_id', 'worker_instance_id', 'context_instance_id')},
+                      **fields)
         if command in {"prepare_concurrent_publish", "release_concurrent_publish"}:
-            created = next((e for e in reversed(self.events) if e.get("event") == "endpoint_created"), {})
+            created = next((e for e in reversed(self.events) if e.get("event") == "endpoint_created"
+                            and all(e.get(k) == fields[k] for k in ('logical_id', 'generation', 'endpoint_generation') if k in fields)), {})
             self.emit("concurrent_publish_requested" if command == "prepare_concurrent_publish" else "concurrent_publish_release",
                       concurrency_group=fields["concurrency_group"],
                       command_id=command_id if command == "prepare_concurrent_publish" else fields["prepared_command_id"],
                       **{k: created.get(k) for k in ("logical_id", "generation", "endpoint_gid", "pid", "pgid", "process_start_ticks", "endpoint_generation")})
         if command == "snapshot":
-            created = next((e for e in reversed(self.events) if e.get("event") == "endpoint_created"), {})
+            created = next((e for e in reversed(self.events) if e.get("event") == "endpoint_created"
+                            and all(e.get(k) == fields[k] for k in ('logical_id', 'generation', 'endpoint_generation') if k in fields)), {})
+            identity = {k: (self.metadata or {}).get(k, created.get(k)) for k in
+                        ("logical_id", "generation", "endpoint_gid", "pid", "process_start_ticks", "endpoint_generation")}
+            if 'participant_control' in self.config:
+                identity.update({k: self.metadata[k] for k in
+                                 ('pgid', 'group_id', 'worker_instance_id', 'context_instance_id')})
             self.emit("topology_snapshot_requested", command="snapshot", command_id=command_id,
-                      **{k: (self.metadata or {}).get(k, created.get(k)) for k in ("logical_id", "generation", "endpoint_gid", "pid", "process_start_ticks", "endpoint_generation")})
+                      **identity)
         data = (json.dumps(payload) + "\n").encode()
         audit = command == "assert_liveliness"
         if audit:
-            created = next((e for e in reversed(self.events) if e.get("event") == "endpoint_created"), {})
+            created = next((e for e in reversed(self.events) if e.get("event") == "endpoint_created"
+                            and all(e.get(k) == fields[k] for k in ('logical_id', 'generation', 'endpoint_generation') if k in fields)), {})
             identity = {k: created.get(k) for k in ("logical_id", "generation", "endpoint_gid", "pid", "process_start_ticks", "endpoint_generation", "run_id")}
             identity["worker_role"] = self.role
             identity["worker_generation"] = self.config.get("generation")
@@ -2361,6 +2645,8 @@ class RosTopologyBackend:
         self.closed = False
         self.netem_isolation = None
         self.instrumentation_reference = None
+        self.group_program = None
+        self.groups = {}
 
     def set_event_sink(self, sink):
         self.event_sink = sink
@@ -2381,6 +2667,12 @@ class RosTopologyBackend:
         cfg = dict(self.config)
         cfg.update(config or {})
         cfg.setdefault("source_repo", str(REPO))
+        from .participant_groups import enabled, validate_control
+        try:
+            validate_control(program, cfg)
+        except (ValueError, KeyError, TypeError) as exc:
+            raise TopologyUnsupported('participant_control_scope', str(exc)) from exc
+        self.group_program = deepcopy(program) if enabled(program) else None
         # Hard gate: this backend must refuse to touch a live domain unless an
         # explicit owner GO was supplied.  Direct API use cannot bypass it.
         if cfg.get("live_execution_go") is not True:
@@ -2467,6 +2759,10 @@ class RosTopologyBackend:
             raise TopologyBackendError("backend_closed")
         if self.environment is None:
             raise TopologyBackendError("backend_not_prepared")
+        if self.group_program is not None:
+            order = [a['endpoint_id'] for a in self.group_program['actions'] if a['op'] == 'create']
+            if len(self.handles) >= len(order) or spec.get('logical_id') != order[len(self.handles)]:
+                raise TopologyBackendError('group_endpoint_create_order')
         prepared = endpoint_expressibility(spec, self.config)
         endpoint_dir = (self.output_dir / "endpoints"
                         / re.sub(r"[^A-Za-z0-9_.-]", "_", spec["logical_id"])
@@ -2481,6 +2777,15 @@ class RosTopologyBackend:
             "startup_timeout_sec": float(self.config.get("startup_timeout_sec", 10.0)),
         }
 
+        if self.group_program is not None:
+            declared = [e for e in self.group_program['endpoints'] if e == spec]
+            if len(declared) != 1 or type(generation) is not int or generation != 1 or spec['logical_id'] in self.handles:
+                raise TopologyBackendError('group_endpoint_not_exact_admitted_spec')
+            label = spec['participant_id']
+            worker_config.update(participant_control=self.group_program['participant_control'],
+                group_id=label,
+                group_members=[e for e in self.group_program['endpoints'] if e['participant_id'] == label],
+                worker_instance_id=uuid.uuid4().hex, context_instance_id=uuid.uuid4().hex)
         if self.instrumentation_reference is not None:
             worker_config["observation_mode"] = "instrumentation"
             worker_config["fastdds_peer_instrumentation"] = {
@@ -2491,25 +2796,46 @@ class RosTopologyBackend:
 
         def sink(event, **fields):
             value = dict(fields)
-            value.setdefault("topology_logical_id", spec["logical_id"])
-            value.setdefault("topology_generation", generation)
-            value.setdefault("topology_worker_role", worker_role)
+            if self.group_program is None:
+                value.setdefault("topology_logical_id", spec["logical_id"])
+                value.setdefault("topology_generation", generation)
+                value.setdefault("topology_worker_role", worker_role)
+            elif value.get('logical_id') is not None:
+                value.setdefault('topology_logical_id', value['logical_id'])
+                value.setdefault('topology_generation', value['generation'])
+                value.setdefault('topology_worker_role', value.get('worker_role', value.get('role')))
             value.setdefault("backend", self.backend_name)
             value.setdefault("real_ros", True)
             if self.event_sink is not None:
                 self.event_sink(event, **value)
 
-        process = _EndpointProcess(worker_config, self.environment, endpoint_dir,
-                                   worker_role, sink)
-        self.processes.append(process)
+        grouped = self.group_program is not None
+        process = self.groups.get(spec['participant_id']) if grouped else None
+        fresh = process is None
+        if fresh:
+            process = _EndpointProcess(worker_config, self.environment, endpoint_dir,
+                                       worker_role, sink)
+            self.processes.append(process)
+            if grouped:
+                self.groups[spec['participant_id']] = process
         try:
-            process.start()
+            if fresh:
+                process.start()
             pid = process.process.pid
-            process.wait(lambda: process.has("endpoint_created", pid=pid),
+            if grouped:
+                process.wait(lambda: process.has('group_worker_ready', pid=pid),
+                             worker_config['startup_timeout_sec'], 'group_ready')
+                cid = process.command('create_endpoint', logical_id=spec['logical_id'],
+                                      generation=generation, worker_role=worker_role)
+                process.wait(lambda: process.has('command_done', command_id=cid,
+                              logical_id=spec['logical_id'], generation=generation),
+                             worker_config['startup_timeout_sec'], 'group_endpoint_create_ack')
+            process.wait(lambda: process.has("endpoint_created", pid=pid, logical_id=spec['logical_id']),
                          worker_config["startup_timeout_sec"],
                          "topology_endpoint_created:" + spec["logical_id"])
             row = [e for e in process.events
-                   if e.get("event") == "endpoint_created" and e.get("pid") == pid][-1]
+                   if e.get("event") == "endpoint_created" and e.get("pid") == pid
+                   and e.get('logical_id') == spec['logical_id']][-1]
             gid = row.get("endpoint_gid")
             if not isinstance(gid, str) or not re.fullmatch(r"[0-9a-fA-F]{2,}", gid):
                 raise TopologyBackendError("endpoint_created_without_real_guid")
@@ -2541,6 +2867,14 @@ class RosTopologyBackend:
                 "process": process, "alive": True, "real_ros": True,
                 "created_monotonic_ns": row.get("created_monotonic_ns"),
             }
+            if grouped:
+                from .participant_groups import LINK_KEYS
+                handle.update({k: row.get(k) for k in LINK_KEYS})
+                if any(handle[k] != process.config[k] for k in LINK_KEYS):
+                    raise TopologyBackendError('group_endpoint_binding_mismatch')
+                ack = [e for e in process.events if e.get('event') == 'command_done' and e.get('command_id') == cid]
+                if len(ack) != 1 or any(ack[0].get(k) != handle[k] for k in ('logical_id','generation','endpoint_generation','endpoint_gid')):
+                    raise TopologyBackendError('group_create_ack_identity_mismatch')
             if prepared["initial_content_filter"] is not None:
                 # Only child API results can populate this observation.
                 handle["initial_content_filter"] = deepcopy(row.get("initial_content_filter"))
@@ -2554,9 +2888,14 @@ class RosTopologyBackend:
             return handle
         except Exception:
             process.close()
+            for handle in self.handles.values():
+                if handle.get('process') is process:
+                    handle['alive'] = False
             raise
 
     def destroy_endpoint(self, handle):
+        if self.group_program is not None:
+            raise TopologyUnsupported('participant_control_scope', 'authored destroy not supported; final close owns group')
         process = handle.get("process")
         receipt = process.close() if process is not None else {"closed": False}
         handle["alive"] = False
@@ -2575,7 +2914,9 @@ class RosTopologyBackend:
 
     def _batch(self, handle, command, **fields):
         process = handle["process"]
-        command_id = process.command(command, **fields)
+        address = ({k: handle[k] for k in ('logical_id', 'generation', 'endpoint_generation')}
+                   if self.group_program is not None else {})
+        command_id = process.command(command, **address, **fields)
         try:
             process.wait(lambda: process.has("command_done", command_id=command_id),
                          float(self.config.get("publish_timeout_sec", 10.0)),
@@ -2585,6 +2926,10 @@ class RosTopologyBackend:
                 raise TopologyBackendTimeout(
                     str(exc), command_id=command_id, endpoint_id=handle["logical_id"]) from exc
             raise
+        if self.group_program is not None:
+            acks = [e for e in process.events if e.get('event') == 'command_done' and e.get('command_id') == command_id]
+            if len(acks) != 1 or any(acks[0].get(k) != handle[k] for k in ('logical_id', 'generation', 'endpoint_generation')):
+                raise TopologyBackendError('group_command_ack_target_mismatch')
         errors = [e for e in process.events
                   if e.get("event") == "worker_command_error" and e.get("command_id") == command_id]
         if errors:
@@ -2695,6 +3040,13 @@ class RosTopologyBackend:
         if interval_sec < 0 or interval_sec > MAX_INTERVAL_SEC:
             raise TopologyUnsupported("burst_interval_not_expressible",
                                       "interval outside bounded worker input")
+        if self.group_program is not None:
+            expected = {e['logical_id'] for e in self.group_program['endpoints']}
+            if set(self.handles) != expected or any(not h.get('alive') for h in self.handles.values()):
+                raise TopologyBackendError('group_publish_requires_both_created_endpoints')
+            for process in self.groups.values():
+                member = next(h for h in self.handles.values() if h['process'] is process)
+                self._batch(member, 'group_snapshot')
         command_id = self._batch(handle, "publish_batch", sequences=list(sequences),
                                  interval_sec=float(interval_sec), phase=phase,
                                  payload=payload, repeat_string_data=repeat_string_data)
@@ -2719,7 +3071,9 @@ class RosTopologyBackend:
         snapshots = {}
         for logical_id, handle in (handles.items() if isinstance(handles, dict) else handles):
             process = handle["process"]
-            command_id = process.command("snapshot")
+            address = ({k: handle[k] for k in ('logical_id', 'generation', 'endpoint_generation')}
+                       if self.group_program is not None else {})
+            command_id = process.command("snapshot", **address)
             try:
                 process.wait(lambda: process.has("command_done", command_id=command_id),
                              float(self.config.get("snapshot_timeout_sec", 5.0)),
@@ -2729,6 +3083,10 @@ class RosTopologyBackend:
                     raise TopologyBackendTimeout(str(exc), command_id=command_id,
                                                  endpoint_id=logical_id) from exc
                 raise
+            if self.group_program is not None:
+                acks = [e for e in process.events if e.get('event') == 'command_done' and e.get('command_id') == command_id]
+                if len(acks) != 1 or any(acks[0].get(k) != handle[k] for k in ('logical_id','generation','endpoint_generation')):
+                    raise TopologyBackendError('group_snapshot_ack_target_mismatch')
             matches = [e for e in process.events if e.get("event") == "match_snapshot"
                        and e.get("command_id") == command_id]
             graphs = [e for e in process.events if e.get("event") == "graph_snapshot"
@@ -2739,6 +3097,10 @@ class RosTopologyBackend:
                 "command_id": command_id,
                 "complete": bool(matches and graphs),
             }
+        if self.group_program is not None and len(self.handles) == 2:
+            for process in self.groups.values():
+                handle = next(h for h in self.handles.values() if h['process'] is process)
+                self._batch(handle, 'group_snapshot')
         return {"snapshots": snapshots, "command_id": None,
                 "complete": all(v["complete"] for v in snapshots.values())}
 
@@ -2759,8 +3121,21 @@ class RosTopologyBackend:
         workers, errors = [], []
         for process in self.processes:
             try:
+                if (self.group_program is not None and len(self.handles) == 2
+                        and process.process is not None and process.process.poll() is None):
+                    member = next((h for h in self.handles.values() if h.get('process') is process and h.get('alive')), None)
+                    if member is not None:
+                        try:
+                            self._batch(member, 'group_snapshot')
+                        except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+                            errors.append({'error': type(exc).__name__, 'detail': 'final_group_capture:' + str(exc)})
                 receipt = process.close()
                 workers.append(receipt)
+                if self.group_program is not None:
+                    for h in self.handles.values():
+                        if h.get('process') is process and receipt.get('closed'):
+                            h['alive'] = False
+                    continue
                 handle = next((h for h in self.handles.values() if h.get("process") is process and h.get("alive")), None)
                 if handle is not None and receipt.get("closed"):
                     handle["alive"] = False

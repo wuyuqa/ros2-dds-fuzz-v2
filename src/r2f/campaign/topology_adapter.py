@@ -206,6 +206,15 @@ class _Audit:
                         or any(e.get("fixture") is True or e.get("offline_fake") is True
                                or e.get("backend") not in (None, "ros2_public_api") for e in self.events))
         self.specs = {e["logical_id"]: e for e in self.program["endpoints"]}
+        from r2f.runtime.participant_groups import enabled, project_lineage
+        self.group_lineage = None
+        if enabled(self.program):
+            self.group_lineage = project_lineage(self.program, self.events, self.path, config=config)
+            _require(runtime.get('execution_metadata', {}).get('participant_groups') == self.group_lineage,
+                     'group_lineage_metadata_mismatch')
+        elif (runtime.get('execution_metadata', {}).get('schema') == 'r2f.topology-execution-metadata/v2'
+              or 'participant_groups' in runtime.get('execution_metadata', {})):
+            _require(False, 'group_metadata_without_sealed_opt_in')
         self.tokens = {}
         self.action_receipts = []
 
@@ -1387,6 +1396,11 @@ def facts_from_events(events, runtime, config, *, capture_source=None):
             facts["guard_rejected_by"] = "harness"
             facts["guard_refs"] = [a.ref(e) for e in guard]
         facts["endpoint_lineage"] = a.identity()
+        if a.group_lineage is not None:
+            facts['participant_group_observations'] = snapshot(a.group_lineage['observations'])
+            facts['participant_group_relation'] = {
+                'observed': a.group_lineage['group_relation_observed'],
+                'supporting_diagnostic': True, 'candidate_eligible': False}
         facts["endpoint_identity_complete"] = True
         facts["action_receipts"] = a.actions()
         groups = sorted({x["params"]["concurrency_group"] for x in a.program["actions"]

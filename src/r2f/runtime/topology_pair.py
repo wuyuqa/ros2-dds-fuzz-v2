@@ -96,6 +96,8 @@ def build_input_receipts(program, config, *, mutation_receipts=None):
                    "publish_timeout_sec", "snapshot_timeout_sec")
     return {
         "schema": INPUT_SCHEMA,
+        **({"participant_control": deepcopy(program["participant_control"])}
+           if "participant_control" in program else {}),
         "program_sha256": sha256_json(program),
         "validation_status": validation.get("status"),
         "guard_disposition": validation.get("guard_disposition"),
@@ -2033,12 +2035,52 @@ def topology_capabilities(backend=None):
     }
 
 
-def _execution_workers(events, raw_path):
+def group_termination_rows(program, events, raw_path, tokens, boundary):
+    """Audit group shutdown once, preserving actual process and endpoint rows.
+
+    This consumes a closed capture, not a lifecycle transition. Group processes
+    have no endpoint identity; each endpoint keeps its own cleanup receipt.
+    """
+    from .participant_groups import project_lineage
+    lineage = project_lineage(program, events, raw_path)
+    selected = {}
+    fields = ("logical_id", "generation", "endpoint_generation", "endpoint_gid",
+              "group_id", "worker_instance_id", "context_instance_id", "pid", "pgid", "process_start_ticks")
+    group_ids = set()
+    for token in tokens:
+        workers = [w for w in lineage["workers"] if all(w.get(k) == token.get(k) for k in fields)]
+        if len(workers) != 1:
+            raise ValueError("group_termination_endpoint_identity")
+        group_ids.add(workers[0]["group_id"])
+    # Include every cleanup in the group, even when a caller selected one endpoint.
+    for worker in lineage["workers"]:
+        if worker["group_id"] not in group_ids:
+            continue
+        for ref in worker["cleanup_raw_refs"] + worker["exit_raw_refs"]:
+            selected[ref["event_index"]] = events[ref["event_index"]]
+    for context in lineage["contexts"]:
+        if context["group_id"] in group_ids:
+            ref = context["shutdown_raw_ref"]
+            selected[ref["event_index"]] = events[ref["event_index"]]
+    rows = [selected[i] for i in sorted(selected)]
+    previous = boundary
+    for row in rows:
+        if (row["event_index"] <= previous["event_index"]
+                or row["monotonic_ns"] < previous["monotonic_ns"]):
+            raise ValueError("group_termination_after_boundary_chronology")
+        previous = row
+    return rows
+
+
+def _execution_workers(events, raw_path, program=None, *, config=None):
     """Project all captured endpoint generations; never fill actuals from cfg.
 
     Raw refs are offsets into the enclosing result's SHA-bound raw file. No
     self-referential raw hash is embedded in that file's metadata event.
     """
+    from .participant_groups import enabled, lineage_metadata
+    if enabled(program):
+        return lineage_metadata(program, events, raw_path, config=config)['workers']
     def ref(event):
         return {"raw_path": str(raw_path), "event_index": event["event_index"]}
 
@@ -2326,6 +2368,12 @@ def run_topology(program, config, output_dir, *, backend=None):
         result["reason"] = "blocked:input_mutation_failed:" + type(exc).__name__ + ":" + str(exc)
         return result
     validation = model.validate_program(effective_program)
+    from .participant_groups import validate_control
+    try:
+        validate_control(effective_program, cfg)
+    except (ValueError, TypeError, KeyError) as exc:
+        result['reason'] = 'blocked:participant_control_scope:' + str(exc)
+        return result
     try:
         result["input_receipts"] = build_input_receipts(
             effective_program, cfg, mutation_receipts=mutation_receipts)
@@ -3799,14 +3847,18 @@ def run_topology(program, config, output_dir, *, backend=None):
                 validator = _delivery_recreated_no_sends_basis if regenerated else _delivery_no_sends_basis
                 basis = validator(writer, reader, effective_program, events, chains)
                 valid = cleanup_complete and basis is not None and all(claim.get(k) == v for k, v in basis.items())
-                for token in (writer, reader):
-                    exits = [e for e in events if e.get("event") == "topology_worker_exit"
-                             and e.get("logical_id") == token["logical_id"]
-                             and (not regenerated or e.get("generation") == token["generation"])]
-                    valid = valid and len(exits) == 1 and exits[0].get("returncode") == 0 and all(
-                        exits[0].get(k) == token[k] for k in
-                        ("generation", "endpoint_gid", "pid", "process_start_ticks", "endpoint_generation"))
-                    valid = valid and exits[0]["event_index"] > claim["event_index"]
+                from .participant_groups import enabled as group_control_enabled
+                if group_control_enabled(effective_program):
+                    group_termination_rows(effective_program, events, raw_path, (writer, reader), claim)
+                else:
+                    for token in (writer, reader):
+                        exits = [e for e in events if e.get("event") == "topology_worker_exit"
+                                 and e.get("logical_id") == token["logical_id"]
+                                 and (not regenerated or e.get("generation") == token["generation"])]
+                        valid = valid and len(exits) == 1 and exits[0].get("returncode") == 0 and all(
+                            exits[0].get(k) == token[k] for k in
+                            ("generation", "endpoint_gid", "pid", "process_start_ticks", "endpoint_generation"))
+                        valid = valid and exits[0]["event_index"] > claim["event_index"]
             except (KeyError, IndexError, TypeError, ValueError):
                 valid = False
             if not valid:
@@ -3833,12 +3885,19 @@ def run_topology(program, config, output_dir, *, backend=None):
             "program_sha256": result["input_receipts"]["program_sha256"] if result["input_receipts"] else None,
             "processes_started": len(getattr(backend, "processes", []) or []),
         }
-        workers = _execution_workers(events, raw_path)
+        workers = _execution_workers(events, raw_path, effective_program, config=cfg)
+        from .participant_groups import enabled, lineage_metadata
+        group_lineage = (lineage_metadata(effective_program, events, raw_path, config=cfg)
+                         if enabled(effective_program) else None)
+        if group_lineage is not None:
+            result['observation_receipts'].extend(deepcopy(group_lineage['observations']))
         actual_workers = [w for w in workers if w["real_ros"]]
         actual_rmws = {w["rmw_identifier"] for w in actual_workers if w["rmw_identifier"] is not None}
         actual_domains = {w["domain_id"] for w in actual_workers if w["domain_id"] is not None}
         result["execution_metadata"] = {
-            "schema": "r2f.topology-execution-metadata/v1",
+            "schema": ("r2f.topology-execution-metadata/v2" if group_lineage is not None
+                       else "r2f.topology-execution-metadata/v1"),
+            **({'participant_groups': group_lineage} if group_lineage is not None else {}),
             "backend": backend.backend_name,
             "real_ros": bool(result["real_execution"]),
             "source_identity": deepcopy(result["environment"].get("source")) if backend.real_ros else None,
