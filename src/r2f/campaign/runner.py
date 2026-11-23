@@ -33,6 +33,28 @@ HOST_RUNTIME = 'host'
 ISOLATED_RUNTIME = 'isolated_netns'
 RUNTIME_BOUNDARIES = (HOST_RUNTIME, ISOLATED_RUNTIME)
 
+_OBSERVATION_UNSET = object()
+_OBSERVATION_CELL = "rmw_cyclonedds_cpp.baseline.0"
+
+
+def _observation_selection(observation, target_id):
+    """CP1 declaration only; not adoption, effect or replay evidence."""
+    if observation is _OBSERVATION_UNSET:
+        return None
+    keys = {"observation_mode", "observe_adopted_config"}
+    if not isinstance(observation, dict) or set(observation) != keys:
+        raise ValueError("observation must contain exactly observation_mode and observe_adopted_config")
+    mode, adopted = observation["observation_mode"], observation["observe_adopted_config"]
+    if type(mode) is not str or mode not in ("blackbox", "instrumentation"):
+        raise ValueError("observation_mode must be blackbox or instrumentation")
+    if type(adopted) is not bool:
+        raise ValueError("observe_adopted_config must be boolean")
+    if adopted and mode != "instrumentation":
+        raise ValueError("observe_adopted_config requires instrumentation mode")
+    if target_id != EXECUTION_ORDER[0]:
+        raise ValueError("observation CP1 supports only discovery.late_endpoint")
+    return {"observation_mode": mode, "observe_adopted_config": adopted}
+
 
 def _validate_expected_source_manifest(source, expected_source_manifest):
     """Bind a caller's optional pin to the measured, complete intake source."""
@@ -42,12 +64,18 @@ def _validate_expected_source_manifest(source, expected_source_manifest):
 
 def plan_campaign(output_dir, *, repo=None, run_id=None, domain_id=173, seed=0,
                   target_id=EXECUTION_ORDER[0], parameters=None,
-                  expected_source_manifest=None):
+                  expected_source_manifest=None, observation=_OBSERVATION_UNSET):
     """Build input capsules offline; planning never implies reached or executed.
 
     An optional expected_source_manifest must equal the entire measured intake
     source; a mismatch raises before any plan artifacts are written.
+    observation is an optional exact mode/bool pair, scoped to Cyclone baseline0
+    on the first target in CP1. Its declaration is execution metadata only;
+    omission preserves legacy artifacts, and explicit null is invalid.
     """
+    selection = _observation_selection(observation, target_id)
+    if isinstance(parameters, dict) and {"observation_mode", "observe_adopted_config"}.intersection(parameters):
+        semantic_input("baseline", parameters, target_id=target_id)
     repo = Path(repo or Path(__file__).resolve().parents[3]).resolve()
     output_dir = Path(output_dir).resolve()
     if output_dir.exists() and any(output_dir.iterdir()):
@@ -70,6 +98,8 @@ def plan_campaign(output_dir, *, repo=None, run_id=None, domain_id=173, seed=0,
                 "source_manifest": source, "environment_mode": "ros_overlay",
                 "execution_order": list(EXECUTION_ORDER), "requested_domain": domain_id,
                 "maturity_denominator_changed": False, "applicable_rmws_requested": list(target.rmw_applicability)}
+    if selection is not None:
+        manifest["observation"] = dict(selection, cell_id=_OBSERVATION_CELL)
     identity = identity_hashes(manifest)
     write_json(output_dir / "manifest.json", manifest)
     rows = []
@@ -105,6 +135,8 @@ def plan_campaign(output_dir, *, repo=None, run_id=None, domain_id=173, seed=0,
                                 final_input=submitted, effective_input_sha256=capsule.input["effective_input_sha256"],
                                 input_layer_receipts=capsule.input["effective_input"]["input_layer_receipts"],
                                 control_kind=cell.get("control_kind"))
+        if selection is not None and cell["cell_id"] == _OBSERVATION_CELL:
+            config.update(selection)
         directory = output_dir / "cells" / cell["cell_id"]
         replay_path = directory / "capsule.json"
         config_path = directory / "runtime_config.json"
@@ -118,6 +150,7 @@ def plan_campaign(output_dir, *, repo=None, run_id=None, domain_id=173, seed=0,
                          mutation_receipt=dict.fromkeys(("planned", "submitted", "carrier_admitted", "configured", "applied", "hit", "effect_observed"), False),
                          oracle_verdict="unknown", replay_status="not_run", candidate_status="none", actual_run=False))
     return {"schema_version": 1, "run_id": run_id, "manifest_path": str(output_dir / "manifest.json"),
+            **({"observation": deepcopy(manifest["observation"])} if selection is not None else {}),
             "identity": identity, "rows": rows, "control_references": control_references(rows),
             "required_cells": 18, "independent_fault_controls": 6, "full_scope_required_cells": 72,
             "scope_dispositions": module.dispositions, "maturity_denominator_changed": False,
@@ -292,8 +325,15 @@ def run_campaign(output_dir, *, runtime=None, execute=False,
     It does not bound replay: an explicit budget conflicts with auto_replay,
     whose separate policy may dispatch additional executions. None preserves
     historical behavior. Planning never dispatches, even with a budget.
+    Explicit CP1 observation execution requires max_executions=1, so the
+    unchanged canonical order dispatches only Cyclone baseline0. This intake
+    does not establish adoption, effect, replay or audit qualification.
     query_runner_evidence exposes associations without revising this report.
     """
+    selection = _observation_selection(
+        options.get("observation", _OBSERVATION_UNSET), options.get("target_id", EXECUTION_ORDER[0]))
+    if selection is not None and execute and (type(max_executions) is not int or max_executions != 1):
+        raise ValueError("observation CP1 execution requires max_executions=1")
     if max_executions is not None:
         cell_count = len(first_slice_cells(options.get("target_id", EXECUTION_ORDER[0])))
         if type(max_executions) is not int or not 1 <= max_executions <= cell_count:
