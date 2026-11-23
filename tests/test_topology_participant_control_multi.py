@@ -97,22 +97,43 @@ from test_topology_adapter import RawFixture
 
 class CanonicalRawFixture(RawFixture):
     """Construct protocol observations with the runner's aliases at emission."""
+    recorder_defaults = False
     def add(self, event, **fields):
         if fields.get('logical_id') is not None and 'role' in fields:
             alias = caller_roles(self.program)[fields['logical_id']]
             fields.update(role=alias, worker_role=alias)
+        if self.recorder_defaults:
+            gids = {'gid-' + e['logical_id']: f'{i:032x}'
+                    for i, e in enumerate(self.program['endpoints'], 1)}
+            def wire_gid(value):
+                if isinstance(value, dict):
+                    return {k: wire_gid(v) for k, v in value.items()}
+                if isinstance(value, list):
+                    return [wire_gid(v) for v in value]
+                return gids.get(value, value) if isinstance(value, str) else value
+            fields = wire_gid(fields)
+            if event == 'worker_command_requested':
+                event = 'topology_snapshot_requested'
+            elif fields.get('logical_id') is not None:
+                # Endpoint worker emit overrides the recorder default.
+                alias = caller_roles(self.program)[fields['logical_id']]
+                fields = {'role': alias, 'worker_role': alias, **fields}
+            fields = {'role': 'topology_controller', **fields}
         return super().add(event, **fields)
 
 
 from test_topology_participant_control_public import facts, resave
 
 
-def multi_fixture(root, writers=1, readers=2, layout='shared', observed_ownership=False, **kwargs):
+def multi_fixture(root, writers=1, readers=2, layout='shared', observed_ownership=False,
+                  producer_framing=False, **kwargs):
     """Adapt the established raw protocol fixture, preserving all action evidence.
 
     Only supporting captures are unavailable. These rows are NOT measurements.
     """
-    f=CanonicalRawFixture(writers=writers, readers=readers, **kwargs)
+    class RecorderFixture(CanonicalRawFixture):
+        recorder_defaults = producer_framing
+    f=RecorderFixture(writers=writers, readers=readers, **kwargs)
     parent=deepcopy(f.plan.operations[0].parameters['input_layer_receipts'][0]['input_before'])
     parent['participant_control']=dict(CONTROL)
     for e in parent['endpoints']:
@@ -152,6 +173,15 @@ def multi_fixture(root, writers=1, readers=2, layout='shared', observed_ownershi
                  domain_observation_source='offline_fixture',**identities[labels[eid]])
     additions=[]
     def row(kind,g,**kw):
+        if producer_framing:
+            # topology_pair.emit defaults actor role; child endpoint fields override it.
+            # Group owner ACK/capture tokens contain worker_role, not role.
+            eid = kw.get('logical_id')
+            kw = {'role': 'topology_controller', **kw}
+            if eid is not None and kind in {'command_done', 'endpoint_destroyed'}:
+                kw['worker_role'] = caller_roles(f.program)[eid]
+                if kind == 'endpoint_destroyed':
+                    kw['role'] = kw['worker_role']
         return dict(event=kind,fixture=True,backend='offline_fake',real_ros=False,run_id='fixture-topology',
                     domain_id=191,observed_domain_id=191,rmw_identifier='rmw_cyclonedds_cpp',**identities[g],**kw)
     started=set()
@@ -159,7 +189,9 @@ def multi_fixture(root, writers=1, readers=2, layout='shared', observed_ownershi
     def request(g,command,eid=None,**kw):
         serial[g]+=1
         address={} if eid is None else {k:tokens[eid][k] for k in ('logical_id','generation','endpoint_generation')}
-        if command=='create_endpoint': address.pop('endpoint_generation')
+        if command=='create_endpoint':
+            address.pop('endpoint_generation')
+            if producer_framing: address['worker_role'] = caller_roles(f.program)[eid]
         return row('group_command_requested',g,command=command,command_id=serial[g],**address,**kw)
     # Existing snapshot fixture uses the same controller CID for both endpoints;
     # group transport has process-serial addressed CIDs instead.
@@ -199,7 +231,10 @@ def multi_fixture(root, writers=1, readers=2, layout='shared', observed_ownershi
                         'kind': next(e['role'] for e in f.program['endpoints'] if e['logical_id'] == t['logical_id'])}}
                         for t in group_tokens}
                     obs.update(_capture_group_ownership({'group_id': label, 'domain_id': 191}, sessions))
-                additions.append(row('participant_group_snapshot',label,command_id=req['command_id'],**obs))
+                capture_token = ({k: group_tokens[0][k] for k in
+                    ('logical_id', 'generation', 'endpoint_generation', 'endpoint_gid', 'worker_role')}
+                    if producer_framing else {})
+                additions.append(row('participant_group_snapshot',label,command_id=req['command_id'],**obs,**capture_token))
                 additions.append(row('command_done',label,command='group_snapshot',command_id=req['command_id'],
                     **{k:group_tokens[0][k] for k in ('logical_id','generation','endpoint_generation')}))
                 stop=request(label,'stop');additions += [stop,row('command_done',label,command='stop',command_id=stop['command_id'])]
@@ -603,3 +638,86 @@ def test_worker_rejects_unbound_global_alias_map(monkeypatch, damage):
     rc, calls, events = worker_capture(monkeypatch, 2, 2, layout='split', group_id='r1', damage=corrupt)
     assert rc == 1 and events[-1]['event'] == 'worker_error'
     assert 'context' not in calls
+
+
+@pytest.mark.parametrize('writers,readers', [(1, 2), (2, 2)])
+@pytest.mark.parametrize('layout', ['shared', 'roles'])
+def test_recorder_actor_framing_reaches_lineage_and_pair_projection(tmp_path, writers, readers, layout):
+    f = multi_fixture(tmp_path, writers, readers, layout=layout, producer_framing=True)
+    controller = [e for e in f.events if e.get('logical_id') and
+                  e.get('role') == 'topology_controller']
+    assert {e['event'] for e in controller} >= {
+        'group_command_requested', 'topology_snapshot_requested',
+        'participant_group_snapshot', 'command_done'}
+    observed = facts(f)
+    assert observed['diagnostic_valid'], observed
+    assert all(p['observed_match'] == 'bidirectional' for p in observed['state_after']['pairs'])
+    assert not observed['candidate_eligible'] and not observed['execution_evidence']
+
+
+def recorder_pair_facts(f):
+    """Observe the public pair consumer at each final worker snapshot prefix."""
+    from r2f.runtime.topology_pair import pair_graph_facts
+    tokens = {e['logical_id']: e for e in f.events if e['event'] == 'endpoint_created'}
+    snapshots = {}
+    limits = []
+    for eid in tokens:
+        match = next(e for e in reversed(f.events)
+                     if e['event'] == 'match_snapshot' and e.get('logical_id') == eid)
+        cid = match['command_id']
+        graph = next(e for e in f.events if e['event'] == 'graph_snapshot'
+                     and e.get('logical_id') == eid and e.get('command_id') == cid)
+        ack = next(e for e in f.events if e['event'] == 'command_done'
+                   and e.get('logical_id') == eid and e.get('command_id') == cid)
+        limits.append(ack['event_index'] + 1)
+        snapshots[eid] = dict(command_id=cid, complete=True,
+                              match_snapshot=match, graph_snapshot=graph)
+    return [pair_graph_facts(tokens[w['logical_id']], tokens[r['logical_id']],
+                snapshots[w['logical_id']], snapshots[r['logical_id']],
+                raw_events=f.events, before_index=max(limits), real_ros=False)
+            for w in f.program['endpoints'] if w['role'] == 'writer'
+            for r in f.program['endpoints'] if r['role'] == 'reader']
+
+
+@pytest.mark.parametrize('writers,readers', [(1, 2), (2, 2)])
+@pytest.mark.parametrize('layout', ['shared', 'roles'])
+def test_recorder_actor_framing_authenticates_live_pair_scope(tmp_path, writers, readers, layout):
+    f = multi_fixture(tmp_path, writers, readers, layout=layout, producer_framing=True)
+    pairs = recorder_pair_facts(f)
+    assert len(pairs) == writers * readers
+    assert all(p['status'] == 'matched' for p in pairs), [(p['writer'], p['reader'], p['reasons']) for p in pairs]
+    assert all(not p['execution_evidence'] and not p['candidate_eligible'] for p in pairs)
+
+
+@pytest.mark.parametrize('event,command,field,value', [
+    ('group_command_requested', 'create_endpoint', 'role', 'reader2'),
+    ('group_command_requested', 'create_endpoint', 'worker_role', 'reader2'),
+    ('group_command_requested', 'create_endpoint', 'role', 'forged_controller'),
+    ('command_done', 'create_endpoint', 'role', 'reader2'),
+    ('command_done', 'create_endpoint', 'worker_role', 'reader2'),
+    ('topology_snapshot_requested', 'snapshot', 'role', 'reader2'),
+    ('topology_snapshot_requested', 'snapshot', 'worker_role', 'reader2'),
+    ('match_snapshot', None, 'role', 'topology_controller'),
+    ('graph_snapshot', None, 'role', 'topology_controller'),
+    ('endpoint_created', None, 'role', 'topology_controller'),
+    ('command_done', None, 'role', 'topology_controller'),
+])
+def test_recorder_actor_exception_rejects_forged_endpoint_and_actor_roles(
+        tmp_path, event, command, field, value):
+    f = multi_fixture(tmp_path, producer_framing=True)
+    target = next(e for e in f.events if e['event'] == event
+                  and e.get('logical_id') == 'r0' and e.get('command') == command)
+    target[field] = value  # Explicit negative capture, not recorder framing.
+    with pytest.raises(ValueError, match='role_alias|endpoint_identity'):
+        project_lineage(f.program, f.events, str(f.raw), config=f.config)
+    assert all(p['status'] == 'unknown' for p in recorder_pair_facts(f))
+
+
+@pytest.mark.parametrize('field,value', [('role', 'reader2'), ('worker_role', 'reader2'),
+                                        ('role', 'forged_controller')])
+def test_group_capture_actor_does_not_excuse_forged_endpoint_alias(tmp_path, field, value):
+    f = multi_fixture(tmp_path, producer_framing=True)
+    capture = next(e for e in f.events if e['event'] == 'participant_group_snapshot')
+    capture[field] = value
+    with pytest.raises(ValueError, match='endpoint_event_role_alias'):
+        project_lineage(f.program, f.events, str(f.raw), config=f.config)

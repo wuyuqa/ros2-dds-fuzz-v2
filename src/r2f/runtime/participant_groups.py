@@ -13,6 +13,30 @@ LINK_KEYS = ('group_id', 'worker_instance_id', 'context_instance_id')
 PROCESS_KEYS = ('pid', 'pgid', 'process_start_ticks', 'worker_instance_id')
 ENDPOINT_KEYS = ('logical_id', 'generation', 'endpoint_generation', 'endpoint_gid')
 
+def _endpoint_event_roles_match(event, alias):
+    """Keep recorder actor provenance separate from exact endpoint aliases.
+
+    Group transport requests and group-owner token-only replies inherit the
+    topology recorder's actor default. Endpoint worker replies override it.
+    All present worker_role fields still authenticate the addressed endpoint.
+    """
+    if 'worker_role' in event and event['worker_role'] != alias:
+        return False
+    if 'role' not in event or event['role'] == alias:
+        return True
+    kind = event.get('event')
+    if event['role'] != 'topology_controller':
+        return False
+    if kind == 'group_command_requested':
+        return event.get('command') in {'create_endpoint', 'snapshot', 'publish_batch', 'group_snapshot'}
+    if kind == 'topology_snapshot_requested':
+        return event.get('command') == 'snapshot'
+    if kind == 'participant_group_snapshot':
+        return event.get('worker_role') == alias
+    return (kind == 'command_done' and event.get('command') in {'create_endpoint', 'group_snapshot'}
+            and event.get('worker_role') == alias)
+
+
 def enabled(program):
     return isinstance(program, dict) and 'participant_control' in program
 
@@ -234,7 +258,7 @@ def _validate_shared_process(tokens, events, *, request_index, before_index):
                     and e.get('command') == 'create_endpoint'):
                 address_keys += ('endpoint_generation',)
             require(equal(e, addressed, address_keys), 'endpoint_event_context_or_incarnation')
-            require(all(k not in e or e[k] == addressed[k] for k in ('role', 'worker_role')),
+            require(_endpoint_event_roles_match(e, addressed['role']),
                     'endpoint_event_role_alias')
     start = one([e for e in scoped if e.get('event') == 'process_started'], 'group_start')
     ctx = one([e for e in scoped if e.get('event') == 'group_context_created'], 'context_created')
@@ -443,8 +467,8 @@ def project_lineage(program, events, raw_path, *, config=None):
             if not (event.get('event') == 'group_command_requested' and event.get('command') == 'create_endpoint'):
                 keys += ('endpoint_generation',)
             require(equal(event, token, keys), 'endpoint_event_context_or_incarnation')
-            require(all(k not in event or event[k] == aliases[token['logical_id']]
-                        for k in ('role', 'worker_role')), 'endpoint_event_role_alias')
+            require(_endpoint_event_roles_match(event, aliases[token['logical_id']]),
+                    'endpoint_event_role_alias')
     relation = (all(o['group_relation_observed'] for o in observations)
                 and (len(groups) == 1 or len(all_gids) == len(groups)))
     return {'schema': LINEAGE_SCHEMA, 'processes': processes, 'contexts': contexts,
