@@ -69,7 +69,7 @@ class TraceConfig:
         return {'CYCLONEDDS_URI': self.xml}
 
     def to_dict(self):
-        return asdict(self)
+        return dict(asdict(self), categories=list(self.categories))
 
 
 def build_trace_config(output_file, *, domain_id, base_xml=None, observe_adopted_config=False):

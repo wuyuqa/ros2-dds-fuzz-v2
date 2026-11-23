@@ -222,3 +222,70 @@ def test_cli_budget_without_observation_preserves_issue16_lease_flag(tmp_path, c
         assert config['observe_participant_leases'] is True
         assert capsule['input']['effective_input']['final_input']['observe_participant_leases'] is True
         assert not set(SELECTION).intersection(config)
+
+
+@pytest.fixture
+def offline_trace_runtime():
+    """Public runtime double: empty trace files, no ROS/DDS or qualification."""
+    from r2f.instrumentation.cyclonedds import build_trace_config, collect_trace
+
+    captured = {}
+
+    def runtime(config, directory):
+        directory = Path(directory)
+        trace_path = directory / 'offline.trace.log'
+        trace_config = build_trace_config(
+            trace_path, domain_id=config['domain_id'],
+            observe_adopted_config=config['observe_adopted_config'])
+        trace_path.write_text('')
+        result = {
+            'runtime_status': 'blocked', 'real_execution': False,
+            'reason': 'offline_fixture_no_ROS_DDS_execution',
+            'observation': {'offline_fixture': True, 'traces': [collect_trace(
+                trace_config, processes=[], control_task='offline_fixture')]},
+        }
+        path = directory / 'runtime_result.json'
+        path.write_text(json.dumps(result))
+        captured.update(returned=result, path=path, original_bytes=path.read_bytes())
+        return result
+
+    return runtime, captured
+
+
+@pytest.mark.parametrize('adopted', [False, True])
+@pytest.mark.parametrize('different_evidence', [False, True])
+def test_offline_trace_runtime_persistence_contract(
+        tmp_path, offline_trace_runtime, adopted, different_evidence):
+    from r2f.campaign.runner import run_campaign
+
+    runtime, captured = offline_trace_runtime
+
+    def dispatch(config, directory):
+        result = runtime(config, directory)
+        if different_evidence:
+            result['reason'] = 'different_offline_evidence_after_publication'
+        return result
+
+    report = run_campaign(
+        tmp_path / 'campaign', run_id='offline-trace-persistence', execute=True,
+        runtime=dispatch, max_executions=1,
+        observation={'observation_mode': 'instrumentation', 'observe_adopted_config': adopted})
+    row = report['rows'][0]
+    persisted = json.loads(captured['path'].read_text())
+    assert captured['path'].read_bytes() == captured['original_bytes']
+    assert json.loads((tmp_path / 'campaign' / 'report.json').read_text())['rows'][0] == row
+    assert report['full_scope_required_cells'] == 72
+    assert report['formal_runtime'] is False
+    assert report['seal']['sealed'] is False
+    assert all(item['actual_run'] is False for item in report['rows'])
+    ledger = json.loads((tmp_path / 'campaign' / 'candidate_ledger.json').read_text())
+    assert ledger['natural_candidate_count'] == ledger['confirmed_candidates'] == 0
+    if different_evidence:
+        assert row['abort_reason'] == 'runner_wrapper_failure'
+        assert row['runner_exception']['detail'] == 'runtime_result_differs_from_returned_evidence'
+        assert persisted['reason'] == 'offline_fixture_no_ROS_DDS_execution'
+    else:
+        assert 'runner_exception' not in row
+        assert persisted == captured['returned']
+        categories = captured['returned']['observation']['traces'][0]['config']['categories']
+        assert categories == (['discovery', 'plist', 'config'] if adopted else ['discovery', 'plist'])
