@@ -4,6 +4,7 @@ No ROS import, subprocess, namespace, nft/tc operation or campaign is executed.
 """
 import hashlib
 import json
+import os
 import tempfile
 import unittest
 import xml.etree.ElementTree as ET
@@ -583,6 +584,27 @@ class WorkerGenerationTests(unittest.TestCase):
         self.pool.selector = Mock()
         self.pool.selector.select.return_value = []
         self.first, self.second = Process(501), Process(502)
+        # Popen PIDs are synthetic: model the OS boundary too, never bind or
+        # signal a host process/group (even if PID 501/502 happens to exist).
+        # The self-PID entry serves the capability probe; worker pidfds and
+        # /proc start identities remain distinct across the two generations.
+        pidfds = {os.getpid(): 10000, 501: 10501, 502: 10502}
+        identities = {pid: dict(pid=pid, state='S', pgid=pid, sid=pid,
+                                start_ticks=pid * 10) for pid in (501, 502)}
+        for target, options in (
+            ('os.pidfd_open', dict(side_effect=pidfds.__getitem__, create=True)),
+            ('signal.pidfd_send_signal', dict(side_effect=ProcessLookupError,
+                                             create=True)),
+            ('os.close', {}),
+            ('_identity', dict(side_effect=identities.__getitem__)),
+        ):
+            p = patch('r2f.runtime.process.' + target, **options)
+            p.start()
+            self.addCleanup(p.stop)
+        # ESRCH above models no surviving group at cleanup (and is accepted
+        # by the capability probe); wait only reaps an already-exited fake.
+        for process in (self.first, self.second):
+            process.wait = Mock(side_effect=lambda timeout, proc=process: proc.returncode)
         p = patch('r2f.runtime.process.subprocess.Popen', side_effect=[self.first, self.second])
         p.start()
         self.addCleanup(p.stop)
