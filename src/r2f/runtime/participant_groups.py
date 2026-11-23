@@ -155,6 +155,106 @@ def qualify_observation(observation, tokens):
             'unknown_reasons': reasons}
 
 
+
+def _validate_shared_process(tokens, events, *, request_index, before_index):
+    """Authenticate a live CP1 PID share using only already observed raw lineage.
+
+    This is the process/context identity part of the group lineage contract,
+    bounded at a fresh endpoint snapshot. It grants no DDS participant ownership
+    or sharing: those remain independently qualified by qualify_observation.
+    No future closure, group label alone, or GUID prefix supplies identity.
+    """
+    def require(ok, reason):
+        if not ok:
+            raise ValueError('group_lineage:' + reason)
+    def one(rows, reason):
+        require(len(rows) == 1, reason)
+        return rows[0]
+    def equal(row, other, keys):
+        return all(row.get(k) is not None and row.get(k) == other.get(k) for k in keys)
+    def ordered(*rows):
+        return all(a['event_index'] < b['event_index']
+                   and type(a.get('monotonic_ns')) is int
+                   and type(b.get('monotonic_ns')) is int
+                   and a['monotonic_ns'] <= b['monotonic_ns']
+                   for a, b in zip(rows, rows[1:]))
+
+    raw = events[:before_index]
+    require(all(e.get('event_index') == i for i, e in enumerate(raw)), 'event_offsets')
+    require(len(tokens) == 2 and {t.get('role') for t in tokens} == {'writer', 'reader'},
+            'shared_process_scope')
+    token = tokens[0]
+    keys = PROCESS_KEYS + LINK_KEYS
+    require(all(equal(t, token, keys) for t in tokens), 'endpoint_process_context_link')
+    require(all(isinstance(token[k], str) and bool(token[k].strip()) for k in LINK_KEYS),
+            'process_context_labels')
+    require(all(type(token[k]) is int and token[k] > 0
+                for k in ('pid', 'pgid', 'process_start_ticks'))
+            and token['pid'] == token['pgid']
+            and token['worker_instance_id'] != token['context_instance_id'], 'process_identity')
+    binding = one([e for e in raw if e.get('event') == 'input_binding'], 'input_binding_count')
+    require(binding.get('receipt', {}).get('participant_control') == CONTROL,
+            'group_lineage_requires_explicit_input')
+    # Inspect the entire process/group scope, so a foreign worker/context cannot
+    # disappear by filtering it out before checking its identity.
+    worker_events = {'process_started', 'process_exit', 'group_context_created',
+                     'group_worker_ready', 'group_context_shutdown', 'endpoint_created',
+                     'endpoint_group_bound', 'endpoint_destroyed', 'worker_exit',
+                     'group_command_requested', 'command_done', 'participant_group_snapshot',
+                     'topology_snapshot_requested', 'match_snapshot', 'graph_snapshot'}
+    scoped = [e for e in raw if e.get('group_id') == token['group_id']
+              or (e.get('event') in worker_events and e.get('pid') == token['pid'])]
+    for e in scoped:
+        require(equal(e, token, keys + ('run_id', 'domain_id')), 'raw_process_context_link')
+        if e.get('logical_id') is not None:
+            addressed = one([t for t in tokens if t['logical_id'] == e['logical_id']],
+                            'endpoint_event_address')
+            address_keys = ENDPOINT_KEYS[:2]
+            if not (e.get('event') == 'group_command_requested'
+                    and e.get('command') == 'create_endpoint'):
+                address_keys += ('endpoint_generation',)
+            require(equal(e, addressed, address_keys), 'endpoint_event_context_or_incarnation')
+    start = one([e for e in scoped if e.get('event') == 'process_started'], 'group_start')
+    ctx = one([e for e in scoped if e.get('event') == 'group_context_created'], 'context_created')
+    ready = one([e for e in scoped if e.get('event') == 'group_worker_ready'], 'group_ready')
+    require(start.get('fresh_process') is True and start.get('separate_context') is False
+            and not any(k in start for k in ENDPOINT_KEYS), 'process_identity')
+    require(ordered(binding, start, ctx, ready) and ctx.get('ros_context_created') is True
+            and ctx.get('api') == 'rclpy.context.Context+rclpy.init'
+            and bool(ctx.get('rmw_identifier'))
+            and (token.get('rmw_identifier') is None
+                 or ctx['rmw_identifier'] == token['rmw_identifier'])
+            and ctx.get('observed_domain_id') == token['domain_id'], 'context_chronology')
+    require(not any(e.get('event') in {'group_context_shutdown', 'process_exit',
+                                     'endpoint_destroyed', 'worker_exit'} for e in scoped),
+            'shared_process_retired')
+    requests = [e for e in scoped if e.get('event') == 'group_command_requested']
+    require([r.get('command_id') for r in requests] == list(range(1, len(requests)+1)),
+            'process_command_serial')
+    bindings = []
+    for t in tokens:
+        bound = one([e for e in scoped if e.get('event') == 'endpoint_group_bound'
+                     and equal(e.get('endpoint', {}), t, ENDPOINT_KEYS)], 'endpoint_binding')
+        req = one([r for r in requests if r.get('command') == 'create_endpoint'
+                   and equal(r, t, ENDPOINT_KEYS[:2])], 'create_request')
+        ack = one([e for e in scoped if e.get('event') == 'command_done'
+                   and e.get('command_id') == req.get('command_id')], 'create_ack')
+        require(ack.get('command') == 'create_endpoint'
+                and equal(ack, t, ENDPOINT_KEYS) and ordered(ready, req, t, bound, ack),
+                'create_request_binding_ack_order')
+        bindings.append(ack)
+    request = events[request_index]
+    req = one([r for r in requests if r.get('command_id') == request.get('command_id')],
+              'snapshot_request')
+    ack = one([e for e in scoped if e.get('event') == 'command_done'
+               and e.get('command_id') == req.get('command_id')], 'snapshot_ack')
+    require(req.get('command') == request.get('command') == 'snapshot'
+            and equal(req, request, ENDPOINT_KEYS[:3])
+            and equal(ack, request, ENDPOINT_KEYS[:3])
+            and ordered(req, request, ack)
+            and all(ordered(b, req) for b in bindings), 'snapshot_command_chronology')
+
+
 def project_lineage(program, events, raw_path, *, config=None):
     """Validate complete opt-in process/context/endpoint raw and project metadata.
 

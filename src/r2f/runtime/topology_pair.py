@@ -204,20 +204,39 @@ def _direct_peer_membership(token, peer, snapshot, events, *, before_index=None)
                             before_index=request["event_index"]))
             except ValueError as exc:
                 return None, "per_peer_incarnation_invalid:" + str(exc)
-    for field in ("logical_id", "endpoint_gid", "endpoint_generation", "pid"):
+    for field in ("logical_id", "endpoint_gid", "endpoint_generation"):
         values = [row.get(field) for row in live]
         if None in values or len(set(values)) != len(values):
             return None, "per_peer_live_identity_alias:" + field
+    pids = [row.get("pid") for row in live]
+    shared_process = len(set(pids)) != len(pids)
+    if None in pids:
+        return None, "per_peer_live_identity_alias:pid"
+    if shared_process:
+        from .participant_groups import _validate_shared_process
+        for pid in set(pids):
+            shared = [row for row in live if row["pid"] == pid]
+            if len(shared) < 2:
+                continue
+            try:
+                _validate_shared_process(shared, events, request_index=request["event_index"],
+                                        before_index=chain[-1]["event_index"] + 1)
+            except (ValueError, TypeError, KeyError, IndexError) as exc:
+                return None, "per_peer_live_identity_alias:pid:" + str(exc)
     opposite = "reader" if worker_role_kind(token.get("role")) == "writer" else "writer"
     inventory = [e for e in live if worker_role_kind(e.get("role")) == opposite
                  and e.get("topic") == token.get("topic")]
     known = {e.get("endpoint_gid") for e in inventory}
     for queried, role in ((token, worker_role_kind(token.get("role"))), (peer, opposite)):
         bound = [e for e in live if e.get("logical_id") == queried.get("logical_id")]
+        identity_keys = ("generation", "endpoint_gid", "endpoint_generation", "pid",
+                         "process_start_ticks", "topic", "message_type")
+        if shared_process:
+            from .participant_groups import LINK_KEYS
+            identity_keys += ("pgid",) + LINK_KEYS
         if (len(bound) != 1 or worker_role_kind(bound[0].get("role")) != role
                 or any(queried.get(key) is None or bound[0].get(key) != queried[key]
-                       for key in ("generation", "endpoint_gid", "endpoint_generation", "pid",
-                                   "process_start_ticks", "topic", "message_type"))):
+                       for key in identity_keys)):
             return None, "per_peer_query_identity_not_current_raw_generation"
     if (not set(gids) <= known
             or (peer.get("topic") == token.get("topic") and peer.get("endpoint_gid") not in known)):
