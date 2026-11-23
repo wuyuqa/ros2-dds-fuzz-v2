@@ -171,11 +171,67 @@ def _semantic_profiles(qualification, domain):
     return values
 
 
+def _audit_adopted_settings(observation, prepared, workers, rebuilt, config):
+    """Rebuild execution metadata from bound artifacts, never from its summary."""
+    expected = {'schema': 'r2f.adopted-domain-settings/v1', 'roles': {},
+                'status': 'not_run', 'semantic_effect': 'unknown',
+                'parser_acceptance': 'pending_real_trace',
+                'fastdds': {'status': 'unsupported', 'execution': 'not_run'}}
+    if config['rmw'] == FASTDDS_RMW:
+        expected['status'] = 'unsupported'
+    elif config.get('observe_adopted_config', False):
+        for role, trace_config in prepared['trace_configs'].items():
+            matches = [t for t in rebuilt if canonical_hash(t['config']) == canonical_hash(trace_config)]
+            if len(matches) != 1:
+                raise ValueError('adopted trace role not unique:' + role)
+            adopted = deepcopy(matches[0]['adopted_domain_settings'])
+            worker = workers[role]
+            endpoint = worker['endpoint_event']
+            if (not endpoint.get('endpoint_generation')
+                    or str(endpoint.get('process_start_ticks', '')) != str(worker['process']['process_start_ticks'])):
+                raise ValueError('adopted process lifetime not bound to raw:' + role)
+            # collect_trace recomputes this identity from the actual trace stat;
+            # the process proof and the saved FD audit must both bind that file.
+            if worker['audit'].get('trace_file_identity') != adopted['collection_identity'][:2]:
+                raise ValueError('trace file identity differs from process audit:' + role)
+            adopted['endpoint_binding'] = {
+                'role': role, 'pid': worker['pid'], 'endpoint_guid': worker['endpoint_guid'],
+                'endpoint_generation': worker['endpoint_event']['endpoint_generation'],
+                'endpoint_event': deepcopy(worker['endpoint_event']),
+                'process_capture': deepcopy(observation['process_captures'][role]),
+                'runtime_raw_path': observation['raw_path'],
+                'runtime_raw_sha256': observation['raw_sha256']}
+            adopted['binding_unknowns'] = []
+            adopted['status'] = 'unknown' if adopted['unknown_fields'] else 'observed'
+            expected['roles'][role] = adopted
+        expected['status'] = ('observed' if len(expected['roles']) == 2 and
+                              all(r['status'] == 'observed' for r in expected['roles'].values())
+                              else 'unknown')
+    presented = {role: {'scope': 'parent_prepared',
+                         'worker_byte_read': 'not_observed',
+                         'input_xml_source': deepcopy(profile['source']),
+                         'non_tracing_sha256': profile['non_tracing_sha256'],
+                         'trace_xml_sha256': (TraceConfig(**prepared['trace_configs'][role]).sha256
+                                              if role in prepared.get('trace_configs', {}) else None),
+                         'prepared': deepcopy(observation['prepared'])}
+                for role, profile in prepared.get('profiles', {}).items()}
+    if observation.get('semantic_effect') != 'unknown':
+        raise ValueError('adoption semantic_effect must remain unknown')
+    if canonical_hash(observation.get('presented_configuration')) != canonical_hash(presented):
+        raise ValueError('presented_configuration differs from prepared configuration')
+    if canonical_hash(observation.get('adopted_domain_settings')) != canonical_hash(expected):
+        raise ValueError('adopted_domain_settings differs from independent recomputation')
+    return expected
+
+
 def qualify_observation(row, runtime, config, *, capsule=None):
     observation = runtime.get('observation')
     result = {'schema':'r2f.campaign-observation-intake/v1', 'observation_status':'not_run',
               'qualification':'not_evaluated', 'intake_count':None, 'admissible_count':None,
-              'qualified_intake':[], 'errors':[], 'blackbox_task':None, 'zero_candidate':False}
+              'qualified_intake':[], 'errors':[], 'blackbox_task':None, 'zero_candidate':False,
+              'configuration_presentation_status':'legacy_unverified',
+              'configuration_adoption_status':'unknown',
+              'adoption_audit_status':'legacy_unverified', 'semantic_effect':'unknown'}
     if observation is None:
         return result
     result.update(observation_status=observation.get('status','unknown'),
@@ -209,6 +265,8 @@ def qualify_observation(row, runtime, config, *, capsule=None):
         verify_raw(row['raw_path'], row['raw_sha256'])
         events = [json.loads(line) for line in Path(row['raw_path']).read_text().splitlines() if line.strip()]
         prepared = _read(observation['prepared'])
+        if config.get('observe_adopted_config') is True and 'adopted_domain_settings' not in observation:
+            raise ValueError('adopted_domain_settings missing for explicit observe_adopted_config')
         for key in ('run_id','domain_id','rmw'):
             if prepared.get(key) != config.get(key):
                 raise ValueError('prepared identity differs:'+key)
@@ -243,6 +301,15 @@ def qualify_observation(row, runtime, config, *, capsule=None):
                 raise ValueError('process provenance incomplete:'+role)
             if token not in events or token.get('event')!='endpoint_created' or token.get('role')!=role:
                 raise ValueError('worker endpoint not bound to raw:'+role)
+            if worker.get('role') != role:
+                raise ValueError('worker capture role differs from raw:' + role)
+            if proof.get('pid') != worker['pid']:
+                raise ValueError('worker process PID differs from raw:' + role)
+            gid = token.get('endpoint_gid')
+            if isinstance(gid, str) and len(gid) == 48:
+                gid = bytes.fromhex(gid)
+            if worker.get('endpoint_guid') != normalize_guid(gid):
+                raise ValueError('worker endpoint GUID differs from raw:' + role)
             for key in ('pid','run_id','domain_id','rmw_identifier'):
                 expected = worker['pid'] if key=='pid' else config['rmw'] if key=='rmw_identifier' else config.get(key)
                 if token.get(key)!=expected:
@@ -316,6 +383,14 @@ def qualify_observation(row, runtime, config, *, capsule=None):
             # instrumented zero or automatic confirmation of another execution.
             if observation.get('blackbox_observer',{}).get('status')!='verified':
                 raise ValueError('blackbox clean observer not verified')
+            if 'adopted_domain_settings' in observation:
+                audited = _audit_adopted_settings(observation, prepared, workers, [], config)
+                result.update(configuration_presentation_status='verified',
+                              configuration_adoption_status=audited['status'],
+                              adoption_audit_status='verified', semantic_effect='unknown',
+                              adopted_domain_settings=deepcopy(observation['adopted_domain_settings']))
+            elif 'presented_configuration' in observation:
+                raise ValueError('presented_configuration present without adopted-domain audit contract')
             result.update(qualification='blackbox_observed', provenance_verified=True, input_binding=input_binding,
                           non_tracing_profiles=deepcopy(prepared['profiles']), profile_policy=deepcopy(policy))
             return result
@@ -344,6 +419,14 @@ def qualify_observation(row, runtime, config, *, capsule=None):
             if not actual.get('vendor_process_verified') or not actual.get('internal_event_witness'):
                 raise ValueError('empty or unverified internal observation')
             rebuilt.append(actual)
+        if 'adopted_domain_settings' in observation:
+            audited = _audit_adopted_settings(observation, prepared, workers, rebuilt, config)
+            result.update(configuration_presentation_status='verified',
+                          configuration_adoption_status=audited['status'],
+                          adoption_audit_status='verified', semantic_effect='unknown',
+                          adopted_domain_settings=deepcopy(observation['adopted_domain_settings']))
+        elif 'presented_configuration' in observation:
+            raise ValueError('presented_configuration present without adopted-domain audit contract')
         comparisons=observation.get('reconciliations',[])
         if len(comparisons)!=2 or {c.get('role') for c in comparisons}!={'writer','reader'}:
             raise ValueError('two independent graph comparisons required')
