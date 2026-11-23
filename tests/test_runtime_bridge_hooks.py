@@ -1,9 +1,11 @@
 """Offline hook lifecycle checks: no endpoints and no execution evidence."""
+import gc
 import hashlib
 import json
 from pathlib import Path
 import tempfile
 import unittest
+import weakref
 from unittest.mock import Mock, patch
 
 from r2f.runtime.domains import IsolationError, LeaseSet
@@ -11,11 +13,12 @@ from r2f.runtime.ros2_pair import run_pair
 
 
 class BridgeHooks(unittest.TestCase):
-    def invoke(self, root, prepare):
+    def invoke(self, root, prepare, *, close_error=None):
         config = {'run_id': 'hook-offline', 'campaign_id': 'hook-offline',
                   'domain_id': 173, 'lock_root': str(root / 'locks')}
         pool = Mock()
         pool.metadata = []
+        pool.close.side_effect = close_error
         # Never synthesize an endpoint_created or an execution record.
         pool.start.side_effect = RuntimeError('offline_worker_not_started')
         with patch('r2f.runtime.ros2_pair.check_environment', return_value={'ok': True}), \
@@ -58,6 +61,41 @@ class BridgeHooks(unittest.TestCase):
             self.assertEqual(result['observation']['verdict'], 'unknown')
             with LeaseSet(root / 'locks', root / 'state', 'hook-offline', 173):
                 pass
+
+    def test_cleanup_failure_retains_all_leases_after_result_and_collection(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            leases = []
+            def acquire(*args, **kwargs):
+                lease = LeaseSet(*args, **kwargs)
+                leases.append(weakref.ref(lease))
+                return lease
+            context = Mock(base_env={}, role_env={})
+            context.collect.return_value = {'status': 'incomplete', 'verdict': 'unknown', 'intake': []}
+            try:
+                with patch('r2f.runtime.ros2_pair.LeaseSet', side_effect=acquire):
+                    result, _, pool = self.invoke(root, Mock(return_value=context),
+                                                  close_error=OSError('offline_cleanup_denied'))
+                self.assertEqual(result['reason'], 'worker_cleanup_error:offline_cleanup_denied')
+                gc.collect()
+                # Check each of campaign/domain/state through independent opens.
+                for state, campaign, domain in ((root / 'other', 'hook-offline', 174),
+                                                (root / 'other', 'other', 173),
+                                                (root / 'state', 'other', 174)):
+                    with self.assertRaises(IsolationError):
+                        with LeaseSet(root / 'locks', state, campaign, domain):
+                            pass
+                self.assertTrue(result['cleanup']['lease_retained'])
+                self.assertFalse(result['cleanup']['confirmed'])
+                saved = json.loads((root / 'state' / 'runtime_result.json').read_text())
+                self.assertEqual(saved['cleanup'], result['cleanup'])
+            finally:
+                # This injected close failure owns no child processes. Explicit
+                # test-only release avoids relying on GC or unlocking host files.
+                for reference in leases:
+                    lease = reference()
+                    if lease is not None:
+                        lease.__exit__(None, None, None)
 
     def test_collection_exception_is_observation_unknown_only(self):
         with tempfile.TemporaryDirectory() as tmp:

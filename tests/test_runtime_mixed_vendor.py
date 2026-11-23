@@ -3,7 +3,9 @@
 No ROS context, worker process, namespace, or DDS traffic is created here.
 Every environment below is constructed by pure Python and compared as data.
 """
+import contextlib
 import json
+import os
 import tempfile
 import time
 import unittest
@@ -36,6 +38,25 @@ class FakeProcess:
         self.stdin = Mock()
 
 
+@contextlib.contextmanager
+def fake_process_pidfds():
+    """The fake transport has no kernel PID; own and release its fixture FDs."""
+    actual_open = os.pidfd_open
+    handles = []
+    def open_pidfd(pid):
+        if pid == FakeProcess.pid:
+            fd = actual_open(os.getpid())
+            handles.append(fd)
+            return fd
+        return actual_open(pid)
+    try:
+        with patch('r2f.runtime.process.os.pidfd_open', side_effect=open_pidfd):
+            yield
+    finally:
+        for fd in handles:
+            os.close(fd)
+
+
 class FakePool:
     """Capture the exact environment WorkerPool.start builds."""
 
@@ -54,7 +75,7 @@ class EnvironmentContract(unittest.TestCase):
     def start_env(self, config, base_env, role_env, *, mixed_pool, output_dir=None):
         pool = FakePool(config, base_env, output_dir or tempfile.mkdtemp(), role_env)
         process = FakeProcess()
-        with patch('r2f.runtime.process.subprocess.Popen', return_value=process) as popen, \
+        with fake_process_pidfds(), patch('r2f.runtime.process.subprocess.Popen', return_value=process) as popen, \
              patch('r2f.runtime.process.selectors.DefaultSelector') as selector, \
              patch('r2f.runtime.process.os.set_blocking'):
             selector.return_value = Mock()
@@ -118,7 +139,7 @@ class EnvironmentContract(unittest.TestCase):
             with self.subTest(role=role):
                 pool = FakePool(config, {'BASE': '1'}, tempfile.mkdtemp(), role_env)
                 process = FakeProcess()
-                with patch('r2f.runtime.process.subprocess.Popen', return_value=process) as popen, \
+                with fake_process_pidfds(), patch('r2f.runtime.process.subprocess.Popen', return_value=process) as popen, \
                      patch('r2f.runtime.process.selectors.DefaultSelector') as selector, \
                      patch('r2f.runtime.process.os.set_blocking'):
                     selector.return_value = Mock()
