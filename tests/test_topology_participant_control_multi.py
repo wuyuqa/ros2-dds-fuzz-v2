@@ -40,7 +40,7 @@ def test_1w2r_input_enters_existing_plan_and_receipt_without_execution_authority
     assert not receipt['execution_evidence'] and not receipt['candidate_eligible']
 
 
-def worker_capture(monkeypatch, writers=1, readers=2, *, layout='shared', group_id=None, damage=None):
+def worker_capture(monkeypatch, writers=1, readers=2, *, layout='shared', group_id=None, damage=None, graph_view=None):
     """Use the established external ROS/OS fixture, with distinct observed GIDs."""
     import json
     import sys
@@ -67,6 +67,10 @@ def worker_capture(monkeypatch, writers=1, readers=2, *, layout='shared', group_
                 e.gid = f'{len(entities):032x}'
                 return e
             monkeypatch.setattr(Node, method, create)
+        if graph_view is not None:
+            original_rows = Node.rows
+            monkeypatch.setattr(Node, 'rows', lambda self, role: graph_view(
+                role, original_rows(self, role), entities))
         monkeypatch.setattr(sys, 'argv', ['worker', json.dumps(cfg), 'writer'])
         rc = worker.worker_main()
     return rc, calls, [json.loads(line) for line in stream.getvalue().splitlines()]
@@ -752,7 +756,7 @@ def test_group_capture_actor_does_not_excuse_forged_endpoint_alias(tmp_path, fie
         project_lineage(f.program, f.events, str(f.raw), config=f.config)
 
 
-def cp3_worker_capture(monkeypatch, *, bad_destroy_nonce=False, fail_destroy=False, scenario_commands=None):
+def cp3_worker_capture(monkeypatch, *, bad_destroy_nonce=False, fail_destroy=False, scenario_commands=None, graph_view=None):
     """External ROS/pipe fixture exercises the existing worker entry, no DDS."""
     import sys
     from r2f.runtime import topology_worker as worker
@@ -808,6 +812,10 @@ def cp3_worker_capture(monkeypatch, *, bad_destroy_nonce=False, fail_destroy=Fal
                 stream.write(json.dumps({**request, 'event': 'topology_snapshot_requested', 'endpoint_gid': token['endpoint_gid']}) + '\n')
             checkpoints.append((command['command_id'], len(entities), calls.count('shutdown')))
             return json.dumps(command).encode() + b'\n'
+        if graph_view is not None:
+            original_rows = Node.rows
+            monkeypatch.setattr(Node, 'rows', lambda self, role: graph_view(
+                role, original_rows(self, role), entities))
         monkeypatch.setattr(worker.os, 'read', read_command)
         monkeypatch.setattr(sys, 'argv', ['worker', json.dumps(group_config()), 'writer'])
         rc = worker.worker_main()
@@ -1068,3 +1076,134 @@ def test_topology_writer_and_empty_interval_preserve_groups_and_new_delivery(tmp
         e['event_index'] = i
     with pytest.raises(ValueError, match='group_lineage:'):
         project_lineage(p, forged, result['raw_path'], config=backend.config)
+
+
+@pytest.mark.parametrize('transient', ['unbound', 'ambiguous'])
+def test_worker_bootstrap_waits_for_delayed_own_graph_after_visible_sibling(monkeypatch, transient):
+    from types import SimpleNamespace
+    reads = []
+    def graph_view(role, rows, entities):
+        if role == 'writer' and len([e for e in entities if e.role == role]) == 2:
+            reads.append(True)
+            if len(reads) == 1:
+                if transient == 'unbound':
+                    return rows[:1]
+                return rows + [SimpleNamespace(**{**vars(rows[-1]), 'endpoint_gid': bytes.fromhex('aa'*16)})]
+        return rows
+    rc, calls, events = worker_capture(monkeypatch, writers=2, readers=1, graph_view=graph_view)
+    assert rc == 0, events[-1]
+    created = [e for e in events if e['event'] == 'endpoint_created']
+    assert [(e['logical_id'], e['endpoint_gid']) for e in created] == [
+        ('w0', '0'*31+'1'), ('w1', '0'*31+'2'), ('r0', '0'*31+'3')]
+    attempts = [e for e in events if e['event'] == 'endpoint_identity_bootstrap' and e['logical_id'] == 'w1']
+    assert [e['candidate_count'] for e in attempts] == ([0, 1] if transient == 'unbound' else [2, 1])
+    assert [e['phase'] for e in attempts] == ['attempt', 'attempt']
+    assert attempts[0]['status'] == 'unknown' and attempts[-1]['status'] == 'bound'
+    assert len(attempts[0]['graph']['publishers']) == (1 if transient == 'unbound' else 3)
+    assert all(e['candidate_eligible'] is False for e in attempts)
+
+
+@pytest.mark.parametrize('visibility,count', [('absent', 0), ('sibling_only', 0), ('multiple', 2)])
+def test_worker_bootstrap_deadline_keeps_last_graph_unknown(monkeypatch, visibility, count):
+    from itertools import count as ticks
+    from types import SimpleNamespace
+    from r2f.runtime import topology_worker as worker
+    clock = ticks(0, .001)
+    monkeypatch.setattr(worker.time, 'monotonic', lambda: next(clock))
+    def configure(cfg, commands):
+        cfg['startup_timeout_sec'] = .01
+    def graph_view(role, rows, entities):
+        if role == 'writer' and len([e for e in entities if e.role == role]) == 2:
+            if visibility == 'absent':
+                return []
+            if visibility == 'sibling_only':
+                return rows[:1]
+            return rows + [SimpleNamespace(**{**vars(rows[-1]), 'endpoint_gid': bytes.fromhex('aa'*16)})]
+        return rows
+    rc, calls, events = worker_capture(monkeypatch, writers=2, readers=1,
+                                      damage=configure, graph_view=graph_view)
+    assert rc == 1
+    assert not any(e['event'] == 'endpoint_created' and e['logical_id'] == 'w1' for e in events)
+    diagnostics = [e for e in events if e['event'] == 'endpoint_identity_bootstrap' and e['logical_id'] == 'w1']
+    final = diagnostics[-1]
+    assert final['phase'] == 'final_failure' and final['status'] == 'unknown'
+    assert final['reason'] == 'endpoint_gid_not_observed_within_startup_timeout'
+    assert final['candidate_count'] == count and final['endpoint_gid'] is None
+    assert final['graph'] == diagnostics[-2]['graph']
+    assert 2 <= len(diagnostics) <= 12
+    assert all(e['candidate_eligible'] is False for e in diagnostics)
+    assert calls.count('destroy_writer') == 2 and calls.count('shutdown') == 1
+
+
+@pytest.mark.parametrize('damage_kind,reason', [
+    ('malformed', 'local_graph_endpoint_gid_invalid'),
+    ('zero', 'local_graph_endpoint_gid_invalid'),
+    ('duplicate', 'local_group_graph_identity_invalid'),
+    ('missing_sibling', 'local_group_graph_identity_invalid'),
+    ('malformed_ambiguous', 'local_graph_endpoint_gid_invalid'),
+])
+def test_worker_bootstrap_invalid_identity_fails_closed_with_raw_diagnostic(monkeypatch, damage_kind, reason):
+    from types import SimpleNamespace
+    def graph_view(role, rows, entities):
+        if role != 'writer' or len([e for e in entities if e.role == role]) != 2:
+            return rows
+        if damage_kind == 'missing_sibling':
+            return rows[1:]
+        gid = bytes.fromhex('aa') if damage_kind.startswith('malformed') else bytes(16)
+        if damage_kind == 'duplicate':
+            gid = rows[0].endpoint_gid
+        rows[-1] = SimpleNamespace(**{**vars(rows[-1]), 'endpoint_gid': gid})
+        if damage_kind == 'malformed_ambiguous':
+            rows.append(SimpleNamespace(**{**vars(rows[-1]), 'endpoint_gid': bytes.fromhex('bb'*16)}))
+        return rows
+    rc, calls, events = worker_capture(monkeypatch, writers=2, graph_view=graph_view)
+    assert rc == 1
+    diagnostics = [e for e in events if e['event'] == 'endpoint_identity_bootstrap' and e['logical_id'] == 'w1']
+    assert [e['phase'] for e in diagnostics] == ['attempt', 'final_failure']
+    assert all(e['status'] == 'error' and e['reason'] == reason and e['endpoint_gid'] is None
+               and not e['candidate_eligible'] for e in diagnostics)
+    assert diagnostics[-1]['graph'] == diagnostics[0]['graph']
+    assert not any(e['event'] == 'endpoint_created' and e['logical_id'] == 'w1' for e in events)
+
+
+@pytest.mark.parametrize('retired_only', [False, True])
+def test_worker_bootstrap_never_binds_retired_gid_on_recreation(monkeypatch, retired_only):
+    from itertools import count
+    from types import SimpleNamespace
+    from r2f.runtime import topology_worker as worker
+    clock = count(0, .1)
+    monkeypatch.setattr(worker.time, 'monotonic', lambda: next(clock))
+    seen = []
+    def graph_view(role, rows, entities):
+        if role == 'reader' and rows and rows[0].endpoint_gid.hex() == '0'*31+'3':
+            seen.append(True)
+            if retired_only or len(seen) == 1:
+                return [SimpleNamespace(**{**vars(rows[0]), 'endpoint_gid': bytes.fromhex('0'*31+'2')})]
+        return rows
+    rc, calls, events, _ = cp3_worker_capture(monkeypatch, graph_view=graph_view)
+    assert rc == (1 if retired_only else 0)
+    attempts = [e for e in events if e['event'] == 'endpoint_identity_bootstrap'
+                and e['logical_id'] == 'r0' and e['generation'] == 2]
+    assert attempts[0]['reason'] == 'local_graph_endpoint_gid_retired'
+    assert attempts[0]['candidate_count'] == 1 and attempts[0]['status'] == 'unknown'
+    assert attempts[0]['retired_gids'] == ['0'*31+'2']
+    created = [e for e in events if e['event'] == 'endpoint_created' and e['logical_id'] == 'r0']
+    assert [e['endpoint_gid'] for e in created] == (['0'*31+'2'] if retired_only else ['0'*31+'2', '0'*31+'3'])
+    assert attempts[-1]['phase'] == ('final_failure' if retired_only else 'attempt')
+
+
+def test_worker_rejects_identity_change_after_binding_without_bootstrap_retry(monkeypatch):
+    from types import SimpleNamespace
+    reads = []
+    def graph_view(role, rows, entities):
+        if role == 'reader' and rows:
+            reads.append(True)
+            if len(reads) > 2:
+                return [SimpleNamespace(**{**vars(rows[0]), 'endpoint_gid': bytes.fromhex('ab'*16)})]
+        return rows
+    rc, calls, events, _ = cp3_worker_capture(monkeypatch, graph_view=graph_view)
+    assert rc == 1
+    assert any(e['event'] == 'worker_error' and 'unreceipted_endpoint_identity_change' in e.get('error', '') for e in events)
+    created = [e for e in events if e['event'] == 'endpoint_created' and e['logical_id'] == 'r0']
+    assert created and all(e['endpoint_gid'] in {'0'*31+'2', '0'*31+'3'} for e in created)
+    assert not any(e['event'] == 'endpoint_identity_bootstrap' and e['status'] == 'unknown' for e in events)

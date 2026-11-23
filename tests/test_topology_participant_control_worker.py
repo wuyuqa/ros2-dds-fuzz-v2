@@ -475,3 +475,30 @@ def test_existing_topology_state_machine_routes_group_lifecycle_offline(tmp_path
     assert [(w['logical_id'], w['generation']) for w in lineage['workers']] == [('w0', 1), ('r0', 1), ('r0', 2)]
     assert all(not w['real_ros'] and w['fixture'] for w in lineage['workers'])
     assert not result['real_execution'] and not result['candidate_eligible'] and not result['sealed']
+
+
+@pytest.mark.parametrize('command', [
+    {'command': 'create_endpoint', 'command_id': 1, 'logical_id': 'w0',
+     'generation': 2, 'worker_role': 'writer'},
+    {'command': 'create_endpoint', 'command_id': 1, 'logical_id': 'w0',
+     'generation': True, 'worker_role': 'writer'},
+])
+def test_public_worker_rejects_future_or_malformed_creation_before_gid_bootstrap(monkeypatch, command):
+    rc, calls, events = run_worker(monkeypatch, [command])
+    assert rc == 1
+    assert any(e['event'] == 'worker_error' for e in events)
+    assert not any(e['event'] in {'endpoint_create_begin', 'endpoint_created',
+                                 'endpoint_identity_bootstrap'} for e in events)
+    assert 'writer' not in calls and calls.count('shutdown') == 1
+
+
+def test_public_worker_rejects_future_snapshot_identity_without_rebinding(monkeypatch):
+    rc, calls, events = run_worker(monkeypatch, [create('w0', 1),
+        {'command': 'snapshot', 'command_id': 2, 'logical_id': 'w0',
+         'generation': 2, 'endpoint_generation': 'uncreated-future-generation'}])
+    assert rc == 1
+    assert any(e['event'] == 'worker_error' and 'group_command_target_or_operation_invalid'
+               in e.get('error', '') for e in events)
+    created = [e for e in events if e['event'] == 'endpoint_created']
+    assert len(created) == 1 and created[0]['generation'] == 1
+    assert not any(e['event'] == 'command_done' and e.get('command_id') == 2 for e in events)

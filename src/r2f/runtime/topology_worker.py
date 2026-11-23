@@ -136,6 +136,11 @@ class TopologyBackendError(RuntimeError):
 def _graph_local_gid(snapshot, node_name, kind, *, group_gids=None):
     rows = snapshot["publishers" if kind == "writer" else "subscriptions"]
     own = [row for row in rows if row.get("node_name") == node_name]
+    for row in own:
+        gid = row.get("endpoint_gid")
+        if (not isinstance(gid, str) or not re.fullmatch(r"[0-9a-f]{32}", gid)
+                or not any(c != "0" for c in gid)):
+            raise TopologyBackendError("local_graph_endpoint_gid_invalid")
     if group_gids is not None:
         # One serialized create per endpoint in the same node/context. Previously
         # bound siblings remain visible; only the unique unbound graph identity
@@ -146,11 +151,7 @@ def _graph_local_gid(snapshot, node_name, kind, *, group_gids=None):
         own = [row for row in own if row.get("endpoint_gid") not in group_gids]
     if len(own) != 1:
         raise TopologyBackendError("local_graph_endpoint_not_unique")
-    gid = own[0].get("endpoint_gid")
-    if (not isinstance(gid, str) or not re.fullmatch(r"[0-9a-f]{32}", gid)
-            or not any(c != "0" for c in gid)):
-        raise TopologyBackendError("local_graph_endpoint_gid_invalid")
-    return gid
+    return own[0]["endpoint_gid"]
 
 
 def _observe_filter_state(endpoint, emit, *, command, command_id, reader_gid, phase):
@@ -1558,27 +1559,66 @@ def _worker_main(argv, group_owner=None):
             snapshot = {"publishers": publishers, "subscriptions": subscriptions}
             if authenticate:
                 rows = publishers if kind == "writer" else subscriptions
-                if local_gid is None and not any(x["node_name"] == node_name for x in rows):
-                    return snapshot
                 siblings = None
                 if group_owner is not None:
                     siblings = {item['token']['endpoint_gid']
                                 for eid, item in group_owner['sessions'].items()
                                 if eid != config['logical_id'] and 'token' in item
                                 and item['token']['kind'] == kind}
-                observed = _graph_local_gid(snapshot, node_name, kind, group_gids=siblings)
-                if local_gid is None:
+                bootstrapping = local_gid is None
+                try:
+                    observed = _graph_local_gid(snapshot, node_name, kind, group_gids=siblings)
+                except TopologyBackendError as exc:
+                    if not bootstrapping:
+                        raise
+                    reason = str(exc)
+                    retry = reason == "local_graph_endpoint_not_unique"
+                    # A wholly absent local graph is also an unbound attempt.
+                    if not any(row["node_name"] == node_name for row in rows):
+                        retry = True
+                        reason = "local_graph_endpoint_not_unique"
+                    bootstrap_diagnostic(snapshot, siblings, phase="attempt",
+                                         status="unknown" if retry else "error", reason=reason)
+                    if not retry:
+                        bootstrap_diagnostic(snapshot, siblings, phase="final_failure",
+                                             status="error", reason=reason)
+                        raise
+                    return snapshot
+                if bootstrapping:
+                    if group_owner is not None and observed in group_owner['retired_gids']:
+                        bootstrap_diagnostic(snapshot, siblings, phase="attempt", status="unknown",
+                                             reason="local_graph_endpoint_gid_retired")
+                        return snapshot
                     local_gid = observed
+                    bootstrap_diagnostic(snapshot, siblings, phase="attempt", status="bound", reason=None)
                 elif local_gid != observed:
                     raise TopologyBackendError("unreceipted_endpoint_identity_change")
             return snapshot
 
-        initial_graph = graph()
+        def bootstrap_diagnostic(snapshot, siblings, *, phase, status, reason):
+            rows = snapshot["publishers" if kind == "writer" else "subscriptions"]
+            own = [row for row in rows if row.get("node_name") == node_name]
+            candidates = [row.get("endpoint_gid") for row in own
+                          if row.get("endpoint_gid") not in (siblings or set())]
+            emit("endpoint_identity_bootstrap", phase=phase, status=status, reason=reason,
+                 graph=snapshot, graph_count=len(rows), local_graph_count=len(own),
+                 candidate_count=len(candidates), candidate_gids=candidates,
+                 sibling_gids=sorted(siblings or ()),
+                 retired_gids=sorted(group_owner['retired_gids']) if group_owner else [],
+                 endpoint_gid=local_gid,
+                 candidate_eligible=False)
+
         deadline = time.monotonic() + float(config.get("startup_timeout_sec", 10.0))
+        initial_graph = graph()
         while local_gid is None and time.monotonic() < deadline:
-            executor.spin_once(timeout_sec=0.02)
+            executor.spin_once(timeout_sec=min(0.02, max(0.0, deadline - time.monotonic())))
             initial_graph = graph()
         if local_gid is None:
+            siblings = {item['token']['endpoint_gid']
+                        for item in group_owner['sessions'].values()
+                        if 'token' in item and item['token']['kind'] == kind} if group_owner else set()
+            bootstrap_diagnostic(initial_graph, siblings, phase="final_failure", status="unknown",
+                                 reason="endpoint_gid_not_observed_within_startup_timeout")
             emit("worker_error", error="endpoint_gid_not_observed_within_startup_timeout")
             return 1
         # Graph retains the independent remote contract and GID/type. Local
@@ -1929,7 +1969,7 @@ def _group_worker_main(argv):
         executor.add_node(node)
         owner = dict(context=context, node=node, executor=executor, rmw_identifier=rmw,
                      observed_domain_id=observed_domain, process_start_ticks=ticks,
-                     node_name=node_name, emit=emit, sessions=sessions)
+                     node_name=node_name, emit=emit, sessions=sessions, retired_gids=set())
         emit('group_worker_ready', node_name=node_name)
         buffer = b''
         serial = 0
@@ -1988,6 +2028,7 @@ def _group_worker_main(argv):
                             or command.get('endpoint_generation') != token['endpoint_generation']):
                         raise TopologyBackendError('group_destroy_address_invalid')
                     item['session'].close()  # ROS endpoint destroy; owner context stays alive
+                    owner['retired_gids'].add(token['endpoint_gid'])
                     del sessions[eid]
                     emit('command_done', command=op, command_id=cid, cleanup_status='closed', **token)
                 elif op == 'group_snapshot':
