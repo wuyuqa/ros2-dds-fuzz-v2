@@ -26,6 +26,11 @@ REPO = SHADOW_OWNER / 'baseline' if SHADOW_OWNER else TEST_ROOT
 REVIEW_ROOT = (SHADOW_OWNER.parent if SHADOW_OWNER else
                REPO / 'results/main-review/s1-frontier-repair-20261118')
 LIVE = REVIEW_ROOT / 'f1-control-owner/isolated-scope-v2/live-output'
+# The pinned historical capsule embeds this absolute root. Hosted CI installs
+# its unchanged bytes there; keep repo-relative evidence preferred when present.
+if not LIVE.exists():
+    LIVE = Path('/home/wuyuqa/ros2-dds-fuzz-v2/results/main-review/'
+                's1-frontier-repair-20261118/f1-control-owner/isolated-scope-v2/live-output')
 sys.path.insert(0, str(REPO / 'tests'))
 from test_fuzz_exploratory_targets import _profile, _corpus, LATE
 from test_exploratory_checkpoint import SOURCE

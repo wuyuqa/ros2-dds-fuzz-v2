@@ -8,8 +8,12 @@ from pathlib import Path
 import pytest
 from r2f.campaign import topology_adapter as adapter
 
-ROOT = Path(os.environ.get("R2F_GUARD_REPOSITORY", Path(__file__).resolve().parents[1]))
-P16 = ROOT / "results/main-review/s1-final-breadth-prep-20261120/continuation-db4f12e/live-remaining-fifteen/partition-16"
+P16_RELATIVE = Path("results/main-review/s1-final-breadth-prep-20261120/continuation-db4f12e/live-remaining-fifteen/partition-16")
+LOCAL_ROOT = Path(__file__).resolve().parents[1]
+# The pinned installer preserves the historical absolute raw/source bindings.
+ROOT = Path(os.environ.get("R2F_GUARD_REPOSITORY",
+    LOCAL_ROOT if (LOCAL_ROOT / P16_RELATIVE).is_dir() else "/home/wuyuqa/ros2-dds-fuzz-v2"))
+P16 = ROOT / P16_RELATIVE
 
 
 def original():

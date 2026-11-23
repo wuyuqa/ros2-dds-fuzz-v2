@@ -128,7 +128,9 @@ class ReconnectQualification(unittest.TestCase):
         view = report['capability_reconnect']
         self.assertEqual(view['evaluation_status'], 'evaluated')
         self.assertEqual(view['activation_status'], 'pending')
-        self.assertIn('evaluation_source_not_frozen', view['implementation_pending_obligations'])
+        # Clean CI and dirty development trees must enforce the same capture gate.
+        self.assertEqual('evaluation_source_not_frozen' in view['implementation_pending_obligations'],
+                         not self.fixture.source['source_frozen'])
         self.assertIn('capture_source_not_qualified', view['implementation_pending_obligations'])
         self.assertFalse(view['implemented'])
         self.assertFalse(view['human_confirmed'])
@@ -229,8 +231,12 @@ class ReconnectQualification(unittest.TestCase):
                 elif claim == 'record':
                     evaluation['human_record_refs'][0]['record_id'] = 'forged-authority'
                 elif claim == 'source':
-                    evaluation['evaluation_source']['source_frozen'] = True
-                    evaluation['evaluation_source']['dirty_behavior_paths'] = []
+                    # Always tamper, even when a clean checkout is already frozen.
+                    source = evaluation['evaluation_source']
+                    source['source_frozen'] = not source['source_frozen']
+                    source['dirty_behavior_paths'] = ([] if source['source_frozen']
+                                                      else ['fixture-source-tampering.py'])
+                    self.assertNotEqual(source, original['evaluation_source'])
                 else:
                     evaluation['task_assessment']['blackbox_followup'] = {
                         'status': 'not_required', 'reason': 'Caller says supported.'}

@@ -3,17 +3,35 @@
     R2F_NATIVE_DDS_TESTS=0 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python3 -m unittest discover \
         -s tests -p test_native_participant.py -v
 
-Default run is fully offline: library load + symbol/ABI identity only, no
-participant.  Set R2F_NATIVE_DDS_TESTS=1 to also exercise a real bare DDS
-participant create/delete in this process (non-ROS), which is still **not**
+Default run is fully offline: temporary identity files and library doubles, no
+native library load or participant.  Set R2F_NATIVE_DDS_TESTS=1 to also exercise
+a real bare DDS participant create/delete in this process (non-ROS), which is still **not**
 gated live ROS execution and is only a capability check.
 """
+from contextlib import ExitStack, contextmanager
 import ctypes
+import hashlib
 import os
+from pathlib import Path
+import tempfile
 import unittest
 from unittest import mock
 
 from r2f.runtime import native_participant as np
+
+
+@contextmanager
+def native_probe_files():
+    """Identity inputs only: these fixture bytes are never a compiled library."""
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        for name in (*np.PRELOAD, 'libddsc.so.0', 'dds.h',
+                     'dds_public_qos.h', 'dds_public_impl.h'):
+            (root / name).write_bytes(('offline fixture:' + name).encode())
+        with mock.patch.multiple(np, LIBRARY_DIR=root, HEADER=root / 'dds.h',
+                                 QOS_HEADER=root / 'dds_public_qos.h',
+                                 IMPL_HEADER=root / 'dds_public_impl.h'):
+            yield root
 
 
 class AbiTests(unittest.TestCase):
@@ -36,21 +54,45 @@ class AbiTests(unittest.TestCase):
         self.assertEqual(np.INSTANCE_STATE[0x40], 'NOT_ALIVE_NO_WRITERS')
 
     def test_provenance_has_no_compiled_artifact(self):
-        value = np.provenance()
+        with native_probe_files() as root:
+            value = np.provenance()
+            expected_headers = {
+                name: hashlib.sha256((root / name).read_bytes()).hexdigest()
+                for name in ('dds.h', 'dds_public_impl.h', 'dds_public_qos.h')}
         self.assertEqual(value['backend'], 'ctypes-cyclonedds')
         self.assertFalse(value['build']['compiler_required'])
         self.assertIsNone(value['build']['binary'])
         self.assertIsNone(value['build']['build_root'])
         headers = value['abi']['source_headers']
         self.assertEqual(sorted(headers), ['dds.h', 'dds_public_impl.h', 'dds_public_qos.h'])
-        self.assertTrue(all(len(digest) == 64 for digest in headers.values()))
+        self.assertEqual(headers, expected_headers)
         self.assertEqual(len(value['module_sha256']), 64)
+
+    def test_missing_headers_are_recorded_without_inventing_hashes(self):
+        with native_probe_files() as root:
+            for name in ('dds.h', 'dds_public_qos.h', 'dds_public_impl.h'):
+                (root / name).unlink()
+            value = np.provenance()
+        self.assertEqual(value['abi']['source_headers'], {
+            'dds.h': None, 'dds_public_qos.h': None, 'dds_public_impl.h': None})
+        self.assertEqual(len(value['module_sha256']), 64)
+        self.assertEqual(value['abi']['layout_sha256'], np.abi_sha256())
 
 
 class CapabilityTests(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.value = np.capability()
+    def setUp(self):
+        stack = ExitStack()
+        self.addCleanup(stack.close)
+        self.root = stack.enter_context(native_probe_files())
+        self.library = mock.Mock(spec=np.REQUIRED_SYMBOLS)
+        self.loader = stack.enter_context(mock.patch.object(
+            np.ctypes, 'CDLL', return_value=self.library))
+        self.value = np.capability()
+
+    def tearDown(self):
+        # Inventory may bind signatures, but must never invoke a DDS operation.
+        for name in np.REQUIRED_SYMBOLS:
+            getattr(self.library, name).assert_not_called()
 
     def test_capability_is_observed_without_entities(self):
         self.assertTrue(self.value['ok'], self.value)
@@ -62,18 +104,40 @@ class CapabilityTests(unittest.TestCase):
 
     def test_library_identity_and_symbols(self):
         self.assertTrue(self.value['available'])
-        self.assertTrue(self.value['library'].endswith('libddsc.so.0.10.5'))
-        self.assertEqual(len(self.value['library_sha256']), 64)
+        path = self.root / 'libddsc.so.0'
+        self.assertEqual(self.value['library'], str(path.resolve()))
+        self.assertEqual(self.value['library_sha256'],
+                         hashlib.sha256(path.read_bytes()).hexdigest())
         self.assertEqual(sorted(self.value['symbols']), sorted(np.REQUIRED_SYMBOLS))
         preloads = {item['name'] for item in self.value['preloads']}
-        self.assertTrue({'libiceoryx_hoofs.so', 'libiceoryx_binding_c.so'} <= preloads)
+        self.assertEqual(preloads, set(np.PRELOAD))
+        self.assertEqual(self.loader.call_args_list, [
+            mock.call(str(self.root / name), mode=ctypes.RTLD_GLOBAL)
+            for name in (*np.PRELOAD, 'libddsc.so.0')])
+        for item in self.value['preloads']:
+            self.assertEqual(item['sha256'], hashlib.sha256(
+                (self.root / item['name']).read_bytes()).hexdigest())
 
     def test_missing_library_is_a_capability_gap(self):
-        value = np.capability('/nonexistent/libddsc.so.0')
+        self.loader.reset_mock()
+        missing = self.root / 'missing' / 'libddsc.so.0'
+        value = np.capability(str(missing))
+        self.loader.assert_not_called()
         self.assertFalse(value['ok'])
         self.assertEqual(value['capability_status'], 'capability_gap')
         self.assertEqual(value['layer'], 'capability_gap')
         self.assertFalse(value['participant_created'])
+
+    def test_unloadable_library_is_a_capability_gap(self):
+        self.loader.side_effect = OSError('fixture load failure')
+        value = np.capability()
+        self.assertFalse(value['ok'])
+        self.assertFalse(value['available'])
+        self.assertEqual(value['capability_status'], 'capability_gap')
+        self.assertEqual(value['layer'], 'capability_gap')
+        self.assertEqual(value['reason'], 'preload_failed:' + np.PRELOAD[0])
+        self.assertFalse(value['participant_created'])
+        self.assertFalse(value['candidate_eligible'])
 
     def test_summary_keeps_probe_non_evidence(self):
         summary = np.summarize_capability(self.value)
@@ -101,9 +165,13 @@ class GateTests(unittest.TestCase):
         self.assertIsNone(self.backend.library)
 
     def test_library_identity_must_match_authorization(self):
-        value = self.backend.run({'enabled': True,
-                                  'live_authorization': {'granted': True,
-                                                         'library_sha256': 'b' * 64}})
+        with native_probe_files() as root:
+            value = self.backend.run({'enabled': True,
+                                      'live_authorization': {'granted': True,
+                                                             'library_sha256': 'b' * 64}})
+            observed = hashlib.sha256((root / 'libddsc.so.0').read_bytes()).hexdigest()
+        self.assertEqual(value['observed'], observed)
+        self.assertEqual(value['expected'], 'b' * 64)
         self.assertEqual(value['reason'], 'library_identity_mismatch')
         self.assertEqual(value['layer'], 'identity')
         self.assertIsNone(self.backend.library)

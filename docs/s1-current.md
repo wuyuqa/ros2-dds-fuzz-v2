@@ -15,20 +15,20 @@
 
 ## 集成身份与活动交付
 
-MAIN：`/home/wuyuqa/ros2-dds-fuzz-v2`，branch `codex/s1-issue6-integration`，本轮实施起点 HEAD `4be53e9e92dd5b91a27f06a1ae5d63511298a761`。受保护文档 dirty，另有 untracked 历史 docs/results；HEAD 正确不等于整个工作树 clean/source_frozen。当前行为 hash、当轮环境与 live 资格未核定。
+MAIN：`/home/wuyuqa/ros2-dds-fuzz-v2`，branch `codex/s1-issue6-integration`，本轮实施起点 HEAD `4be53e9e92dd5b91a27f06a1ae5d63511298a761`。工程改进已提交 `d13a0bade68c92ee16f6e5cb1a9ae26df20acc43`，行为 hash `82be48b470fe2b73c17218ddc8c2d050bb3c5a862ea81b33a77e76d16fb23afd`，该次实测 source_frozen=true。受保护文档正文仍 dirty，另有 untracked 历史 docs/results；开始新动作须重新核对源码身份，不能以本截面授予 live 资格。
 
-本票 WT：`/dev/shm/r2f-retro-issue26-20261123`，base 同上；写集只有 `docs/**`、`README.md`、`AGENTS.md`。六份 MAIN dirty 文档已复制到此 WT，编辑前 [归档清单](history/issue26-before-2026-11-23/manifest.json) 保存原字节/hash；MAIN 的其他 untracked 历史文件没有复制，也不得删除。
+本票原 WT：`/dev/shm/r2f-retro-issue26-20261123`（交付已整合、工作树已回收；差异留存于 [回收记录](/tmp/s1-retro-implementation-20261123/worker-cleanup.json)），base 同上；原写集只有 `docs/**`、`README.md`、`AGENTS.md`。六份 MAIN dirty 文档已复制到此 WT，编辑前 [归档清单](history/issue26-before-2026-11-23/manifest.json) 保存原字节/hash；MAIN 的其他 untracked 历史文件没有复制，也不得删除。
 
 | 活动 | 交付入口／owner WT | 当前含义与下一步 |
 |---|---|---|
-| #17 CP2 | [DELIVERY.md](/tmp/r2f-s1-issue6-20261121/issue17-cp2-adoption-audit-owner/DELIVERY.md)、[source-identity.json](/tmp/r2f-s1-issue6-20261121/issue17-cp2-adoption-audit-owner/source-identity.json)；WT `/dev/shm/r2f-s1-issue17-cp2-adoption-audit` | MAIN #28 已完成隔离应用与相关检查，见下节实测结果；必要审查/整合仍按原票执行。修改 `src/r2f/campaign/observations.py` + 新 `tests/test_campaign_adopted_config_audit.py`，base 为本页 MAIN HEAD。不能写成已整合。 |
+| #17 CP2 | [DELIVERY.md](/tmp/r2f-s1-issue6-20261121/issue17-cp2-adoption-audit-owner/DELIVERY.md)、[source-identity.json](/tmp/r2f-s1-issue6-20261121/issue17-cp2-adoption-audit-owner/source-identity.json)；WT `/dev/shm/r2f-s1-issue17-cp2-adoption-audit` | MAIN #28 已完成隔离应用与相关检查（d13a0ba 源识别 base_changed=true，并新跑134项通过），见 [最终校验](/tmp/s1-retro-implementation-20261123/issue28-final-issue17.json) 及下节首次实测结果；必要审查/整合仍按原票执行。修改 `src/r2f/campaign/observations.py` + 新 `tests/test_campaign_adopted_config_audit.py`，base 为本页 MAIN HEAD。不能写成已整合。 |
 | #12 consumer continuation | [REPORT-consumer-continuation.md](/tmp/r2f-s1-issue6-20261121/issue12-ros-group-control-cp1-v9-owner/consumer-next-cp-20261123T094225/REPORT-consumer-continuation.md)、[delivery.json](/tmp/r2f-s1-issue6-20261121/issue12-ros-group-control-cp1-v9-owner/consumer-next-cp-20261123T094225/delivery.json)；WT `/dev/shm/r2f-s1-offline-worktrees-20261122/issue12-ros-group-control-cp1-v9` | 待整合；owner base `d4c1070`，声明在 MAIN `4be53e9` 干净 archive 测试。按 manifest 区分 COMBINED 与 DELTA，不能混用；213 pass 是交付历史结果。 |
 | #23 v11 | [REPORT.md](/tmp/r2f-s1-issue6-20261121/issue23-v11-fix-owner/REPORT.md) | 仍是 template only；不授 batch GO、不代表实际运行/清理验收完成。 |
-| #27 | [issue-27.json](/tmp/s1-retro-implementation-20261123/issue-27.json) | 入口、依赖及 CI 配置已整合至 MAIN 工作树；标准 `python3 scripts/check_offline.py`、依赖 `.[test]`。审查前诊断全套已中断并保留2个过期测试期望失败，相关期望已修正；最终源码全套及托管 CI 仍待实际结果，不预填通过。 |
+| #27 | [issue-27.json](/tmp/s1-retro-implementation-20261123/issue-27.json) | 统一入口、测试依赖及 CI 已提交 d13a0ba；后续完整 CI 暴露本机 ROS/UID/header 假设、历史输入缺失、editable wheel 路径及全局 stat fixture 等可移植性问题，逐项修复并保留原失败。标准 `python3 scripts/check_offline.py`，先安装 `.[test]` 并核验固定历史输入；CI 同入口按文件分组用两个 worker，全量收集、不加排除。相关检查及双轴审查记录在 `/tmp/s1-retro-implementation-20261123/`。最终全套与托管 CI 的实际验收结果以 #27 和 PR #25 最新证据评论为准；本页不预填通过。 |
 
 ## 本轮空间回收
 
-#29 清理命令已在结束的本轮复现副本上实际执行，删除逻辑132,291字节／文件分配167,936字节，文件系统观测 free delta 为 +176,128字节（并发活动下不作独占归因）。[回执](/tmp/s1-retro-implementation-20261123/issue29/final-reproduction-apply.json) 确认保护对象仍在；[限定盘点](/tmp/s1-retro-implementation-20261123/issue29/bounded-inventory.json) 列出活动worktree、待整合交付、原始运行证据、失败记录和重复scratch的占用、引用及保留理由。旧副本因活动引用覆盖尚不完整而保留；本次回收未解决磁盘压力。使用 `python3 scripts/cleanup_task_artifacts.py --help` 查预览/重验入口；新清理须重新给定限定目录、完成记录、相同保留副本及当前引用，不能套用旧预览。
+#29 清理命令已在结束的本轮复现副本上实际执行，最终 d13a0ba 源复现删除逻辑207,252字节／文件分配253,952字节，文件系统观测 free delta 为 +262,144字节（并发活动下不作独占归因）。[回执](/tmp/s1-retro-implementation-20261123/issue29/final-source-apply.json) 确认保护对象仍在；[限定盘点](/tmp/s1-retro-implementation-20261123/issue29/bounded-inventory.json) 列出活动worktree、待整合交付、原始运行证据、失败记录和重复scratch的占用、引用及保留理由。旧副本因活动引用覆盖尚不完整而保留；本次回收未解决磁盘压力。使用 `python3 scripts/cleanup_task_artifacts.py --help` 查预览/重验入口；新清理须重新给定限定目录、完成记录、相同保留副本及当前引用，不能套用旧预览。
 
 ## 接续演示与下一步
 

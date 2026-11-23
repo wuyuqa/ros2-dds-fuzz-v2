@@ -12,10 +12,14 @@
 python3 -m venv .venv
 . .venv/bin/activate
 python3 -m pip install -e '.[test]'
+python3 scripts/prepare_offline_evidence.py
+python3 scripts/prepare_offline_evidence.py --capsule p16
 python3 scripts/check_offline.py
 ```
 
-该入口收集 unittest 和 pytest 风格的离线测试，并显示失败、错误和跳过原因；CI 使用同一命令。可在命令后传入测试路径或 `--collect-only`。独立证据验收使用 `python3 scripts/verify_s1.py REPORT`。离线合同、真实 ROS/DDS、历史缺陷检出和 required/seal 各自验收，真实运行仍需当轮 GO、唯一 owner 与环境/锁核对。
+历史 F1/P16 测试使用仓库内固定 hash 的真实输入归档。安装器保留原绝对路径绑定，要求其 canonical parent 已存在且可写；具体路径及 CI 的限定准备步骤见 [.github/workflows/offline.yml](.github/workflows/offline.yml)。已有原件只读核验，不能覆盖或将安装视为新运行。
+
+该入口收集 unittest 和 pytest 风格的离线测试，并显示失败、错误和跳过原因；CI 使用同一入口，加 `-p xdist.plugin -n 2 --dist loadfile --junitxml=offline-junit.xml` 并行运行全部测试。可在命令后传入测试路径或 `--collect-only`。独立证据验收使用 `python3 scripts/verify_s1.py REPORT`。离线合同、真实 ROS/DDS、历史缺陷检出和 required/seal 各自验收，真实运行仍需当轮 GO、唯一 owner 与环境/锁核对。
 
 ## 按需阅读
 

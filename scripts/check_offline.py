@@ -29,6 +29,11 @@ class OfflineImports(importlib.abc.MetaPathFinder):
         return None
 
 
+def pytest_configure(config):
+    """Install the same import boundary in controller and xdist workers."""
+    sys.meta_path.insert(0, OfflineImports())
+
+
 def main():
     blocked = [name for name in ("R2F_NATIVE_DDS_TESTS", "R2F_BOUNDARY_KERNEL_TESTS")
                if os.environ.get(name) == "1"]
@@ -51,10 +56,9 @@ def main():
         print(f"offline check environment error: {exc}; "
               "install with python3 -m pip install -e '.[test]'", file=sys.stderr)
         return 2
-    sys.meta_path.insert(0, OfflineImports())
     print("Offline code checks only; no execution/candidate/seal qualification. "
           "Evidence acceptance: python3 scripts/verify_s1.py REPORT", flush=True)
-    return int(pytest.main(["-c", str(ROOT / "pyproject.toml"), "-ra", *sys.argv[1:]]))
+    return int(pytest.main(["-p", "scripts.check_offline", "-c", str(ROOT / "pyproject.toml"), "-ra", *sys.argv[1:]]))
 
 
 if __name__ == "__main__":

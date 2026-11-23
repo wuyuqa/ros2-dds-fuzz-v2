@@ -165,8 +165,17 @@ def test_cycle_never_trusts_missing_tampered_or_runtime_returned_facts(tmp_path,
     row = cycle['rows'][0]
     assert not row.get('candidate_eligible')
     if damage == 'forged_summary':
-        assert row['oracle_verdict'] == 'pass'  # BB raw, false returned BR fact ignored
-        assert row['rule_id'] == 's1.discovery.compatibility_guard.v1'
+        # The persisted runtime result and returned evidence must agree before
+        # ingest. A forged return is a tool failure, even when raw is healthy.
+        assert row['oracle_verdict'] == 'unknown'
+        assert row['execution_stage'] == 'aborted'
+        assert row['abort_reason'] == 'runner_wrapper_failure'
+        assert row['runner_exception']['detail'] == 'runtime_result_differs_from_returned_evidence'
+        saved = json.loads(Path(row['runtime_result_path']).read_text())
+        assert saved.get('relation_guard_facts') != {
+            'incompatible': True, 'identity_backed_delivery': True}
+        raw = Path(saved['raw_path'])
+        assert hashlib.sha256(raw.read_bytes()).hexdigest() == saved['raw_sha256']
     else:
         assert row['oracle_verdict'] != 'pass'
         assert row['execution_stage'] == 'aborted'

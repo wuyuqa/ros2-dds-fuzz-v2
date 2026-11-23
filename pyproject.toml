@@ -16,7 +16,7 @@ where = ["src"]
 "r2f.modules.s1" = ["s1_coverage.json", "seed_lineage.json"]
 
 [project.optional-dependencies]
-test = ["pytest>=7.4,<10"]
+test = ["pytest>=7.4,<10", "pytest-xdist>=3.5,<4", "setuptools>=61", "wheel"]
 
 [tool.pytest.ini_options]
 minversion = "7.4"

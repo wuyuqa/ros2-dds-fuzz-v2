@@ -4,10 +4,13 @@
         -s tests -p test_participant_backend.py -v
 
 No ROS context, DDS participant, domain lock or campaign.  The capability
-probe only dlopens vendor libraries and imports rclpy to inspect signatures.
+probe subprocess is doubled with explicit inventories; no ROS/vendor loading.
 """
+from contextlib import ExitStack
 import json
+import subprocess
 import unittest
+from unittest import mock
 
 from r2f.runtime import participant_backend as pb
 
@@ -296,9 +299,46 @@ class LedgerTests(unittest.TestCase):
 
 
 class CapabilityProbeTests(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.value = pb.capability_probe()
+    def setUp(self):
+        stack = ExitStack()
+        self.addCleanup(stack.close)
+        # Explicit child-process output, not a claim about the CI host stack.
+        self.inventory = {
+            'public_api': {
+                'rclpy_import': True,
+                'create_subscription_has_content_filter_options': True,
+                'subscription_set_content_filter': True,
+                'subscription_get_content_filter': True,
+                'subscription_is_cft_enabled': True,
+                'publisher_assert_liveliness': True,
+                'content_filter_options_fields': [
+                    'filter_expression', 'expression_parameters'],
+                'context_created': False, 'node_created': False,
+                'participant_created': False},
+            'packages': {
+                'rclpy': {'version': 'fixture-version'},
+                'rmw_cyclonedds_cpp': {'package_xml_sha256': 'a' * 64}},
+            'ddsc': {
+                'available': True, 'participant_created': False,
+                'library': '/fixture/libddsc.so.0',
+                'realpath': '/fixture/libddsc.so.fixture',
+                'sha256': 'b' * 64,
+                'symbols': {name: True for name in (
+                    'dds_create_participant', 'dds_delete', 'dds_get_guid',
+                    'dds_create_reader', 'dds_create_topic', 'dds_take',
+                    'dds_return_loan', 'dds_builtintopic_free_participant',
+                    'dds_qget_liveliness', 'dds_qget_history')}},
+            'errors': []}
+        self.process = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout=json.dumps(self.inventory), stderr='')
+        self.run = stack.enter_context(mock.patch.object(
+            pb.subprocess, 'run', return_value=self.process))
+        self.value = pb.capability_probe()
+        self.run.assert_called_once()
+        self.assertEqual(self.run.call_args.args,
+                         ([pb.sys.executable, '-B', '-c', pb._probe_code()],))
+        self.assertTrue(self.run.call_args.kwargs['capture_output'])
+        self.assertTrue(self.run.call_args.kwargs['text'])
 
     def test_probe_runs_without_creating_entities(self):
         self.assertTrue(self.value['ok'], self.value)
@@ -324,11 +364,11 @@ class CapabilityProbeTests(unittest.TestCase):
 
     def test_versions_and_library_hashes_are_recorded(self):
         packages = self.value['capabilities']['packages']
-        self.assertEqual(packages['rclpy']['version'], '7.1.12')
+        self.assertEqual(packages, self.inventory['packages'])
         self.assertEqual(len(packages['rmw_cyclonedds_cpp']['package_xml_sha256']), 64)
         ddsc = self.value['capabilities']['ddsc']
         self.assertTrue(ddsc['available'])
-        self.assertEqual(len(ddsc['sha256']), 64)
+        self.assertEqual(ddsc['sha256'], self.inventory['ddsc']['sha256'])
         self.assertTrue(ddsc['library'].endswith('libddsc.so.0'))
         self.assertTrue(all(ddsc['symbols'].values()))
 
@@ -337,7 +377,8 @@ class CapabilityProbeTests(unittest.TestCase):
         self.assertEqual(route['backend'], 'ctypes-cyclonedds')
         self.assertFalse(route['compiler_required'])
         self.assertEqual(route['live_create_destroy'], 'not_run_no_live_go')
-        self.assertEqual(len(route['library_sha256']), 64)
+        self.assertEqual(route['library_sha256'], self.inventory['ddsc']['sha256'])
+        self.assertEqual(route['library'], self.inventory['ddsc']['realpath'])
 
     def test_probe_receipt_is_not_execution_evidence(self):
         self.assertFalse(self.value['counts_toward_maturity'])
@@ -346,11 +387,46 @@ class CapabilityProbeTests(unittest.TestCase):
         self.assertEqual(len(self.value['source_identity']['sha256']), 64)
 
     def test_failed_probe_is_an_unknown_capability_guard(self):
-        value = pb.capability_probe(timeout_sec=0.000001)
+        self.run.reset_mock()
+        self.run.side_effect = subprocess.TimeoutExpired('fixture-probe', 0.01)
+        value = pb.capability_probe(timeout_sec=0.01)
+        self.run.assert_called_once()
+        self.assertEqual(self.run.call_args.kwargs['timeout'], 0.01)
         self.assertFalse(value['ok'])
         self.assertEqual(value['capability_status'], 'probe_failed')
         self.assertEqual(value['layer'], 'unknown_capability')
         self.assertFalse(value['participant_created'])
+        self.assertIsNone(value['native_ddsc_available'])
+        self.assertIsNone(value['native_route']['available'])
+        self.assertEqual(value['native_route']['live_create_destroy'], 'unknown')
+
+    def test_unavailable_features_are_explicit_gaps_not_probe_failure(self):
+        absent = {
+            'public_api': {'rclpy_import': False,
+                           'context_created': False, 'node_created': False,
+                           'participant_created': False},
+            'ddsc': {'available': False, 'error': 'fixture:library_unavailable',
+                     'participant_created': False},
+            'errors': ['rclpy:ModuleNotFoundError', 'ddsc:OSError']}
+        self.process.stdout = json.dumps(absent)
+        value = pb.capability_probe()
+        self.assertTrue(value['ok'])  # Inventory succeeded; features are absent.
+        self.assertEqual(value['capability_status'], 'observed')
+        self.assertEqual(value['capabilities'], absent)
+        self.assertFalse(value['public_filter_api'])
+        self.assertFalse(value['native_ddsc_available'])
+        self.assertEqual(value['public_api_gaps'], [
+            'subscription_set_content_filter', 'subscription_get_content_filter',
+            'subscription_is_cft_enabled', 'publisher_assert_liveliness'])
+        self.assertEqual(value['native_route'], {
+            'backend': 'ctypes-cyclonedds', 'available': False,
+            'reason': 'fixture:library_unavailable',
+            'live_create_destroy': 'capability_gap'})
+        self.assertFalse(value['participant_created'])
+        self.assertFalse(value['context_created'])
+        self.assertFalse(value['candidate_eligible'])
+        self.assertFalse(value['counts_toward_maturity'])
+        self.assertFalse(value['mutation_receipt'])
 
 
 if __name__ == '__main__':

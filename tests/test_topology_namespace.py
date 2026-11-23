@@ -228,8 +228,10 @@ def binding_fixture(monkeypatch):
     monkeypatch.setattr(boundary, '_ticks', lambda p: 123)
     monkeypatch.setattr(boundary.os, 'getgid', lambda: 1000)
     stat = SimpleNamespace(st_dev=7, st_ino=8)
-    monkeypatch.setattr(bridge.os, 'stat', lambda *a, **kw: stat)
-    monkeypatch.setattr(bridge.os, 'fstat', lambda *a, **kw: stat)
+    # Patch the module binding, so pytest/filesystem code retains real stat.
+    monkeypatch.setattr(bridge, 'os', SimpleNamespace(
+        **{**vars(bridge.os), 'stat': lambda *a, **kw: stat,
+           'fstat': lambda *a, **kw: stat}))
     monkeypatch.setattr(boundary.fcntl, 'ioctl', lambda fd, cmd: boundary.CLONE_FLAGS[boundary.NAMESPACES[fd-11]])
     return packet, (3, 1000, 1000), [10, 11, 12, 13, 14], outer, actual
 

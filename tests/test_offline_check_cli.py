@@ -120,3 +120,13 @@ def test_real_ros_import_is_blocked_before_module_execution(tmp_path):
     assert result.returncode == 2, result.stdout
     assert "offline check forbids real ROS imports" in result.stdout
     assert "ROS_MODULE_EXECUTED" not in result.stdout
+
+
+def test_real_ros_import_is_blocked_in_parallel_worker(tmp_path):
+    (tmp_path / "rclpy.py").write_text("raise RuntimeError('ROS_MODULE_EXECUTED')\n")
+    suite = tmp_path / "test_parallel_ros.py"
+    suite.write_text("import rclpy\ndef test_never():\n    pass\n")
+    result = run_cli(tmp_path, suite, "-p", "xdist.plugin", "-n", "2", "--dist", "loadfile")
+    assert result.returncode != 0, result.stdout
+    assert "offline check forbids real ROS imports" in result.stdout
+    assert "ROS_MODULE_EXECUTED" not in result.stdout

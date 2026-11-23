@@ -18,6 +18,8 @@ import sys
 
 site = Path(sys.argv[1]).resolve()
 checkout = Path(sys.argv[2]).resolve()
+# -I still loads editable-install .pth files; isolate this wheel query explicitly.
+sys.path[:] = [p for p in sys.path if not Path(p).resolve().is_relative_to(checkout)]
 sys.path.insert(0, str(site))
 assert not any(Path(p).resolve().is_relative_to(checkout) for p in sys.path)
 
@@ -155,6 +157,8 @@ import sys
 
 site = Path(sys.argv[1]).resolve()
 checkout = Path(sys.argv[2]).resolve()
+# -I still loads editable-install .pth files; isolate this wheel query explicitly.
+sys.path[:] = [p for p in sys.path if not Path(p).resolve().is_relative_to(checkout)]
 sys.path.insert(0, str(site))
 assert not any(Path(p).resolve().is_relative_to(checkout) for p in sys.path)
 from r2f.core import Registry
