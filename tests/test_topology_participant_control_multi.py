@@ -322,7 +322,7 @@ def transport(monkeypatch, tmp_path):
         def add(self,event,**fields):
             value={'event':event,'pid':self.pid,'pgid':self.pid,'process_start_ticks':900,
                 'domain_id':173,'observed_domain_id':173,'rmw_identifier':'rmw_cyclonedds_cpp',
-                'run_id':'offline-fixture','domain_observation_source':'fixture_api','monotonic_ns':1000,
+                'run_id':'offline-fixture','domain_observation_source':'fixture_api','monotonic_ns':__import__('time').monotonic_ns(),
                 **{k:self.cfg[k] for k in ('group_id','worker_instance_id','context_instance_id')},**fields}
             self.output+=json.dumps(value).encode()+b'\n'
         def handle(self,c):
@@ -334,8 +334,8 @@ def transport(monkeypatch, tmp_path):
                 self.returncode=0;return
             if op=='create_endpoint':
                 spec=next(e for e in self.cfg['group_members'] if e['logical_id']==eid)
-                token=dict(logical_id=eid,generation=1,endpoint_generation=f'fixture-{eid}',
-                    endpoint_gid=f"{list(self.cfg['group_worker_roles']).index(eid)+1:032x}",
+                token=dict(logical_id=eid,generation=c['generation'],endpoint_generation=f"fixture-{eid}-g{c['generation']}",
+                    endpoint_gid=f"{list(self.cfg['group_worker_roles']).index(eid)+1+(c['generation']-1)*8:032x}",
                     role=c['worker_role'],worker_role=c['worker_role'])
                 self.tokens[eid]=token
                 from r2f.runtime.topology_worker import endpoint_expressibility
@@ -344,7 +344,23 @@ def transport(monkeypatch, tmp_path):
                     node_name='fixture-group-node',created_monotonic_ns=100,
                     identity_source='get_publishers_info_by_topic' if spec['role']=='writer' else 'get_subscriptions_info_by_topic')
                 self.add('endpoint_group_bound',endpoint={k:token[k] for k in ('logical_id','generation','endpoint_generation','endpoint_gid','worker_role')})
+            if op == 'group_snapshot' and eid is None:
+                assert not self.tokens
+                self.add('participant_group_snapshot', command_id=cid,
+                    schema='r2f.ros-participant-group-observation/v1', supporting_diagnostic=True, candidate_eligible=False,
+                    requested_grouping=self.cfg['group_id'], ros_context_application_observed=True,
+                    endpoint_ownership_observed=False, local_root_inventory_complete=False, group_relation_observed=False,
+                    actual_local_root_count=None, roots_before=None, roots_after=None, endpoints=[],
+                    unknown_reasons=['local_root_inventory_incomplete'], endpoint_absence_observed=True, active_endpoint_count=0)
+                self.add('command_done', command=op, command_id=cid, endpoint_absence_observed=True, active_endpoint_count=0)
+                return
+            assert eid in self.tokens, ('retired_endpoint_command', op, eid)
             token=deepcopy(self.tokens[eid])
+            if op=='destroy_endpoint':
+                self.add('endpoint_destroyed',**token,cleanup_status='closed')
+                self.add('command_done',**token,command=op,command_id=cid,cleanup_status='closed')
+                del self.tokens[eid]
+                return
             if op=='snapshot':
                 self.add('match_snapshot',**token,command_id=cid,matched_count=1)
                 pubs=[dict(endpoint_gid=t['endpoint_gid'],node_name='fixture-group-node',topic_type='std_msgs/msg/String',qos={}) for t in self.tokens.values() if t['role'].startswith('writer')]
@@ -352,7 +368,20 @@ def transport(monkeypatch, tmp_path):
                 self.add('graph_snapshot',**token,command_id=cid,publishers=pubs,subscriptions=subs)
             elif op=='publish_batch':
                 for sequence in c['sequences']:
-                    self.add('send',**token,command_id=cid,send_sequence=sequence,writer_gid=token['endpoint_gid'])
+                    body = dict(run_id=self.cfg['run_id'], writer_id=eid, writer_generation=token['generation'],
+                                endpoint_gid=token['endpoint_gid'], send_sequence=sequence, phase=c['phase'])
+                    data = json.dumps(body, sort_keys=True)
+                    digest = hashlib.sha256(data.encode()).hexdigest()
+                    self.add('send', **token, command_id=cid, send_sequence=sequence, writer_gid=token['endpoint_gid'],
+                             phase=c['phase'], string_data=data, payload_sha256=digest, publish_returned=True)
+                    for child in allocated:
+                        for reader in child.tokens.values():
+                            if reader['worker_role'].startswith('reader'):
+                                child.add('receive', **reader, send_sequence=sequence, phase=c['phase'],
+                                    publisher_gid=None, publisher_gid_status='unavailable_api', identity_basis='endpoint_correlated',
+                                    payload_run_id=body['run_id'], payload_writer_id=eid,
+                                    payload_writer_generation=token['generation'], payload_endpoint_gid=token['endpoint_gid'],
+                                    string_data=data, payload_sha256=digest)
             elif op=='group_snapshot':
                 self.add('participant_group_snapshot',**token,command_id=cid,
                     schema='r2f.ros-participant-group-observation/v1',supporting_diagnostic=True,candidate_eligible=False,
@@ -721,3 +750,321 @@ def test_group_capture_actor_does_not_excuse_forged_endpoint_alias(tmp_path, fie
     capture[field] = value
     with pytest.raises(ValueError, match='endpoint_event_role_alias'):
         project_lineage(f.program, f.events, str(f.raw), config=f.config)
+
+
+def cp3_worker_capture(monkeypatch, *, bad_destroy_nonce=False, fail_destroy=False, scenario_commands=None):
+    """External ROS/pipe fixture exercises the existing worker entry, no DDS."""
+    import sys
+    from r2f.runtime import topology_worker as worker
+    from test_topology_participant_control_worker import ros_fixture, group_config, create
+    commands = [create('w0', 1), create('r0', 2),
+                dict(command='destroy_endpoint', command_id=3, logical_id='r0', generation=1),
+                dict(command='create_endpoint', command_id=4, logical_id='r0', generation=2, worker_role='reader'),
+                dict(command='snapshot', command_id=5, logical_id='w0', generation=1),
+                dict(command='snapshot', command_id=6, logical_id='r0', generation=2),
+                dict(command='group_snapshot', command_id=7, logical_id='w0', generation=1),
+                dict(command='stop', command_id=8)]
+    if scenario_commands is not None:
+        commands = scenario_commands
+    checkpoints = []
+    with ros_fixture(monkeypatch, [], fail_destroy=fail_destroy) as (calls, entities, stream):
+        Node = sys.modules['rclpy.node'].Node
+        serial = [0]
+        if fail_destroy:
+            destroy = Node.destroy_subscription
+            def failed_destroy(self, endpoint):
+                destroy(self, endpoint)
+                return False
+            monkeypatch.setattr(Node, 'destroy_subscription', failed_destroy)
+        for method in ('create_publisher', 'create_subscription'):
+            original = getattr(Node, method)
+            def create_entity(self, *args, _create=original, **kwargs):
+                e = _create(self, *args, **kwargs)
+                serial[0] += 1
+                e.gid = f'{serial[0]:032x}'
+                return e
+            monkeypatch.setattr(Node, method, create_entity)
+        class PeerAPI:
+            # External ABI fixture observes only the currently allocated endpoints.
+            def sample(self, domain, gid, kind):
+                return dict(complete=True, domain_id=domain, local_gid=gid, role_kind=kind,
+                            matched_peer_gids=[e.gid for e in entities if e.role != kind])
+        monkeypatch.setattr(worker, 'CycloneMatchedPeerObserver', PeerAPI)
+        pending = iter(commands)
+        def read_command(*_):
+            command = next(pending, None)
+            if command is None:
+                return b''
+            rows = [json.loads(s) for s in stream.getvalue().splitlines()]
+            if command['command'] in {'destroy_endpoint', 'snapshot', 'group_snapshot', 'publish_batch'} and command.get('logical_id') is not None:
+                token = next(e for e in reversed(rows) if e['event'] == 'endpoint_created'
+                             and e['logical_id'] == command['logical_id'])
+                command['endpoint_generation'] = ('wrong' if bad_destroy_nonce and command['command'] == 'destroy_endpoint'
+                                                  else token['endpoint_generation'])
+            identity = {k: rows[0][k] for k in ('pid', 'pgid', 'process_start_ticks', 'group_id', 'worker_instance_id', 'context_instance_id', 'run_id', 'domain_id')}
+            request = dict(event='group_command_requested', role='topology_controller', **identity, **command)
+            stream.write(json.dumps(request) + '\n')
+            if command['command'] == 'snapshot':
+                stream.write(json.dumps({**request, 'event': 'topology_snapshot_requested', 'endpoint_gid': token['endpoint_gid']}) + '\n')
+            checkpoints.append((command['command_id'], len(entities), calls.count('shutdown')))
+            return json.dumps(command).encode() + b'\n'
+        monkeypatch.setattr(worker.os, 'read', read_command)
+        monkeypatch.setattr(sys, 'argv', ['worker', json.dumps(group_config()), 'writer'])
+        rc = worker.worker_main()
+    return rc, calls, [json.loads(s) for s in stream.getvalue().splitlines()], checkpoints
+
+
+def test_group_endpoint_destroy_recreate_keeps_sibling_and_context(monkeypatch):
+    rc, calls, rows, checkpoints = cp3_worker_capture(monkeypatch)
+    assert rc == 0, rows[-1]
+    assert (4, 1, 0) in checkpoints  # reader gone; writer and context survive
+    assert (5, 2, 0) in checkpoints
+    assert calls.count('context') == calls.count('shutdown') == 1
+    created = [e for e in rows if e['event'] == 'endpoint_created']
+    assert [(e['logical_id'], e['generation']) for e in created] == [('w0', 1), ('r0', 1), ('r0', 2)]
+    assert len({e['endpoint_gid'] for e in created}) == len({e['endpoint_generation'] for e in created}) == 3
+    retired = next(e for e in rows if e['event'] == 'endpoint_destroyed' and e['logical_id'] == 'r0')
+    ack = next(e for e in rows if e['event'] == 'command_done' and e['command_id'] == 3)
+    assert rows.index(created[1]) < rows.index(retired) < rows.index(ack) < rows.index(created[2])
+    assert retired['cleanup_status'] == ack['cleanup_status'] == 'closed'
+    assert ack['endpoint_generation'] == created[1]['endpoint_generation']
+    assert any(e['event'] == 'command_done' and e.get('command_id') == 5 and e.get('logical_id') == 'w0' for e in rows)
+
+
+def cp3_lineage_fixture(monkeypatch):
+    from test_topology_participant_control_worker import group_config
+    cfg = group_config()
+    p = program(deepcopy(cfg['group_members']))
+    p['participant_control'] = dict(CONTROL)
+    p['actions'] += [action('destroy_r0', 'destroy', 'r0', 1), action('recreate_r0', 'recreate', 'r0', 2)]
+    rc, _, rows, _ = cp3_worker_capture(monkeypatch)
+    assert rc == 0, rows[-1]
+    identity = {k: rows[0][k] for k in ('pid', 'pgid', 'process_start_ticks', 'group_id', 'worker_instance_id', 'context_instance_id', 'run_id', 'domain_id')}
+    events = [dict(event='input_binding', run_id=cfg['run_id'], receipt=dict(program_sha256=canonical_hash(p), participant_control=dict(CONTROL))),
+              dict(event='process_started', fresh_process=True, separate_context=False, **identity), *rows,
+              dict(event='process_exit', returncode=0, **identity)]
+    for i, e in enumerate(events):
+        e.update(event_index=i, monotonic_ns=1000+i*1000, fixture=True, real_ros=False, backend='offline_fake')
+    return p, events
+
+
+def test_recreated_group_lineage_projects_all_incarnations(monkeypatch, tmp_path):
+    p, events = cp3_lineage_fixture(monkeypatch)
+    (tmp_path/'fixture.jsonl').write_text(''.join(json.dumps(e, sort_keys=True)+'\n' for e in events))
+    lineage = project_lineage(p, events, tmp_path/'fixture.jsonl')
+    assert [(w['logical_id'], w['generation']) for w in lineage['workers']] == [('w0', 1), ('r0', 1), ('r0', 2)]
+    assert len(lineage['processes']) == len(lineage['contexts']) == 1
+    assert all(w['closed'] and not w['real_ros'] for w in lineage['workers'])
+    assert not lineage['candidate_eligible'] and not lineage['group_relation_observed']
+
+
+def test_recreated_pair_consumer_excludes_old_relation_in_shared_process(monkeypatch):
+    from r2f.runtime.topology_pair import pair_graph_facts
+    p, rows = cp3_lineage_fixture(monkeypatch)
+    tokens = {e['logical_id']: e for e in rows if e['event'] == 'endpoint_created'}
+    snapshots = {}
+    for eid in tokens:
+        match = next(e for e in rows if e['event'] == 'match_snapshot' and e['logical_id'] == eid)
+        cid = match['command_id']
+        graph = next(e for e in rows if e['event'] == 'graph_snapshot' and e.get('logical_id') == eid and e.get('command_id') == cid)
+        snapshots[eid] = dict(command_id=cid, complete=True, match_snapshot=match, graph_snapshot=graph)
+    limit = next(e['event_index'] for e in rows if e['event'] == 'command_done' and e['command_id'] == 6) + 1
+    pair = pair_graph_facts(tokens['w0'], tokens['r0'], snapshots['w0'], snapshots['r0'],
+                            raw_events=rows, before_index=limit, real_ros=False)
+    assert pair['status'] == 'matched', pair['reasons']
+    assert pair['reader_generation'] == 2
+    old = next(e for e in rows if e['event'] == 'endpoint_created' and e['logical_id'] == 'r0')
+    stale = pair_graph_facts(tokens['w0'], old, snapshots['w0'], snapshots['r0'],
+                            raw_events=rows, before_index=limit, real_ros=False)
+    assert stale['status'] == 'unknown'
+
+
+def test_recreated_group_final_audit_preserves_earlier_retirement(monkeypatch, tmp_path):
+    from r2f.runtime.topology_pair import group_termination_rows
+    p, events = cp3_lineage_fixture(monkeypatch)
+    tokens = {e['logical_id']: e for e in events if e['event'] == 'endpoint_created'}
+    boundary = next(e for e in events if e['event'] == 'command_done' and e['command_id'] == 6)
+    rows = group_termination_rows(p, events, tmp_path/'fixture.jsonl', list(tokens.values()), boundary)
+    assert all(e['event_index'] > boundary['event_index'] for e in rows)
+    assert {(e['logical_id'], e['generation']) for e in rows if e['event'] == 'endpoint_destroyed'} == {('w0', 1), ('r0', 2)}
+    # A retired generation cannot be presented as active at the final boundary.
+    old = next(e for e in events if e['event'] == 'endpoint_created' and e['logical_id'] == 'r0')
+    with pytest.raises(ValueError):
+        group_termination_rows(p, events, tmp_path/'fixture.jsonl', [old], boundary)
+
+
+def test_numbered_endpoint_retirement_preserves_exact_alias_and_siblings(tmp_path, transport):
+    p = multi_program(2, 2)
+    p['actions'] += [action('destroy_r1', 'destroy', 'r1', 1), action('recreate_r1', 'recreate', 'r1', 2)]
+    backend = prepared_backend(tmp_path, p)
+    rows = []
+    backend.set_event_sink(lambda event, **fields: rows.append(dict(event=event, **fields)))
+    handles = {e['logical_id']: backend.create_endpoint(e, 1, caller_roles(p)[e['logical_id']]) for e in p['endpoints']}
+    old = handles['r1']
+    assert backend.destroy_endpoint(old)['process_retained']
+    retired = next(e for e in rows if e['event'] == 'topology_endpoint_destroyed')
+    assert retired['role'] == 'reader2'
+    assert all(h['alive'] for eid, h in handles.items() if eid != 'r1')
+    new = backend.create_endpoint(p['endpoints'][-1], 2, 'reader2')
+    assert new['generation'] == 2 and new['pid'] == old['pid']
+    assert new['endpoint_gid'] != old['endpoint_gid']
+    assert len(transport) == 1
+    assert backend.close()['closed']
+
+
+@pytest.mark.parametrize('damage', ['missing_destroy_ack', 'wrong_destroy_nonce', 'failed_cleanup',
+    'duplicate_cleanup', 'destroy_ack_before_cleanup', 'reused_gid', 'reused_nonce',
+    'wrong_generation', 'changed_context', 'wrong_alias', 'late_old_activity', 'backdated_destroy', 'backdated_create_ack'])
+def test_recreated_group_lineage_rejects_forged_or_incomplete_history(monkeypatch, tmp_path, damage):
+    p, rows = cp3_lineage_fixture(monkeypatch)
+    tokens = [e for e in rows if e['event'] == 'endpoint_created']
+    old, new = tokens[1:]
+    cleanup = next(e for e in rows if e['event'] == 'endpoint_destroyed' and e['logical_id'] == 'r0')
+    ack = next(e for e in rows if e['event'] == 'command_done' and e['command_id'] == 3)
+    req = next(e for e in rows if e['event'] == 'group_command_requested' and e['command_id'] == 3)
+    if damage == 'missing_destroy_ack': ack['event'] = 'missing_ack'
+    elif damage == 'wrong_destroy_nonce': req['endpoint_generation'] = 'foreign'
+    elif damage == 'failed_cleanup': cleanup['cleanup_status'] = 'unknown'
+    elif damage == 'duplicate_cleanup': rows.insert(rows.index(cleanup), deepcopy(cleanup))
+    elif damage == 'destroy_ack_before_cleanup':
+        rows.remove(ack); rows.insert(rows.index(cleanup), ack)
+    elif damage == 'reused_gid': new['endpoint_gid'] = old['endpoint_gid']
+    elif damage == 'reused_nonce': new['endpoint_generation'] = old['endpoint_generation']
+    elif damage == 'wrong_generation': new['generation'] = 3
+    elif damage == 'changed_context': new['context_instance_id'] = 'foreign'
+    elif damage == 'wrong_alias': ack['worker_role'] = 'reader2'
+    elif damage == 'late_old_activity':
+        activity = next(e for e in rows if e['event'] == 'graph_snapshot' and e.get('logical_id') == 'r0')
+        rows.insert(rows.index(new)+1, deepcopy(activity))
+    elif damage == 'backdated_destroy': req['monotonic_ns'] = ack['monotonic_ns'] + 1
+    elif damage == 'backdated_create_ack':
+        next(e for e in rows if e['event'] == 'command_done' and e['command_id'] == 4)['monotonic_ns'] = new['monotonic_ns'] - 1
+    for i, e in enumerate(rows): e['event_index'] = i
+    with pytest.raises(ValueError, match='group_lineage:'):
+        project_lineage(p, rows, tmp_path/'negative-fixture.jsonl')
+
+
+def test_worker_rejects_stale_destroy_nonce_without_success_ack(monkeypatch):
+    rc, _, rows, _ = cp3_worker_capture(monkeypatch, bad_destroy_nonce=True)
+    assert rc == 1 and rows[-1]['event'] == 'worker_error'
+    assert not any(e['event'] == 'command_done' and e.get('command_id') == 3 for e in rows)
+    assert not any(e['event'] == 'endpoint_created' and e['generation'] == 2 for e in rows)
+
+
+def test_worker_failed_endpoint_destroy_keeps_unknown_raw_without_success_ack(monkeypatch):
+    rc, _, rows, _ = cp3_worker_capture(monkeypatch, fail_destroy=True)
+    assert rc == 1 and rows[-1]['event'] == 'worker_error'
+    cleanup = next(e for e in rows if e['event'] == 'endpoint_destroyed' and e['logical_id'] == 'r0')
+    assert cleanup['cleanup_status'] == 'unknown'
+    assert not any(e['event'] == 'command_done' and e.get('command_id') == 3 for e in rows)
+    assert not any(e['event'] == 'endpoint_created' and e['generation'] == 2 for e in rows)
+
+
+def test_worker_writer_reincarnation_and_bounded_empty_group_deliver_new_generation(monkeypatch, tmp_path):
+    # One command stream through the worker entry; doubles only at ROS/OS boundaries.
+    commands = [
+        dict(command='create_endpoint', logical_id='w0', generation=1, worker_role='writer'),
+        dict(command='create_endpoint', logical_id='r0', generation=1, worker_role='reader'),
+        dict(command='destroy_endpoint', logical_id='w0', generation=1),
+        dict(command='snapshot', logical_id='r0', generation=1),
+        dict(command='create_endpoint', logical_id='w0', generation=2, worker_role='writer'),
+        dict(command='publish_batch', logical_id='w0', generation=2, sequences=[0], interval_sec=0, phase='writer_reborn'),
+        dict(command='destroy_endpoint', logical_id='w0', generation=2),
+        dict(command='destroy_endpoint', logical_id='r0', generation=1),
+        dict(command='group_snapshot'),
+        dict(command='group_snapshot'),
+        dict(command='create_endpoint', logical_id='w0', generation=3, worker_role='writer'),
+        dict(command='create_endpoint', logical_id='r0', generation=2, worker_role='reader'),
+        dict(command='publish_batch', logical_id='w0', generation=3, sequences=[0], interval_sec=0, phase='all_reborn'),
+        dict(command='snapshot', logical_id='r0', generation=2),
+        dict(command='stop'),
+    ]
+    for cid, command in enumerate(commands, 1):
+        command['command_id'] = cid
+    rc, calls, rows, checkpoints = cp3_worker_capture(monkeypatch, scenario_commands=commands)
+    (tmp_path/'offline-fixture-worker.jsonl').write_text(''.join(json.dumps(dict(e, fixture=True, real_ros=False))+'\n' for e in rows))
+    assert rc == 0, rows[-1]
+    assert (4, 1, 0) in checkpoints  # reader remains while writer is retired
+    assert (9, 0, 0) in checkpoints and (11, 0, 0) in checkpoints
+    assert calls.count('context') == calls.count('shutdown') == 1
+    created = [e for e in rows if e['event'] == 'endpoint_created']
+    assert [(e['logical_id'], e['generation']) for e in created] == [
+        ('w0', 1), ('r0', 1), ('w0', 2), ('w0', 3), ('r0', 2)]
+    assert len({e['endpoint_gid'] for e in created}) == len({e['endpoint_generation'] for e in created}) == 5
+    assert len({tuple(e[k] for k in ('pid', 'pgid', 'process_start_ticks', 'worker_instance_id', 'context_instance_id')) for e in created}) == 1
+    empty = [e for e in rows if e['event'] == 'participant_group_snapshot']
+    assert [e['command_id'] for e in empty] == [9, 10]
+    assert all(e['endpoint_absence_observed'] and e['active_endpoint_count'] == 0 and e['endpoints'] == [] for e in empty)
+    assert empty[0]['monotonic_ns'] <= empty[1]['monotonic_ns']
+    assert empty[1]['monotonic_ns'] - empty[0]['monotonic_ns'] < 1_000_000_000
+    sends = [e for e in rows if e['event'] == 'send']
+    received = [e for e in rows if e['event'] == 'receive']
+    assert [(e['generation'], e['send_sequence']) for e in sends] == [(2, 0), (3, 0)]
+    assert [(e['generation'], e['payload_writer_generation'], e['send_sequence']) for e in received] == [(1, 2, 0), (2, 3, 0)]
+    assert [json.loads(e['string_data'])['endpoint_gid'] for e in sends] == [created[2]['endpoint_gid'], created[3]['endpoint_gid']]
+
+
+@pytest.mark.parametrize('layout,group_count', [('shared', 1), ('roles', 2), ('split', 4)])
+def test_topology_writer_and_empty_interval_preserve_groups_and_new_delivery(tmp_path, transport, layout, group_count):
+    from r2f.runtime.topology_pair import run_topology
+    p = multi_program(2, 2, layout)
+    p['actions'] += [
+        action('retire_writer', 'destroy', 'w0', 1),
+        action('siblings_live', 'snapshot'),
+        action('writer_reborn', 'recreate', 'w0', 2),
+        action('writer_reborn_send', 'publish_batch', 'w0', 2, count=1, start_sequence=0),
+        action('retire_w0', 'destroy', 'w0', 2),
+        action('retire_w1', 'destroy', 'w1', 1),
+        action('retire_r0', 'destroy', 'r0', 1),
+        action('retire_r1', 'destroy', 'r1', 1),
+        action('empty_begin', 'snapshot'), action('empty_end', 'snapshot'),
+        action('reborn_w0', 'recreate', 'w0', 3),
+        action('reborn_w1', 'recreate', 'w1', 2),
+        action('reborn_r0', 'recreate', 'r0', 2),
+        action('reborn_r1', 'recreate', 'r1', 2),
+        action('new_generation_send', 'publish_batch', 'w0', 3, count=1, start_sequence=0),
+        action('new_generation_observe', 'snapshot'),
+    ]
+    assert model.validate_program(p)['status'] == 'valid'
+    backend = prepared_backend(tmp_path/'carrier', p)
+    backend.real_ros = False
+    result = run_topology(p, dict(backend.config), tmp_path/'runtime', backend=backend)
+    assert result['status'] != 'aborted', (result['reason'], result['unknowns'])
+    applied = {e['action_id'] for e in result['events'] if e['event'] == 'topology_action_done'
+               and e['receipt']['disposition'] == 'applied'}
+    assert {'retire_writer', 'writer_reborn', 'new_generation_send'} <= applied
+    lineage = result['execution_metadata']['participant_groups']
+    assert 'error' not in lineage, lineage
+    assert len(transport) == len(lineage['processes']) == len(lineage['contexts']) == group_count
+    events = result['events']
+    empty = [e for e in events if e['event'] == 'participant_group_snapshot' and e.get('endpoint_absence_observed')]
+    # Every snapshot audits each already empty group, including during partial retirement.
+    assert len(empty) >= 2 * group_count
+    assert all(e['active_endpoint_count'] == 0 and e['endpoints'] == [] and 'logical_id' not in e for e in empty)
+    receipts = {r['step_id']: r for r in result['observation_receipts'] if 'step_id' in r}
+    assert all(len(receipts['snapshot:'+aid]['group_observations']) == group_count for aid in ('empty_begin', 'empty_end'))
+    assert all(receipts['snapshot:'+aid]['complete'] for aid in ('empty_begin', 'empty_end'))
+    created = [e for e in events if e['event'] == 'endpoint_created']
+    assert len(created) == len({e['endpoint_gid'] for e in created}) == len({e['endpoint_generation'] for e in created}) == 9
+    assert len({tuple(e[k] for k in ('pid', 'process_start_ticks', 'worker_instance_id', 'context_instance_id')) for e in created}) == group_count
+    sends = [e for e in events if e['event'] == 'send']
+    receives = [e for e in events if e['event'] == 'receive']
+    assert [(e['generation'], e['send_sequence']) for e in sends] == [(2, 0), (3, 0)]
+    assert [(e['logical_id'], e['generation'], e['payload_writer_generation']) for e in receives] == [
+        ('r0', 1, 2), ('r1', 1, 2), ('r0', 2, 3), ('r1', 2, 3)]
+    assert all(e['publisher_gid'] is None and e['publisher_gid_status'] == 'unavailable_api' for e in receives)
+    assert not result['real_execution'] and not result['candidate_eligible'] and not result['sealed']
+
+    # Empty-owner observations cannot start before the last destroy ACK closes.
+    forged = deepcopy(events)
+    first_empty = next(e for e in forged if e['event'] == 'participant_group_snapshot' and e.get('endpoint_absence_observed'))
+    request = next(e for e in forged if e['event'] == 'group_command_requested'
+                   and e['pid'] == first_empty['pid'] and e['command_id'] == first_empty['command_id'])
+    destroy_ack = next(e for e in reversed(forged[:forged.index(request)])
+                       if e['event'] == 'command_done' and e.get('command') == 'destroy_endpoint' and e['pid'] == first_empty['pid'])
+    forged.remove(destroy_ack)
+    forged.insert(forged.index(request)+1, destroy_ack)
+    for i, e in enumerate(forged):
+        e['event_index'] = i
+    with pytest.raises(ValueError, match='group_lineage:'):
+        project_lineage(p, forged, result['raw_path'], config=backend.config)

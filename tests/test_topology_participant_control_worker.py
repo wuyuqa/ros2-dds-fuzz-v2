@@ -202,7 +202,8 @@ def transport(monkeypatch, tmp_path):
         def add(self,event,**fields):
             value={'event':event,'pid':self.pid,'pgid':self.pid,'process_start_ticks':900,
                 'domain_id':173,'observed_domain_id':173,'rmw_identifier':'rmw_cyclonedds_cpp',
-                'run_id':'offline-fixture','domain_observation_source':'fixture_api','monotonic_ns':1000,
+                'run_id':'offline-fixture','domain_observation_source':'fixture_api',
+                'fixture':True,'real_ros':False,'monotonic_ns':worker.time.monotonic_ns(),
                 **{k:self.cfg[k] for k in ('group_id','worker_instance_id','context_instance_id')},**fields}
             self.output+=json.dumps(value).encode()+b'\n'
         def handle(self,c):
@@ -214,8 +215,8 @@ def transport(monkeypatch, tmp_path):
                 self.returncode=0;return
             if op=='create_endpoint':
                 spec=next(e for e in self.cfg['group_members'] if e['logical_id']==eid)
-                token=dict(logical_id=eid,generation=1,endpoint_generation=f'fixture-{eid}',
-                    endpoint_gid=('11' if spec['role']=='writer' else '22')*16,
+                token=dict(logical_id=eid,generation=c['generation'],endpoint_generation=f"fixture-{eid}-g{c['generation']}",
+                    endpoint_gid=f"{(17 if spec['role']=='writer' else 34) + c['generation'] - 1:02x}"*16,
                     role=spec['role'],worker_role=spec['role'])
                 self.tokens[eid]=token
                 from r2f.runtime.topology_worker import endpoint_expressibility
@@ -225,6 +226,11 @@ def transport(monkeypatch, tmp_path):
                     identity_source='get_publishers_info_by_topic' if spec['role']=='writer' else 'get_subscriptions_info_by_topic')
                 self.add('endpoint_group_bound',endpoint={k:token[k] for k in ('logical_id','generation','endpoint_generation','endpoint_gid','worker_role')})
             token=deepcopy(self.tokens[eid])
+            if op=='destroy_endpoint':
+                self.add('endpoint_destroyed',**token,cleanup_status='closed')
+                self.add('command_done',**token,command=op,command_id=cid,cleanup_status='closed')
+                del self.tokens[eid]
+                return
             if op=='snapshot':
                 self.add('match_snapshot',**token,command_id=cid,matched_count=1)
                 pubs=[dict(endpoint_gid=t['endpoint_gid'],node_name='fixture-group-node',topic_type='std_msgs/msg/String',qos={}) for t in self.tokens.values() if t['role']=='writer']
@@ -394,3 +400,78 @@ def test_public_worker_preserves_endpoint_cleanup_failure_and_closes_owner(monke
     closed=next(e for e in events if e['event']=='group_context_shutdown')
     assert not closed['closed'] and closed['errors']
     assert any(e['event']=='endpoint_destroyed' and e.get('cleanup_status')=='unknown' for e in events)
+
+
+def test_public_backend_destroys_only_addressed_endpoint_and_reuses_group(tmp_path, transport):
+    from test_s1_topology_model import action
+    p = controlled()
+    p['actions'] += [action('destroy_r0', 'destroy', 'r0', 1), action('recreate_r0', 'recreate', 'r0', 2)]
+    backend = prepared_backend(tmp_path, p)
+    writer = backend.create_endpoint(p['endpoints'][0], 1, 'writer')
+    old = backend.create_endpoint(p['endpoints'][1], 1, 'reader')
+    receipt = backend.destroy_endpoint(old)
+    assert receipt['cleanup_status'] == 'closed' and receipt['process_retained'] is True
+    assert not old['alive'] and writer['alive'] and transport[0].poll() is None
+    assert set(transport[0].tokens) == {'w0'}
+    new = backend.create_endpoint(p['endpoints'][1], 2, 'reader')
+    assert len(transport) == 1 and new['process'] is writer['process']
+    assert new['endpoint_gid'] != old['endpoint_gid'] and new['endpoint_generation'] != old['endpoint_generation']
+    assert new['generation'] == 2 and new['pid'] == old['pid']
+    assert backend.snapshot({'w0': writer, 'r0': new})['complete']
+    with pytest.raises(worker.TopologyBackendError):
+        backend.destroy_endpoint(old)
+    assert backend.close()['closed']
+
+
+@pytest.mark.parametrize('field', ['endpoint_gid', 'endpoint_generation'])
+def test_backend_rejects_recreated_identity_reuse_at_observed_transport(tmp_path, transport, monkeypatch, field):
+    from test_s1_topology_model import action
+    p = controlled()
+    p['actions'] += [action('destroy_r0', 'destroy', 'r0', 1), action('recreate_r0', 'recreate', 'r0', 2)]
+    backend = prepared_backend(tmp_path, p)
+    backend.create_endpoint(p['endpoints'][0], 1, 'writer')
+    old = backend.create_endpoint(p['endpoints'][1], 1, 'reader')
+    backend.destroy_endpoint(old)
+    child = transport[0]
+    original = child.add
+    def damaged(event, **fields):
+        if fields.get('logical_id') == 'r0' and fields.get('generation') == 2:
+            fields[field] = old[field]
+            child.tokens['r0'][field] = old[field]
+        original(event, **fields)
+    monkeypatch.setattr(child, 'add', damaged)
+    with pytest.raises(worker.TopologyBackendError, match='group_endpoint_identity_reused'):
+        backend.create_endpoint(p['endpoints'][1], 2, 'reader')
+    assert 'r0' not in {eid for eid, h in backend.handles.items() if h['alive']}
+    backend.close()
+
+
+@pytest.mark.parametrize('explicit_destroy', [True, False])
+def test_existing_topology_state_machine_routes_group_lifecycle_offline(tmp_path, transport, explicit_destroy):
+    from r2f.runtime.topology_pair import run_topology
+    from test_s1_topology_model import action
+    p = controlled()
+    if explicit_destroy:
+        p['actions'].append(action('destroy_r0', 'destroy', 'r0', 1))
+    p['actions'].append(action('recreate_r0', 'recreate', 'r0', 2))
+    backend = prepared_backend(tmp_path/'carrier', p)
+    # The only doubles are the external transport/ROS boundary supplied above.
+    # This fixture never grants real execution, candidate or source-freeze authority.
+    backend.real_ros = False
+    cfg = dict(backend.config)
+    result = run_topology(p, cfg, tmp_path/'runtime', backend=backend)
+    assert result['status'] != 'aborted', (result['reason'], result['unknowns'])
+    applied = {e['action_id']: e['receipt'] for e in result['events']
+               if e['event'] == 'topology_action_done' and e['receipt']['disposition'] == 'applied'}
+    assert 'recreate_r0' in applied
+    if explicit_destroy:
+        assert not applied['destroy_r0']['after']['alive']
+    else:
+        assert any(e['event'] == 'topology_generation_retired' for e in result['events'])
+    assert applied['recreate_r0']['after']['generation'] == 2
+    assert len(transport) == 1
+    lineage = result['execution_metadata']['participant_groups']
+    assert 'error' not in lineage, lineage
+    assert [(w['logical_id'], w['generation']) for w in lineage['workers']] == [('w0', 1), ('r0', 1), ('r0', 2)]
+    assert all(not w['real_ros'] and w['fixture'] for w in lineage['workers'])
+    assert not result['real_execution'] and not result['candidate_eligible'] and not result['sealed']

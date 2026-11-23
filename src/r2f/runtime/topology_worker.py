@@ -1902,6 +1902,7 @@ def _group_worker_main(argv):
     from rclpy.executors import SingleThreadedExecutor
     context = node = executor = None
     sessions, errors = {}, []
+    generations = {}
     ticks = int(Path('/proc/self/stat').read_text().rsplit(')', 1)[1].split()[19])
     rmw = observed_domain = None
     def emit(event, **fields):
@@ -1952,22 +1953,47 @@ def _group_worker_main(argv):
                     emit('command_done', command='stop', command_id=cid)
                     return 0
                 eid = command.get('logical_id')
-                if eid not in members or (type(command.get('generation')) is not int or command['generation'] != 1):
+                if op == 'group_snapshot' and eid is None:
+                    # An empty group still has a live process/context owner. Do
+                    # not borrow an already retired endpoint's address or token.
+                    if sessions or any(k in command for k in ('generation', 'endpoint_generation', 'endpoint_gid', 'worker_role')):
+                        raise TopologyBackendError('group_empty_snapshot_address_invalid')
+                    capture = _capture_group_ownership(config, sessions)
+                    emit('participant_group_snapshot', command_id=cid,
+                         supporting_diagnostic=True, candidate_eligible=False,
+                         endpoint_absence_observed=True, active_endpoint_count=0,
+                         **capture)
+                    emit('command_done', command=op, command_id=cid,
+                         endpoint_absence_observed=True, active_endpoint_count=0)
+                    continue
+                if eid not in members or type(command.get('generation')) is not int:
                     raise TopologyBackendError('group_command_address_invalid')
                 if op == 'create_endpoint':
-                    if eid in sessions or command.get('worker_role') != aliases[eid]:
+                    if (eid in sessions or command.get('worker_role') != aliases[eid]
+                            or command['generation'] != generations.get(eid, 0) + 1):
                         raise TopologyBackendError('group_create_reused_or_wrong_role')
                     spec = members[eid]
                     prepared = endpoint_expressibility(spec, config)
-                    cfg = {**config, **spec, 'generation': 1, 'qos': prepared['public_qos']}
+                    cfg = {**config, **spec, 'generation': command['generation'], 'qos': prepared['public_qos']}
                     session = _worker_main([argv[0], json.dumps(cfg), command['worker_role']], owner)
                     sessions[eid] = {'session': session}
                     next(session)  # exactly this endpoint, never another declaration
                     token = sessions[eid]['token']
+                    generations[eid] = command['generation']
                     emit('command_done', command=op, command_id=cid, **token)
+                elif op == 'destroy_endpoint':
+                    item = sessions.get(eid)
+                    token = item.get('token') if item else None
+                    if (token is None or command['generation'] != token['generation']
+                            or command.get('endpoint_generation') != token['endpoint_generation']):
+                        raise TopologyBackendError('group_destroy_address_invalid')
+                    item['session'].close()  # ROS endpoint destroy; owner context stays alive
+                    del sessions[eid]
+                    emit('command_done', command=op, command_id=cid, cleanup_status='closed', **token)
                 elif op == 'group_snapshot':
                     token = sessions.get(eid, {}).get('token')
-                    if token is None or command.get('endpoint_generation') != token['endpoint_generation']:
+                    if (token is None or command['generation'] != token['generation']
+                            or command.get('endpoint_generation') != token['endpoint_generation']):
                         raise TopologyBackendError('group_snapshot_address_invalid')
                     capture = _capture_group_ownership(config, sessions)
                     emit('participant_group_snapshot', command_id=cid,
@@ -1976,6 +2002,7 @@ def _group_worker_main(argv):
                 else:
                     token = sessions.get(eid, {}).get('token')
                     if (op not in {'snapshot', 'publish_batch'} or token is None
+                            or command['generation'] != token['generation']
                             or command.get('endpoint_generation') != token['endpoint_generation']):
                         raise TopologyBackendError('group_command_target_or_operation_invalid')
                     sessions[eid]['session'].send(command)
@@ -2813,8 +2840,10 @@ class RosTopologyBackend:
         if self.environment is None:
             raise TopologyBackendError("backend_not_prepared")
         if self.group_program is not None:
-            order = [a['endpoint_id'] for a in self.group_program['actions'] if a['op'] == 'create']
-            if len(self.handles) >= len(order) or spec.get('logical_id') != order[len(self.handles)]:
+            order = [(a['endpoint_id'], a['generation']) for a in self.group_program['actions']
+                     if a['op'] in {'create', 'recreate'}]
+            created_count = sum(e.get('event') == 'endpoint_created' for p in self.processes for e in p.events)
+            if created_count >= len(order) or (spec.get('logical_id'), generation) != order[created_count]:
                 raise TopologyBackendError('group_endpoint_create_order')
         if (self.group_program is not None
                 and worker_role != canonical_worker_roles(self.group_program['endpoints']).get(spec.get('logical_id'))):
@@ -2835,7 +2864,10 @@ class RosTopologyBackend:
 
         if self.group_program is not None:
             declared = [e for e in self.group_program['endpoints'] if e == spec]
-            if len(declared) != 1 or type(generation) is not int or generation != 1 or spec['logical_id'] in self.handles:
+            previous = self.handles.get(spec['logical_id'])
+            expected = previous['generation'] + 1 if previous is not None else 1
+            if (len(declared) != 1 or type(generation) is not int or generation != expected
+                    or (previous is not None and previous.get('alive'))):
                 raise TopologyBackendError('group_endpoint_not_exact_admitted_spec')
             label = spec['participant_id']
             worker_config.update(participant_control=self.group_program['participant_control'],
@@ -2887,12 +2919,12 @@ class RosTopologyBackend:
                 process.wait(lambda: process.has('command_done', command_id=cid,
                               logical_id=spec['logical_id'], generation=generation),
                              worker_config['startup_timeout_sec'], 'group_endpoint_create_ack')
-            process.wait(lambda: process.has("endpoint_created", pid=pid, logical_id=spec['logical_id']),
+            process.wait(lambda: process.has("endpoint_created", pid=pid, logical_id=spec['logical_id'], generation=generation),
                          worker_config["startup_timeout_sec"],
                          "topology_endpoint_created:" + spec["logical_id"])
             row = [e for e in process.events
                    if e.get("event") == "endpoint_created" and e.get("pid") == pid
-                   and e.get('logical_id') == spec['logical_id']][-1]
+                   and e.get('logical_id') == spec['logical_id'] and e.get('generation') == generation][-1]
             gid = row.get("endpoint_gid")
             if not isinstance(gid, str) or not re.fullmatch(r"[0-9a-fA-F]{2,}", gid):
                 raise TopologyBackendError("endpoint_created_without_real_guid")
@@ -2932,6 +2964,11 @@ class RosTopologyBackend:
                 ack = [e for e in process.events if e.get('event') == 'command_done' and e.get('command_id') == cid]
                 if len(ack) != 1 or any(ack[0].get(k) != handle[k] for k in ('logical_id','generation','endpoint_generation','endpoint_gid')):
                     raise TopologyBackendError('group_create_ack_identity_mismatch')
+            if grouped:
+                prior = [e for e in process.events if e.get('event') == 'endpoint_created' and e is not row]
+                if any(e.get('endpoint_gid') == gid or e.get('endpoint_generation') == handle['endpoint_generation']
+                       for e in prior):
+                    raise TopologyBackendError('group_endpoint_identity_reused')
             if prepared["initial_content_filter"] is not None:
                 # Only child API results can populate this observation.
                 handle["initial_content_filter"] = deepcopy(row.get("initial_content_filter"))
@@ -2952,7 +2989,30 @@ class RosTopologyBackend:
 
     def destroy_endpoint(self, handle):
         if self.group_program is not None:
-            raise TopologyUnsupported('participant_control_scope', 'authored destroy not supported; final close owns group')
+            if self.handles.get(handle.get('logical_id')) is not handle or not handle.get('alive'):
+                raise TopologyBackendError('group_destroy_stale_handle')
+            process = handle['process']
+            begin = len(process.events)
+            cid = self._batch(handle, 'destroy_endpoint')
+            from .participant_groups import ENDPOINT_KEYS, PROCESS_KEYS, LINK_KEYS
+            keys = ENDPOINT_KEYS + PROCESS_KEYS + LINK_KEYS
+            rows = process.events[begin:]
+            cleanups = [e for e in rows if e.get('event') == 'endpoint_destroyed'
+                        and all(e.get(k) == handle.get(k) for k in keys)]
+            acks = [e for e in rows if e.get('event') == 'command_done' and e.get('command_id') == cid]
+            if (len(cleanups) != 1 or len(acks) != 1
+                    or cleanups[0].get('cleanup_status') != 'closed'
+                    or acks[0].get('command') != 'destroy_endpoint' or acks[0].get('cleanup_status') != 'closed'
+                    or any(acks[0].get(k) != handle.get(k) for k in keys)
+                    or rows.index(cleanups[0]) >= rows.index(acks[0])
+                    or process.process.poll() is not None):
+                raise TopologyBackendError('group_destroy_cleanup_ack_invalid')
+            handle['alive'] = False
+            identity = {k: handle[k] for k in keys}
+            self._emit('topology_endpoint_destroyed', **identity, role=handle['worker_role'],
+                       cleanup_status='closed', command_id=cid, process_retained=True)
+            return {**identity, 'cleanup_status': 'closed', 'command_id': cid,
+                    'process_retained': True, 'returncode': None}
         process = handle.get("process")
         receipt = process.close() if process is not None else {"closed": False}
         handle["alive"] = False
@@ -3122,6 +3182,32 @@ class RosTopologyBackend:
             "backend": self.backend_name,
         }
 
+    def _snapshot_group(self, process):
+        member = next((h for h in self.handles.values()
+                       if h['process'] is process and h.get('alive')), None)
+        begin = len(process.events)
+        if member is not None:
+            cid = self._batch(member, 'group_snapshot')
+        else:
+            cid = process.command('group_snapshot')
+            process.wait(lambda: process.has('command_done', command_id=cid),
+                         float(self.config.get('snapshot_timeout_sec', 5.0)),
+                         'topology_empty_group_snapshot')
+        rows = process.events[begin:]
+        captures = [e for e in rows if e.get('event') == 'participant_group_snapshot' and e.get('command_id') == cid]
+        acks = [e for e in rows if e.get('event') == 'command_done' and e.get('command_id') == cid]
+        if (len(captures) != 1 or len(acks) != 1 or acks[0].get('command') != 'group_snapshot'
+                or rows.index(captures[0]) >= rows.index(acks[0]) or process.process.poll() is not None):
+            raise TopologyBackendError('group_capture_ack_invalid')
+        if member is None:
+            from .participant_groups import ENDPOINT_KEYS
+            if (any(k in e for e in (captures[0], acks[0]) for k in ENDPOINT_KEYS + ('worker_role',))
+                    or any(e.get('endpoint_absence_observed') is not True or type(e.get('active_endpoint_count')) is not int
+                           or e['active_endpoint_count'] != 0 for e in (captures[0], acks[0]))
+                    or captures[0].get('endpoints') != []):
+                raise TopologyBackendError('group_empty_capture_invalid')
+        return deepcopy(captures[0])
+
     def snapshot(self, handles):
         if self.closed:
             raise TopologyBackendError("backend_closed")
@@ -3154,12 +3240,13 @@ class RosTopologyBackend:
                 "command_id": command_id,
                 "complete": bool(matches and graphs),
             }
+        group_observations = []
         if (self.group_program is not None
                 and len(self.handles) == len(self.group_program['endpoints'])):
             for process in self.groups.values():
-                handle = next(h for h in self.handles.values() if h['process'] is process)
-                self._batch(handle, 'group_snapshot')
+                group_observations.append(self._snapshot_group(process))
         return {"snapshots": snapshots, "command_id": None,
+                "group_observations": group_observations,
                 "complete": all(v["complete"] for v in snapshots.values())}
 
     def assert_liveliness(self, handle):

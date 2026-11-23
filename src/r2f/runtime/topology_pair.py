@@ -2071,11 +2071,15 @@ def group_termination_rows(program, events, raw_path, tokens, boundary):
         if len(workers) != 1:
             raise ValueError("group_termination_endpoint_identity")
         group_ids.add(workers[0]["group_id"])
-    # Include every cleanup in the group, even when a caller selected one endpoint.
+        if any(ref['event_index'] <= boundary['event_index'] for ref in workers[0]['cleanup_raw_refs']):
+            raise ValueError('group_termination_selected_endpoint_retired')
+    # Audit the entire lineage above; final closure excludes already retired siblings.
     for worker in lineage["workers"]:
         if worker["group_id"] not in group_ids:
             continue
         for ref in worker["cleanup_raw_refs"] + worker["exit_raw_refs"]:
+            if ref['event_index'] <= boundary['event_index']:
+                continue  # Historical endpoint closure was authenticated by project_lineage.
             selected[ref["event_index"]] = events[ref["event_index"]]
     for context in lineage["contexts"]:
         if context["group_id"] in group_ids:
@@ -2555,7 +2559,7 @@ def run_topology(program, config, output_dir, *, backend=None):
         handles = {eid: st["handle"] for eid, st in state.items()
                    if st["alive"] and st["handle"] is not None
                    and (endpoint_ids is None or eid in endpoint_ids)}
-        if not handles:
+        if not handles and "participant_control" not in effective_program:
             # Zero-endpoint programs are a supported boundary case; an empty
             # fresh snapshot is complete, not an observation failure.
             return {"snapshots": {}, "command_id": None, "complete": True}
@@ -2721,6 +2725,8 @@ def run_topology(program, config, output_dir, *, backend=None):
             "snapshot_command_id": snapshot.get("command_id"),
             "label": label,
             "snapshots": deepcopy(snapshot.get("snapshots", {})),
+            **({"group_observations": deepcopy(snapshot["group_observations"])}
+               if "group_observations" in snapshot else {}),
             "complete": snapshot.get("complete") is True,
             "real_ros": bool(backend.real_ros),
             "execution_evidence": bool(backend.real_ros),

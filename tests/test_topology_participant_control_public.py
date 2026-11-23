@@ -195,7 +195,8 @@ def test_legacy_metadata_cannot_select_group_contract(tmp_path):
     assert result.get('evidence_error')=='group_metadata_without_sealed_opt_in'
 
 
-def test_existing_runner_carrier_capsule_replay_keep_exact_opt_in_and_fixture_exclusion(tmp_path):
+@pytest.mark.parametrize('lifecycle', [False, True], ids=['create-only', 'destroy-recreate'])
+def test_existing_runner_carrier_capsule_replay_keep_exact_opt_in_and_fixture_exclusion(tmp_path, lifecycle):
     from unittest.mock import patch
     from r2f.campaign import runner,replay
     from r2f.reports import run_report
@@ -211,7 +212,13 @@ def test_existing_runner_carrier_capsule_replay_keep_exact_opt_in_and_fixture_ex
     doc=profile(1);doc['rmws']=['rmw_cyclonedds_cpp']
     source=fuzz_mutators_v2.corpus_v2()
     selected=next(e for e in source['entries'] if e['seed_id']=='topology.multi_endpoint')
-    selected['document']=controlled();selected['content_sha256']=input_model.content_hash(selected['document'])
+    selected['document']=controlled()
+    if lifecycle:
+        from test_s1_topology_model import action
+        selected['document']['actions'] += [
+            action('destroy_r0', 'destroy', 'r0', 1),
+            action('recreate_r0', 'recreate', 'r0', 2)]
+    selected['content_sha256']=input_model.content_hash(selected['document'])
     corpus=topology_corpus_from_profile(doc,source,cycle_id='topology-authored')
     feedback=FeedbackLog();scheduler=ExploratoryScheduler(corpus,feedback,rng_seed=17,warmup=0)
     captured=[]
@@ -226,17 +233,61 @@ def test_existing_runner_carrier_capsule_replay_keep_exact_opt_in_and_fixture_ex
         capsule=ReplayCapsule.from_dict(json.loads(Path(row['replay_path']).read_text()))
         p=capsule.input['mutation_plan']['final_config']['topology_program']
         assert p['participant_control']==CONTROL
+        if lifecycle:
+            assert [(a['action_id'], a['op'], a['endpoint_id'], a['generation'])
+                    for a in p['actions'] if a['op'] in ('destroy', 'recreate')] == [
+                        ('destroy_r0', 'destroy', 'r0', 1),
+                        ('recreate_r0', 'recreate', 'r0', 2)]
         assert captured[0]['topology_program']==p
+        config=json.loads(Path(row['runtime_config_path']).read_text())
+        assert config['topology_program']==row['final_input']['topology_program']==p
+        assert capsule.input['effective_input']['final_input']['topology_program']==p
+        assert row['input_layer_receipts'][0]['input_before']==selected['document']
         # Plain OfflineTopologyBackend lacks actual group context/lineage; keep that unknown.
         runtime=json.loads(Path(row['runtime_result_path']).read_text())
         assert runtime['execution_metadata']['schema']=='r2f.topology-execution-metadata/v2'
         assert runtime['execution_metadata']['participant_groups'].get('error')
         assert not row['actual_run'] and not row['candidate_eligible'] and not row['seal_eligible']
-        saved=Path(row['replay_path']).read_bytes()
+        report=json.loads(Path(result['report_path']).read_text())
+        assert report['rows'][0]['typed_facts']==row['typed_facts']
+        assert row['typed_facts']['fixture']
+        assert not row['typed_facts']['execution_evidence']
+        assert not row['typed_facts']['candidate_eligible'] and not row['typed_facts']['seal_eligible']
+        assert row['typed_facts']['unknown_reasons']
+        assert row['oracle_verdict']=='unknown'
+        assert runtime['execution_metadata']['participant_groups']['group_relation_observed'] is False
+        originals={path: path.read_bytes() for path in (tmp_path/'cycle').rglob('*') if path.is_file()}
         attempt=replay.replay_cell(row['replay_path'],output_dir=tmp_path/'replay',domain_id=81,runtime=offline)
         assert captured[-1]['topology_program']==p
-        assert Path(row['replay_path']).read_bytes()==saved
-        assert not attempt['real_ros_execution']
+        assert all(path.read_bytes()==saved for path,saved in originals.items())
+        assert not attempt['real_ros_execution'] and not attempt['maturity_denominator_changed']
+        assert attempt['original']['effective_input_sha256']==row['effective_input_sha256']
+        assert attempt['original']['capsule_sha256']==hashlib.sha256(originals[Path(row['replay_path'])]).hexdigest()
+        derived=ReplayCapsule.from_dict(json.loads((tmp_path/'replay'/'derived_capsule.json').read_text()))
+        assert derived.input['mutation_plan']==capsule.input['mutation_plan']
+        # Check the persisted action receipts, not only the submitted program.
+        # This backend deliberately has no actual participant-group observations.
+        replay_runtime=json.loads((tmp_path/'replay'/'runtime'/'runtime_result.json').read_text())
+        for saved_runtime in (runtime, replay_runtime):
+            assert saved_runtime['fixture'] and not saved_runtime['real_execution']
+            assert not saved_runtime['candidate_eligible'] and not saved_runtime['sealed']
+            events=[json.loads(line) for line in Path(saved_runtime['raw_path']).read_text().splitlines()]
+            done=[event for event in events if event['event']=='topology_action_done']
+            assert [event['action'] for event in done]==p['actions']
+            assert [event['receipt']['action'] for event in done]==p['actions']
+            assert saved_runtime['input_receipts']['validation_status']=='valid'
+            assert saved_runtime['input_receipts']['program_sha256']==canonical_hash(p)
+            expected=[('w0', 1), ('r0', 1)] + ([('r0', 2)] if lifecycle else [])
+            created=[event for event in events if event['event']=='endpoint_created']
+            assert [(event['logical_id'],event['generation']) for event in created]==expected
+            assert len({event['endpoint_generation'] for event in created})==len(expected)
+            if lifecycle:
+                receipts={event['action_id']:event['receipt'] for event in done}
+                assert receipts['destroy_r0']['disposition']=='applied'
+                assert receipts['destroy_r0']['after']=={'alive': False, 'generation': 1}
+                assert receipts['recreate_r0']['disposition']=='applied'
+                assert receipts['recreate_r0']['after']['generation']==2
+                assert receipts['recreate_r0']['after']['endpoint_generation']==created[-1]['endpoint_generation']
     assert required_catalog_hash()==before
 
 

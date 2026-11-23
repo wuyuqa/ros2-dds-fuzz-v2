@@ -13,12 +13,13 @@ def controlled(shared=True):
         ep['participant_id'] = 'group_a' if shared or i == 0 else 'group_b'
     return p
 
-def test_producer_shaped_destroy_is_rejected_at_participant_admission():
+def test_producer_shaped_destroy_recreate_is_admitted_without_execution_authority():
     p = controlled()
     p['actions'].append(action('destroy_reader', 'destroy', 'r0', 1))
     result = model.validate_program(p)
-    assert result['status'] == 'invalid'
-    assert any(e['code'] == 'participant_control_scope' for e in result['errors']), result
+    p['actions'].append(action('recreate_reader', 'recreate', 'r0', 2))
+    result = model.validate_program(p)
+    assert result['status'] == 'valid', result
 
 def test_opt_in_binds_state_history_and_legacy_omission_is_stable():
     from r2f.runtime.topology_pair import build_input_receipts
