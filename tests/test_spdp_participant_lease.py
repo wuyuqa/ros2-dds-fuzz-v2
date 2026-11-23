@@ -334,6 +334,69 @@ def test_public_parser_rejects_nonmapping_capture_metadata(location, value):
     assert result['candidate_eligible'] is False
 
 
+@pytest.fixture
+def producer_health():
+    # Literal health from the retained domain148 producer receipt (source 4be53e9),
+    # api-feasibility/spdp-observation.json; no collector or DDS is started.
+    return {'filtered_rtps_completeness': 'complete_for_known_target_prefixes',
+            'filtered_rtps_count': 26, 'filtered_rtps_metadata_overflow': 0,
+            'filtered_rtps_target_related_count': 0,
+            'kernel_drop_status': 'known_at_stop', 'reasons': [], 'status': 'ok'}
+
+
+@pytest.mark.parametrize('prefix', [False, True])
+@pytest.mark.parametrize('overflow', [0, False])
+def test_public_parser_accepts_producer_zero_overflow_and_legacy_false(
+        tmp_path, producer_health, prefix, overflow):
+    from r2f.instrumentation.spdp_wire import parse_spdp_capture_prefix
+    artifact = capture(tmp_path, [LE_DATA])
+    health = {**producer_health, 'filtered_rtps_metadata_overflow': overflow}
+    if prefix:
+        path = Path(artifact['raw']['path'])
+        st = path.stat()
+        raw = {**artifact['raw'], 'size': st.st_size, 'final': False,
+               'file_identity': {'device': st.st_dev, 'inode': st.st_ino}}
+        result = parse_spdp_capture_prefix(raw, capture_health=health)
+    else:
+        result = parse_spdp_capture({**artifact, 'health': health})
+    assert result['status'] == 'observed'
+    event, = result['observations']
+    assert event['participant_guid'] == GUID
+    assert event['lease']['nanoseconds'] == 3500000000
+    assert result['capture_health'] == health
+    assert type(result['capture_health']['filtered_rtps_metadata_overflow']) is type(overflow)
+    assert result['candidate_eligible'] is False
+    assert result['expiry_status'] == result['cleanup_status'] == 'unknown'
+
+
+@pytest.mark.parametrize('prefix', [False, True])
+@pytest.mark.parametrize('overflow,status', [
+    (1, 'ok'), (2, 'ok'), (True, 'ok'),
+    (1, 'degraded'), (True, 'degraded'), (0, 'degraded'), (False, 'degraded')])
+def test_public_parser_keeps_overflow_or_degraded_health_unknown(
+        tmp_path, producer_health, prefix, overflow, status):
+    from r2f.instrumentation.spdp_wire import parse_spdp_capture_prefix
+    artifact = capture(tmp_path, [LE_DATA])
+    health = {**producer_health, 'filtered_rtps_metadata_overflow': overflow,
+              'status': status}
+    if prefix:
+        path = Path(artifact['raw']['path'])
+        st = path.stat()
+        raw = {**artifact['raw'], 'size': st.st_size, 'final': False,
+               'file_identity': {'device': st.st_dev, 'inode': st.st_ino}}
+        result = parse_spdp_capture_prefix(raw, capture_health=health)
+    else:
+        result = parse_spdp_capture({**artifact, 'health': health})
+    assert result['status'] == 'unknown'
+    assert 'capture_health_degraded_or_unknown' in result['reasons']
+    assert 'invalid_capture_health' not in result['reasons']
+    assert result['capture_health'] == health
+    assert result['raw']['sha256'] == artifact['raw']['sha256']
+    assert result['observations'][0]['participant_guid'] == GUID
+    assert result['candidate_eligible'] is False
+    assert result['expiry_status'] == result['cleanup_status'] == 'unknown'
+
+
 @pytest.mark.parametrize('prefix', [False, True])
 @pytest.mark.parametrize('health', [False, 42, 'ok', [],
     {'status':42}, {'status':[]}, {'status':'ok','reasons':None},
@@ -342,7 +405,8 @@ def test_public_parser_rejects_nonmapping_capture_metadata(location, value):
     {'status':'ok','filtered_rtps_count':True},
     {'status':'ok','filtered_rtps_count':float('nan')},
     {'status':'ok','filtered_rtps_target_related_count':float('inf')},
-    {'status':'ok','filtered_rtps_metadata_overflow':0}])
+    *[{'status':'ok','filtered_rtps_metadata_overflow': value}
+      for value in (-1, '0', '1', 0.0, 1.0, float('nan'), float('inf'), None, [], {})]])
 def test_public_parser_rejects_malformed_health(tmp_path, prefix, health):
     from r2f.instrumentation.spdp_wire import parse_spdp_capture_prefix
     artifact = capture(tmp_path, [LE_DATA])

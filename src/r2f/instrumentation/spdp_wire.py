@@ -98,9 +98,11 @@ def _invalid_health(health):
     for key in ('filtered_rtps_count', 'filtered_rtps_target_related_count'):
         if key in health and (type(health[key]) is not int or health[key] < 0):
             return True
-    if ('filtered_rtps_metadata_overflow' in health and
-            type(health['filtered_rtps_metadata_overflow']) is not bool):
-        return True
+    if 'filtered_rtps_metadata_overflow' in health:
+        # The capture producer emits a count; retain legacy boolean receipts.
+        overflow = health['filtered_rtps_metadata_overflow']
+        if type(overflow) not in (int, bool) or overflow < 0:
+            return True
     for key in ('kernel_drop_status', 'filtered_rtps_completeness'):
         if key in health and not isinstance(health[key], str):
             return True
@@ -298,7 +300,8 @@ def _decode(raw, records, diagnostics, health, policy):
                 event['reasons'].append('frame_framing_incomplete')
             observations.append(event)
     reasons = []
-    if not health or health.get('status') != 'ok':
+    if (not health or health.get('status') != 'ok' or
+            health.get('filtered_rtps_metadata_overflow', 0) > 0):
         reasons.append('capture_health_degraded_or_unknown')
     if diagnostics:
         reasons.append('capture_parse_diagnostics')
