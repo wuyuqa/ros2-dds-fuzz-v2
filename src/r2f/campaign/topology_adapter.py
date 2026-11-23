@@ -1470,12 +1470,19 @@ def facts_from_events(events, runtime, config, *, capture_source=None):
         locks = [e for e in a.events if e["event"] == "isolation_locks_acquired"]
         facts["environment_healthy"] = (not a.fixture and len(env) == 1 and env[0].get("ok") is True
                                          and len(locks) == 1 and bool(locks[0].get("locks")))
-        exits = [e for e in a.events if e["event"] == "topology_worker_exit"]
-        facts["process_healthy"] = (not facts["tool_error"] and len(exits) == len(a.tokens)
-            and len({tuple(e.get(k) for k in _LINEAGE) for e in exits}) == len(exits)
-            and all(e.get("returncode") == 0 and (e.get("logical_id"), e.get("generation")) in a.tokens
-                    and all(e.get(k) == a.tokens[(e["logical_id"], e["generation"])][k] for k in _LINEAGE)
-                    for e in exits) and a.end.get("cleanup_complete") is True)
+        if a.group_lineage is not None:
+            # _Audit independently authenticates the sealed opt-in raw lineage:
+            # one clean exit per process, context shutdown, and every endpoint's
+            # cleanup. Shared endpoints must not invent per-endpoint exits.
+            facts["process_healthy"] = (not facts["tool_error"]
+                and a.end.get("cleanup_complete") is True)
+        else:
+            exits = [e for e in a.events if e["event"] == "topology_worker_exit"]
+            facts["process_healthy"] = (not facts["tool_error"] and len(exits) == len(a.tokens)
+                and len({tuple(e.get(k) for k in _LINEAGE) for e in exits}) == len(exits)
+                and all(e.get("returncode") == 0 and (e.get("logical_id"), e.get("generation")) in a.tokens
+                        and all(e.get(k) == a.tokens[(e["logical_id"], e["generation"])][k] for k in _LINEAGE)
+                        for e in exits) and a.end.get("cleanup_complete") is True)
         # Precondition execution is separately checked against the actual target
         # in canonical_receipts; no helper boolean qualifies a step here.
         try:

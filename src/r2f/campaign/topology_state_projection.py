@@ -434,10 +434,26 @@ class _Projection:
                 active = {eid: endpoint_identity_at(self.events, origin,
                               before_index=chain[0]["event_index"])
                           for eid, origin in active.items()}
-                for key in ("endpoint_gid", "endpoint_generation", "pid"):
+                for key in ("endpoint_gid", "endpoint_generation"):
                     values = [event.get(key) for event in active.values()]
                     if None in values or len(set(values)) != len(values):
                         raise ValueError("direct_peer_scope_identity_alias_or_missing:" + key)
+                pids = [event.get("pid") for event in active.values()]
+                if None in pids:
+                    raise ValueError("direct_peer_scope_identity_alias_or_missing:pid")
+                shared_process = len(set(pids)) != len(pids)
+                if shared_process:
+                    from r2f.runtime.participant_groups import (
+                        LINK_KEYS, _validate_shared_process, validate_control,
+                    )
+                    if (native_declared or source != "dds_matched_endpoint_api"
+                            or validate_control(self.program) is None):
+                        raise ValueError("direct_peer_scope_identity_alias_or_missing:pid")
+                    # Authenticate only the raw prefix through this snapshot ACK.
+                    # A later group binding or clean shutdown cannot repair it.
+                    _validate_shared_process(list(active.values()), self.events,
+                        request_index=chain[0]["event_index"],
+                        before_index=chain[-1]["event_index"] + 1)
                 for name, role in (("publishers", "writer"), ("subscriptions", "reader")):
                     raw = [event for eid, event in active.items()
                            if self.roles.get(eid) == role and event.get("topic") == token["topic"]]
@@ -455,12 +471,15 @@ class _Projection:
                 opposite = "reader" if self.roles.get(token["logical_id"]) == "writer" else "writer"
                 known = {_gid(event["endpoint_gid"]) for eid, event in active.items()
                          if self.roles.get(eid) == opposite and event.get("topic") == token["topic"]}
+                identity_keys = ("generation", "endpoint_gid", "endpoint_generation", "pid",
+                                 "process_start_ticks", "topic", "message_type")
+                if shared_process:
+                    identity_keys += ("pgid",) + LINK_KEYS
                 for queried, role in ((token, self.roles.get(token["logical_id"])), (peer, opposite)):
                     bound = active.get(queried["logical_id"])
                     if (bound is None or re.fullmatch(role + r"[1-9]?", str(bound.get("role"))) is None
                             or any(queried.get(key) is None or bound.get(key) != queried[key]
-                                   for key in ("generation", "endpoint_gid", "endpoint_generation", "pid",
-                                               "process_start_ticks", "topic", "message_type"))):
+                                   for key in identity_keys)):
                         raise ValueError("direct_peer_query_identity_not_current_raw_generation")
                 if (not set(gids) <= known or (peer["topic"] == token["topic"]
                         and _gid(peer["endpoint_gid"]) not in known)):
