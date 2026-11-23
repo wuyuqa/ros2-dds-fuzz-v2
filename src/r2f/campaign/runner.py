@@ -63,7 +63,7 @@ def _validate_expected_source_manifest(source, expected_source_manifest):
 
 
 def plan_campaign(output_dir, *, repo=None, run_id=None, domain_id=173, seed=0,
-                  target_id=EXECUTION_ORDER[0], parameters=None,
+                  target_id=EXECUTION_ORDER[0], parameters=None, rmws=None,
                   expected_source_manifest=None, observation=_OBSERVATION_UNSET):
     """Build input capsules offline; planning never implies reached or executed.
 
@@ -72,6 +72,9 @@ def plan_campaign(output_dir, *, repo=None, run_id=None, domain_id=173, seed=0,
     observation is an optional exact mode/bool pair, scoped to Cyclone baseline0
     on the first target in CP1. Its declaration is execution metadata only;
     omission preserves legacy artifacts, and explicit null is invalid.
+    rmws optionally selects a nonempty, unique subset of target-applicable RMWs.
+    Partial plans list uncovered cells; the frozen required scope and its audit
+    are unchanged. None preserves the complete plan and legacy artifact shape.
     """
     selection = _observation_selection(observation, target_id)
     if isinstance(parameters, dict) and {"observation_mode", "observe_adopted_config"}.intersection(parameters):
@@ -90,6 +93,20 @@ def plan_campaign(output_dir, *, repo=None, run_id=None, domain_id=173, seed=0,
     module = register(registry)
     target = registry.get_target(target_id)
     services = registry.get_services(target_id)
+    rmw_selection = None
+    if rmws is not None:
+        if (not isinstance(rmws, (list, tuple)) or not rmws
+                or any(not isinstance(rmw, str) for rmw in rmws)
+                or len(set(rmws)) != len(rmws)
+                or any(rmw not in target.rmw_applicability for rmw in rmws)):
+            raise ValueError("rmws must be a nonempty unique list of target-applicable RMWs")
+        uncovered = [cell["cell_id"] for cell in first_slice_cells(target_id)
+                     if cell["rmw"] not in rmws]
+        if selection is not None and _OBSERVATION_CELL in uncovered:
+            raise ValueError("rmws selection excludes observation cell: " + _OBSERVATION_CELL)
+        rmw_selection = {"plan_kind": "partial_rmw_plan" if uncovered else "full_rmw_plan",
+                         "selected_rmws": [rmw for rmw in target.rmw_applicability if rmw in rmws],
+                         "partial": bool(uncovered), "uncovered_cell_ids": uncovered}
     scope = json.loads((repo / "config/s1_scope.json").read_text())
     source = source_manifest(repo)
     _validate_expected_source_manifest(source, expected_source_manifest)
@@ -100,10 +117,14 @@ def plan_campaign(output_dir, *, repo=None, run_id=None, domain_id=173, seed=0,
                 "maturity_denominator_changed": False, "applicable_rmws_requested": list(target.rmw_applicability)}
     if selection is not None:
         manifest["observation"] = dict(selection, cell_id=_OBSERVATION_CELL)
+    if rmw_selection is not None:
+        manifest["rmw_selection"] = rmw_selection
     identity = identity_hashes(manifest)
     write_json(output_dir / "manifest.json", manifest)
     rows = []
     for cell in first_slice_cells(target_id):
+        if rmw_selection is not None and cell["rmw"] not in rmw_selection["selected_rmws"]:
+            continue
         cell = dict(cell, target_id=target_id)
         submitted = semantic_input(cell["arm"], parameters, target_id=target_id)
         recovery = target_id == EXECUTION_ORDER[2]
@@ -151,6 +172,7 @@ def plan_campaign(output_dir, *, repo=None, run_id=None, domain_id=173, seed=0,
                          oracle_verdict="unknown", replay_status="not_run", candidate_status="none", actual_run=False))
     return {"schema_version": 1, "run_id": run_id, "manifest_path": str(output_dir / "manifest.json"),
             **({"observation": deepcopy(manifest["observation"])} if selection is not None else {}),
+            **({"rmw_selection": deepcopy(rmw_selection)} if rmw_selection is not None else {}),
             "identity": identity, "rows": rows, "control_references": control_references(rows),
             "required_cells": 18, "independent_fault_controls": 6, "full_scope_required_cells": 72,
             "scope_dispositions": module.dispositions, "maturity_denominator_changed": False,

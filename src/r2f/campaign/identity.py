@@ -200,7 +200,7 @@ def projection_input(arm, parameters=None):
     """Initial fourth-target payload; no execution/source paths enter identity."""
     from copy import deepcopy
     p = dict(parameters or {})
-    supported = {"topic", "baseline_qos", "variant_qos", "match_timeout_sec", "startup_timeout_sec", "projection_timeout_sec"}
+    supported = {"topic", "baseline_qos", "variant_qos", "match_timeout_sec", "startup_timeout_sec", "projection_timeout_sec", "projection_discovery_layers"}
     if set(p) - supported:
         raise ValueError("unknown projection parameters: " + ",".join(sorted(set(p) - supported)))
     baseline = deepcopy(p.get("baseline_qos", {"reliability": "reliable", "durability": "volatile", "depth": 64,
@@ -214,5 +214,11 @@ def projection_input(arm, parameters=None):
               "match_timeout_sec": p.get("match_timeout_sec", 8.0), "startup_timeout_sec": p.get("startup_timeout_sec", 10.0),
               "projection_timeout_sec": p.get("projection_timeout_sec", 8.0),
               "fault_id": "controlled_projection_field_mismatch" if arm == "negative" else None}
+    if "projection_discovery_layers" in p:
+        from r2f.runtime.discovery_profiles import validate_discovery_layers
+        # Validate the observation token here; runtime_config separately checks
+        # the actual cell RMW and continues to reject non-Cyclone admission.
+        validate_discovery_layers(p["projection_discovery_layers"], "rmw_cyclonedds_cpp")
+        result["projection_discovery_layers"] = p["projection_discovery_layers"]
     reject_execution_identity(result)
     return result

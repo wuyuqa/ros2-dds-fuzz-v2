@@ -115,6 +115,179 @@ def projection_fixture(root,arm='baseline', *, graph_clocks=None):
 
 
 class ProjectionPipeline(unittest.TestCase):
+    def test_plan_rejects_subset_excluding_requested_observation_cell(self):
+        from r2f.campaign.runner import plan_campaign
+        for mode, adopted in (('instrumentation', True), ('instrumentation', False),
+                              ('blackbox', False)):
+            with self.subTest(mode=mode, adopted=adopted), tempfile.TemporaryDirectory() as tmp:
+                output = Path(tmp) / 'rejected'
+                with self.assertRaisesRegex(ValueError,
+                        'rmws selection excludes observation cell: rmw_cyclonedds_cpp.baseline.0'):
+                    plan_campaign(output, rmws=['rmw_fastrtps_cpp'],
+                        observation={'observation_mode': mode, 'observe_adopted_config': adopted})
+                self.assertFalse((output / 'manifest.json').exists())
+                self.assertFalse((output / 'cells').exists())
+        with tempfile.TemporaryDirectory() as tmp:
+            selection = {'observation_mode': 'instrumentation', 'observe_adopted_config': True}
+            plan = plan_campaign(tmp, rmws=['rmw_cyclonedds_cpp'], observation=selection)
+            row = plan['rows'][0]
+            self.assertEqual(row['cell_id'], 'rmw_cyclonedds_cpp.baseline.0')
+            config = json.loads(Path(row['runtime_config_path']).read_text())
+            for key, value in selection.items():
+                self.assertEqual(config[key], value)
+            self.assertEqual(plan['observation'], dict(selection, cell_id=row['cell_id']))
+
+    def test_execute_intake_rejects_excluded_observation_without_dispatch(self):
+        from r2f.campaign.runner import run_campaign
+        calls = []
+        def forbidden_runtime(config, directory):
+            calls.append(config['cell_id'])
+            raise RuntimeError('offline sentinel: excluded observation must not dispatch')
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / 'rejected'
+            with self.assertRaisesRegex(ValueError,
+                    'rmws selection excludes observation cell: rmw_cyclonedds_cpp.baseline.0'):
+                run_campaign(output, execute=True, max_executions=1, runtime=forbidden_runtime,
+                    rmws=['rmw_fastrtps_cpp'], observation={
+                        'observation_mode': 'instrumentation', 'observe_adopted_config': True})
+            self.assertEqual(calls, [])
+            self.assertFalse((output / 'manifest.json').exists())
+            self.assertFalse((output / 'cells').exists())
+
+    def test_canonical_cyclone_normal_control_preserves_discovery_layers(self):
+        from r2f.campaign.runner import run_campaign
+        cyclone = 'rmw_cyclonedds_cpp'
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            enabled = run_campaign(root / 'enabled', target_id=TARGET, rmws=[cyclone],
+                parameters={'projection_discovery_layers': 'participant_topic_v1'},
+                run_id='offline-layers-control', max_executions=1)
+            manifest = json.loads(Path(enabled['manifest_path']).read_text())
+            selection = manifest['rmw_selection']
+            self.assertEqual(selection['plan_kind'], 'partial_rmw_plan')
+            self.assertEqual(selection['selected_rmws'], [cyclone])
+            self.assertTrue(selection['partial'])
+            self.assertEqual(len(selection['uncovered_cell_ids']), 12)
+            self.assertTrue(all(cell.startswith('rmw_fastrtps_cpp.')
+                                for cell in selection['uncovered_cell_ids']))
+            self.assertEqual(manifest['applicable_rmws_requested'],
+                             list(S1Module().targets[TARGET].rmw_applicability))
+            self.assertEqual(len(enabled['rows']), 12)
+            self.assertEqual(enabled['required_cells'], 18)
+            self.assertEqual(enabled['independent_fault_controls'], 6)
+            self.assertEqual(enabled['full_scope_required_cells'], 72)
+            self.assertFalse(enabled['maturity_denominator_changed'])
+            self.assertFalse(enabled['seal']['sealed'])
+            from r2f.reports.run_report import audit_report
+            audit = audit_report(root / 'enabled' / 'report.json')
+            self.assertFalse(audit['sealed'])
+            self.assertIn('matrix_missing_duplicate_or_extra_cell', audit['errors'])
+            self.assertIn('required_matrix_not_18', audit['errors'])
+            self.assertEqual(audit['required_expected'], 18)
+            self.assertEqual(audit['fault_expected'], 6)
+            self.assertEqual(enabled['rmw_selection'], selection)
+            row = enabled['rows'][0]
+            self.assertEqual(row['cell_id'], cyclone + '.baseline.0')
+            self.assertEqual(row['arm'], 'baseline')
+            self.assertFalse(row['actual_run'])
+            self.assertEqual(row['execution_stage'], 'planned')
+            self.assertFalse(any(row['mutation_receipt'].values()))
+            config = json.loads(Path(row['runtime_config_path']).read_text())
+            capsule = ReplayCapsule.from_dict(json.loads(Path(row['replay_path']).read_text()))
+            final = capsule.input['effective_input']['final_input']
+            self.assertEqual(config['projection_discovery_layers'], 'participant_topic_v1')
+            self.assertEqual(final['projection_discovery_layers'], 'participant_topic_v1')
+            self.assertEqual(config['final_input'], final)
+            self.assertEqual(config['qos'], config['baseline_qos'])
+            self.assertIsNone(final['fault_id'])
+            self.assertIsNone(capsule.execution)
+
+    def test_discovery_layers_are_only_deterministic_observation_input(self):
+        from r2f.campaign.runner import plan_campaign
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            plans = [plan_campaign(root / name, target_id=TARGET,
+                         rmws=['rmw_cyclonedds_cpp'], run_id=name, domain_id=domain,
+                         parameters=parameters)
+                     for name, domain, parameters in (
+                         ('plain', 19, {}),
+                         ('enabled', 20, {'projection_discovery_layers': 'participant_topic_v1'}),
+                         ('different-execution', 21, {'projection_discovery_layers': 'participant_topic_v1'}))]
+            inputs = []
+            for plan in plans:
+                configs = {row['arm']: json.loads(Path(row['runtime_config_path']).read_text())
+                           for row in plan['rows']}
+                self.assertEqual(configs['baseline']['final_input'], configs['transparent']['final_input'])
+                for arm in ('baseline', 'transparent', 'negative'):
+                    self.assertEqual(configs[arm]['qos'], configs[arm]['baseline_qos'])
+                self.assertIsNone(configs['baseline']['fault_id'])
+                self.assertEqual(configs['negative']['fault_id'], 'controlled_projection_field_mismatch')
+                capsule = json.loads(Path(plan['rows'][0]['replay_path']).read_text())
+                inputs.append(capsule['input'])
+            plain, enabled, other = inputs
+            self.assertNotIn('projection_discovery_layers', plain['effective_input']['final_input'])
+            expected = dict(plain['effective_input']['final_input'],
+                            projection_discovery_layers='participant_topic_v1')
+            self.assertEqual(enabled['effective_input']['final_input'], expected)
+            self.assertNotEqual(plain['effective_input_sha256'], enabled['effective_input_sha256'])
+            self.assertEqual(enabled['effective_input'], other['effective_input'])
+            self.assertEqual(enabled['effective_input_sha256'], other['effective_input_sha256'])
+
+    def test_rmw_selection_fails_closed_and_keeps_canonical_order(self):
+        from r2f.campaign.runner import plan_campaign
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            invalid = ([], (), 'rmw_cyclonedds_cpp', {'rmw_cyclonedds_cpp'},
+                       ['rmw_cyclonedds_cpp', 'rmw_cyclonedds_cpp'],
+                       [None], [[]], ['rmw_unknown_cpp'], ['rmw_fastrtps_cpp', ''])
+            for index, rmws in enumerate(invalid):
+                with self.subTest(rmws=rmws), self.assertRaisesRegex(ValueError, 'rmws'):
+                    plan_campaign(root / str(index), target_id=TARGET, rmws=rmws)
+                self.assertFalse((root / str(index) / 'manifest.json').exists())
+            applicable = list(S1Module().targets[TARGET].rmw_applicability)
+            full = plan_campaign(root / 'all', target_id=TARGET, rmws=applicable[::-1])
+            self.assertEqual(len(full['rows']), 24)
+            self.assertEqual(full['rows'][0]['cell_id'], 'rmw_cyclonedds_cpp.baseline.0')
+            self.assertEqual(full['rmw_selection']['selected_rmws'], applicable)
+            self.assertFalse(full['rmw_selection']['partial'])
+            self.assertEqual(full['rmw_selection']['uncovered_cell_ids'], [])
+
+    def test_discovery_layer_tokens_and_fastdds_still_fail_closed(self):
+        from r2f.campaign.runner import plan_campaign
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for index, value in enumerate((None, '', 'other', False, 1, [], {})):
+                with self.subTest(value=value), self.assertRaisesRegex(
+                        ValueError, 'unsupported_projection_discovery_layers'):
+                    plan_campaign(root / str(index), target_id=TARGET,
+                        rmws=['rmw_cyclonedds_cpp'], parameters={'projection_discovery_layers': value})
+            with self.assertRaisesRegex(ValueError, 'unsupported_projection_discovery_layers_rmw'):
+                plan_campaign(root / 'fastdds', target_id=TARGET, rmws=['rmw_fastrtps_cpp'],
+                    parameters={'projection_discovery_layers': 'participant_topic_v1'})
+
+    def test_default_rmw_selection_keeps_legacy_plan_shape_and_inputs(self):
+        from r2f.campaign.runner import plan_campaign
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            default = plan_campaign(root / 'default', target_id=TARGET, run_id='same-default-input')
+            explicit_none = plan_campaign(root / 'none', target_id=TARGET, rmws=None,
+                                          run_id='same-default-input')
+            for plan in (default, explicit_none):
+                self.assertEqual(len(plan['rows']), 24)
+                self.assertEqual(plan['required_cells'], 18)
+                self.assertEqual(plan['independent_fault_controls'], 6)
+                self.assertEqual(plan['full_scope_required_cells'], 72)
+                self.assertNotIn('rmw_selection', plan)
+                manifest = json.loads(Path(plan['manifest_path']).read_text())
+                self.assertNotIn('rmw_selection', manifest)
+                for row in plan['rows']:
+                    config = json.loads(Path(row['runtime_config_path']).read_text())
+                    self.assertNotIn('projection_discovery_layers', config)
+                    self.assertNotIn('projection_discovery_layers', config['final_input'])
+            self.assertEqual(default['identity'], explicit_none['identity'])
+            self.assertEqual([row['effective_input_sha256'] for row in default['rows']],
+                             [row['effective_input_sha256'] for row in explicit_none['rows']])
+
     def test_plan_exact_config_neutral_identity_and_unchanged_first_two(self):
         from r2f.campaign.runner import plan_campaign
         with tempfile.TemporaryDirectory() as tmp:
