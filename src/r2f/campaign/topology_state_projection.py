@@ -451,9 +451,12 @@ class _Projection:
                         raise ValueError("direct_peer_scope_identity_alias_or_missing:pid")
                     # Authenticate only the raw prefix through this snapshot ACK.
                     # A later group binding or clean shutdown cannot repair it.
-                    _validate_shared_process(list(active.values()), self.events,
-                        request_index=chain[0]["event_index"],
-                        before_index=chain[-1]["event_index"] + 1)
+                    for pid in set(pids):
+                        members = [e for e in active.values() if e['pid'] == pid]
+                        if len(members) > 1:
+                            _validate_shared_process(members, self.events,
+                                request_index=chain[0]["event_index"],
+                                before_index=chain[-1]["event_index"] + 1)
                 for name, role in (("publishers", "writer"), ("subscriptions", "reader")):
                     raw = [event for eid, event in active.items()
                            if self.roles.get(eid) == role and event.get("topic") == token["topic"]]

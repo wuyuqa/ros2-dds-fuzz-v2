@@ -35,7 +35,7 @@ def test_opt_in_binds_state_history_and_legacy_omission_is_stable():
     assert not receipt['execution_evidence'] and not receipt['candidate_eligible']
 
 @pytest.mark.parametrize('change', ['null','tag','label','recreate','episode','filter','concurrent','multi','topic'])
-def test_opt_in_rejects_cp2_and_malformed_shapes(change):
+def test_opt_in_rejects_unsupported_and_malformed_shapes(change):
     p=controlled()
     if change == 'null': p['participant_control']=None
     elif change == 'tag': p['participant_control']['mechanism']='contexts_only'

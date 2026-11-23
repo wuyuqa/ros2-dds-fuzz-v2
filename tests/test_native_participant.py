@@ -34,6 +34,43 @@ def native_probe_files():
             yield root
 
 
+@contextmanager
+def native_topic_headers():
+    """Minimal independent C declarations transcribed from the installed 0.10.5 headers.
+
+    File I/O is the seam: these aren't a library and cannot be loaded.
+    """
+    headers = {
+        'HEADER': ('dds.h', """
+#define DDS_BUILTIN_TOPIC_DCPSTOPIC ((dds_entity_t) (DDS_MIN_PSEUDO_HANDLE + 2))
+typedef struct dds_sample_info {
+ dds_sample_state_t sample_state; dds_view_state_t view_state;
+ dds_instance_state_t instance_state; bool valid_data; dds_time_t source_timestamp;
+ dds_instance_handle_t instance_handle; dds_instance_handle_t publication_handle;
+ uint32_t disposed_generation_count; uint32_t no_writers_generation_count;
+ uint32_t sample_rank; uint32_t generation_rank; uint32_t absolute_generation_rank;
+} dds_sample_info_t;
+typedef struct dds_builtintopic_topic_key { unsigned char d[16]; } dds_builtintopic_topic_key_t;
+typedef struct dds_builtintopic_topic {
+ dds_builtintopic_topic_key_t key; char *topic_name; char *type_name; dds_qos_t *qos;
+} dds_builtintopic_topic_t;
+"""),
+        'QOS_HEADER': ('dds_public_qos.h', 'DDS_EXPORT bool dds_qget_history (const dds_qos_t * __restrict qos, dds_history_kind_t *kind, int32_t *depth);'),
+        'QOS_DEFS_HEADER': ('dds_public_qosdefs.h',
+            'typedef enum dds_history_kind { DDS_HISTORY_KEEP_LAST, DDS_HISTORY_KEEP_ALL } dds_history_kind_t;'),
+        'VERSION_HEADER': ('version.h', '#define DDS_VERSION "0.10.5"'),
+        'FEATURES_HEADER': ('features.h', '#define DDS_HAS_TOPIC_DISCOVERY 1'),
+    }
+    with tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
+        paths = {}
+        for attr, (name, text) in headers.items():
+            path = Path(directory) / name
+            path.write_text(text)
+            stack.enter_context(mock.patch.object(np, attr, path, create=True))
+            paths[attr] = path
+        yield paths
+
+
 class AbiTests(unittest.TestCase):
     def test_declared_layout_matches_headers(self):
         # dds_sample_info_t is 64 bytes on this ABI with these offsets; a wrong
@@ -182,6 +219,346 @@ class GateTests(unittest.TestCase):
         self.assertFalse(value['candidate_eligible'])
         self.assertFalse(value['mutation_receipt'])
         self.assertFalse(value['counts_toward_maturity'])
+
+
+class BuiltinTopicTests(unittest.TestCase):
+    """Public native carrier seam; every C operation is a Python fake."""
+
+    def setUp(self):
+        self.backend = np.NativeParticipantBackend()
+        self.library = mock.Mock(spec=[*np.REQUIRED_SYMBOLS, 'dds_qget_history',
+                                       'dds_builtintopic_free_topic'])
+        self.backend.library = self.library
+        self.backend.participant = 11  # Fake handle only; never create a participant.
+        self.backend.identity = {'library_sha256':
+            '9a63f94ee673c5efddb337a7dd012e4c98960b10ce256dcc3a7b4c331fabf5b5'}
+        stack = ExitStack()
+        self.addCleanup(stack.close)
+        self.topic_headers = stack.enter_context(native_topic_headers())
+        self.library.dds_create_reader.return_value = 17
+
+    def tearDown(self):
+        self.library.dds_create_participant.assert_not_called()
+        self.library.dds_builtintopic_free_topic.assert_not_called()
+        self.library.dds_builtintopic_free_participant.assert_not_called()
+        self.library.dds_qget_liveliness.assert_not_called()
+
+    def topic_sample(self, *, kind=0, depth=7, valid=True, state=0x10):
+        class Topic(ctypes.Structure):
+            _fields_ = [('key', ctypes.c_ubyte * 16), ('topic_name', ctypes.c_char_p),
+                        ('type_name', ctypes.c_char_p), ('qos', ctypes.c_void_p)]
+        self.name = ctypes.create_string_buffer('温度'.encode())
+        self.type_name = ctypes.create_string_buffer(b'Temperature')
+        self.native = Topic((ctypes.c_ubyte * 16)(*range(16)),
+                            ctypes.cast(self.name, ctypes.c_char_p),
+                            ctypes.cast(self.type_name, ctypes.c_char_p), 0x1234)
+        def take(reader, buffer, info, capacity, maximum):
+            buffer[0] = ctypes.addressof(self.native)
+            info[0].valid_data = valid
+            info[0].instance_state = state
+            info[0].source_timestamp = 987
+            return 1
+        def history(qos, actual_kind, actual_depth):
+            self.assertEqual(qos.value, 0x1234)  # Sample QoS, never reader QoS.
+            ctypes.cast(actual_kind, ctypes.POINTER(ctypes.c_int32))[0] = kind
+            ctypes.cast(actual_depth, ctypes.POINTER(ctypes.c_int32))[0] = depth
+            return True
+        def return_loan(*args):
+            self.name.value = b'gone'
+            self.type_name.value = b'gone'
+            self.native.key[:] = b'X' * 16
+            return 0
+        self.library.dds_take.side_effect = take
+        self.library.dds_qget_history.side_effect = history
+        self.library.dds_return_loan.side_effect = return_loan
+        return self.backend.builtin_reader(topic='DCPSTopic')['reader_handle']
+
+    def test_topic_take_copies_opaque_key_strings_and_sample_history_before_return(self):
+        reader = self.topic_sample()
+        value = self.backend.take_topics(reader, max_samples=1)
+        self.assertTrue(value['ok'], value)
+        self.assertEqual(value['receipt_kind'], 'native_builtin_topics')
+        self.assertEqual(value['observation_basis'], 'dcpstopic_builtin_topic')
+        sample = value['samples'][0]
+        self.assertEqual(sample['topic_key'], '000102030405060708090a0b0c0d0e0f')
+        self.assertEqual(sample['key_kind'], 'opaque16')
+        self.assertNotIn('guid', sample)
+        self.assertEqual((sample['topic_name'], sample['type_name']), ('温度', 'Temperature'))
+        self.assertEqual((sample['valid_data'], sample['instance_state'],
+                          sample['source_timestamp_ns']), (True, 'ALIVE', 987))
+        self.assertEqual(sample['history'], {
+            'status': 'observed', 'kind': 'KEEP_LAST', 'kind_raw': 0,
+            'depth': 7, 'depth_raw': 7, 'depth_status': 'observed',
+            'source': 'sample.qos:dds_qget_history'})
+        self.assertTrue(value['loan_returned'])
+        self.assertFalse(value['candidate_eligible'])
+        self.assertFalse(value['counts_toward_maturity'])
+        self.library.dds_return_loan.assert_called_once()
+        self.library.dds_builtintopic_free_participant.assert_not_called()
+
+    def test_topic_missing_qos_and_getter_false_stay_unavailable(self):
+        reader = self.topic_sample()
+        self.native.qos = None
+        value = self.backend.take_topics(reader)
+        self.assertEqual(value['samples'][0]['history']['status'], 'unavailable_on_sample')
+        self.assertEqual(value['samples'][0]['history']['reason'], 'qos_null')
+        self.library.dds_qget_history.assert_not_called()
+        reader = self.topic_sample()
+        self.library.dds_qget_history.side_effect = None
+        self.library.dds_qget_history.return_value = False
+        value = self.backend.take_topics(reader)
+        self.assertEqual(value['samples'][0]['history']['status'], 'unavailable_on_sample')
+        self.assertEqual(value['samples'][0]['history']['reason'], 'getter_false')
+        self.assertIsNone(value['samples'][0]['history']['depth'])
+
+    def test_topic_lifecycle_samples_do_not_dereference_invalid_payload(self):
+        for valid, state, status in [(False, 0x10, 'not_applicable_invalid_data'),
+                                     (True, 0x20, 'not_applicable_instance_not_alive'),
+                                     (True, 0x40, 'not_applicable_instance_not_alive')]:
+            with self.subTest(valid=valid, state=state):
+                reader = self.topic_sample(valid=valid, state=state)
+                self.native.topic_name = None
+                self.native.type_name = None
+                self.native.qos = 1  # Poison pointer: it must never reach a getter.
+                self.library.dds_qget_history.reset_mock()
+                value = self.backend.take_topics(reader)
+                self.assertTrue(value['ok'], value)
+                sample = value['samples'][0]
+                self.assertEqual(sample['history']['status'], status)
+                self.assertIsNone(sample['topic_name'])
+                self.assertIsNone(sample['type_name'])
+                self.library.dds_qget_history.assert_not_called()
+                self.assertTrue(value['loan_returned'])
+
+    def test_keep_all_depth_is_diagnostic_not_a_finite_history_depth(self):
+        reader = self.topic_sample(kind=1, depth=-1)
+        value = self.backend.take_topics(reader)
+        self.assertTrue(value['ok'], value)
+        history = value['samples'][0]['history']
+        self.assertEqual(history['kind'], 'KEEP_ALL')
+        self.assertEqual(history['kind_raw'], 1)
+        self.assertIsNone(history['depth'])
+        self.assertEqual(history['depth_raw'], -1)
+        self.assertEqual(history['depth_status'], 'not_applicable_keep_all')
+
+    def test_malformed_history_blocks_observation_and_still_returns_loan(self):
+        for kind, depth, getter in [(99, 7, True), (0, 0, True), (0, -1, True),
+                                    (0, 7, 'not-a-C-bool')]:
+            with self.subTest(kind=kind, depth=depth, getter=getter):
+                reader = self.topic_sample(kind=kind, depth=depth)
+                if getter is not True:
+                    self.library.dds_qget_history.side_effect = None
+                    self.library.dds_qget_history.return_value = getter
+                self.library.dds_return_loan.reset_mock()
+                value = self.backend.take_topics(reader)
+                self.assertFalse(value['ok'], value)
+                self.assertEqual(value['reason'], 'builtin_sample_parse_failed')
+                self.assertFalse(value['effect_observed'])
+                self.assertFalse(value['candidate_eligible'])
+                self.assertTrue(value['loan_returned'])
+                self.library.dds_return_loan.assert_called_once()
+
+    def test_wrong_reader_sample_types_are_blocked_before_take(self):
+        topic = self.backend.builtin_reader(topic='DCPSTopic')['reader_handle']
+        value = self.backend.take_participants(topic)
+        self.assertEqual(value['reason'], 'builtin_reader_topic_mismatch')
+        self.library.dds_take.assert_not_called()
+        self.library.dds_create_reader.return_value = 18
+        participant = self.backend.builtin_reader()['reader_handle']
+        for handle in (participant, 999):
+            value = self.backend.take_topics(handle)
+            self.assertEqual(value['reason'], 'builtin_reader_topic_mismatch')
+            self.library.dds_take.assert_not_called()
+        self.library.dds_take.return_value = 0
+        self.assertTrue(self.backend.take_participants(999)['ok'])  # Legacy API.
+
+    def test_missing_history_symbol_blocks_only_topic_capability(self):
+        library = mock.Mock(spec=[name for name in np.REQUIRED_SYMBOLS
+                                  if name != 'dds_qget_history'])
+        library.dds_create_reader.return_value = 18
+        with native_probe_files(), mock.patch.object(np.ctypes, 'CDLL', return_value=library):
+            loaded, _ = np.load_library()
+        self.backend.library = loaded
+        value = self.backend.builtin_reader(topic='DCPSTopic')
+        self.assertEqual(value['reason'], 'topic_symbols_missing')
+        self.assertEqual(value['layer'], 'capability_gap')
+        library.dds_create_reader.assert_not_called()
+        self.assertEqual(self.backend.builtin_reader()['reader_handle'], 18)
+
+    def test_history_getter_has_the_installed_bool_enum_int32_pointer_signature(self):
+        with native_probe_files(), mock.patch.object(np.ctypes, 'CDLL',
+                                                    return_value=self.library):
+            loaded, _ = np.load_library()
+        self.assertIs(loaded.dds_qget_history.restype, ctypes.c_bool)
+        self.assertEqual(loaded.dds_qget_history.argtypes,
+                         [ctypes.c_void_p, ctypes.POINTER(ctypes.c_int32),
+                          ctypes.POINTER(ctypes.c_int32)])
+        loaded.dds_qget_history.assert_not_called()
+
+    def test_unknown_abi_platform_blocks_topic_without_breaking_participant(self):
+        with mock.patch('platform.machine', return_value='unverified-architecture'):
+            value = self.backend.builtin_reader(topic='DCPSTopic')
+            self.assertEqual(value['reason'], 'topic_abi_unsupported_platform')
+            self.assertEqual(value['layer'], 'abi_contract')
+            self.library.dds_create_reader.assert_not_called()
+            self.assertEqual(self.backend.builtin_reader()['topic'], 'DCPSParticipant')
+
+    def test_changed_topic_header_is_not_decoded_with_assumed_layout(self):
+        path = self.topic_headers['HEADER']
+        path.write_text(path.read_text().replace('unsigned char d[16]', 'unsigned char d[12]'))
+        value = self.backend.builtin_reader(topic='DCPSTopic')
+        self.assertEqual(value['reason'], 'topic_abi_header_mismatch')
+        self.assertEqual(value['layer'], 'abi_contract')
+        self.library.dds_create_reader.assert_not_called()
+        self.assertEqual(self.backend.builtin_reader()['topic'], 'DCPSParticipant')
+
+    def test_unknown_native_binary_cannot_use_the_topic_layout_profile(self):
+        for identity in (None, {}, {'library_sha256': '0' * 64}):
+            with self.subTest(identity=identity):
+                self.backend.identity = identity
+                value = self.backend.builtin_reader(topic='DCPSTopic')
+                self.assertEqual(value['reason'], 'topic_abi_library_mismatch')
+                self.assertEqual(value['layer'], 'abi_contract')
+                self.library.dds_create_reader.assert_not_called()
+
+    def test_topic_take_revalidates_headers_and_layout_before_native_read(self):
+        reader = self.topic_sample()
+        self.topic_headers['QOS_HEADER'].write_text('DDS_EXPORT int dds_qget_history(void);')
+        value = self.backend.take_topics(reader)
+        self.assertEqual(value['reason'], 'topic_abi_header_mismatch')
+        self.library.dds_take.assert_not_called()
+        self.library.dds_return_loan.assert_not_called()
+
+    def test_unverified_native_alignment_blocks_topic_before_any_c_call(self):
+        with mock.patch.object(ctypes, 'alignment', return_value=4):
+            value = self.backend.builtin_reader(topic='DCPSTopic')
+        self.assertEqual(value['reason'], 'topic_abi_layout_mismatch')
+        self.library.dds_create_reader.assert_not_called()
+
+    def test_topic_loans_return_once_on_null_sample_getter_error_and_oversized_count(self):
+        for failure in ('null_sample', 'null_names', 'invalid_utf8', 'getter_error',
+                        'oversized', 'return_error', 'parse_and_return_error'):
+            with self.subTest(failure=failure):
+                reader = self.topic_sample()
+                self.library.dds_return_loan.reset_mock()
+                if failure == 'null_sample':
+                    def take(reader, buffer, info, capacity, maximum):
+                        return 1
+                    self.library.dds_take.side_effect = take
+                elif failure == 'null_names':
+                    self.native.topic_name = None
+                    self.native.type_name = None
+                elif failure == 'invalid_utf8':
+                    self.native.topic_name = b'\xff'
+                elif failure in ('getter_error', 'parse_and_return_error'):
+                    self.library.dds_qget_history.side_effect = ValueError('offline getter fault')
+                elif failure == 'oversized':
+                    self.library.dds_take.side_effect = None
+                    self.library.dds_take.return_value = 9
+                if failure in ('return_error', 'parse_and_return_error'):
+                    self.library.dds_return_loan.side_effect = RuntimeError('offline return fault')
+                value = self.backend.take_topics(reader, max_samples=1)
+                self.library.dds_return_loan.assert_called_once()
+                args = self.library.dds_return_loan.call_args.args
+                self.assertEqual((args[0].value, len(args[1]), args[2].value), (17, 1, 1))
+                if failure == 'null_names':
+                    self.assertTrue(value['ok'], value)
+                    self.assertIsNone(value['samples'][0]['topic_name'])
+                    self.assertIsNone(value['samples'][0]['type_name'])
+                else:
+                    self.assertFalse(value['ok'], value)
+                    self.assertFalse(value['effect_observed'])
+                    self.assertFalse(value['candidate_eligible'])
+                if failure == 'oversized':
+                    self.assertTrue(value['loan_cleanup_uncertain'])
+                    self.assertEqual(value['abi_contract_violation'], 'dds_take_count_exceeds_capacity')
+                if failure in ('return_error', 'parse_and_return_error'):
+                    self.assertTrue(value['free_errors'])
+                    self.assertFalse(value['loan_returned'])
+                if failure == 'parse_and_return_error':
+                    self.assertIsNotNone(value['parse_error'])
+
+    def test_topic_interrupt_and_emit_error_happen_after_loan_cleanup(self):
+        reader = self.topic_sample()
+        self.library.dds_qget_history.side_effect = KeyboardInterrupt()
+        with self.assertRaises(KeyboardInterrupt):
+            self.backend.take_topics(reader)
+        self.library.dds_return_loan.assert_called_once()
+        reader = self.topic_sample()
+        self.library.dds_return_loan.reset_mock()
+        def emit(value):
+            self.library.dds_return_loan.assert_called_once()
+            raise RuntimeError('offline emit fault')
+        self.backend.emit = emit
+        with self.assertRaisesRegex(RuntimeError, 'offline emit fault'):
+            self.backend.take_topics(reader)
+
+    def test_topic_nonpositive_take_and_bad_capacity_do_not_return_nonexistent_loans(self):
+        reader = self.topic_sample()
+        self.library.dds_take.side_effect = None
+        for count in (0, -1):
+            self.library.dds_take.return_value = count
+            value = self.backend.take_topics(reader)
+            self.assertEqual(value['ok'], count == 0)
+            self.assertFalse(value['effect_observed'])
+            self.assertFalse(value['loan_return_attempted'])
+            self.library.dds_return_loan.assert_not_called()
+        self.library.dds_take.reset_mock()
+        for capacity in (True, None, 1.5, '1', 0, -1, 1025):
+            value = self.backend.take_topics(reader, capacity)
+            self.assertFalse(value['ok'])
+            self.library.dds_take.assert_not_called()
+            self.library.dds_return_loan.assert_not_called()
+
+    def test_changed_sample_info_type_blocks_topic_decoding(self):
+        path = self.topic_headers['HEADER']
+        path.write_text(path.read_text().replace('bool valid_data', 'int64_t valid_data'))
+        value = self.backend.builtin_reader(topic='DCPSTopic')
+        self.assertEqual(value['reason'], 'topic_abi_header_mismatch')
+        self.library.dds_create_reader.assert_not_called()
+
+    def test_topic_profile_rejects_near_miss_feature_and_version_defines(self):
+        for attr, text in [('FEATURES_HEADER', '#define DDS_HAS_TOPIC_DISCOVERY 10'),
+                           ('FEATURES_HEADER', '#define DDS_HAS_TOPIC_DISCOVERY 0'),
+                           ('VERSION_HEADER', '#define DDS_VERSION "0.10.5-custom"')]:
+            with self.subTest(attr=attr, text=text):
+                with native_topic_headers() as paths:
+                    paths[attr].write_text(text)
+                    value = self.backend.builtin_reader(topic='DCPSTopic')
+                self.assertEqual(value['reason'], 'topic_abi_header_mismatch')
+                self.library.dds_create_reader.assert_not_called()
+
+    def test_closed_topic_reader_cannot_be_reused_as_an_admitted_topic_handle(self):
+        reader = self.topic_sample()
+        self.library.dds_delete.return_value = 0
+        self.assertTrue(self.backend.close()['cleanup_complete'])
+        value = self.backend.take_topics(reader)
+        self.assertEqual(value['reason'], 'builtin_reader_topic_mismatch')
+        self.library.dds_take.assert_not_called()
+
+    def test_invalid_topic_handles_are_receipted_without_native_calls(self):
+        self.topic_sample()
+        for handle in (True, False, {}, [], None, '17', ctypes.c_int32(17), 0, -1):
+            with self.subTest(handle=handle):
+                value = self.backend.take_topics(handle)
+                self.assertEqual(value['reason'], 'builtin_reader_handle_invalid')
+                self.assertFalse(value['effect_observed'])
+                self.library.dds_take.assert_not_called()
+        # Preserve the legacy API's exception for a non-convertible handle.
+        with self.assertRaises(TypeError):
+            self.backend.take_participants([])
+
+    def test_topic_reader_uses_dcpstopic_and_preserves_participant_default(self):
+        topic = self.backend.builtin_reader(topic='DCPSTopic')
+        self.assertEqual((topic['topic'], topic['topic_handle'], topic['reader_handle']),
+                         ('DCPSTopic', 0x7fff0002, 17))
+        self.assertFalse(topic['candidate_eligible'])
+        args = self.library.dds_create_reader.call_args.args
+        self.assertEqual((args[0].value, args[1].value, args[2:]),
+                         (11, 0x7fff0002, (None, None)))
+        participant = self.backend.builtin_reader()
+        self.assertEqual(participant['topic'], 'DCPSParticipant')
+        self.assertEqual(participant['topic_handle'], 0x7fff0001)
 
 
 class BuiltinLoanTests(unittest.TestCase):

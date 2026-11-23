@@ -133,9 +133,17 @@ class TopologyBackendError(RuntimeError):
     """A backend/tool error, never a SUT verdict."""
 
 
-def _graph_local_gid(snapshot, node_name, kind):
+def _graph_local_gid(snapshot, node_name, kind, *, group_gids=None):
     rows = snapshot["publishers" if kind == "writer" else "subscriptions"]
     own = [row for row in rows if row.get("node_name") == node_name]
+    if group_gids is not None:
+        # One serialized create per endpoint in the same node/context. Previously
+        # bound siblings remain visible; only the unique unbound graph identity
+        # can be this endpoint. Never select a first row or infer a GUID prefix.
+        gids = [row.get("endpoint_gid") for row in own]
+        if len(set(gids)) != len(gids) or not set(group_gids) <= set(gids):
+            raise TopologyBackendError("local_group_graph_identity_invalid")
+        own = [row for row in own if row.get("endpoint_gid") not in group_gids]
     if len(own) != 1:
         raise TopologyBackendError("local_graph_endpoint_not_unique")
     gid = own[0].get("endpoint_gid")
@@ -1521,7 +1529,13 @@ def _worker_main(argv, group_owner=None):
                 rows = publishers if kind == "writer" else subscriptions
                 if local_gid is None and not any(x["node_name"] == node_name for x in rows):
                     return snapshot
-                observed = _graph_local_gid(snapshot, node_name, kind)
+                siblings = None
+                if group_owner is not None:
+                    siblings = {item['token']['endpoint_gid']
+                                for eid, item in group_owner['sessions'].items()
+                                if eid != config['logical_id'] and 'token' in item
+                                and item['token']['kind'] == kind}
+                observed = _graph_local_gid(snapshot, node_name, kind, group_gids=siblings)
                 if local_gid is None:
                     local_gid = observed
                 elif local_gid != observed:
@@ -1842,8 +1856,13 @@ def _group_worker_main(argv):
             or config.get('observation_mode', 'blackbox') != 'blackbox'):
         raise TopologyBackendError('group_worker_admission_invalid')
     members = {e['logical_id']: e for e in config['group_members']}
-    if (not 1 <= len(members) <= 2 or len(members) != len(config['group_members'])
-            or any(e['participant_id'] != config['group_id'] for e in members.values())):
+    if (not 1 <= len(members) <= 8 or len(members) != len(config['group_members'])
+            or any(e.get('participant_id') != config['group_id']
+                   or e.get('role') not in {'writer', 'reader'}
+                   or e.get('type_name') != 'std_msgs/msg/String'
+                   or e.get('filter') is not None for e in members.values())
+            or any(sum(e['role'] == role for e in members.values()) > 4 for role in ('writer', 'reader'))
+            or len({e.get('topic') for e in members.values()}) != 1):
         raise TopologyBackendError('group_worker_members_invalid')
     import rclpy
     from rclpy.context import Context
@@ -3097,7 +3116,8 @@ class RosTopologyBackend:
                 "command_id": command_id,
                 "complete": bool(matches and graphs),
             }
-        if self.group_program is not None and len(self.handles) == 2:
+        if (self.group_program is not None
+                and len(self.handles) == len(self.group_program['endpoints'])):
             for process in self.groups.values():
                 handle = next(h for h in self.handles.values() if h['process'] is process)
                 self._batch(handle, 'group_snapshot')
@@ -3121,7 +3141,8 @@ class RosTopologyBackend:
         workers, errors = [], []
         for process in self.processes:
             try:
-                if (self.group_program is not None and len(self.handles) == 2
+                if (self.group_program is not None
+                and len(self.handles) == len(self.group_program['endpoints'])
                         and process.process is not None and process.process.poll() is None):
                     member = next((h for h in self.handles.values() if h.get('process') is process and h.get('alive')), None)
                     if member is not None:

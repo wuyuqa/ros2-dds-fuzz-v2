@@ -1,4 +1,4 @@
-"""Opt-in CP1 ROS groups: pure input and raw-lineage contracts, no runtime owner.
+"""Opt-in bounded ROS groups: pure input and raw-lineage contracts, no runtime owner.
 
 participant_id is a group label. Neither allocation nor this projection proves
 DDS ownership. Only supporting root captures can qualify a measured relation.
@@ -24,9 +24,14 @@ def validate_control(program, config=None):
     if program['participant_control'] != CONTROL:
         raise ValueError('participant_control_tag_invalid')
     eps, actions = program.get('endpoints'), program.get('actions')
-    if (not isinstance(eps, list) or len(eps) != 2
-            or sorted(str(e.get('role')) for e in eps if isinstance(e, dict)) != ['reader', 'writer']):
-        raise ValueError('participant_control_scope:requires_1W1R')
+    if (not isinstance(eps, list) or not 2 <= len(eps) <= 8
+            or any(not isinstance(e, dict) or e.get('role') not in {'writer', 'reader'} for e in eps)
+            or any(not 1 <= sum(e['role'] == role for e in eps) <= 4 for role in ('writer', 'reader'))):
+        raise ValueError('participant_control_scope:requires_1_to_4_writers_and_readers')
+    ids = [e.get('logical_id') for e in eps]
+    if (any(not isinstance(eid, str) or not eid.strip() for eid in ids)
+            or len(set(ids)) != len(ids)):
+        raise ValueError('participant_control_scope:unique_endpoint_ids_required')
     groups = {}
     for ep in eps:
         label = ep.get('participant_id')
@@ -35,7 +40,9 @@ def validate_control(program, config=None):
         if ep.get('filter') is not None or ep.get('type_name') != 'std_msgs/msg/String':
             raise ValueError('participant_control_scope:filter_or_type')
         groups.setdefault(label, []).append(ep['logical_id'])
-    if eps[0].get('topic') != eps[1].get('topic') or 'episode' in program:
+    if (any(e.get('topic') != eps[0].get('topic') for e in eps)
+            or not isinstance(eps[0].get('topic'), str) or not eps[0]['topic']
+            or 'episode' in program):
         raise ValueError('participant_control_scope:topic_or_episode')
     if not isinstance(actions, list):
         raise ValueError('participant_control_scope:actions')
@@ -157,7 +164,7 @@ def qualify_observation(observation, tokens):
 
 
 def _validate_shared_process(tokens, events, *, request_index, before_index):
-    """Authenticate a live CP1 PID share using only already observed raw lineage.
+    """Authenticate a live bounded PID share using only already observed raw lineage.
 
     This is the process/context identity part of the group lineage contract,
     bounded at a fresh endpoint snapshot. It grants no DDS participant ownership
@@ -181,7 +188,10 @@ def _validate_shared_process(tokens, events, *, request_index, before_index):
 
     raw = events[:before_index]
     require(all(e.get('event_index') == i for i, e in enumerate(raw)), 'event_offsets')
-    require(len(tokens) == 2 and {t.get('role') for t in tokens} == {'writer', 'reader'},
+    require(2 <= len(tokens) <= 8
+            and all(t.get('role') in {'writer', 'reader'} for t in tokens)
+            and all(sum(t['role'] == role for t in tokens) <= 4 for role in ('writer', 'reader'))
+            and len({t.get('logical_id') for t in tokens}) == len(tokens),
             'shared_process_scope')
     token = tokens[0]
     keys = PROCESS_KEYS + LINK_KEYS
@@ -244,6 +254,16 @@ def _validate_shared_process(tokens, events, *, request_index, before_index):
                 'create_request_binding_ack_order')
         bindings.append(ack)
     request = events[request_index]
+    require(request.get('event') in {'topology_snapshot_requested', 'worker_command_requested'}
+            and request.get('command') == 'snapshot'
+            and all(ordered(b, request) for b in bindings), 'snapshot_command_chronology')
+    if request.get('pid') != token['pid']:
+        # The caller audits every shared process in the current raw universe.
+        # This group's complete create/binding ACKs must precede the other
+        # process's request. Its own snapshot chain is checked when queried;
+        # do not manufacture a command addressed to this group.
+        require(request.get('group_id') != token['group_id'], 'raw_process_context_link')
+        return
     req = one([r for r in requests if r.get('command_id') == request.get('command_id')],
               'snapshot_request')
     ack = one([e for e in scoped if e.get('event') == 'command_done'
@@ -283,11 +303,11 @@ def project_lineage(program, events, raw_path, *, config=None):
     require(binding.get('receipt', {}).get('program_sha256') == digest
             and binding.get('receipt', {}).get('participant_control') == CONTROL, 'exact_program_binding')
     tokens = [e for e in events if e.get('event') == 'endpoint_created']
-    require(len(tokens) == 2 and {t.get('logical_id') for t in tokens} == {e['logical_id'] for e in program['endpoints']}, 'endpoint_coverage')
+    require(len(tokens) == len(program['endpoints']) and {t.get('logical_id') for t in tokens} == {e['logical_id'] for e in program['endpoints']}, 'endpoint_coverage')
     order = [a['endpoint_id'] for a in program['actions'] if a['op'] == 'create']
     require([t['logical_id'] for t in tokens] == order, 'lazy_create_order')
-    require(len({t.get('endpoint_gid') for t in tokens}) == 2
-            and len({t.get('endpoint_generation') for t in tokens}) == 2, 'endpoint_reuse')
+    require(len({t.get('endpoint_gid') for t in tokens}) == len(tokens)
+            and len({t.get('endpoint_generation') for t in tokens}) == len(tokens), 'endpoint_reuse')
     starts = [e for e in events if e.get('event') == 'process_started']
     exits = [e for e in events if e.get('event') == 'process_exit']
     require(len(starts) == len(exits) == len(groups), 'actual_process_inventory_count')
