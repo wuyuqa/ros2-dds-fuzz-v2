@@ -70,6 +70,7 @@ def validate_control(program, config=None):
 
 def qualify_observation(observation, tokens):
     """Derive supporting status from captures; never trust supplied status flags."""
+    from .topology_worker import worker_role_kind
     reasons = []
     before, after = observation.get('roots_before'), observation.get('roots_after')
     def roots(capture):
@@ -114,6 +115,9 @@ def qualify_observation(observation, tokens):
             matching = [t for t in tokens if all(row.get(k) == t.get(k) for k in ENDPOINT_KEYS)]
             if len(matching) != 1 or row['logical_id'] in seen:
                 raise ValueError('group_endpoint_capture_identity')
+            expected_alias = matching[0].get('worker_role', matching[0].get('role'))
+            if any(k in row and row[k] != expected_alias for k in ('role', 'worker_role')):
+                raise ValueError('group_endpoint_capture_role_alias')
             seen.add(row['logical_id'])
             samples = row.get('samples')
             if not isinstance(samples, list) or len(samples) != 2:
@@ -123,7 +127,7 @@ def qualify_observation(observation, tokens):
                 if (sample.get('schema') != 'r2f.cyclone-participant-ownership/v2'
                         or sample.get('complete') is not True or sample.get('status') != 'observed'
                         or sample.get('local_gid') != row['endpoint_gid']
-                        or sample.get('role_kind') != matching[0].get('role', matching[0].get('kind'))
+                        or sample.get('role_kind') != worker_role_kind(matching[0].get('role', matching[0].get('kind')))
                         or sample.get('provenance') != before['provenance']
                         or sample.get('domain_id') != before.get('domain_id')
                         or sample.get('stable_sample_count') != 2
@@ -186,11 +190,17 @@ def _validate_shared_process(tokens, events, *, request_index, before_index):
                    and a['monotonic_ns'] <= b['monotonic_ns']
                    for a, b in zip(rows, rows[1:]))
 
+    from .topology_worker import worker_role_kind, worker_role_for
     raw = events[:before_index]
     require(all(e.get('event_index') == i for i, e in enumerate(raw)), 'event_offsets')
+    legacy_pair = len(tokens) == 2 and {t.get('role') for t in tokens} == {'writer', 'reader'}
+    allowed_aliases = {worker_role_for(kind, i) for kind in ('writer', 'reader') for i in range(4)}
     require(2 <= len(tokens) <= 8
-            and all(t.get('role') in {'writer', 'reader'} for t in tokens)
-            and all(sum(t['role'] == role for t in tokens) <= 4 for role in ('writer', 'reader'))
+            and all(t.get('role') in allowed_aliases
+                    and t.get('worker_role', t.get('role') if legacy_pair else None) == t.get('role')
+                    for t in tokens)
+            and len({t['role'] for t in tokens}) == len(tokens)
+            and all(sum(worker_role_kind(t['role']) == role for t in tokens) <= 4 for role in ('writer', 'reader'))
             and len({t.get('logical_id') for t in tokens}) == len(tokens),
             'shared_process_scope')
     token = tokens[0]
@@ -224,6 +234,8 @@ def _validate_shared_process(tokens, events, *, request_index, before_index):
                     and e.get('command') == 'create_endpoint'):
                 address_keys += ('endpoint_generation',)
             require(equal(e, addressed, address_keys), 'endpoint_event_context_or_incarnation')
+            require(all(k not in e or e[k] == addressed[k] for k in ('role', 'worker_role')),
+                    'endpoint_event_role_alias')
     start = one([e for e in scoped if e.get('event') == 'process_started'], 'group_start')
     ctx = one([e for e in scoped if e.get('event') == 'group_context_created'], 'context_created')
     ready = one([e for e in scoped if e.get('event') == 'group_worker_ready'], 'group_ready')
@@ -283,9 +295,11 @@ def project_lineage(program, events, raw_path, *, config=None):
     """
     import hashlib
     import json
+    from .topology_worker import canonical_worker_roles
     groups = validate_control(program, config)
     if groups is None:
         raise ValueError('group_lineage_requires_explicit_input')
+    aliases = canonical_worker_roles(program['endpoints'])
     def require(ok, reason):
         if not ok:
             raise ValueError('group_lineage:' + reason)
@@ -359,7 +373,8 @@ def project_lineage(program, events, raw_path, *, config=None):
             require(equal(token, st, PROCESS_KEYS + LINK_KEYS), 'endpoint_process_context_link')
             spec = next(e for e in program['endpoints'] if e['logical_id'] == token['logical_id'])
             require(token.get('generation') == 1 and type(token['generation']) is int
-                    and token.get('role') == spec['role'] and token.get('worker_role') == spec['role']
+                    and token.get('role') == aliases[spec['logical_id']]
+                    and token.get('worker_role') == aliases[spec['logical_id']]
                     and token.get('rmw_identifier') == ctx.get('rmw_identifier')
                     and token.get('observed_domain_id') == ctx.get('observed_domain_id')
                     and token.get('domain_id') == ctx.get('domain_id')
@@ -369,6 +384,8 @@ def project_lineage(program, events, raw_path, *, config=None):
             require(ready['event_index'] < token['event_index'] < shut['event_index'], 'endpoint_context_chronology')
             bound = one([e for e in owned if e.get('event') == 'endpoint_group_bound'
                          and equal(e.get('endpoint', {}), token, ENDPOINT_KEYS)], 'endpoint_binding')
+            require(all(k not in bound['endpoint'] or bound['endpoint'][k] == aliases[token['logical_id']]
+                        for k in ('role', 'worker_role')), 'endpoint_binding_role_alias')
             require(token['event_index'] < bound['event_index'] < shut['event_index'], 'binding_order')
             cleanup = one([e for e in owned if e.get('event') == 'endpoint_destroyed'
                            and equal(e, token, ENDPOINT_KEYS)], 'endpoint_cleanup')
@@ -426,6 +443,8 @@ def project_lineage(program, events, raw_path, *, config=None):
             if not (event.get('event') == 'group_command_requested' and event.get('command') == 'create_endpoint'):
                 keys += ('endpoint_generation',)
             require(equal(event, token, keys), 'endpoint_event_context_or_incarnation')
+            require(all(k not in event or event[k] == aliases[token['logical_id']]
+                        for k in ('role', 'worker_role')), 'endpoint_event_role_alias')
     relation = (all(o['group_relation_observed'] for o in observations)
                 and (len(groups) == 1 or len(all_gids) == len(groups)))
     return {'schema': LINEAGE_SCHEMA, 'processes': processes, 'contexts': contexts,

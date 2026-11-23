@@ -280,6 +280,37 @@ def worker_role_kind(role):
     return match.group(1) if match else None
 
 
+def canonical_worker_roles(endpoints):
+    """Use the runner's declaration-order aliases, globally rather than per group."""
+    ordinals = {'writer': 0, 'reader': 0}
+    result = {}
+    for spec in endpoints:
+        eid, kind = spec['logical_id'], spec['role']
+        if eid in result:
+            raise ValueError('duplicate logical endpoint')
+        result[eid] = worker_role_for(kind, ordinals[kind])
+        ordinals[kind] += 1
+    return result
+
+
+def _group_worker_roles(config):
+    """Authenticate global aliases; legacy 1W1R configs may omit the binding."""
+    members = config['group_members']
+    program = config.get('group_program')
+    if program is None:
+        if any(sum(e['role'] == kind for e in members) > 1 for kind in ('writer', 'reader')):
+            raise ValueError('group canonical program required')
+        expected = canonical_worker_roles(members)
+        if config.get('group_worker_roles', expected) != expected:
+            raise ValueError('group worker role binding mismatch')
+        return expected
+    expected = canonical_worker_roles(program['endpoints'])
+    if (config.get('group_worker_roles') != expected
+            or members != [e for e in program['endpoints'] if e['participant_id'] == config['group_id']]):
+        raise ValueError('group worker role binding mismatch')
+    return expected
+
+
 def _finite_ns(seconds, field):
     if seconds == "infinite":
         return INFINITE_NS
@@ -1864,6 +1895,7 @@ def _group_worker_main(argv):
             or any(sum(e['role'] == role for e in members.values()) > 4 for role in ('writer', 'reader'))
             or len({e.get('topic') for e in members.values()}) != 1):
         raise TopologyBackendError('group_worker_members_invalid')
+    aliases = _group_worker_roles(config)
     import rclpy
     from rclpy.context import Context
     from rclpy.node import Node
@@ -1920,10 +1952,10 @@ def _group_worker_main(argv):
                     emit('command_done', command='stop', command_id=cid)
                     return 0
                 eid = command.get('logical_id')
-                if eid not in members or command.get('generation') != 1:
+                if eid not in members or (type(command.get('generation')) is not int or command['generation'] != 1):
                     raise TopologyBackendError('group_command_address_invalid')
                 if op == 'create_endpoint':
-                    if eid in sessions or command.get('worker_role') != members[eid]['role']:
+                    if eid in sessions or command.get('worker_role') != aliases[eid]:
                         raise TopologyBackendError('group_create_reused_or_wrong_role')
                     spec = members[eid]
                     prepared = endpoint_expressibility(spec, config)
@@ -2095,7 +2127,9 @@ class _EndpointProcess:
                 eid = event.get('logical_id')
                 if eid is not None:
                     specs = [e for e in self.config['group_members'] if e['logical_id'] == eid]
-                    if len(specs) != 1 or event.get('worker_role', event.get('role')) != specs[0]['role']:
+                    aliases = _group_worker_roles(self.config)
+                    if (len(specs) != 1 or event.get('worker_role') != aliases[eid]
+                            or ('role' in event and event['role'] != aliases[eid])):
                         raise ValueError('group endpoint role mismatch')
             else:
                 event["worker_role"] = self.role
@@ -2782,6 +2816,9 @@ class RosTopologyBackend:
             order = [a['endpoint_id'] for a in self.group_program['actions'] if a['op'] == 'create']
             if len(self.handles) >= len(order) or spec.get('logical_id') != order[len(self.handles)]:
                 raise TopologyBackendError('group_endpoint_create_order')
+        if (self.group_program is not None
+                and worker_role != canonical_worker_roles(self.group_program['endpoints']).get(spec.get('logical_id'))):
+            raise TopologyBackendError('group_endpoint_worker_role_mismatch')
         prepared = endpoint_expressibility(spec, self.config)
         endpoint_dir = (self.output_dir / "endpoints"
                         / re.sub(r"[^A-Za-z0-9_.-]", "_", spec["logical_id"])
@@ -2802,7 +2839,8 @@ class RosTopologyBackend:
                 raise TopologyBackendError('group_endpoint_not_exact_admitted_spec')
             label = spec['participant_id']
             worker_config.update(participant_control=self.group_program['participant_control'],
-                group_id=label,
+                group_id=label, group_program=deepcopy(self.group_program),
+                group_worker_roles=canonical_worker_roles(self.group_program['endpoints']),
                 group_members=[e for e in self.group_program['endpoints'] if e['participant_id'] == label],
                 worker_instance_id=uuid.uuid4().hex, context_instance_id=uuid.uuid4().hex)
         if self.instrumentation_reference is not None:

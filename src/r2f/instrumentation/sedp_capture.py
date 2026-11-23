@@ -171,6 +171,14 @@ def _filtered_submessage_entities(payload, submessages):
                         entry['reason'] = 'unknown_other_builtin_counterpart'
                     else:
                         entry.update(classification='other_builtin', reason=pair[1] + '_entity_pair')
+                elif writer == '000002c2' or reader == '000002c7':
+                    # RTPS 2.5 Table 9.2 topic announcer/detector pair. Reader-
+                    # originated controls must identify the actual topic reader.
+                    if writer == '000002c2' and (reader == '000002c7' or
+                            (reader == '00000000' and kind not in (0x06, 0x12))):
+                        entry.update(classification='discovery', reason='builtin_entity')
+                    else:
+                        entry['reason'] = 'unknown_topic_builtin_counterpart'
                 elif writer in BUILTIN_WRITERS or reader in ('000100c7', '000003c7', '000004c7'):
                     entry.update(classification='discovery', reason='builtin_entity')
                 elif writer[-2:] in ('02', '03') and (reader == '00000000' or reader[-2:] in ('04', '07')):

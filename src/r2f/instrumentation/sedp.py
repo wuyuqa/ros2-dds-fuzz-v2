@@ -18,7 +18,7 @@ from .sedp_fields import discovery_layer_schema
 
 
 def reconcile_discovery_projection(discovery, graph_snapshot, *, endpoint_bindings,
-                                   observation_window, field_policy=None):
+                                   observation_window, field_policy=None, discovery_layers=None):
     """Expose CP1 schema limits and asynchronous source times, without a new oracle."""
     result = _reconcile_projection(
         discovery, graph_snapshot, endpoint_bindings=endpoint_bindings,
@@ -133,4 +133,19 @@ def reconcile_discovery_projection(discovery, graph_snapshot, *, endpoint_bindin
         'layers': discovery_layer_schema(), 'endpoint_observations': observations,
         'all_layer_obligations_closed': False,
         'assurance': 'schema/field facts only; no participant/topic builtin or remote receipt claim'}
+    if discovery_layers is not None:
+        from .discovery_layers import discovery_layers_schema
+        layers = discovery_layers_schema(discovery_layers,
+            discovery.get('capture_receipt') or {}, field_policy=field_policy)
+        result['schema_check']['discovery_layers'] = layers
+        for name in ('participant', 'topic'):
+            result['schema_check']['layers'][name].update(
+                status='independent_observations' if layers[name].get('observation_status') == 'observed' else 'unknown',
+                observation_ref='discovery_layers.' + name)
+            result['schema_check']['layers'][name]['reconciliation_status'] = 'unknown'
+            if 'applicability' in layers[name]:
+                result['schema_check']['layers'][name].update(
+                    fields=deepcopy(layers[name]['applicability']),
+                    basis='independent builtin samples and same-capture wire; instance association remains qualified separately')
+        result['schema_check']['assurance'] = 'raw-backed auxiliary observations; obligations remain open'
     return result

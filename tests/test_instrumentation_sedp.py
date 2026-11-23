@@ -799,6 +799,89 @@ class PassiveCaptureContracts(unittest.TestCase):
         self.assertEqual(result['filtered_rtps']['target_related'], [])
         self.assertEqual(stopped['health']['status'], 'ok')
 
+    def test_dcps_topic_data_is_retained_as_distinct_discovery_activity(self):
+        # OMG DDSI-RTPS 2.5 Table 9.2: topic announcer/detector, not endpoints.
+        # Literal DATA body: inline offset=16, reader/writer, SN=1, CDR header.
+        body = bytes.fromhex('00001000000002c7000002c2000000000100000000010000')
+        base = frame(source_port=61000, destination_port=61002)
+        packet = with_rtps_payload(base, base[42:62] + submessage(0x15, body, flags=5))
+        result, stopped, record, parsed = self.retained_observation(packet)
+        self.assertEqual(record['classification'], 'discovery')
+        self.assertEqual(record['submessage_entities'][0]['reader_entity_id'], '000002c7')
+        self.assertEqual(record['submessage_entities'][0]['writer_entity_id'], '000002c2')
+        self.assertEqual(result['status'], 'observed')
+        self.assertEqual(result['counts_by_kind'], {'DCPSTopic_DATA': 1})
+        self.assertEqual(stopped['health']['status'], 'ok')
+        self.assertFalse(record['parse_diagnostics'])
+        event = result['events'][0]
+        self.assertEqual(event['raw_ref'], record['raw_ref'])
+        self.assertEqual(event['frame_sha256'], hashlib.sha256(packet).hexdigest())
+        self.assertEqual(event['submessage_offset'], 62)
+        self.assertEqual(event['source_guid_prefix'], PREFIX)
+        self.assertEqual(parsed['activity'][0]['kind'], 'DCPSTopic_DATA')
+        self.assertEqual(parsed['events'], [])  # Topic activity is not an endpoint announcement.
+
+    def test_dcps_topic_controls_keep_reader_and_raw_activity_identity(self):
+        # Literal RTPS control bodies, with the Table 9.2 topic entity pair.
+        bodies = {
+            'ACKNACK': (0x06, '000002c7000002c200000000010000000000000001000000'),
+            'HEARTBEAT': (0x07, '000002c7000002c20000000001000000000000000100000001000000'),
+            'GAP': (0x08, '000002c7000002c20000000001000000000000000100000000000000'),
+            'NACK_FRAG': (0x12, '000002c7000002c20000000001000000010000000000000001000000'),
+            'HEARTBEAT_FRAG': (0x13, '000002c7000002c200000000010000000100000001000000'),
+        }
+        base = frame(source_port=61000, destination_port=61002)
+        for name, (kind, literal) in bodies.items():
+            with self.subTest(control=name):
+                packet = with_rtps_payload(base, base[42:62] + submessage(kind, bytes.fromhex(literal)))
+                result, stopped, record, parsed = self.retained_observation(packet)
+                self.assertEqual(record['classification'], 'discovery')
+                self.assertFalse(record['parse_diagnostics'])
+                self.assertEqual(result['status'], 'observed')
+                self.assertEqual(result['counts_by_kind'], {'DCPSTopic_' + name: 1})
+                self.assertEqual(stopped['health']['status'], 'ok')
+                event = result['events'][0]
+                self.assertEqual(event['builtin_writer_id'], '000002c2')
+                self.assertEqual(event['builtin_reader_id'], '000002c7')
+                self.assertEqual(event['sequence_number'], 1)
+                self.assertEqual(event['raw_ref'], record['raw_ref'])
+                self.assertEqual(event['frame_sha256'], hashlib.sha256(packet).hexdigest())
+                self.assertEqual(parsed['activity'][0]['kind'], 'DCPSTopic_' + name)
+
+    def test_dcps_topic_invalid_routing_and_framing_stay_unknown(self):
+        base = frame(source_port=61000, destination_port=61002)
+        body = bytes.fromhex('00001000000002c7000002c2000000000100000000010000')
+        valid = with_rtps_payload(base, base[42:62] + submessage(0x15, body, flags=5))
+        zero_prefix = bytearray(valid)
+        zero_prefix[50:62] = bytes(12)
+        packets = [
+            # Topic writer plus an unknown or another builtin reader is not proof.
+            frame(writer='000002c2', reader='000202c7'),
+            frame(writer='000002c2', reader='000003c7'),
+            frame(writer='000202c2', reader='000002c7'),
+            frame(writer='00000103', reader='000002c7'),
+            # ACKNACK/NACK_FRAG must identify the originating topic reader.
+            frame(0x06, writer='000002c2'),
+            frame(0x12, writer='000002c2'),
+            bytes(zero_prefix),
+            with_rtps_payload(base, base[42:62] + submessage(0x15, body, flags=13)),
+            with_rtps_payload(base, base[42:62] + submessage(0x15, body[:-4], flags=5)),
+            with_rtps_payload(base, base[42:62] + submessage(0x15, body, flags=7)),
+            with_rtps_payload(base, valid[42:-1]),
+            with_rtps_payload(base, valid[42:] + submessage(0x30, bytes(16))),
+        ]
+        for packet in packets:
+            with self.subTest(packet=packet.hex()):
+                result, stopped, record, _ = self.retained_observation(packet)
+                self.assertEqual(record['classification'], 'unknown')
+                self.assertEqual(result['status'], 'unknown')
+                self.assertEqual(result['observation_completeness'], 'incomplete')
+                self.assertEqual(stopped['health']['status'], 'degraded')
+        result, stopped, record, _ = self.retained_observation(valid, flags=socket.MSG_TRUNC)
+        self.assertEqual(record['classification'], 'unknown')
+        self.assertEqual(result['status'], 'unknown')
+        self.assertEqual(stopped['health']['status'], 'degraded')
+
     def test_unknown_entities_controls_and_malformed_user_packets_stay_incomplete(self):
         user = frame(writer='00000103', source_port=61000, destination_port=61002)
         heartbeat = frame(0x07, writer='00000103', source_port=61000, destination_port=61002)
@@ -809,7 +892,7 @@ class PassiveCaptureContracts(unittest.TestCase):
         inline = bytearray(user)
         inline[63] |= 2  # Inline QoS flag without a sentinel.
         packets = [frame(writer=writer, source_port=61000, destination_port=61002)
-                   for writer in ('00000000', '000001ff', '000002c2')]
+                   for writer in ('00000000', '000001ff', '000202c2')]
         fragment = frame(0x16, writer='00000103', source_port=61000, destination_port=61002)
         packets += [frame(writer='00000103', prefix='0' * 24, source_port=61000, destination_port=61002),
                     with_rtps_payload(fragment, fragment[42:62] + submessage(0x16, fragment[66:-4])),

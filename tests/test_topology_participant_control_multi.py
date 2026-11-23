@@ -6,6 +6,15 @@ from r2f.runtime.participant_groups import CONTROL
 from test_s1_topology_model import action, endpoint, program
 
 
+def caller_roles(p):
+    from r2f.runtime.topology_worker import worker_role_for
+    result = {}
+    for kind in ('writer', 'reader'):
+        for ordinal, ep in enumerate(e for e in p['endpoints'] if e['role'] == kind):
+            result[ep['logical_id']] = worker_role_for(kind, ordinal)
+    return result
+
+
 def multi_program(writers=1, readers=2, layout='shared'):
     eps = [endpoint(f'w{i}', 'writer') for i in range(writers)]
     eps += [endpoint(f'r{i}', 'reader') for i in range(readers)]
@@ -31,18 +40,23 @@ def test_1w2r_input_enters_existing_plan_and_receipt_without_execution_authority
     assert not receipt['execution_evidence'] and not receipt['candidate_eligible']
 
 
-def worker_capture(monkeypatch, writers=1, readers=2):
+def worker_capture(monkeypatch, writers=1, readers=2, *, layout='shared', group_id=None, damage=None):
     """Use the established external ROS/OS fixture, with distinct observed GIDs."""
     import json
     import sys
     from r2f.runtime import topology_worker as worker
     from test_topology_participant_control_worker import ros_fixture, group_config
-    p = multi_program(writers, readers)
+    p = multi_program(writers, readers, layout)
     cfg = group_config()
-    cfg.update(group_id='all', group_members=p['endpoints'])
+    group_id = group_id or p['endpoints'][0]['participant_id']
+    cfg.update(group_id=group_id,
+               group_members=[e for e in p['endpoints'] if e['participant_id'] == group_id], group_program=p,
+               group_worker_roles=caller_roles(p))
     commands = [dict(command='create_endpoint', command_id=i, logical_id=e['logical_id'],
-                     generation=1, worker_role=e['role'])
-                for i, e in enumerate(p['endpoints'], 1)]
+                     generation=1, worker_role=caller_roles(p)[e['logical_id']])
+                for i, e in enumerate(cfg['group_members'], 1)]
+    if damage is not None:
+        damage(cfg, commands)
     commands.append(dict(command='stop', command_id=len(commands)+1))
     with ros_fixture(monkeypatch, commands) as (calls, entities, stream):
         Node = sys.modules['rclpy.node'].Node
@@ -81,15 +95,24 @@ from r2f.runtime.participant_groups import CONTROL, OBSERVATION_SCHEMA, project_
 from test_topology_adapter import RawFixture
 
 
+class CanonicalRawFixture(RawFixture):
+    """Construct protocol observations with the runner's aliases at emission."""
+    def add(self, event, **fields):
+        if fields.get('logical_id') is not None and 'role' in fields:
+            alias = caller_roles(self.program)[fields['logical_id']]
+            fields.update(role=alias, worker_role=alias)
+        return super().add(event, **fields)
+
+
 from test_topology_participant_control_public import facts, resave
 
 
-def multi_fixture(root, writers=1, readers=2, layout='shared', **kwargs):
+def multi_fixture(root, writers=1, readers=2, layout='shared', observed_ownership=False, **kwargs):
     """Adapt the established raw protocol fixture, preserving all action evidence.
 
     Only supporting captures are unavailable. These rows are NOT measurements.
     """
-    f=RawFixture(writers=writers, readers=readers, **kwargs)
+    f=CanonicalRawFixture(writers=writers, readers=readers, **kwargs)
     parent=deepcopy(f.plan.operations[0].parameters['input_layer_receipts'][0]['input_before'])
     parent['participant_control']=dict(CONTROL)
     for e in parent['endpoints']:
@@ -125,7 +148,7 @@ def multi_fixture(root, writers=1, readers=2, layout='shared', **kwargs):
             for v in value:update(v)
     update(f.events)
     for eid,t in tokens.items():
-        t.update(worker_role=t['role'],rmw_identifier='rmw_cyclonedds_cpp',observed_domain_id=191,
+        t.update(rmw_identifier='rmw_cyclonedds_cpp',observed_domain_id=191,
                  domain_observation_source='offline_fixture',**identities[labels[eid]])
     additions=[]
     def row(kind,g,**kw):
@@ -169,6 +192,13 @@ def multi_fixture(root, writers=1, readers=2, layout='shared', **kwargs):
                     ros_context_application_observed=True,endpoint_ownership_observed=False,local_root_inventory_complete=False,
                     group_relation_observed=False,actual_local_root_count=None,roots_before=None,roots_after=None,endpoints=[],
                     unknown_reasons=['local_root_inventory_incomplete'])
+                if observed_ownership:
+                    from r2f.runtime.topology_worker import _capture_group_ownership
+                    sessions = {t['logical_id']: {'token': {**{k: t[k] for k in
+                        ('logical_id', 'generation', 'endpoint_generation', 'endpoint_gid', 'worker_role')},
+                        'kind': next(e['role'] for e in f.program['endpoints'] if e['logical_id'] == t['logical_id'])}}
+                        for t in group_tokens}
+                    obs.update(_capture_group_ownership({'group_id': label, 'domain_id': 191}, sessions))
                 additions.append(row('participant_group_snapshot',label,command_id=req['command_id'],**obs))
                 additions.append(row('command_done',label,command='group_snapshot',command_id=req['command_id'],
                     **{k:group_tokens[0][k] for k in ('logical_id','generation','endpoint_generation')}))
@@ -232,13 +262,94 @@ def test_2w2r_shared_carrier_uses_four_distinct_graph_identities(monkeypatch):
     assert calls.count('context') == calls.count('shutdown') == 1
 
 
-from test_topology_participant_control_worker import transport, prepared_backend
+from test_topology_participant_control_worker import prepared_backend
+@pytest.fixture
+def transport(monkeypatch, tmp_path):
+    """Labelled OS process/pipe/selector/lease doubles, never real spawn/locks."""
+    from copy import deepcopy
+    from itertools import count
+    from r2f.runtime import topology_worker as worker
+    allocated=[]; pids=count(3000)
+    class Pipe:
+        def __init__(self,child,read=False):self.child=child;self.reading=read
+        def fileno(self):return 88
+        def read(self):data=self.child.output;self.child.output=b'';return data
+        def write(self,data):self.child.handle(json.loads(data));return len(data)
+        def flush(self):pass
+        def close(self):pass
+    class Child:
+        def __init__(self,argv,**kw):
+            self.cfg=json.loads(argv[-2]);self.pid=next(pids);self.returncode=None;self.output=b'';self.tokens={}
+            self.stdin=Pipe(self);self.stdout=Pipe(self,True);self.bad_ack=False
+            allocated.append(self)
+            for event in ('group_context_created','group_worker_ready'):
+                self.add(event,api='rclpy.context.Context+rclpy.init',ros_context_created=True)
+        def add(self,event,**fields):
+            value={'event':event,'pid':self.pid,'pgid':self.pid,'process_start_ticks':900,
+                'domain_id':173,'observed_domain_id':173,'rmw_identifier':'rmw_cyclonedds_cpp',
+                'run_id':'offline-fixture','domain_observation_source':'fixture_api','monotonic_ns':1000,
+                **{k:self.cfg[k] for k in ('group_id','worker_instance_id','context_instance_id')},**fields}
+            self.output+=json.dumps(value).encode()+b'\n'
+        def handle(self,c):
+            op=c['command'];cid=c['command_id'];eid=c.get('logical_id')
+            if op=='stop':
+                for token in self.tokens.values():self.add('endpoint_destroyed',**token,cleanup_status='closed')
+                self.add('command_done',command='stop',command_id=cid)
+                self.add('group_context_shutdown',closed=True,errors=[])
+                self.returncode=0;return
+            if op=='create_endpoint':
+                spec=next(e for e in self.cfg['group_members'] if e['logical_id']==eid)
+                token=dict(logical_id=eid,generation=1,endpoint_generation=f'fixture-{eid}',
+                    endpoint_gid=f"{list(self.cfg['group_worker_roles']).index(eid)+1:032x}",
+                    role=c['worker_role'],worker_role=c['worker_role'])
+                self.tokens[eid]=token
+                from r2f.runtime.topology_worker import endpoint_expressibility
+                q=endpoint_expressibility(spec,{})['public_qos']
+                self.add('endpoint_created',**token,topic=spec['topic'],message_type=spec['type_name'],qos=q,
+                    node_name='fixture-group-node',created_monotonic_ns=100,
+                    identity_source='get_publishers_info_by_topic' if spec['role']=='writer' else 'get_subscriptions_info_by_topic')
+                self.add('endpoint_group_bound',endpoint={k:token[k] for k in ('logical_id','generation','endpoint_generation','endpoint_gid','worker_role')})
+            token=deepcopy(self.tokens[eid])
+            if op=='snapshot':
+                self.add('match_snapshot',**token,command_id=cid,matched_count=1)
+                pubs=[dict(endpoint_gid=t['endpoint_gid'],node_name='fixture-group-node',topic_type='std_msgs/msg/String',qos={}) for t in self.tokens.values() if t['role'].startswith('writer')]
+                subs=[dict(endpoint_gid=t['endpoint_gid'],node_name='fixture-group-node',topic_type='std_msgs/msg/String',qos={}) for t in self.tokens.values() if t['role'].startswith('reader')]
+                self.add('graph_snapshot',**token,command_id=cid,publishers=pubs,subscriptions=subs)
+            elif op=='publish_batch':
+                for sequence in c['sequences']:
+                    self.add('send',**token,command_id=cid,send_sequence=sequence,writer_gid=token['endpoint_gid'])
+            elif op=='group_snapshot':
+                self.add('participant_group_snapshot',**token,command_id=cid,
+                    schema='r2f.ros-participant-group-observation/v1',supporting_diagnostic=True,candidate_eligible=False,
+                    requested_grouping=self.cfg['group_id'],ros_context_application_observed=True,
+                    endpoint_ownership_observed=False,local_root_inventory_complete=False,group_relation_observed=False,
+                    actual_local_root_count=None,roots_before=None,roots_after=None,endpoints=[],
+                    unknown_reasons=['local_root_inventory_incomplete'])
+            if self.bad_ack:token['logical_id']='cross-address'
+            self.add('command_done',**token,command_id=cid,command=op)
+        def poll(self):return self.returncode
+        def wait(self,**kw):return self.returncode
+    class Selector:
+        def register(self,*a):pass
+        def unregister(self,*a):pass
+        def close(self):pass
+        def select(self,*a):return [(None,None)]
+    monkeypatch.setattr(worker.subprocess,'Popen',Child)
+    monkeypatch.setattr(worker.selectors,'DefaultSelector',Selector)
+    monkeypatch.setattr(worker.os,'set_blocking',lambda *a:None)
+    original=worker.Path.read_text
+    monkeypatch.setattr(worker.Path,'read_text',lambda p,*a,**kw: '100 (fixture) '+' '.join(['0']*19+['900']) if str(p).startswith('/proc/') else original(p,*a,**kw))
+    import r2f.runtime.ros2_pair as pair
+    monkeypatch.setattr(pair,'verify_pair_lease',lambda *a:[{'fixture':True}]*3)
+    return allocated
+
+
 
 
 def test_multi_backend_captures_every_active_group_at_snapshot_and_close(tmp_path, transport):
     p = multi_program(1, 2)
     backend = prepared_backend(tmp_path, p)
-    handles = {e['logical_id']: backend.create_endpoint(e, 1, e['role']) for e in p['endpoints']}
+    handles = {e['logical_id']: backend.create_endpoint(e, 1, caller_roles(p)[e['logical_id']]) for e in p['endpoints']}
     try:
         result = backend.snapshot(handles)
         assert result['complete'] and set(result['snapshots']) == {'w0', 'r0', 'r1'}
@@ -345,3 +456,150 @@ def test_4w4r_shared_carrier_binds_eight_distinct_endpoints(monkeypatch):
     assert len(tokens) == len({e['endpoint_gid'] for e in tokens}) == 8
     assert len({e['endpoint_generation'] for e in tokens}) == 8
     assert calls.count('context') == calls.count('shutdown') == 1
+
+
+@pytest.mark.parametrize('writers,readers', [(1, 2), (2, 2), (4, 4)])
+def test_canonical_caller_worker_aliases(monkeypatch, writers, readers):
+    rc, _, events = worker_capture(monkeypatch, writers, readers)
+    assert rc == 0, events[-1]
+    tokens = [e for e in events if e['event'] == 'endpoint_created']
+    expected = caller_roles(multi_program(writers, readers))
+    assert {e['logical_id']: e['role'] for e in tokens} == expected
+    assert {e['logical_id']: e['worker_role'] for e in tokens} == expected
+
+
+@pytest.mark.parametrize('layout,group_id,expected', [
+    ('split', 'r1', {'r1': 'reader2'}),
+    ('split', 'w1', {'w1': 'writer2'}),
+    ('roles', 'reader', {'r0': 'reader', 'r1': 'reader2'})])
+def test_worker_global_aliases_survive_group_subset(monkeypatch, layout, group_id, expected):
+    rc, _, events = worker_capture(monkeypatch, 2, 2, layout=layout, group_id=group_id)
+    assert rc == 0, events[-1]
+    assert {e['logical_id']: e['worker_role'] for e in events if e['event'] == 'endpoint_created'} == expected
+
+
+@pytest.mark.parametrize('damage', ['wrong_kind', 'duplicate_alias', 'swapped_alias', 'swapped_logical_id', 'wrong_logical_id', 'duplicate_create'])
+def test_worker_rejects_noncanonical_endpoint_address(monkeypatch, damage):
+    def corrupt(cfg, commands):
+        if damage == 'wrong_kind': commands[-1]['worker_role'] = 'writer2'
+        elif damage == 'duplicate_alias': commands[-1]['worker_role'] = 'reader'
+        elif damage == 'swapped_alias':
+            commands[-2]['worker_role'], commands[-1]['worker_role'] = 'reader2', 'reader'
+        elif damage == 'swapped_logical_id':
+            commands[-2]['logical_id'], commands[-1]['logical_id'] = 'r1', 'r0'
+        elif damage == 'wrong_logical_id': commands[-1]['logical_id'] = 'foreign'
+        else: commands[-1]['logical_id'], commands[-1]['worker_role'] = 'r0', 'reader'
+    rc, _, events = worker_capture(monkeypatch, damage=corrupt)
+    assert rc == 1
+    assert events[-1]['event'] == 'worker_error'
+    assert not any(e['event'] == 'endpoint_created' and e['logical_id'] == 'r1' for e in events)
+
+
+@pytest.mark.parametrize('layout', ['shared', 'roles', 'split'])
+@pytest.mark.parametrize('writers,readers', [(1, 2), (2, 2), (4, 4)])
+def test_backend_transmits_global_exact_alias_binding(tmp_path, transport, layout, writers, readers):
+    p = multi_program(writers, readers, layout)
+    backend = prepared_backend(tmp_path, p)
+    try:
+        for e in p['endpoints']:
+            h = backend.create_endpoint(e, 1, caller_roles(p)[e['logical_id']])
+            assert h['worker_role'] == caller_roles(p)[e['logical_id']]
+        for child in transport:
+            assert child.cfg['group_program'] == p
+            assert child.cfg['group_worker_roles'] == caller_roles(p)
+        assert backend.snapshot(backend.handles)['complete']
+    finally:
+        assert backend.close()['closed']
+
+
+@pytest.mark.parametrize('alias', ['writer2', 'reader', 'reader3'])
+def test_backend_rejects_wrong_caller_alias_before_spawning(tmp_path, transport, alias):
+    from r2f.runtime.topology_worker import TopologyBackendError
+    p = multi_program(layout='split')
+    backend = prepared_backend(tmp_path, p)
+    try:
+        for e in p['endpoints'][:2]:
+            backend.create_endpoint(e, 1, caller_roles(p)[e['logical_id']])
+        count = len(transport)
+        with pytest.raises(TopologyBackendError, match='group_endpoint_worker_role_mismatch'):
+            backend.create_endpoint(p['endpoints'][2], 1, alias)
+        assert len(transport) == count
+    finally:
+        assert backend.close()['closed']
+
+
+@pytest.mark.parametrize('field', ['role', 'worker_role'])
+def test_lineage_rejects_consistent_same_kind_alias_swap(tmp_path, field):
+    f = multi_fixture(tmp_path, 2, 2)
+    # Even a consistently forged stream cannot swap declaration-order identity.
+    for e in f.events:
+        if e.get('logical_id') in ('r0', 'r1') and field in e:
+            e[field] = 'reader2' if e['logical_id'] == 'r0' else 'reader'
+    with pytest.raises(ValueError, match='endpoint_identity|role_alias'):
+        project_lineage(f.program, f.events, str(f.raw), config=f.config)
+
+
+def test_numbered_role_double_sample_producer_projects_same_observed_status(monkeypatch, tmp_path):
+    from r2f.runtime import topology_worker as worker
+    class NativeFixture:
+        """External ownership ABI double only; no native library or ROS."""
+        def sample_roots(self, domain):
+            return {'complete': True, 'domain_id': domain, 'count': 1,
+                    'provenance': {'fixture': True, 'not_native': True},
+                    'roots': [{'participant_handle': 10, 'participant_gid': f'{90:032x}',
+                               'domain_id': domain, 'domain_return_code': 0, 'parent': 0,
+                               'participant_self_return': 10, 'valid': True}]}
+        def sample_ownership(self, domain, gid, kind):
+            h = (20 if kind == 'writer' else 30) + int(gid.rsplit('-', 1)[-1][1:])
+            return {'schema': 'r2f.cyclone-participant-ownership/v2', 'complete': True,
+                    'status': 'observed', 'candidate_eligible': False, 'stable_sample_count': 2,
+                    'domain_id': domain, 'local_gid': gid, 'role_kind': kind, 'local_handle': h,
+                    'participant_handle': 10, 'participant_gid': f'{90:032x}', 'parent_chain': [h, 10],
+                    'entity_inventory': [[10, [h]], [h, []]],
+                    'entity_identities': [{'handle': h, 'gid': gid}, {'handle': 10, 'gid': f'{90:032x}'}],
+                    'participant_root_observation': {'participant_handle': 10, 'participant_self_return': 10,
+                                                     'lookup_participants': [10]},
+                    'provenance': {'fixture': True, 'not_native': True}}
+    monkeypatch.setattr(worker, 'CycloneMatchedPeerObserver', NativeFixture)
+    f = multi_fixture(tmp_path, 2, 2, observed_ownership=True)
+    captures = [e for e in f.events if e['event'] == 'participant_group_snapshot']
+    assert all(e['endpoint_ownership_observed'] and e['group_relation_observed'] for e in captures)
+    assert {e['worker_role'] for e in captures[0]['endpoints']} == {'writer', 'writer2', 'reader', 'reader2'}
+    lineage = project_lineage(f.program, f.events, str(f.raw), config=f.config)
+    assert all(o['endpoint_ownership_observed'] and o['group_relation_observed'] for o in lineage['observations'])
+    assert facts(f)['diagnostic_valid']
+
+
+@pytest.mark.parametrize('field', ['role', 'worker_role'])
+def test_backend_readback_rejects_same_kind_alias_impersonation(tmp_path, transport, field):
+    from r2f.runtime.topology_worker import TopologyBackendError
+    p = multi_program()
+    backend = prepared_backend(tmp_path, p)
+    try:
+        for e in p['endpoints'][:2]:
+            backend.create_endpoint(e, 1, caller_roles(p)[e['logical_id']])
+        child = transport[0]
+        original = child.add
+        def add(event, **fields):
+            if event == 'endpoint_created' and fields.get('logical_id') == 'r1':
+                fields[field] = 'reader'  # Explicit negative OS-boundary fixture.
+            return original(event, **fields)
+        child.add = add
+        with pytest.raises(TopologyBackendError):
+            backend.create_endpoint(p['endpoints'][2], 1, 'reader2')
+        assert not any(e['event'] == 'endpoint_created' and e.get('logical_id') == 'r1'
+                       for e in backend.processes[0].events)
+    finally:
+        backend.close()
+
+
+@pytest.mark.parametrize('damage', ['missing_map', 'swapped_map', 'subset_renumber'])
+def test_worker_rejects_unbound_global_alias_map(monkeypatch, damage):
+    def corrupt(cfg, commands):
+        if damage == 'missing_map': cfg.pop('group_worker_roles')
+        elif damage == 'swapped_map':
+            cfg['group_worker_roles']['r0'], cfg['group_worker_roles']['r1'] = 'reader2', 'reader'
+        else: cfg['group_worker_roles']['r1'] = 'reader'
+    rc, calls, events = worker_capture(monkeypatch, 2, 2, layout='split', group_id='r1', damage=corrupt)
+    assert rc == 1 and events[-1]['event'] == 'worker_error'
+    assert 'context' not in calls

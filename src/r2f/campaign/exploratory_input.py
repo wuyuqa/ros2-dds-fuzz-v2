@@ -55,7 +55,7 @@ F2_SURFACE_MUTATORS = {'E02': 'M07', 'E03': 'M06'}
 F2_TIMING_FIELDS = frozenset({'runtime_capability', 'anchor_timing_policy',
                               'anchor_lateness_tolerance_sec'})
 
-PROJECTION_FIELDS = frozenset({'projection_roles', 'projection_role_qos'})
+PROJECTION_FIELDS = frozenset({'projection_roles', 'projection_role_qos', 'projection_discovery_layers'})
 CONTROL_FIELDS = RECOVERY_FIELDS | PROJECTION_FIELDS | F2_TIMING_FIELDS | {'rmws'}
 PROFILE_CONTROL_FIELDS = (CONTROL_FIELDS - {'rmws'}) | {'role_rmws'}
 # These are declarations/provenance, never a blanket runtime passthrough.
@@ -259,6 +259,9 @@ def _controls(config, backend):
         if not isinstance(config['rmws'], dict) or not config['rmws']:
             raise ValueError('rmws must be a nonempty role mapping')
         _validate_rmws(config['rmws'])
+    if 'projection_discovery_layers' in present:
+        from r2f.runtime.discovery_profiles import validate_discovery_layers
+        validate_discovery_layers(config['projection_discovery_layers'], config.get('rmw', 'rmw_cyclonedds_cpp'))
     if present & PROJECTION_FIELDS:
         from r2f.runtime.projection_pair import projection_roles, validate_qos
         roles = projection_roles(config)

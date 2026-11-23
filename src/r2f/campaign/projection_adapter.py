@@ -428,6 +428,36 @@ def projection_facts(events, runtime, config):
         for key in ('capture_receipt','graph_snapshot','observation_window','field_policy'):
             if raw_observation.get(key) != observation.get(key):
                 raise ValueError('projection raw observation differs:'+key)
+        layers_enabled = 'projection_discovery_layers' in config
+        if layers_enabled:
+            from r2f.runtime.discovery_profiles import validate_discovery_layers
+            validate_discovery_layers(config['projection_discovery_layers'], config['rmw'])
+            if (not observation.get('discovery_layers')
+                    or raw_observation.get('discovery_layers') != observation['discovery_layers']):
+                raise ValueError('projection discovery layers raw observation differs')
+            started = _one(events, 'discovery_builtin_observer_started')
+            native = _json(observation['discovery_layers']['raw'])
+            admission = _one(events, 'namespace_host_admission_verified')
+            if not isinstance(native, dict) or not isinstance(native.get('admission'), dict):
+                raise ValueError('projection discovery layers admission object required')
+            if (native.get('admission', {}).get('raw_event_ref') != admission.get('raw_event_ref')
+                    or native.get('admission', {}).get('isolation') != admission.get('isolation')
+                    or started.get('admission_ref') != admission.get('raw_event_ref')
+                    or native.get('profile') != started.get('profile')
+                    or native.get('environment') != started.get('environment')):
+                raise ValueError('projection discovery layers admission/profile differs')
+            stopped = _one(events, 'discovery_builtin_observer_stopped')
+            if stopped.get('receipt') != observation['discovery_layers']:
+                raise ValueError('projection discovery layers stop receipt differs')
+            if (native.get('domain_id') != config['domain_id']
+                    or native.get('pid') != raw_observation.get('pid')
+                    or any(event.get('domain_id') != config['domain_id']
+                           or event.get('run_id') != config['run_id']
+                           or event.get('pid') != raw_observation.get('pid')
+                           for event in (native['admission'], admission, started, stopped, raw_observation))):
+                raise ValueError('projection discovery layers canonical admission/domain differs')
+        elif 'discovery_layers' in observation or 'discovery_layers' in raw_observation:
+            raise ValueError('projection discovery layers require submitted opt-in')
         tokens = _lifecycle(events,runtime,config,observation)
         roles = tuple(tokens)
         facts.update(tokens)
@@ -452,6 +482,8 @@ def projection_facts(events, runtime, config):
         kwargs = {'endpoint_bindings': canonical,
                   'observation_window': observation['observation_window'],
                   'field_policy': observation.get('field_policy')}
+        if layers_enabled:
+            kwargs['discovery_layers'] = observation['discovery_layers']
         graph_for_reconcile = deepcopy(observation['graph_snapshot'])
         original = reconcile_discovery_projection(discovery,graph_for_reconcile,**kwargs)
         result = original
