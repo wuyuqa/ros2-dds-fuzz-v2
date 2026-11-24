@@ -69,16 +69,24 @@ def test_fixture_pass_preserves_unknown_internal_lifecycle_and_original_artifact
     "race_observed", "historical_reproduced", "exact_parent", "unknown_source",
     "missing_lifecycle", "unknown_obligation", "missing_generation", "erased_gap",
     "wrong_parent_source", "wrong_parent_pointer", "null_reference", "null_policy", "null_history",
+    "capture_collision", "wrong_case", "unknown_capture_schema",
 ])
 def test_report_fails_closed_on_invalid_or_overclaimed_lifecycle_capture(tmp_path, monkeypatch, fault):
     from r2f.modules.s1 import coverage
 
     run_campaign(tmp_path / "plan", run_id="issue14-invalid-capture", execute=False)
-    data = json.loads(coverage._CAPTURE.read_text())
-    case = next(row for row in data["cases"] if row["case_id"] == "Fast-DDS-issue3770")
-    calibration = case["lifecycle_calibration"]
-    if fault == "missing_calibration":
-        case.pop("lifecycle_calibration")
+    data = json.loads(coverage._LIFECYCLE_CAPTURE.read_text())
+    original = json.loads(coverage._CAPTURE.read_text())
+    case = next(row for row in original["cases"] if row["case_id"] == "Fast-DDS-issue3770")
+    calibration = data["lifecycle_calibration"]
+    if fault == "capture_collision":
+        data["source_captures"]["case-matrix.json"] = dict(original["source_captures"]["case-matrix.json"])
+    elif fault == "wrong_case":
+        data["case_id"] = "core215"
+    elif fault == "unknown_capture_schema":
+        data["schema"] = "r2f.unknown/v1"
+    elif fault == "missing_calibration":
+        data.pop("lifecycle_calibration")
     elif fault in {"execution_credit", "maturity_credit"}:
         calibration[fault.replace("_credit", "_evidence")] = True
     elif fault == "new_credit":
@@ -111,7 +119,7 @@ def test_report_fails_closed_on_invalid_or_overclaimed_lifecycle_capture(tmp_pat
         calibration["requirements"][0]["named_gaps"] = []
     capture = tmp_path / "invalid-coverage.json"
     capture.write_text(json.dumps(data))
-    monkeypatch.setattr(coverage, "_CAPTURE", capture)
+    monkeypatch.setattr(coverage, "_LIFECYCLE_CAPTURE", capture)
     result = audit_report(tmp_path / "plan" / "report.json")
     assert result["s1_coverage"]["query_valid"] is False
     assert result["sealed"] is False

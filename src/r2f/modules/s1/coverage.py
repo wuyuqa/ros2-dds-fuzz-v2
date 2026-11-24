@@ -10,6 +10,7 @@ from importlib.resources import files
 
 SCHEMA = "r2f.s1-coverage-lineage/v1"
 _CAPTURE = files(__package__).joinpath("s1_coverage.json")
+_LIFECYCLE_CAPTURE = files(__package__).joinpath("fastdds_lifecycle_calibration.json")
 
 
 def catalog_lineage():
@@ -17,6 +18,7 @@ def catalog_lineage():
     data = json.loads(_CAPTURE.read_text(encoding="utf-8"))
     if data.get("schema") != SCHEMA:
         raise ValueError("unsupported S1 coverage lineage schema")
+    _attach_lifecycle_calibration(data)
     for row in data["obligations"]:
         row["case_ids"] = [case["case_id"] for case in data["cases"]
                            if row["id"] in case["coverage_rows"]]
@@ -36,6 +38,23 @@ def catalog_lineage():
                                    if story["id"] in row["story_ids"]]
     _validate(data)
     return data
+
+
+def _attach_lifecycle_calibration(data):
+    """Extend the query, never the original byte-pinned knowledge capture."""
+    addition = json.loads(_LIFECYCLE_CAPTURE.read_text(encoding="utf-8"))
+    if (not isinstance(addition, dict)
+            or addition.get("schema") != "r2f.s1-lifecycle-calibration-capture/v1"
+            or addition.get("case_id") != "Fast-DDS-issue3770"):
+        raise ValueError("invalid S1 lifecycle calibration: capture scope")
+    sources = addition.get("source_captures")
+    if not isinstance(sources, dict) or set(sources).intersection(data["source_captures"]):
+        raise ValueError("invalid S1 lifecycle calibration: captured source overwrite")
+    cases = [row for row in data["cases"] if row["case_id"] == addition["case_id"]]
+    if len(cases) != 1 or "lifecycle_calibration" in cases[0]:
+        raise ValueError("invalid S1 lifecycle calibration: original case overwrite or missing")
+    data["source_captures"].update(sources)
+    cases[0]["lifecycle_calibration"] = addition.get("lifecycle_calibration")
 
 
 def target_lineage(target):

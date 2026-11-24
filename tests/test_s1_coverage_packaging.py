@@ -35,6 +35,9 @@ rule = registry.get_rule_lineage(
     "discovery.late_endpoint", "discovery.late_endpoint.match_and_receive_after_join")
 coverage = catalog.coverage_lineage()
 assert rule["coverage_lineage"]["source_captures"] == coverage["source_captures"]
+case = next(row for row in coverage["cases"] if row["case_id"] == "Fast-DDS-issue3770")
+assert len(case["lifecycle_calibration"]["requirements"]) == 5
+assert case["lifecycle_calibration"]["maturity_evidence"] is False
 assert rule["coverage_lineage"]["model_binding"]["target_id"] == "discovery.late_endpoint"
 seed_lineage = coverage["seed_lineage"]
 linked_seed_ids = sorted({seed["seed_id"] for binding in coverage["model_bindings"].values()
@@ -222,5 +225,8 @@ def test_wheel_preserves_original_coverage_capture_bytes(built_wheel):
     with zipfile.ZipFile(built_wheel) as archive:
         data = archive.read("r2f/modules/s1/s1_coverage.json")
         assert "r2f/modules/s1/seed_lineage.json" in archive.namelist()
+        calibration = json.loads(archive.read("r2f/modules/s1/fastdds_lifecycle_calibration.json"))
+        assert calibration["case_id"] == "Fast-DDS-issue3770"
+        assert calibration["lifecycle_calibration"]["execution_evidence"] is False
     assert hashlib.sha256(data).hexdigest() == (
         "5f886f6a4e7d47e2ecb975e034c1d386f22fe82b06aeb4c7a66cd75fefbb7106")
