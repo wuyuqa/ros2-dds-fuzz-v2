@@ -198,8 +198,11 @@ def _replay_observation_config(capsule):
         for key in ('target_id', 'target_revision', 'rmw', 'arm', 'repeat', 'seed', 'mutation_kind', 'carrier'):
             if canonical_hash(execution.get(key)) != canonical_hash(capsule.input[key]):
                 raise ValueError('observation_original_input_identity_mismatch:' + key)
+        from r2f.runtime.participant_groups import enabled
+        metadata_schema = ('r2f.topology-execution-metadata/v2' if enabled(final['topology_program'])
+                           else 'r2f.topology-execution-metadata/v1')
         for record in (metadata, raw_metadata):
-            if (record.get('schema') != 'r2f.topology-execution-metadata/v1'
+            if (record.get('schema') != metadata_schema
                     or record.get('context_basis') != 'sealed_input_declaration_not_sut_observation'
                     or canonical_hash(record.get('sealed_execution_context')) != canonical_hash(context)
                     or record.get('raw_refs_hash_binding') != 'enclosing_result.raw_sha256'
