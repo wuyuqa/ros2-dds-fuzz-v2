@@ -3474,6 +3474,30 @@ def run_topology(program, config, output_dir, *, backend=None):
                                       "cross_writer_order_required": False,
                               })
                     return
+                if op == "lookup_topic":
+                    st = state[eid]
+                    if not (st["alive"] and st["generation"] == gen):
+                        record_guard(action, "lookup_target_alive_guard",
+                                     "lookup requires a live current generation", before=before)
+                        return
+                    value = backend.lookup_topic(st["handle"], params["scope"], params["name"])
+                    emit("topic_lookup_observation", action_id=aid, logical_id=eid,
+                         generation=gen, endpoint_gid=st["handle"]["endpoint_gid"],
+                         lookup_receipt=deepcopy(value), fixture=not backend.real_ros,
+                         candidate_eligible=False)
+                    result["observation_receipts"].append({
+                        "action_id": aid, "kind": "typed_topic_lookup", "receipt": deepcopy(value)})
+                    observed = value.get("complete") is True
+                    record_action(action, before, {**before, "lookup": value},
+                                  disposition="effect_observed" if observed else "unknown",
+                                  satisfied=observed,
+                                  effect_scope="native_typed_topic_lookup_not_endpoint_matching",
+                                  requires=[{"id": "runtime_typed_topic_lookup",
+                                             "status": "satisfied" if observed else "unknown"}])
+                    if not observed:
+                        result["unknowns"].append({"action_id": aid,
+                                                   "reason": value.get("reason", "topic_lookup_incomplete")})
+                    return
                 if op == "snapshot":
                     if eid is not None and not (state[eid]["alive"] and state[eid]["generation"] == gen):
                         record_guard(action, "snapshot_target_alive_guard",

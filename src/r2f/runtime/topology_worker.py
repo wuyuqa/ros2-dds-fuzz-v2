@@ -1753,6 +1753,36 @@ def _worker_main(argv, group_owner=None):
             if command["command"] in ("stop", "destroy"):
                 emit("worker_stopping", command_id=command_id)
                 break
+            if command["command"] == "lookup_topic":
+                from .scoped_topic_lookup import lookup_receipt, observe_topic_lookup
+                scope, name = command.get("scope"), command.get("name")
+                if rmw_identifier != "rmw_cyclonedds_cpp":
+                    lookup = lookup_receipt(scope, name,
+                        reason="rmw_native_typed_topic_lookup_unsupported", execution_evidence=True)
+                    lookup["binding"] = rmw_identifier
+                else:
+                    try:
+                        lookup = observe_topic_lookup(CycloneMatchedPeerObserver(),
+                            config["domain_id"], local_gid, kind, scope, name)
+                    except (ValueError, TypeError, OSError, AttributeError, RuntimeError) as exc:
+                        lookup = lookup_receipt(scope, name,
+                            reason="native_topic_lookup_adapter_unavailable:" + str(exc),
+                            execution_evidence=True)
+                        known_capability = isinstance(exc, ValueError) and str(exc) in {
+                            "native_endpoint_c_abi_platform_unsupported",
+                            "native_endpoint_c_abi_probe_unverified",
+                            "native_endpoint_c_header_fingerprint_changed",
+                        }
+                        lookup["exception_type"] = type(exc).__name__
+                        if not known_capability:
+                            lookup.update(status="unknown",
+                                attribution="binding_adaptation_or_observation_error")
+                emit("topic_lookup_result", command_id=command_id, endpoint_gid=local_gid,
+                     supporting_diagnostic=True, candidate_eligible=False, lookup_receipt=lookup)
+                if lookup.get("cleanup_confirmed") is False:
+                    raise TopologyBackendError("topic_lookup_cleanup_unconfirmed")
+                emit("command_done", command_id=command_id)
+                continue
             if command["command"] == "snapshot":
                 count_api = (endpoint.get_subscription_count if kind == "writer"
                              else endpoint.get_publisher_count)
@@ -2075,7 +2105,7 @@ def _group_worker_main(argv):
                     emit('command_done', command=op, command_id=cid, **token)
                 else:
                     token = sessions.get(eid, {}).get('token')
-                    if (op not in {'snapshot', 'publish_batch'} or token is None
+                    if (op not in {'snapshot', 'publish_batch', 'lookup_topic'} or token is None
                             or command['generation'] != token['generation']
                             or command.get('endpoint_generation') != token['endpoint_generation']):
                         raise TopologyBackendError('group_command_target_or_operation_invalid')
@@ -2738,6 +2768,11 @@ class OfflineTopologyBackend:
         return {"snapshots": snapshots, "command_id": command_id,
                 "complete": all(v["complete"] for v in snapshots.values())}
 
+    def lookup_topic(self, handle, scope, name):
+        from .scoped_topic_lookup import lookup_receipt
+        receipt = lookup_receipt(scope, name, reason="offline_fixture_no_native_topic_lookup")
+        return receipt
+
     def assert_liveliness(self, handle):
         if self.closed:
             raise TopologyBackendError("backend_closed")
@@ -3329,6 +3364,30 @@ class RosTopologyBackend:
         return {"snapshots": snapshots, "command_id": None,
                 "group_observations": group_observations,
                 "complete": all(v["complete"] for v in snapshots.values())}
+
+    def lookup_topic(self, handle, scope, name):
+        command_id = self._batch(handle, "lookup_topic", scope=scope, name=name)
+        rows = [row for row in handle["process"].events
+                if row.get("event") == "topic_lookup_result" and row.get("command_id") == command_id]
+        if len(rows) != 1:
+            raise TopologyBackendError("topic_lookup_result_missing_or_ambiguous")
+        row = rows[0]
+        keys = ("logical_id", "generation", "endpoint_generation", "endpoint_gid", "pid",
+                "pgid", "process_start_ticks")
+        if any(row.get(key) != handle.get(key) for key in keys):
+            raise TopologyBackendError("topic_lookup_worker_identity_mismatch")
+        events = handle["process"].events
+        acks = [event for event in events if event.get("event") == "command_done"
+                and event.get("command_id") == command_id]
+        if (len(acks) != 1 or any(acks[0].get(key) != handle.get(key) for key in keys)
+                or events.index(acks[0]) <= events.index(row)):
+            raise TopologyBackendError("topic_lookup_ack_identity_or_order_mismatch")
+        value = deepcopy(row["lookup_receipt"])
+        if (value.get("scope") != scope or value.get("requested_name") != name
+                or row.get("run_id") != self.config["run_id"]):
+            raise TopologyBackendError("topic_lookup_request_binding_mismatch")
+        value.update(command_id=command_id, worker_identity={key: row[key] for key in keys})
+        return value
 
     def assert_liveliness(self, handle):
         command_id = self._batch(handle, "assert_liveliness")

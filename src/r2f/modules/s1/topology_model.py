@@ -56,6 +56,7 @@ _ACTION_PARAMS = {
     "publish_batch": ({"count", "start_sequence"}, {"interval_sec", "payload", "repeat_data_from", "concurrency_group"}),
     "update_filter": ({"expression", "parameters"}, set()),
     "snapshot": (set(), {"label", "timeout_sec"}),
+    "lookup_topic": ({"scope", "name"}, set()),
     "barrier": ({"condition", "timeout_sec"}, {"endpoint_ids", "publish_action_ids"}),
 }
 MUTATORS = (
@@ -292,6 +293,11 @@ def _shape(program):
                 _error(errors, f"{path}.params.repeat_data_from", "value", "single sample and prior action id required; payload prohibited")
             if "payload" in p and not _text(p["payload"], empty=True, limit=1024):
                 _error(errors, f"{path}.params.payload", "value", "bounded payload text required")
+        if op == "lookup_topic":
+            if p["scope"] not in ("participant", "local_domain", "global"):
+                _error(errors, f"{path}.params.scope", "value", "unknown native lookup scope")
+            if not _text(p["name"], limit=256) or "\x00" in p["name"]:
+                _error(errors, f"{path}.params.name", "value", "bounded native topic name without NUL required")
         if op == "update_filter":
             if not _text(p["expression"], empty=True, limit=1024):
                 _error(errors, f"{path}.params.expression", "value", "bounded expression required")
@@ -445,6 +451,8 @@ def _evaluate(program, count=None):
             for target in p.get("endpoint_ids", []):
                 requires.append(_require("barrier_endpoint_alive:" + target, states[target]["alive"]))
             requires.append(_require("runtime_barrier:" + p["condition"], None, kind="observation"))
+        if op == "lookup_topic":
+            requires.append(_require("runtime_typed_topic_lookup", None, kind="observation"))
         if op == "snapshot":
             requires.append(_require("runtime_snapshot_receipt", None, kind="observation"))
         failed = any(r["status"] == "unsatisfied" for r in requires)

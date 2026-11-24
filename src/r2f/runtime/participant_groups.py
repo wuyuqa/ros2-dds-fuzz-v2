@@ -73,7 +73,7 @@ def validate_control(program, config=None):
     creates = []
     generations, live = {}, set()
     for a in actions:
-        if (not isinstance(a, dict) or a.get('op') not in {'create', 'destroy', 'recreate', 'snapshot', 'barrier', 'publish_batch'}
+        if (not isinstance(a, dict) or a.get('op') not in {'create', 'destroy', 'recreate', 'snapshot', 'barrier', 'publish_batch', 'lookup_topic'}
                 or 'concurrency_group' in (a.get('params') or {})):
             raise ValueError('participant_control_scope:unsupported_action')
         op, eid, gen = a['op'], a.get('endpoint_id'), a.get('generation')
