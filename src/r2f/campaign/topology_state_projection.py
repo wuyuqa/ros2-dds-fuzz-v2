@@ -533,7 +533,24 @@ class _Projection:
             if rows[0] != rows[1]:
                 raise ValueError("observed_contract_sources_contradict")
             row = rows[0]
-            if not _text(row.get("topic_type")) or not isinstance(row.get("qos"), dict):
+            if not _text(row.get("topic_type")):
+                raise ValueError("observed_contract_fields_missing")
+            if row["topic_type"] != token.get("message_type"):
+                raise ValueError("observed_endpoint_type_binding_mismatch")
+            contracts[token["logical_id"]] = row
+        writer, reader = contracts[w["logical_id"]], contracts[r["logical_id"]]
+        if writer["topic_type"] != reader["topic_type"]:
+            # A known type difference is independent of missing QoS. Retain
+            # the observed types; this contract does not infer actual match.
+            return "incompatible", {
+                "reason": "observed_type_mismatch", "actual_match": "not_evaluated",
+                "writer_type": writer["topic_type"], "reader_type": reader["topic_type"],
+                "type_scope": "observed_ros_type_names_not_xtypes_assignability",
+                "qos": "not_evaluated_type_mismatch",
+            }
+        fields_by_endpoint = {}
+        for eid, row in contracts.items():
+            if not isinstance(row.get("qos"), dict):
                 raise ValueError("observed_contract_fields_missing")
             fields = {}
             for policy, key in (("reliability", "reliability"), ("durability", "durability"),
@@ -545,12 +562,8 @@ class _Projection:
                              {"nanoseconds": value} if _integer(value) else None)
                 if value is not None:
                     fields[policy] = {"status": "observed", "value": value}
-            contracts[token["logical_id"]] = fields, row["topic_type"]
-        wf, wt = contracts[w["logical_id"]]
-        rf, rt = contracts[r["logical_id"]]
-        check = check_offered_requested(wf, rf)
-        if w["topic"] != r["topic"] or wt != rt:
-            return "incompatible", check
+            fields_by_endpoint[eid] = fields
+        check = check_offered_requested(fields_by_endpoint[w["logical_id"]], fields_by_endpoint[r["logical_id"]])
         return ("compatible" if check["compatible"] is True else "incompatible"
                 if check["compatible"] is False else "unknown"), check
 

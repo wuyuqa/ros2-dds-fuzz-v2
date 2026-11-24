@@ -2711,12 +2711,15 @@ class OfflineTopologyBackend:
                 matched_count = sum(self.reader_sees.get((eid, handle["logical_id"]), False)
                                     for eid in rows["writer"])
             matched_count = self.count_overrides.get(handle["logical_id"], matched_count)
+            # Discovery rows describe the endpoint owning each GID, not the
+            # observer. Mixed-type peers remain visible without claiming match.
+            gid_types = {h["endpoint_gid"]: h["type_name"] for h in self.handles.values()}
             graph = {
                 "publishers": [{"endpoint_gid": gid, "node_name": "offline_fake",
-                                "node_namespace": "/", "topic_type": handle["type_name"],
+                                "node_namespace": "/", "topic_type": gid_types[gid],
                                 "qos": {}} for gid in publishers],
                 "subscriptions": [{"endpoint_gid": gid, "node_name": "offline_fake",
-                                   "node_namespace": "/", "topic_type": handle["type_name"],
+                                   "node_namespace": "/", "topic_type": gid_types[gid],
                                    "qos": {}} for gid in subscriptions],
             }
             match = {"command_id": command_id, "matched_count": matched_count,
