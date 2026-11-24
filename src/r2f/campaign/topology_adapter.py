@@ -206,10 +206,12 @@ class _Audit:
                         or any(e.get("fixture") is True or e.get("offline_fake") is True
                                or e.get("backend") not in (None, "ros2_public_api") for e in self.events))
         self.specs = {e["logical_id"]: e for e in self.program["endpoints"]}
-        from r2f.runtime.participant_groups import enabled, project_lineage
+        from r2f.runtime.participant_groups import enabled, destroy_receipts
         self.group_lineage = None
+        self.group_destroys = []
         if enabled(self.program):
-            self.group_lineage = project_lineage(self.program, self.events, self.path, config=config)
+            self.group_lineage, self.group_destroys = destroy_receipts(
+                self.program, self.events, self.path, config=config)
             _require(runtime.get('execution_metadata', {}).get('participant_groups') == self.group_lineage,
                      'group_lineage_metadata_mismatch')
         elif (runtime.get('execution_metadata', {}).get('schema') == 'r2f.topology-execution-metadata/v2'
@@ -231,6 +233,9 @@ class _Audit:
 
     def identity(self):
         retired, seen_gids, seen_workers = set(), set(), set()
+        destroys = getattr(self, "group_destroys", ())
+        destroy_acks = {r["ack_ref"] for r in destroys}
+        destroy_controllers = {r["controller_ref"] for r in destroys}
         for event in self.events:
             kind, eid = event["event"], event.get("logical_id")
             if kind == "endpoint_created":
@@ -270,6 +275,8 @@ class _Audit:
                 self.tokens[key] = event
             elif kind in {"endpoint_destroyed", "topology_endpoint_destroyed"}:
                 key = (eid, event.get("generation"))
+                if event["event_index"] in destroy_controllers and key in retired:
+                    continue  # Same authenticated cleanup, not a second retirement.
                 _require(key in self.tokens and key not in retired, "retirement_unknown_generation")
                 token = endpoint_identity_at(self.events, self.tokens[key], before_index=event["event_index"] + 1)
                 _require(event["monotonic_ns"] >= token["identity_valid_after_ns"],
@@ -285,7 +292,8 @@ class _Audit:
                 seen_gids.add(event.get("after_gid"))
             elif kind in _WORKER_EVENTS and eid is not None and kind not in {"endpoint_create_begin", "worker_ready"}:
                 key = (eid, event.get("generation"))
-                _require(key in self.tokens and key not in retired, "worker_event_unknown_or_retired_generation")
+                _require(key in self.tokens and (key not in retired or event["event_index"] in destroy_acks),
+                         "worker_event_unknown_or_retired_generation")
                 self.bound(event, self.tokens[key])
         for event in self.events:
             if event["event"] in {"endpoint_create_begin", "worker_ready"}:
@@ -1188,6 +1196,72 @@ def _history_windows_for_pairs(audit, projection, deliveries, live_pairs, scope)
 
 
 
+def _participant_group_history_windows(audit, projection, deliveries):
+    """Reconcile group history only through authenticated, pre-boundary cleanup.
+
+    A surviving peer keeps its exact final incarnation; every retired peer needs
+    its own closed destroy operation after this window. Whole-run group lineage
+    was audited independently, and no incomplete boundary is upgraded here.
+    """
+    if audit.group_lineage is None:
+        return []
+    boundary = audit.resolve(projection["receipt"]["after"]["boundary_ref"])
+    if boundary.get("lifecycle_complete") is not True:
+        return []
+    final = {e["logical_id"]: e for e in projection["state_after"]["endpoints"]}
+    retired = {(audit.events[r["cleanup_ref"]]["logical_id"],
+                audit.events[r["cleanup_ref"]]["generation"]): r
+               for r in audit.group_destroys if r["action_done_ref"] < boundary["event_index"]
+               and audit.events[r["action_done_ref"]]["monotonic_ns"] <= boundary["monotonic_ns"]}
+    pending_pairs, refs = set(), {}
+    # Opens identify obligations to inspect, but only an authenticated close
+    # before retirement can qualify a window. Missing closes stay unknown.
+    for event in audit.events[:boundary["event_index"] + 1]:
+        if event.get("event") not in {"topology_delivery_window_open", "topology_delivery_window_closed"}:
+            continue
+        key = (event.get("writer"), event.get("writer_generation"),
+               event.get("reader"), event.get("reader_generation"))
+        proofs = []
+        for eid, generation in ((key[0], key[1]), (key[2], key[3])):
+            receipt = retired.get((eid, generation))
+            if receipt is not None:
+                request = audit.events[receipt["request_ref"]]
+                if (event["event_index"] >= request["event_index"]
+                        or event["monotonic_ns"] > request["monotonic_ns"]):
+                    break
+                proofs.append(receipt)
+            elif (final.get(eid, {}).get("liveness") != "alive"
+                  or final[eid].get("generation") != generation):
+                break
+        else:
+            if proofs:
+                pending_pairs.add(key)
+                if event["event"] == "topology_delivery_window_closed":
+                    refs[event["event_index"]] = proofs
+    windows = _history_windows_for_pairs(audit, projection, deliveries, pending_pairs,
+        "participant_control_verified_retirement_historical_window")
+    for row in windows:
+        row["destroy_operation_refs"] = [
+            {name: audit.ref(audit.events[index]) for name, index in receipt.items()}
+            for receipt in refs.get((row.get("close_ref") or {}).get("event_index"), [])]
+        if row.get("close_ref") is not None and not row["destroy_operation_refs"]:
+            row.update(window_projection_valid=False, delivery_closure="unknown",
+                       delivery_window_identity_complete=False, delivery_witnesses=[],
+                       reason="group_history_close_without_qualified_destroy")
+            if "proofs" in row:
+                row["proofs"]["delivery_closure"].update(status="unknown", value="unknown")
+    return windows
+
+
+def _participant_group_send_coverage(audit, group_windows, live_windows, send):
+    if not group_windows:
+        return None
+    coverage = _live_history_send_coverage(audit, group_windows + live_windows, send)
+    if coverage is not None:
+        coverage["scope"] = "received_sample_in_verified_participant_control_historical_windows"
+    return coverage
+
+
 def _retired_episode_history_windows(audit, projection, deliveries, episode_observation):
     """Only opt-in completed episodes may reconcile a retired BOTH-peer window.
 
@@ -1429,6 +1503,8 @@ def facts_from_events(events, runtime, config, *, capture_source=None):
         empty_windows = _historical_no_obligation_windows(a, facts["pairs"], projection)
         historical = _recreated_history_windows(a, facts["pairs"], projection, facts["deliveries"])
         facts["historical_live_windows"] = _live_history_windows(a, facts["pairs"], projection, facts["deliveries"])
+        facts["historical_participant_group_windows"] = _participant_group_history_windows(
+            a, projection, facts["deliveries"])
         if "episode" in a.program:
             from .topology_episode import audit_topology_episode
             facts["episode_observation"] = audit_topology_episode(a.program, runtime, config)
@@ -1451,6 +1527,9 @@ def facts_from_events(events, runtime, config, *, capture_source=None):
             for p in facts["pairs"])}
         facts["historical_send_coverage"] = [coverage for send in sends
             if (coverage := (_recreated_history_send_coverage(a, historical, send)
+                             or (_participant_group_send_coverage(a, facts["historical_participant_group_windows"],
+                                                                 facts["historical_live_windows"], send)
+                                 if send["event_index"] not in current_window_sends else None)
                              or (_retired_episode_send_coverage(a, facts["retired_episode_history_windows"], send)
                                  if "episode_observation" in facts else None)
                              or (_live_history_send_coverage(a, facts["historical_live_windows"], send,
@@ -1460,8 +1539,14 @@ def facts_from_events(events, runtime, config, *, capture_source=None):
             row["filter_decision_evidence"] for coverage in facts["historical_send_coverage"]
             for row in coverage["reader_windows"] if "filter_decision_evidence" in row]
         covered_history = {c["send_ref"]["event_index"] for c in facts["historical_send_coverage"]}
+        # A current label avoids double-counting, not the obligations to every
+        # reader alive at send time (including retired peers and overlaps).
+        qualified_current_window_sends = current_window_sends if a.group_lineage is None else {
+            s["event_index"] for s in sends if s["event_index"] in current_window_sends
+            and _live_history_send_coverage(a, facts["historical_participant_group_windows"]
+                                           + facts["historical_live_windows"], s) is not None}
         facts["unresolved_historical_obligations"] = [a.ref(s) for s in sends
-            if s["event_index"] not in current_window_sends and not _no_obligation_send_covered(a, empty_windows, s)
+            if s["event_index"] not in qualified_current_window_sends and not _no_obligation_send_covered(a, empty_windows, s)
             and s["event_index"] not in covered_history]
         facts["application_audit"] = _application(a)
         facts["source_provenance_qualified"] = _source_qualification(a, capture_source=capture_source)

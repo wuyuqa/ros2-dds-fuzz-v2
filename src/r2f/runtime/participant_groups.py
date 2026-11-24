@@ -586,6 +586,121 @@ def project_lineage(program, events, raw_path, *, config=None):
             'group_relation_observed': relation, 'supporting_diagnostic': True, 'candidate_eligible': False}
 
 
+def destroy_receipts(program, events, raw_path, *, config=None):
+    """Authenticate group destroy receipts; return exact indexes, never a waiver.
+
+    The worker cleanup has no CID and the request has no GID. The complete
+    group contract binds those rows to one endpoint incarnation and command;
+    the controller must close that very command inside its authored action.
+    """
+    lineage = project_lineage(program, events, raw_path, config=config)
+    receipts = closed_destroy_receipts(program, events, before_index=len(events))
+    requests = {e['event_index'] for e in events if e.get('event') == 'group_command_requested'
+                and e.get('command') == 'destroy_endpoint'}
+    if requests != {r['request_ref'] for r in receipts}:
+        raise ValueError('group_lineage:destroy_controller_receipt')
+    return lineage, receipts
+
+
+def closed_destroy_receipts(program, events, *, before_index):
+    """Authenticate only closed local destroys in this prefix, without run exit.
+
+    This grants no whole-run lineage/coverage. A boundary never borrows a future
+    ACK, controller receipt, endpoint creation or process shutdown.
+    """
+    validate_control(program)
+    events = events[:before_index]
+    receipts = []
+    identity = ENDPOINT_KEYS + PROCESS_KEYS + LINK_KEYS
+
+    def require(ok):
+        if not ok:
+            raise ValueError('group_lineage:destroy_controller_receipt')
+
+    def one(rows):
+        require(len(rows) == 1)
+        return rows[0]
+
+    def equal(row, other, keys):
+        return all(row.get(k) == other.get(k) for k in keys)
+
+    from r2f.core.evidence import canonical_hash
+    binding = one([e for e in events if e.get('event') == 'input_binding'])
+    require(binding.get('receipt', {}).get('program_sha256') == canonical_hash(program)
+            and binding.get('receipt', {}).get('participant_control') == CONTROL)
+    from .topology_worker import canonical_worker_roles
+    aliases = canonical_worker_roles(program['endpoints'])
+    for controller in events:
+        if controller.get('event') != 'topology_endpoint_destroyed' or 'group_id' not in controller:
+            continue
+        request = one([e for e in events if e.get('event') == 'group_command_requested'
+                       and e.get('command') == 'destroy_endpoint'
+                       and e.get('command_id') == controller.get('command_id')
+                       and equal(e, controller, PROCESS_KEYS + LINK_KEYS + ENDPOINT_KEYS[:3])])
+        require(type(controller.get('command_id')) is int and controller['command_id'] > 0
+                and type(request.get('command_id')) is int)
+        token = one([e for e in events if e.get('event') == 'endpoint_created'
+                     and equal(e, controller, identity)])
+        spec = one([e for e in program['endpoints'] if e['logical_id'] == token['logical_id']])
+        require(token.get('group_id') == spec.get('participant_id')
+                and all(type(token.get(k)) is int and token[k] > 0 for k in ('pid', 'pgid', 'process_start_ticks'))
+                and token['pid'] == token['pgid']
+                and all(isinstance(token.get(k), str) and token[k] for k in LINK_KEYS + ENDPOINT_KEYS[2:])
+                and token['worker_instance_id'] != token['context_instance_id'])
+        start, context, ready = [one([e for e in events if e.get('event') == kind
+                                 and equal(e, token, PROCESS_KEYS + LINK_KEYS)]) for kind in
+                                 ('process_started', 'group_context_created', 'group_worker_ready')]
+        require(start.get('fresh_process') is True and start.get('separate_context') is False
+                and context.get('ros_context_created') is True
+                and context.get('api') == 'rclpy.context.Context+rclpy.init')
+        created = one([e for e in events if e.get('event') == 'group_command_requested'
+                       and e.get('command') == 'create_endpoint'
+                       and equal(e, token, PROCESS_KEYS + LINK_KEYS + ENDPOINT_KEYS[:2])])
+        bound = one([e for e in events if e.get('event') == 'endpoint_group_bound'
+                     and equal(e, token, PROCESS_KEYS + LINK_KEYS)
+                     and equal(e.get('endpoint', {}), token, ENDPOINT_KEYS)])
+        created_ack = one([e for e in events if e.get('event') == 'command_done'
+                          and e.get('command_id') == created.get('command_id')
+                          and equal(e, token, identity)])
+        origins = [binding, start, context, ready, created, token, bound, created_ack, request]
+        require(created_ack.get('command') == 'create_endpoint'
+                and all(a['event_index'] < b['event_index'] for a, b in zip(origins, origins[1:]))
+                and all(a['monotonic_ns'] <= b['monotonic_ns']
+                        for a, b in zip(origins[4:], origins[5:])))
+        require(not any(e.get('event') in {'process_exit', 'group_context_shutdown'}
+                        and equal(e, token, PROCESS_KEYS + LINK_KEYS) for e in events[:controller['event_index']]))
+        ack = one([e for e in events if e.get('event') == 'command_done'
+                   and e.get('command_id') == request['command_id']
+                   and equal(e, request, PROCESS_KEYS + LINK_KEYS)])
+        cleanup = one([e for e in events if e.get('event') == 'endpoint_destroyed'
+                       and equal(e, ack, identity)])
+        require(equal(ack, controller, identity) and ack.get('command') == 'destroy_endpoint'
+                and ack.get('cleanup_status') == cleanup.get('cleanup_status') == controller.get('cleanup_status') == 'closed'
+                and controller.get('process_retained') is True
+                and all(_endpoint_event_roles_match(e, aliases[token['logical_id']]) for e in (token, request, cleanup, ack, controller)))
+        begin = one([e for e in events if e.get('event') == 'topology_action_begin'
+                     and e['event_index'] < request['event_index']
+                     and e.get('action', {}).get('endpoint_id') == request['logical_id']
+                     and ((e['action'].get('op') == 'destroy' and e['action'].get('generation') == request['generation'])
+                          or (e['action'].get('op') == 'recreate' and e['action'].get('generation') == request['generation'] + 1))
+                     and any(a == e['action'] for a in program['actions'])])
+        done = one([e for e in events if e.get('event') == 'topology_action_done'
+                    and e.get('action') == begin['action'] and e.get('action_id') == begin['action_id']])
+        ordered = [begin, request, cleanup, ack, controller, done]
+        require(all(a['event_index'] < b['event_index'] and a['monotonic_ns'] <= b['monotonic_ns']
+                    for a, b in zip(ordered, ordered[1:])))
+        require(all(equal(e, token, ('run_id', 'domain_id')) for e in origins + ordered))
+        require(not any(e.get('event') == 'group_command_requested'
+                        and equal(e, request, PROCESS_KEYS + LINK_KEYS)
+                        and request['event_index'] < e['event_index'] <= controller['event_index'] for e in events))
+        receipts.append({name + '_ref': row['event_index'] for name, row in
+                         zip(('action_begin', 'request', 'cleanup', 'ack', 'controller', 'action_done'), ordered)})
+    require(len({r['request_ref'] for r in receipts}) == len(receipts))
+    require({e['event_index'] for e in events if e.get('event') == 'topology_endpoint_destroyed'
+             and 'group_id' in e} == {r['controller_ref'] for r in receipts})
+    return receipts
+
+
 def lineage_metadata(program, events, raw_path, *, config=None):
     """Failure-preserving projection: invalid traces retain an explicit error."""
     try:

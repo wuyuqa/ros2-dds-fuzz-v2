@@ -568,7 +568,7 @@ def _single_writer_correlation(pair, events, active_writers_on_topic, sequence):
       one send of this writer generation.
     """
     if type(active_writers_on_topic) is not int or active_writers_on_topic != 1:
-        # A missing value must never be coerced to "only one writer".
+        # The caller's explicit inventory remains necessary, never sufficient.
         return False, "active_writer_inventory_not_exactly_one"
     writer_id = pair.get("writer")
     writer_generation = pair.get("writer_generation")
@@ -595,13 +595,52 @@ def _single_writer_correlation(pair, events, active_writers_on_topic, sequence):
     send_ns = sends[0]["monotonic_ns"]
     if send_ns < created:
         return False, "send_precedes_reader_creation"
-    raw_count, raw_reason = _raw_active_writer_inventory(events, writer_id, send_ns)
-    if raw_count is not None and raw_count != 1:
-        return False, "raw_writer_inventory_contradicts_single_writer"
-    return True, (raw_reason if raw_count is None else None)
+    # Reconstruct the send's prefix, never the final snapshot's writer count.
+    # Excluding the send itself also preserves source order for equal clocks.
+    prefix = events[:events.index(sends[0])]
+    raw_count, raw_reason = _raw_active_writer_inventory(prefix, writer_id, send_ns)
+    if any(e.get("event") == "endpoint_created" for e in prefix):
+        if raw_count is None:
+            return False, raw_reason
+        if raw_count != 1:
+            return False, "raw_writer_inventory_contradicts_single_writer"
+        return True, None
+    # Retain the diagnostic legacy format without raw lifecycle observations.
+    if type(active_writers_on_topic) is not int or active_writers_on_topic != 1:
+        return False, "active_writer_inventory_not_exactly_one"
+    return True, raw_reason
 
 
-def pair_delivery_fact(pair, events, *, active_writers_on_topic=None, real_ros=False):
+def _delivery_lifetimes(events):
+    """Index physical lifetimes once for a captured source prefix."""
+    lifetimes = {}
+    for index, event in enumerate(events):
+        key = (event.get("logical_id"), event.get("generation"))
+        if event.get("event") == "endpoint_created":
+            lifetimes[key] = {"start": index, "created": event, "end": None, "retired": None}
+        elif event.get("event") in {"endpoint_destroyed", "topology_endpoint_destroyed"} and key in lifetimes:
+            life = lifetimes[key]
+            if life["end"] is None:
+                life.update(end=index, retired=event)
+    return lifetimes
+
+
+def _in_delivery_lifetime(event, index, life):
+    if life is None:
+        return True  # Legacy diagnostic rows may lack a raw lifecycle inventory.
+    if index <= life["start"] or life["end"] is not None and index >= life["end"]:
+        return False
+    clock = event.get("monotonic_ns")
+    if type(clock) is int:
+        start = life["created"].get("monotonic_ns")
+        end = (life["retired"] or {}).get("monotonic_ns")
+        if type(start) is int and clock < start or type(end) is int and clock > end:
+            return False
+    return True
+
+
+def pair_delivery_fact(pair, events, *, active_writers_on_topic=None, real_ros=False,
+                       _lifetimes=None):
     """Attribute deliveries per writer generation; never fill from a total count."""
     writer_gid = pair.get("writer_gid")
     reader_gid = pair.get("reader_gid")
@@ -611,18 +650,28 @@ def pair_delivery_fact(pair, events, *, active_writers_on_topic=None, real_ros=F
     # Volatile history is not replayed to a later generation, so pre-creation
     # sequences must not be reported as "missing" for that pair.
     reader_created = pair.get("reader_created_monotonic_ns")
-    sends = [e for e in events if e.get("event") == "send"
+    lifetimes = _delivery_lifetimes(events) if _lifetimes is None else _lifetimes
+    writer_life = lifetimes.get((writer_id, pair.get("writer_generation")))
+    reader_life = lifetimes.get((reader_id, pair.get("reader_generation")))
+    sends = [e for index, e in enumerate(events) if e.get("event") == "send"
              and e.get("logical_id") == writer_id
              and e.get("generation") == pair.get("writer_generation")
-             and (reader_created is None
+             and e.get("writer_gid") in (None, writer_gid)
+             and _in_delivery_lifetime(e, index, writer_life)
+             and _in_delivery_lifetime(e, index, reader_life)
+             and (reader_life is not None or reader_created is None
                   or (isinstance(e.get("monotonic_ns"), int)
                       and e["monotonic_ns"] >= reader_created))]
     expected = [e.get("send_sequence") for e in sends]
     direct, correlated, single, unknown = [], [], [], []
     payload_witnesses, attribution_reasons, single_limitations = [], [], []
     effective_sequences = {}
-    for event in events:
+    for event_index, event in enumerate(events):
         if event.get("event") != "receive":
+            continue
+        # A valid receipt can arrive after writer retirement. Only the reader
+        # lifetime bounds receiving; the send obligation was fenced separately.
+        if not _in_delivery_lifetime(event, event_index, reader_life):
             continue
         if event.get("logical_id") != reader_id:
             continue
@@ -2016,11 +2065,12 @@ def _delivery_rows(pairs, events, handles, *, real_ros=False):
     for handle in handles.values():
         if handle.get("alive") and handle.get("role") == "writer":
             active_by_topic[handle.get("topic")] = active_by_topic.get(handle.get("topic"), 0) + 1
+    lifetimes = _delivery_lifetimes(events)
     for pair in pairs:
         rows.append(pair_delivery_fact(
             pair, events,
             active_writers_on_topic=active_by_topic.get(pair.get("topic"), 0),
-            real_ros=real_ros))
+            real_ros=real_ros, _lifetimes=lifetimes))
     return rows
 
 
@@ -2735,8 +2785,10 @@ def run_topology(program, config, output_dir, *, backend=None):
         result["observation_receipts"].append(receipt)
         live = {eid: st["handle"] for eid, st in state.items() if st["alive"]}
         pairs = _pair_rows(live, snapshot, events, real_ros=bool(backend.real_ros))
-        delivery = _delivery_rows(pairs, events, live, real_ros=bool(backend.real_ros))
         _upsert(result["pair_facts"], pairs, _PAIR_KEY)
+        # Refresh every retained generation, including previously complete rows.
+        # Each fact consumes this prefix and its own physical lifetime bounds.
+        delivery = _delivery_rows(result["pair_facts"], events, live, real_ros=bool(backend.real_ros))
         _upsert(result["delivery_facts"], delivery, _PAIR_KEY)
         netem_counter_snapshot(receipt["step_id"], "action_window")
         emit("topology_pair_observation", step_id=receipt["step_id"],
@@ -2760,7 +2812,13 @@ def run_topology(program, config, output_dir, *, backend=None):
             for token in tokens:
                 lifecycle_refs.append(token["event_index"])
                 if token.get("generation") < st["generation"] or not st["alive"]:
-                    retired = [e for e in events if e.get("event") in {"endpoint_destroyed", "topology_endpoint_destroyed"}
+                    # Group controller receipts acknowledge the worker's same
+                    # cleanup; inventory the physical destruction only. Full
+                    # request/cleanup/ACK/controller binding is audited from raw.
+                    from .participant_groups import enabled as groups_enabled
+                    kinds = ({"endpoint_destroyed"} if groups_enabled(effective_program)
+                             else {"endpoint_destroyed", "topology_endpoint_destroyed"})
+                    retired = [e for e in events if e.get("event") in kinds
                                and all(e.get(k) == token.get(k) for k in
                                        ("logical_id", "generation", "pid", "process_start_ticks", "endpoint_generation"))
                                and e.get("cleanup_status") == "closed" and e["event_index"] > token["event_index"]]

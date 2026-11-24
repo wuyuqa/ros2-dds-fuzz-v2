@@ -16,7 +16,7 @@ def test_real_backend_handle_retains_raw_message_type(tmp_path, monkeypatch, obs
         def __init__(self, config, *_):
             self.process = SimpleNamespace(pid=424242)
             row = dict(event='endpoint_created', pid=424242, pgid=424242,
-                       logical_id=config['logical_id'],
+                       logical_id=config['logical_id'], generation=config['generation'],
                        endpoint_gid='aa11', endpoint_generation='fixture-generation',
                        process_start_ticks=17, fixture=True, real_ros=False)
             if observed is not None:

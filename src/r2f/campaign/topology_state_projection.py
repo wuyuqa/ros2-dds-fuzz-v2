@@ -132,6 +132,7 @@ class _Projection:
         self.program, self.path, self.digest = program, path, digest
         self.events, self.receipt = events, receipt
         self.roles = logical_endpoints(program)
+        self.group_destroy_prefixes = {}
         self.declared = {eid: set() for eid in self.roles}
         for a in program["actions"]:
             if isinstance(a, dict) and a.get("op") in ("create", "recreate"):
@@ -218,6 +219,16 @@ class _Projection:
     def endpoints(self, side, boundary, lifecycle):
         facts, tokens = {}, {}
         prefix = self.prefix(boundary)
+        from r2f.runtime.participant_groups import enabled, closed_destroy_receipts
+        def same_destroy(event):
+            if not enabled(self.program):
+                return False
+            index = boundary["event_index"]
+            if index not in self.group_destroy_prefixes:
+                self.group_destroy_prefixes[index] = closed_destroy_receipts(
+                    self.program, self.events, before_index=index + 1)
+            return any(r["controller_ref"] == event["event_index"]
+                       for r in self.group_destroy_prefixes[index])
         for eid in self.roles:
             path = "/endpoints/" + _pointer(eid)
             history = [e for e in prefix if e.get("logical_id") == eid
@@ -256,6 +267,9 @@ class _Projection:
                         # at the boundary; this pass independently fences lifecycle.
                         old_gids.add(_gid(event.get("after_gid")))
                     else:
+                        if (not alive and current is not None and event.get("generation") == generation
+                                and same_destroy(event)):
+                            continue  # Controller receipt for the already verified worker cleanup.
                         if current is None or not alive:
                             raise ValueError("retirement_without_current_generation")
                         current = endpoint_identity_at(self.events, current,

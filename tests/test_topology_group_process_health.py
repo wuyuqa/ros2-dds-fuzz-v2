@@ -185,7 +185,8 @@ def test_projection_binds_snapshot_process_group_and_context_identity(tmp_path, 
 
 
 @pytest.mark.parametrize('damage', ['program_opt_in_missing', 'raw_opt_in_missing',
-                                   'future_binding', 'future_start', 'native_source', 'cp2_program'])
+                                   'future_binding', 'future_start', 'native_source',
+                                   'invalid_generation', 'unsupported_program'])
 def test_projection_shared_pid_requires_current_public_cp1_evidence(tmp_path, damage):
     from r2f.core.evidence import canonical_hash
 
@@ -193,9 +194,10 @@ def test_projection_shared_pid_requires_current_public_cp1_evidence(tmp_path, da
     if damage == 'program_opt_in_missing':
         fixture.program.pop('participant_control')
         fixture.events[0]['receipt']['program_sha256'] = canonical_hash(fixture.program)
-    elif damage == 'cp2_program':
-        fixture.program['actions'].append(dict(action_id='unsupported_destroy', op='destroy',
-            endpoint_id='r0', generation=1))
+    elif damage in ('invalid_generation', 'unsupported_program'):
+        fixture.program['actions'].append(dict(action_id='invalid_future_action',
+            op='destroy' if damage == 'invalid_generation' else 'fixture_unsupported_op',
+            endpoint_id='r0', generation=2 if damage == 'invalid_generation' else 1))
         fixture.events[0]['receipt']['program_sha256'] = canonical_hash(fixture.program)
     elif damage == 'raw_opt_in_missing':
         fixture.events[0]['receipt'].pop('participant_control')
@@ -215,6 +217,30 @@ def test_projection_shared_pid_requires_current_public_cp1_evidence(tmp_path, da
     result = project(fixture)
 
     assert result['state_after']['pairs'][0]['observed_match'] == 'unknown'
+    assert result['eligible'] is False
+    if damage in ('invalid_generation', 'unsupported_program'):
+        reason = ('participant_control_scope:generation' if damage == 'invalid_generation'
+                  else 'participant_control_scope:unsupported_action')
+        assert any(reason in item for item in result['receipt']['reasons'])
+
+
+def test_projection_legal_future_destroy_preserves_current_snapshot_prefix(tmp_path):
+    from r2f.core.evidence import canonical_hash
+
+    fixture = group_trace(tmp_path, True)
+    # A declared future CP3 operation is supported but has not run at this
+    # boundary. It neither retires the current reader nor invalidates its proof.
+    fixture.program['actions'].append(dict(action_id='future_destroy', op='destroy',
+        endpoint_id='r0', generation=1))
+    fixture.events[0]['receipt']['program_sha256'] = canonical_hash(fixture.program)
+    resave(fixture)
+    result = project(fixture)
+
+    assert result['state_after']['pairs'][0]['observed_match'] == 'bidirectional', result['receipt']['reasons']
+    reader = next(e for e in result['state_after']['endpoints'] if e['logical_id'] == 'r0')
+    assert reader['generation'] == 1 and reader['liveness'] == 'alive'
+    assert result['receipt']['status'] == 'observed'
+    assert result['receipt']['fixture'] is True
     assert result['eligible'] is False
 
 
