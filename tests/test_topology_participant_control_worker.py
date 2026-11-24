@@ -38,8 +38,9 @@ def ros_fixture(monkeypatch, commands, fail_reader=False, fail_destroy=False):
         result.liveliness_lease_duration=SimpleNamespace(nanoseconds=defaults['liveliness_lease_duration_ns'])
         return result
     class Endpoint:
-        def __init__(self,role,topic,node,callback=None):
+        def __init__(self,role,topic,node,callback=None,message_type=None):
             self.role=role; self.topic_name=topic; self.node=node; self.callback=callback
+            self.message_type=message_type
             self.gid=('11' if role=='writer' else '22')*16
         def get_subscription_count(self): return sum(e.role=='reader' for e in entities)
         def get_publisher_count(self): return sum(e.role=='writer' for e in entities)
@@ -47,13 +48,13 @@ def ros_fixture(monkeypatch, commands, fail_reader=False, fail_destroy=False):
     class Node:
         def __init__(self,name,**kw): calls.append('node');self.name=name
         def create_publisher(self,typ,topic,qos,**kw):
-            calls.append('writer'); e=Endpoint('writer',topic,self); entities.append(e);return e
+            calls.append('writer'); e=Endpoint('writer',topic,self,message_type=typ); entities.append(e);return e
         def create_subscription(self,typ,topic,cb,qos,**kw):
             calls.append('reader')
             if fail_reader: raise RuntimeError('fixture_reader_create_failure')
-            e=Endpoint('reader',topic,self,cb);entities.append(e);return e
+            e=Endpoint('reader',topic,self,cb,message_type=typ);entities.append(e);return e
         def rows(self,role):
-            return [SimpleNamespace(node_name=e.node.name,node_namespace='/',topic_type='std_msgs/msg/String',endpoint_gid=bytes.fromhex(e.gid),qos_profile=qos_profile()) for e in entities if e.role==role]
+            return [SimpleNamespace(node_name=e.node.name,node_namespace='/',topic_type='std_msgs/msg/'+e.message_type.__name__,endpoint_gid=bytes.fromhex(e.gid),qos_profile=qos_profile()) for e in entities if e.role==role]
         def get_publishers_info_by_topic(self,topic): return self.rows('writer')
         def get_subscriptions_info_by_topic(self,topic): return self.rows('reader')
         def destroy_publisher(self,e): calls.append('destroy_writer'); entities.remove(e);return not fail_destroy
@@ -72,7 +73,8 @@ def ros_fixture(monkeypatch, commands, fail_reader=False, fail_destroy=False):
     from enum import Enum
     for name,values in [('DurabilityPolicy','VOLATILE TRANSIENT_LOCAL'),('HistoryPolicy','KEEP_LAST KEEP_ALL'),('LivelinessPolicy','AUTOMATIC MANUAL_BY_TOPIC'),('ReliabilityPolicy','RELIABLE BEST_EFFORT')]:
         setattr(modules['rclpy.qos'],name,Enum(name,values))
-    modules['std_msgs.msg'].String=type('String',(),{})
+    from topology_ros_message_fixture import add_generated_message_fixtures
+    add_generated_message_fixtures(modules)
     for k,v in modules.items(): monkeypatch.setitem(sys.modules,k,v)
     activation=ModuleType('r2f.instrumentation.fastdds_peer.activation')
     activation.reference_from_config=lambda cfg:None

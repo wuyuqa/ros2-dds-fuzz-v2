@@ -33,6 +33,9 @@ import traceback
 import uuid
 
 from .environment import REPO, RMW_NAMES, activated_environment, check_environment
+from .topology_message_types import (
+    SUPPORTED_MESSAGE_TYPES, MessageTypeBindingError, RosMessageCodec, message_type_contract,
+)
 
 def _monotonic_clock_identity():
     try:
@@ -664,11 +667,17 @@ def endpoint_expressibility(spec, config):
     if not isinstance(topic, str) or not topic or len(topic) > 256:
         raise TopologyUnsupported("invalid_topic", "nonempty bounded topic required")
     type_name = spec.get("type_name")
-    if type_name != SUPPORTED_MESSAGE_TYPE:
+    if type_name not in SUPPORTED_MESSAGE_TYPES:
         raise TopologyUnsupported(
             "message_type_not_expressible",
-            "this worker constructs only std_msgs/msg/String",
-            details={"type_name": type_name, "supported": SUPPORTED_MESSAGE_TYPE})
+            "message type is outside the explicit topology type set",
+            details={"type_name": type_name, "supported": list(SUPPORTED_MESSAGE_TYPES)})
+    if "filter" in spec and type_name != SUPPORTED_MESSAGE_TYPE:
+        raise TopologyUnsupported("content_filter_message_type_not_expressible",
+                                  "content filters require std_msgs/msg/String.data")
+    if config.get("observation_mode") == "instrumentation" and type_name != SUPPORTED_MESSAGE_TYPE:
+        raise TopologyUnsupported("instrumented_message_type_not_expressible",
+                                  "pinned instrumented take requires std_msgs/msg/String")
     initial_filter = (_initial_content_filter(spec["filter"], role)
                       if "filter" in spec else None)
     qos = spec.get("qos")
@@ -710,6 +719,7 @@ def endpoint_expressibility(spec, config):
         "role": role,
         "topic": topic,
         "type_name": type_name,
+        "message_type_support": message_type_contract(type_name),
         "requested_qos": deepcopy(qos),
         "public_api_qos": dict(public_qos),
         "api_fields": sorted(public_qos),
@@ -1359,6 +1369,8 @@ def _worker_main(argv, group_owner=None):
         reference_from_config, manifest_for_reference, verify_vendor_mapping,
     )
     instrumentation = reference_from_config(config)
+    if instrumentation is not None and config["type_name"] != SUPPORTED_MESSAGE_TYPE:
+        raise TopologyUnsupported("instrumented_message_type_not_expressible")
     import rclpy
     from rclpy.context import Context
     from rclpy.executors import SingleThreadedExecutor
@@ -1368,7 +1380,6 @@ def _worker_main(argv, group_owner=None):
         PublisherEventCallbacks = SubscriptionEventCallbacks = UnsupportedEventTypeError = None
     from rclpy.node import Node
     from rclpy.qos import QoSProfile
-    from std_msgs.msg import String
 
     if group_owner is None:
         context = Context()
@@ -1388,7 +1399,11 @@ def _worker_main(argv, group_owner=None):
         node = Node(node_name, context=context, enable_rosout=False, start_parameter_services=False)
         take_capability = {"status": "unavailable", "reason": "unsupported_rmw_identifier",
                            "original_rclpy_dict_provided_gid": False}
-        if kind == "reader" and rmw_identifier == "rmw_fastrtps_cpp":
+        if kind == "reader" and config["type_name"] != SUPPORTED_MESSAGE_TYPE:
+            take_capability = {"status": "unavailable", "reason": "native_take_message_type_not_supported",
+                               "original_rclpy_dict_provided_gid": False}
+        if (kind == "reader" and rmw_identifier == "rmw_fastrtps_cpp"
+                and config["type_name"] == SUPPORTED_MESSAGE_TYPE):
             from .rcl_take_bridge import make_full_info_executor, BridgeUnavailable
             try:
                 executor = make_full_info_executor(context=context, rmw_identifier=rmw_identifier,
@@ -1474,8 +1489,9 @@ def _worker_main(argv, group_owner=None):
         nonlocal receive_sequence
         receive_sequence += 1
         body = None
+        sample = codec.sample_fields(message, capture_stage="callback_reserialization")
         try:
-            body = json.loads(message.data)
+            body = json.loads(sample["payload_text"])
         except (ValueError, TypeError):
             body = None
         get = info.get if isinstance(info, dict) else lambda key: getattr(info, key, None)
@@ -1494,8 +1510,7 @@ def _worker_main(argv, group_owner=None):
             publisher_gid_status=(get("publisher_gid_status") or
                                   ("available" if publisher_gid is not None else "unavailable_api")),
             identity_basis="message_info_gid" if publisher_gid is not None else "endpoint_correlated",
-            payload_sha256=__import__("hashlib").sha256(message.data.encode()).hexdigest(),
-            string_data=message.data,
+            **sample,
             payload_run_id=body.get("run_id") if isinstance(body, dict) else None,
             payload_writer_id=body.get("writer_id") if isinstance(body, dict) else None,
             payload_writer_generation=body.get("writer_generation") if isinstance(body, dict) else None,
@@ -1519,15 +1534,24 @@ def _worker_main(argv, group_owner=None):
         publish_observer = PublishOccurrenceObserver(emit, rmw_identifier)
     endpoint_creation_returned = False
     try:
+        try:
+            codec = RosMessageCodec(config["type_name"])
+        except MessageTypeBindingError as exc:
+            emit("topology_message_type_support",
+                 status="unsupported" if exc.code == "message_type_support_unavailable" else "binding_error",
+                 reason=exc.code,
+                 detail=str(exc), attribution="binding_adapter", candidate_eligible=False)
+            raise TopologyUnsupported(exc.code, str(exc)) from exc
+        emit("topology_message_type_support", **codec.support_receipt)
         create_begin = emit("endpoint_create_begin", topic=config["topic"],
                             qos=config["qos"], message_type=config["type_name"])
         filter_configuration = None
         def create_endpoint():
             if kind == "writer":
-                return node.create_publisher(String, config["topic"], qos, **(
+                return node.create_publisher(codec.message_class, config["topic"], qos, **(
                     {"event_callbacks": callbacks} if callbacks is not None else {})), None
             return _create_reader_with_initial_filter(
-                node, String, config["topic"], receive, qos,
+                node, codec.message_class, config["topic"], receive, qos,
                 config.get("initial_content_filter"), emit=emit, event_callbacks=callbacks)
         liveliness.create_begin_ns = time.monotonic_ns()
         endpoint, filter_configuration = _create_with_liveliness_audit(
@@ -1798,6 +1822,10 @@ def _worker_main(argv, group_owner=None):
                 emit("graph_snapshot", command_id=command_id, **graph())
                 emit("command_done", command_id=command_id)
             elif command["command"] == "update_filter" and kind == "reader":
+                if config["type_name"] != SUPPORTED_MESSAGE_TYPE:
+                    emit("worker_command_error", command_id=command_id,
+                         error="content_filter_message_type_not_expressible")
+                    continue
                 local_gid, incarnation_ordinal = _update_filter_identity(
                     endpoint, lambda: graph(authenticate=False), node_name, local_gid,
                     incarnation_ordinal, command, emit, state_observer=_observe_filter_state)
@@ -1830,6 +1858,10 @@ def _worker_main(argv, group_owner=None):
                 if repeat_data is not None and (not isinstance(repeat_data, str) or len(sequences) != 1):
                     emit("worker_command_error", command_id=command_id, error="invalid_repeat_data")
                     continue
+                if repeat_data is not None and config["type_name"] != SUPPORTED_MESSAGE_TYPE:
+                    emit("worker_command_error", command_id=command_id,
+                         error="repeat_string_data_message_type_not_expressible")
+                    continue
                 for index, sequence in enumerate(sequences):
                     body = {
                         "run_id": config["run_id"], "send_sequence": sequence,
@@ -1840,8 +1872,9 @@ def _worker_main(argv, group_owner=None):
                     if payload is not None:
                         body["declared_payload"] = payload
                         body["declared_payload_sha256"] = _sha256_text(payload)
-                    message = String()
-                    message.data = repeat_data if repeat_data is not None else json.dumps(body, sort_keys=True)
+                    message = codec.make_message(
+                        repeat_data if repeat_data is not None else json.dumps(body, sort_keys=True))
+                    sample = codec.sample_fields(message, capture_stage="pre_publish")
                     publish_begin_ns = time.monotonic_ns()
                     occurrence = publish_observer.publish(
                         endpoint, message, command_id=command_id,
@@ -1852,7 +1885,7 @@ def _worker_main(argv, group_owner=None):
                     emit("send", **native_receipt,
                          publish_begin_ns=publish_begin_ns, publish_return_ns=publish_return_ns, send_sequence=sequence, phase=phase,
                          writer_gid=local_gid, publish_returned=True,
-                         payload_sha256=_sha256_text(message.data), string_data=message.data,
+                         **sample,
                          declared_payload_sha256=body.get("declared_payload_sha256"),
                          command_id=command_id, burst=True)
                     if interval and index + 1 < len(sequences):
@@ -2603,6 +2636,10 @@ class OfflineTopologyBackend:
             if repeat_string_data is not None:
                 body = json.loads(string_data)
             payload_sha256 = _sha256_text(string_data)
+            sample = {"payload_sha256": payload_sha256, "string_data": string_data}
+            if handle["type_name"] == "std_msgs/msg/UInt8MultiArray":
+                sample.update(string_data=None, payload_text=string_data,
+                              message_type=handle["type_name"])
             publish_begin_ns = time.monotonic_ns()
             publish_return_ns = time.monotonic_ns()  # simulated, not DDS
             self._emit("send", publish_begin_ns=publish_begin_ns, publish_return_ns=publish_return_ns, logical_id=handle["logical_id"],
@@ -2610,7 +2647,7 @@ class OfflineTopologyBackend:
                        worker_role=handle["worker_role"], endpoint_gid=handle["endpoint_gid"],
                        writer_gid=handle["endpoint_gid"], send_sequence=sequence,
                        phase=phase, publish_returned=True, command_id=command_id,
-                       burst=True, payload_sha256=payload_sha256, string_data=string_data,
+                       burst=True, **sample,
                        pid=handle["pid"], pgid=handle["pgid"],
                        process_start_ticks=handle["process_start_ticks"],
                        endpoint_generation=handle["endpoint_generation"],
@@ -2633,7 +2670,7 @@ class OfflineTopologyBackend:
                             pid=reader["pid"], pgid=reader["pgid"],
                             process_start_ticks=reader["process_start_ticks"],
                             endpoint_generation=reader["endpoint_generation"],
-                            payload_sha256=payload_sha256, string_data=string_data,
+                            **sample,
                             payload_writer_id=body["writer_id"],
                             payload_writer_generation=body["writer_generation"],
                             payload_endpoint_gid=body["endpoint_gid"],

@@ -27,6 +27,7 @@ import time
 from r2f.modules.s1 import topology_model as model
 
 from .domains import IsolationError
+from .topology_message_types import SUPPORTED_MESSAGE_TYPES
 from .endpoint_incarnation import endpoint_identity_at, validate_filter_identity_update
 from .topology_environment_observation import TopologyEnvironmentObservation
 
@@ -2089,7 +2090,14 @@ def topology_capabilities(backend=None):
         "publish_batch_without_per_sample_ack": True,
         "bounded_barrier": True,
         "assert_liveliness_public_api": bool(getattr(backend, "supports_assert_liveliness", False)),
-        "supported_message_types": ["std_msgs/msg/String"],
+        "supported_message_types": list(SUPPORTED_MESSAGE_TYPES),
+        "message_type_scopes": {
+            "endpoint_process_blackbox": list(SUPPORTED_MESSAGE_TYPES),
+            "participant_control": ["std_msgs/msg/String"],
+            "instrumentation": ["std_msgs/msg/String"],
+            "content_filter": ["std_msgs/msg/String"],
+            "native_full_message_info_take": ["std_msgs/msg/String"],
+        },
         "supported_bypass_fields": {"content_filter": initial_content_filter_capability(),
                                     "ownership_non_shared": False,
                                     "partitions_non_default": False,

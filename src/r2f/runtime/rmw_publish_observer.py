@@ -190,7 +190,7 @@ class PublishOccurrenceObserver:
 
     def publish(self, endpoint, message, *, command_id, send_sequence, writer_gid):
         data = message.data
-        payload_sha256 = hashlib.sha256(data.encode()).hexdigest()
+        payload_sha256 = hashlib.sha256(data.encode('utf-8') if isinstance(data, str) else bytes(data)).hexdigest()
         call_id = uuid.uuid4().hex
         common = {'call_id': call_id, 'command_id': command_id, 'send_sequence': send_sequence,
                   'writer_gid': writer_gid, 'endpoint_gid': writer_gid,
@@ -226,7 +226,7 @@ class PublishOccurrenceObserver:
             returned = False
             error_type = None
             try:
-                # This is the original public API, exactly once, with unchanged String.data.
+                # This is the original public API, exactly once, with unchanged message data.
                 endpoint.publish(message)
                 returned = True
             except BaseException as exc:

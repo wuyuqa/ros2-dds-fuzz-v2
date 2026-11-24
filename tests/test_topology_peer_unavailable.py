@@ -53,7 +53,8 @@ def snapshot_worker(monkeypatch):
                     SimpleNamespace(**{member: policy(member) for member in members}))
         modules["rclpy.qos"].QoSProfile = lambda **kwargs: SimpleNamespace(**kwargs)
         modules["rclpy.duration"].Duration = lambda **kwargs: SimpleNamespace(**kwargs)
-        modules["std_msgs.msg"].String = type("OfflineString", (), {})
+        from topology_ros_message_fixture import add_generated_message_fixtures
+        add_generated_message_fixtures(modules)
         modules["r2f.runtime.actual_qos"].read_public_endpoint_qos = lambda *_: {
             "qos": deepcopy(QOS), "status": "fixture_not_actual_readback",
             "fixture": True, "execution_evidence": False}
