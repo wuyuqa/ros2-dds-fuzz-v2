@@ -168,3 +168,78 @@ def _validate(data):
                 "required target revision drift")
     require(data["required_baseline"]["cell_count"] == 72
             and len(data["required_baseline"]["target_revisions"]) == 4, "required baseline count")
+    _validate_lifecycle_calibration(data)
+
+
+def _validate_lifecycle_calibration(data):
+    """Keep the source-case contract contextual, referenceable and unqualified."""
+    def require(condition, reason):
+        if not condition:
+            raise ValueError("invalid S1 coverage lineage: lifecycle calibration: " + reason)
+
+    cases = [row for row in data["cases"] if row["case_id"] == "Fast-DDS-issue3770"]
+    require(len(cases) == 1, "source case missing")
+    case = cases[0]
+    calibration = case.get("lifecycle_calibration")
+    require(isinstance(calibration, dict), "contract missing")
+    require(calibration.get("schema") == "r2f.s1-lifecycle-calibration/v1"
+            and calibration.get("checkpoint") == "source_lifecycle_obligations"
+            and calibration.get("status") == "requirements_identified_not_validated",
+            "unsupported contract scope")
+    require(calibration.get("execution_evidence") is False
+            and calibration.get("maturity_evidence") is False
+            and type(calibration.get("new_discovery_credit")) is int
+            and calibration["new_discovery_credit"] == 0, "contract cannot grant credit")
+    require(set(calibration["obligation_ids"]) == {"C01", "C02", "C06", "C08", "C16"}
+            and set(calibration["story_ids"]) == {1, 5, 8, 14, 20, 21, 37}
+            and set(calibration["test_ids"]) == {"T08", "T09", "T11"}, "spec mapping drift")
+    requirements = calibration["requirements"]
+    expected = {"proxy_lifetime", "entity_incarnation", "independent_observation",
+                "normal_and_observer_controls", "historical_comparison"}
+    require(len(requirements) == len(expected)
+            and {row["id"] for row in requirements} == expected, "lifecycle requirement missing or repeated")
+    for row in requirements:
+        require(row["obligation_ids"] and set(row["obligation_ids"]) <= set(calibration["obligation_ids"]),
+                "unknown requirement obligation")
+        require(row.get("current_source_status") == "unverified" and row.get("named_gaps")
+                and row.get("statement") and row.get("evidence_required") and row.get("source_refs"),
+                "requirements need evidence and named gaps, not completion labels")
+    binding = {"source_repo", "head", "behavior_tree_sha256", "target_id", "target_revision",
+               "input_sha256", "run_id", "rmw", "repeat", "domain_id", "observation_mode",
+               "vendor_version", "build_manifest_sha256", "binary_sha256", "logical_id",
+               "participant_guid", "endpoint_gid", "generation", "pid", "process_start_ticks",
+               "event_index", "raw_path", "raw_sha256"}
+    require(binding <= set(calibration["execution_binding_required"]), "execution or entity binding missing")
+    historical = calibration["historical_comparison"]
+    require(isinstance(historical, dict), "malformed historical comparison")
+    require(historical.get("status") == "proposed_not_executed"
+            and historical.get("reported_version_is_exact_pre") is False
+            and historical.get("pre") == case["fix"]["recommended_exact_pre"]
+            == case["proposed_pre_post"]["pre"]
+            and historical.get("post") == case["fix"]["recommended_exact_post"]
+            == case["proposed_pre_post"]["post"], "exact pre/post or historical status drift")
+    require(historical.get("pre_source_ref") == {
+                "artifact_id": "Fast-DDS-4220-merge.json", "json_pointer": "/parents/0/sha"}
+            and historical.get("post_source_ref") == {
+                "artifact_id": "Fast-DDS-4220-merge.json", "json_pointer": "/sha"},
+            "exact pre/post need commit-parent source references")
+    refs = [historical["pre_source_ref"], historical["post_source_ref"]]
+    refs.extend(ref for row in requirements for ref in row["source_refs"])
+    for ref in refs:
+        require(isinstance(ref, dict), "malformed source reference")
+        source = data["source_captures"].get(ref.get("artifact_id"))
+        require(source is not None and source.get("format") == "json"
+                and source.get("verification_scope") == "captured_artifact_only"
+                and isinstance(ref.get("json_pointer"), str) and ref["json_pointer"].startswith("/"),
+                "uncaptured source reference")
+    policy = calibration["assessment_policy"]
+    require(isinstance(policy, dict), "malformed assessment policy")
+    require(policy.get("missing_observation") == "unknown"
+            and policy.get("internal_race_status") == "not_observed"
+            and policy.get("historical_reproduction_status") == "unverified"
+            and policy.get("candidate_interface") == "existing_common_anomaly_replay_review"
+            and policy.get("tool_or_control_result") == "not_natural_sut_candidate"
+            and type(policy.get("historical_discovery_credit")) is int
+            and policy["historical_discovery_credit"] == 0
+            and policy.get("user_confirmation_required_for_new_root") is True,
+            "knowledge contract cannot qualify observations or discoveries")
