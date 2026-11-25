@@ -57,6 +57,7 @@ _ACTION_PARAMS = {
     "update_filter": ({"expression", "parameters"}, set()),
     "snapshot": (set(), {"label", "timeout_sec"}),
     "lookup_topic": ({"scope", "name"}, set()),
+    "update_participant_userdata": ({"data"}, set()),
     "barrier": ({"condition", "timeout_sec"}, {"endpoint_ids", "publish_action_ids"}),
 }
 MUTATORS = (
@@ -77,6 +78,15 @@ def _hash(value):
 
 def _text(value, *, empty=False, limit=256):
     return isinstance(value, str) and (empty or bool(value)) and len(value) <= limit
+
+
+def _userdata(value):
+    if not _text(value, limit=256) or "\x00" in value:
+        return False
+    try:
+        return len(value.encode("utf-8")) <= 256
+    except UnicodeError:
+        return False
 
 
 def _int(value, lower, upper):
@@ -293,6 +303,9 @@ def _shape(program):
                 _error(errors, f"{path}.params.repeat_data_from", "value", "single sample and prior action id required; payload prohibited")
             if "payload" in p and not _text(p["payload"], empty=True, limit=1024):
                 _error(errors, f"{path}.params.payload", "value", "bounded payload text required")
+        if op == "update_participant_userdata":
+            if not _userdata(p["data"]):
+                _error(errors, f"{path}.params.data", "value", "1..256 UTF-8 bytes without NUL required")
         if op == "lookup_topic":
             if p["scope"] not in ("participant", "local_domain", "global"):
                 _error(errors, f"{path}.params.scope", "value", "unknown native lookup scope")
@@ -432,7 +445,7 @@ def _evaluate(program, count=None):
                              _require("filter_validity", env.get("filter_validity"), kind="environment", rule="filter")]
         if op == "update_filter":
             requires += [_require("reader_role", ep["role"] == "reader")]
-        if op in ("publish_batch", "assert_liveliness"):
+        if op in ("publish_batch", "assert_liveliness", "update_participant_userdata"):
             requires += [_require("writer_role", ep["role"] == "writer")]
         if op == "publish_batch":
             requires += [_require("nonoverlapping_writer_generation_sequence",
@@ -451,6 +464,8 @@ def _evaluate(program, count=None):
             for target in p.get("endpoint_ids", []):
                 requires.append(_require("barrier_endpoint_alive:" + target, states[target]["alive"]))
             requires.append(_require("runtime_barrier:" + p["condition"], None, kind="observation"))
+        if op == "update_participant_userdata":
+            requires.append(_require("runtime_normal_participant_refresh", None, kind="observation"))
         if op == "lookup_topic":
             requires.append(_require("runtime_typed_topic_lookup", None, kind="observation"))
         if op == "snapshot":

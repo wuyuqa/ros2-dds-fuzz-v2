@@ -31,7 +31,7 @@ SYMBOLS=(
  '_ZN8eprosima8fastrtps4rtps20ParticipantProxyDataC2ERKS2_')
 
 
-def no_dds_probe(binary, vendor):
+def no_dds_probe(binary, vendor, refresh_binary=None):
     C.CDLL(str(vendor),mode=os.RTLD_GLOBAL|os.RTLD_NOW)
     library=C.CDLL(str(binary),mode=os.RTLD_LOCAL|os.RTLD_NOW)
     need(C.sizeof(Record)==96 and C.sizeof(Stats)==48,'probe_python_abi_mismatch')
@@ -41,7 +41,20 @@ def no_dds_probe(binary, vendor):
     value=Stats();need(stats(C.byref(value),48)==0 and value.schema_version==1 and value.struct_size==48
                       and value.produced==value.pending==value.dropped==value.consumed==value.resolve_errors==0,
                       'probe_stats_invalid')
-    return dict(status='passed',dds_entities_created=False,abi=ABI)
+    if refresh_binary is not None:
+        from .refresh import RefreshResult
+        control=C.CDLL(str(refresh_binary),mode=os.RTLD_LOCAL|os.RTLD_NOW)
+        function=control.r2f_fastdds_participant_refresh_writer_v1
+        function.argtypes=[C.c_void_p,C.POINTER(C.c_uint8),C.c_uint32,C.POINTER(RefreshResult),C.c_uint32]
+        function.restype=C.c_int32
+        result=RefreshResult()
+        need(C.sizeof(result)==576 and function(None,None,0,None,576)==-1
+             and function(None,None,0,C.byref(result),575)==-1
+             and function(None,None,0,C.byref(result),576)==1
+             and result.schema_version==1 and result.struct_size==576 and result.complete==0,
+             'refresh_control_no_dds_abi_invalid')
+    return dict(status='passed',dds_entities_created=False,abi=ABI,
+                refresh_control_abi='passed' if refresh_binary is not None else 'not_selected')
 
 
 def run_build(peer_manifest, expected, root):
@@ -84,14 +97,27 @@ def run_build(peer_manifest, expected, root):
         receipt['environment']={k:env[k] for k in ('PATH','LD_LIBRARY_PATH','PYTHONPATH','R2F_FASTDDS_PDP_TRACE_ENABLED')}
         execute('trace-build',command,env,reference['directory']);receipt['verification']['compilation']='passed'
         receipt['binary']=dict(path=str(output),sha256=digest(output))
+        # A separate opt-in normal-input carrier, never preloaded by the observer.
+        refresh=Path(__file__).with_name('refresh.cpp');refresh_snapshot=root/'refresh.cpp'
+        refresh_snapshot.write_bytes(refresh.read_bytes())
+        refresh_output=install/'lib/libr2f_fastdds_participant_refresh.so'
+        refresh_exports=root/'refresh-exports.map'
+        refresh_exports.write_text('{ global: r2f_fastdds_participant_refresh_writer_v1; local: *; };\n')
+        refresh_command,_=trace_command(build,peer['binaries']['vendor']['path'],refresh_snapshot,refresh_output,refresh_exports)
+        execute('refresh-control-build',refresh_command,env,reference['directory'])
+        receipt['refresh_control']=dict(schema='r2f.fastdds-participant-refresh-build/v1',
+            source_sha256=digest(refresh_snapshot),binary=dict(path=str(refresh_output),sha256=digest(refresh_output)),
+            abi_size=576,compilation='passed',scope='explicit_normal_public_userdata_input_control_not_passive_observer')
+
         execute('no-dds-abi',[sys.executable,'-m',__package__+'.build','--probe','--binary',output,
-                              '--vendor',peer['binaries']['vendor']['path']],env,root)
+                              '--vendor',peer['binaries']['vendor']['path'],'--refresh-binary',refresh_output],env,root)
         receipt['no_dds_probe']=json.loads((root/'no-dds-abi.log').read_text())
         need(receipt['no_dds_probe'].get('status')=='passed','no_dds_probe_failed')
         receipt['verification']['no_dds_abi']='passed'
         need(validate_manifest(peer_path,expected)==peer and tree_identity(source)==peer['source_frozen'],
              'peer_identity_changed_during_build')
-        need(digest(hook)==receipt['hook_source_sha256'] and digest(__file__)==receipt['builder_source_sha256'],
+        need(digest(hook)==receipt['hook_source_sha256'] and digest(__file__)==receipt['builder_source_sha256']
+             and digest(refresh)==receipt['refresh_control']['source_sha256'],
              'observer_source_changed_during_build')
         receipt.update(status='built',actual_interposition_verified=False)
         for mode in ('on','off'):
@@ -108,9 +134,9 @@ def run_build(peer_manifest, expected, root):
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--peer-manifest');parser.add_argument('--peer-manifest-sha256');parser.add_argument('--root')
-    parser.add_argument('--probe',action='store_true');parser.add_argument('--binary');parser.add_argument('--vendor')
+    parser.add_argument('--probe',action='store_true');parser.add_argument('--binary');parser.add_argument('--vendor');parser.add_argument('--refresh-binary')
     args=parser.parse_args()
-    if args.probe:result=no_dds_probe(args.binary,args.vendor)
+    if args.probe:result=no_dds_probe(args.binary,args.vendor,args.refresh_binary)
     else:result={'manifest_path':str(run_build(args.peer_manifest,args.peer_manifest_sha256,args.root))}
     print(json.dumps(result))
 

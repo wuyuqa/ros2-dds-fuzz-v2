@@ -1757,8 +1757,30 @@ def continuous_episode_program():
     return program
 
 
+PARTICIPANT_REFRESH_EPISODE_SEED = "topology.participant_refresh_episode"
+
+
+def participant_refresh_episode_program():
+    """Normal opt-in input control, not an observer side effect or discovery."""
+    program = continuous_episode_program()
+    actions = []
+    for item in program["actions"]:
+        actions.append(item)
+        if item["op"] == "barrier" and item["params"].get("condition") == "matched":
+            generation = 1 if item["action_id"] == "matched_1" else 2
+            actions.append(topology_model._action(
+                f"participant_refresh_{generation}", "update_participant_userdata", "w0", generation,
+                {"data": f"issue14-normal-participant-userdata-g{generation}"}))
+    for previous, current in zip(actions, actions[1:]):
+        current["depends_on"] = [previous["action_id"]]
+    program["actions"] = actions
+    if topology_model.validate_program(program)["status"] != "valid":
+        raise ValueError("participant refresh seed violated topology contract")
+    return program
+
+
 def corpus_v2(*, include_catalog=True, seed=0, include_concurrent=False, include_cft_matrix=False,
-              include_episode=False):
+              include_episode=False, include_participant_refresh=False):
     """Offline seed corpus: legal, boundary, environment and guard seeds.
 
     The manifest separates ``authored`` entries from ``pending`` runtime
@@ -1769,6 +1791,8 @@ def corpus_v2(*, include_catalog=True, seed=0, include_concurrent=False, include
     """
     if type(include_episode) is not bool:
         raise ValueError("include_episode must be bool")
+    if type(include_participant_refresh) is not bool:
+        raise ValueError("include_participant_refresh must be bool")
     entries, manifest = [], []
     for kind in ("empty_roles", "writer_only", "reader_only", "multi_endpoint"):
         document = _topology_edge_program(kind)
@@ -1805,6 +1829,15 @@ def corpus_v2(*, include_catalog=True, seed=0, include_concurrent=False, include
         entries.append(entry)
         manifest.append({"seed_id": entry["seed_id"], "surface_id": "S1.topology",
             "status": "authored", "kind": "continuous_episode",
+            "expected_disposition": "expect_pass", "content_sha256": entry["content_sha256"]})
+
+    if include_participant_refresh:
+        entry = _seed_entry("S1.topology", PARTICIPANT_REFRESH_EPISODE_SEED,
+            participant_refresh_episode_program(), "normal_participant_userdata_control", "expect_pass",
+            "authored deterministic normal public Fast DDS participant user_data update; no natural candidate credit")
+        entries.append(entry)
+        manifest.append({"seed_id": entry["seed_id"], "surface_id": "S1.topology",
+            "status": "authored", "kind": "normal_participant_userdata_control",
             "expected_disposition": "expect_pass", "content_sha256": entry["content_sha256"]})
 
     if include_cft_matrix:

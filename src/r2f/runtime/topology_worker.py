@@ -1818,6 +1818,17 @@ def _worker_main(argv, group_owner=None):
                     raise TopologyBackendError("topic_lookup_cleanup_unconfirmed")
                 emit("command_done", command_id=command_id)
                 continue
+            if command["command"] == "refresh_participant" and kind == "writer":
+                from r2f.instrumentation.fastdds_pdp_trace.refresh import refresh_participant
+                if rmw_identifier == "rmw_fastrtps_cpp" and instrumentation is not None:
+                    from .fastdds_peer_observer import FastddsMatchedPeerObserver
+                    if native_peer_observer is None:
+                        native_peer_observer = FastddsMatchedPeerObserver(endpoint, instrumentation=instrumentation)
+                receipt = refresh_participant(native_peer_observer, config["domain_id"], local_gid, command.get("data"))
+                emit("participant_refresh_result", command_id=command_id, endpoint_gid=local_gid,
+                     candidate_eligible=False, refresh_receipt=receipt)
+                emit("command_done", command_id=command_id, endpoint_gid=local_gid)
+                continue
             if command["command"] == "snapshot":
                 count_api = (endpoint.get_subscription_count if kind == "writer"
                              else endpoint.get_publisher_count)
@@ -2369,16 +2380,18 @@ class _EndpointProcess:
             self.emit("topology_snapshot_requested", command="snapshot", command_id=command_id,
                       **identity)
         data = (json.dumps(payload) + "\n").encode()
-        audit = command == "assert_liveliness"
+        audit = command in {"assert_liveliness", "refresh_participant"}
+        audit_prefix = "topology_participant_refresh" if command == "refresh_participant" else "topology_assert_liveliness"
         if audit:
             created = next((e for e in reversed(self.events) if e.get("event") == "endpoint_created"
                             and all(e.get(k) == fields[k] for k in ('logical_id', 'generation', 'endpoint_generation') if k in fields)), {})
             identity = {k: created.get(k) for k in ("logical_id", "generation", "endpoint_gid", "pid", "process_start_ticks", "endpoint_generation", "run_id")}
             identity["worker_role"] = self.role
             identity["worker_generation"] = self.config.get("generation")
-            self.emit("topology_assert_liveliness_requested", command=command, command_id=command_id,
+            self.emit(audit_prefix + "_requested", command=command, command_id=command_id,
                       request_monotonic_ns=time.monotonic_ns(),
-                      request_clock_identity=_monotonic_clock_identity(), **identity)
+                      request_clock_identity=_monotonic_clock_identity(),
+                      **({"requested_data": fields.get("data")} if command == "refresh_participant" else {}), **identity)
         written = None
         try:
             written = self.process.stdin.write(data)
@@ -2387,13 +2400,13 @@ class _EndpointProcess:
             self.process.stdin.flush()
         except (BrokenPipeError, OSError, ValueError) as exc:
             if audit:
-                self.emit("topology_assert_liveliness_write_result", command=command, command_id=command_id,
+                self.emit(audit_prefix + "_write_result", command=command, command_id=command_id,
                           status="failed", bytes_written=written, bytes_expected=len(data),
                           error_type=type(exc).__name__, result_monotonic_ns=time.monotonic_ns(),
                           result_clock_identity=_monotonic_clock_identity(), **identity)
             raise TopologyBackendError("worker_pipe_closed:" + self.role) from exc
         if audit:
-            self.emit("topology_assert_liveliness_write_result", command=command, command_id=command_id,
+            self.emit(audit_prefix + "_write_result", command=command, command_id=command_id,
                       status="flushed", bytes_written=written, bytes_expected=len(data), error_type=None,
                       result_monotonic_ns=time.monotonic_ns(),
                       result_clock_identity=_monotonic_clock_identity(), **identity)
@@ -2823,6 +2836,12 @@ class OfflineTopologyBackend:
         receipt = lookup_receipt(scope, name, reason="offline_fixture_no_native_topic_lookup")
         return receipt
 
+    def refresh_participant(self, handle, data):
+        return {"schema": "r2f.fastdds-participant-refresh/v1", "status": "unsupported",
+                "complete": False, "requested_data": data,
+                "reason": "offline_fixture_no_native_participant_refresh",
+                "candidate_eligible": False, "execution_evidence": False}
+
     def assert_liveliness(self, handle):
         if self.closed:
             raise TopologyBackendError("backend_closed")
@@ -3197,14 +3216,14 @@ class RosTopologyBackend:
         return {"cleanup_status": "closed" if receipt.get("closed") else "unknown",
                 "returncode": receipt.get("returncode"), **identity}
 
-    def _batch(self, handle, command, **fields):
+    def _batch(self, handle, command, *, _timeout_sec=None, **fields):
         process = handle["process"]
         address = ({k: handle[k] for k in ('logical_id', 'generation', 'endpoint_generation')}
                    if self.group_program is not None else {})
         command_id = process.command(command, **address, **fields)
         try:
             process.wait(lambda: process.has("command_done", command_id=command_id),
-                         float(self.config.get("publish_timeout_sec", 10.0)),
+                         float(self.config.get("publish_timeout_sec", 10.0) if _timeout_sec is None else _timeout_sec),
                          "topology_" + command + ":" + handle["logical_id"])
         except TopologyBackendError as exc:
             if isinstance(exc, TopologyBackendTimeout):
@@ -3439,6 +3458,21 @@ class RosTopologyBackend:
                 or row.get("run_id") != self.config["run_id"]):
             raise TopologyBackendError("topic_lookup_request_binding_mismatch")
         value.update(command_id=command_id, worker_identity={key: row[key] for key in keys})
+        return value
+
+    def refresh_participant(self, handle, data):
+        command_id = self._batch(handle, "refresh_participant", data=data, _timeout_sec=30.0)
+        events = handle["process"].events
+        rows = [row for row in events if row.get("event") == "participant_refresh_result" and row.get("command_id") == command_id]
+        acks = [row for row in events if row.get("event") == "command_done" and row.get("command_id") == command_id]
+        keys = ("logical_id", "generation", "endpoint_generation", "endpoint_gid", "pid", "pgid", "process_start_ticks")
+        if (len(rows) != 1 or len(acks) != 1 or any(row.get(key) != handle.get(key) for row in rows+acks for key in keys)
+                or events.index(rows[0]) >= events.index(acks[0])):
+            raise TopologyBackendError("participant_refresh_identity_or_ack_mismatch")
+        value = deepcopy(rows[0]["refresh_receipt"])
+        if value.get("requested_data") != data or rows[0].get("run_id") != self.config["run_id"]:
+            raise TopologyBackendError("participant_refresh_request_binding_mismatch")
+        value.update(command_id=command_id, worker_identity={key: rows[0][key] for key in keys})
         return value
 
     def assert_liveliness(self, handle):

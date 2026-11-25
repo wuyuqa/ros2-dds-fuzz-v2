@@ -175,6 +175,8 @@ class _Audit:
         _require(config.get("final_input") == self.plan.final_config
                  and set(self.plan.final_config) == {"topology_program"}, "final_program_mismatch")
         self.program = self.plan.final_config["topology_program"]
+        from r2f.instrumentation.fastdds_pdp_trace.refresh import validate_declarations
+        validate_declarations(self.events, self.program, self.native_peer_reference)
         self.program_sha = canonical_hash(self.program)
         binding = _one(self.events, "input_binding")
         self.binding = binding
@@ -544,6 +546,13 @@ class _Audit:
                          and receipt["after"] == {**receipt["before"], "filter_update_raw_ref": evidence["update_ref"]}
                          and evidence["update_ref"] < after["event_index"],
                          "action_filter_after_state_mismatch")
+            elif op == "update_participant_userdata":
+                _require(self.specs[action["endpoint_id"]].get("role") == "writer"
+                         and receipt["before"].get("alive") is True
+                         and receipt["before"].get("generation") == action["generation"],
+                         "action_refresh_requires_current_live_writer")
+                from r2f.instrumentation.fastdds_pdp_trace.refresh import validate_action
+                validate_action(self.events, action, receipt, begin, done, self.native_peer_reference, raw_path=self.path)
             elif op == "assert_liveliness":
                 _require(self.specs[action["endpoint_id"]].get("role") == "writer",
                          "action_assert_requires_writer")
@@ -1449,8 +1458,13 @@ def facts_from_events(events, runtime, config, *, capture_source=None):
     pdp_control = isinstance(events, list) and any(
         isinstance(event, dict) and event.get("event") == "native_pdp_provider_selected"
         and event.get("capture_enabled") is False for event in events)
+    refresh_control = (isinstance(events, list) and any(
+        isinstance(event, dict) and event.get("event") in {"participant_refresh_observation", "participant_refresh_result"} for event in events))
+    refresh_control = refresh_control or (isinstance(config.get("topology_program"), dict) and any(
+        isinstance(action, dict) and action.get("op") == "update_participant_userdata"
+        for action in config["topology_program"].get("actions", [])))
     facts = {"schema": SCHEMA, "producer_id": TOPOLOGY_FACT_PRODUCER, "target_id": TOPOLOGY_TARGET,
-             "control_excluded": pdp_control,
+             "control_excluded": pdp_control or refresh_control,
              "environment_healthy": False, "process_healthy": False, "preconditions_reached": False,
              "endpoint_identity_complete": False, "observed_effects": [], "candidate_eligible": False,
              "seal_eligible": False, "execution_evidence": False, "diagnostic_valid": False,
@@ -1464,7 +1478,7 @@ def facts_from_events(events, runtime, config, *, capture_source=None):
                 facts["observe_native_peers"] = config["observe_native_peers"]
         facts.update(raw={"path": a.path, "sha256": a.sha}, program_sha256=a.program_sha,
                      plan_hash=a.plan.plan_hash(), fixture=a.fixture, arm=config.get("arm"),
-                     control_excluded=(pdp_control or config.get("observe_native_peers") is False
+                     control_excluded=(pdp_control or refresh_control or config.get("observe_native_peers") is False
                         or config.get("arm") == "negative" or bool(config.get("control_kind"))
                         or config.get("candidate_source") == "control"
                         or any(e["event"] in {"fault_control_receipt", "harness_omission", "topology_guard_reject"} for e in a.events)),

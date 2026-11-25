@@ -3619,6 +3619,27 @@ def run_topology(program, config, output_dir, *, backend=None):
                                                real_ros=bool(backend.real_ros)),
                                 _PAIR_KEY)
                     return
+                if op == "update_participant_userdata":
+                    st = state[eid]
+                    if not (st["alive"] and st["generation"] == gen and endpoint_specs[eid]["role"] == "writer"):
+                        record_guard(action, "writer_generation_alive_guard",
+                                     "participant refresh requires a live writer generation", before=before)
+                        return
+                    try:
+                        value = backend.refresh_participant(st["handle"], params["data"])
+                    except TopologyBackendError as exc:
+                        record_guard(action, "participant_refresh_error", str(exc), kind="tool", before=before)
+                        return
+                    emit("participant_refresh_observation", logical_id=eid, generation=gen,
+                         action_id=aid, refresh_receipt=value, candidate_eligible=False)
+                    complete = value.get("complete") is True and value.get("status") == "applied"
+                    record_action(action, before, {**before, "participant_refresh": value},
+                                  disposition="effect_observed" if complete else "unknown", satisfied=complete,
+                                  effect_scope="normal_public_participant_userdata_control_only",
+                                  requires=[{"id": "native_participant_refresh_receipt", "status": "satisfied" if complete else "unknown"}])
+                    if not complete:
+                        result["unknowns"].append({"action_id": aid, "reason": value.get("reason", "participant_refresh_incomplete")})
+                    return
                 if op == "assert_liveliness":
                     st = state[eid]
                     spec = endpoint_specs[eid]

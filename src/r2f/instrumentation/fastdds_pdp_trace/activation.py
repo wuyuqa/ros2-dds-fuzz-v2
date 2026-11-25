@@ -46,6 +46,17 @@ def selected_manifest(peer):
     binary_path = Path(binary['path']).resolve(strict=True)
     need(binary_path.is_relative_to(Path(value['install']).resolve(strict=True))
          and digest(binary_path) == binary['sha256'], 'binary_hash_or_install_mismatch')
+    control=value.get('refresh_control')
+    if control is not None:
+        need(isinstance(control,dict) and control.get('schema')=='r2f.fastdds-participant-refresh-build/v1'
+             and control.get('source_sha256')==digest(Path(__file__).with_name('refresh.cpp'))
+             and control.get('abi_size')==576 and control.get('compilation')=='passed', 'refresh_control_contract_invalid')
+        selected=control.get('binary',{})
+        need(isinstance(selected,dict) and set(selected)=={'path','sha256'}
+             and isinstance(selected.get('path'),str) and Path(selected['path']).is_absolute(), 'refresh_control_binary_invalid')
+        selected_path=Path(selected['path']).resolve(strict=True)
+        need(selected_path.is_relative_to(Path(value['install']).resolve(strict=True))
+             and digest(selected_path)==selected['sha256'], 'refresh_control_binary_hash_mismatch')
     original = value.get('peer_manifest_reference', {})
     need(isinstance(original, dict) and set(original) == {'manifest_path', 'manifest_sha256'}, 'peer_reference_invalid')
     from r2f.instrumentation.fastdds_peer.probe import validate_manifest
