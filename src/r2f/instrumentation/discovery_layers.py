@@ -297,7 +297,7 @@ def _process_correlations(bindings, samples, refs, wire, domain):
                     or ownership.get('stable_sample_count') != 2 or ownership.get('candidate_eligible') is not False
                     or ownership.get('domain_id') != domain
                     or ownership.get('local_gid') != binding['endpoint_guid']
-                    or ownership.get('role_kind') != binding['role']
+                    or ownership.get('role_kind') != re.sub(r'[2-4]$', '', binding['role'])
                     or not isinstance(guid, str) or re.fullmatch('[0-9a-f]{24}000001c1', guid) is None
                     or ownership.get('parent_chain', [None])[0] != ownership.get('local_handle')
                     or ownership.get('parent_chain', [None])[-1] != ownership.get('participant_handle')

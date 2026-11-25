@@ -493,7 +493,10 @@ def _worker_counts(config):
         backend = 'discovery_namespace'
     if backend == 'projection_pair':
         from r2f.runtime.projection_pair import projection_roles
-        return Counter(projection_roles(config))
+        counts = Counter(projection_roles(config))
+        if 'projection_discovery_tools' in config:
+            counts['discovery_tools'] = 1
+        return counts
     counts = Counter({'writer': 1, 'reader': 1})
     if backend == 'discovery_namespace' and config.get('arm') == 'mutated':
         from r2f.runtime.namespace_pair import window_churn_schedule
@@ -540,7 +543,8 @@ def _worker_qualification(config, metadata, events):
                 or worker.get('separate_context') is not True):
             errors.append('worker_health_receipt_missing:' + str(role))
         links = []
-        for kind in ('process_started', 'endpoint_created', 'process_exit'):
+        helper = role == 'discovery_tools' and counts.get(role) == 1
+        for kind in ('process_started', 'discovery_tools_ready' if helper else 'endpoint_created', 'process_exit'):
             found = [(index, event) for index, event in enumerate(events)
                      if event.get('event') == kind and event.get('role') == role
                      and event.get('pid') == pid
@@ -551,7 +555,22 @@ def _worker_qualification(config, metadata, events):
                 index, event = found[0]
                 links.append(index)
                 linked.add(index)
-                if kind == 'endpoint_created':
+                if kind == 'discovery_tools_ready':
+                    starts = [item for item in events if item.get('event') == 'process_started'
+                              and item.get('role') == role and item.get('pid') == pid
+                              and item.get('worker_generation') == generation]
+                    if (event.get('manifest') != config.get('projection_discovery_tools')
+                            or event.get('run_id') != config.get('run_id')
+                            or event.get('domain_id') != config.get('domain_id')
+                            or not event.get('observer_generation')
+                            or not event.get('participant_guid')
+                            or type(event.get('process_start_ticks')) is not int
+                            or event.get('process_start_ticks') != worker.get('start_ticks')
+                            or len(starts) != 1
+                            or starts[0].get('start_ticks') != event.get('process_start_ticks')
+                            or worker.get('cleanup_confirmed') is not True):
+                        errors.append('discovery_tools_identity_mismatch')
+                elif kind == 'endpoint_created':
                     endpoint = (event.get('endpoint_gid'), event.get('endpoint_generation'))
                     if (not all(isinstance(value, str) and value for value in endpoint)
                             or endpoint in endpoints):
@@ -564,7 +583,7 @@ def _worker_qualification(config, metadata, events):
         if len(links) == 3 and links != sorted(links):
             errors.append('worker_raw_chronology_mismatch:' + str(role))
     expected_links = {index for index, event in enumerate(events)
-                      if event.get('event') in {'process_started', 'endpoint_created', 'process_exit'}}
+                      if event.get('event') in {'process_started', 'endpoint_created', 'process_exit', 'discovery_tools_ready'}}
     if linked != expected_links:
         errors.append('worker_raw_identity_unaccounted')
     return errors

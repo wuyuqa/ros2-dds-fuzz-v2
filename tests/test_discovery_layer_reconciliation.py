@@ -1,6 +1,7 @@
 """Literal independent wire/native evidence at the public projection seam."""
 from copy import deepcopy
 import json
+import pytest
 from pathlib import Path
 
 from test_discovery_layers_projection import parts_with_layers, reconcile
@@ -40,7 +41,8 @@ def test_topic_mismatch_is_review_material_separate_from_endpoint_oracle(tmp_pat
     assert result['comparison_status'] == baseline['comparison_status']
 
 
-def test_process_correlation_requires_raw_native_ownership_and_independent_spdp(tmp_path):
+@pytest.mark.parametrize('role', ['writer', 'writer2', 'writer4'])
+def test_process_correlation_requires_raw_native_ownership_and_independent_spdp(tmp_path, role):
     from test_instrumentation_sedp_projection import GUID, PREFIX, hashed
     from r2f.instrumentation.sedp import parse_sedp_capture
     parts = parts_with_layers(tmp_path)
@@ -61,6 +63,9 @@ def test_process_correlation_requires_raw_native_ownership_and_independent_spdp(
     binding = parts[2][0]
     path = Path(binding['return_raw_ref']['path'])
     events = [json.loads(line) for line in path.read_text().splitlines()]
+    binding['role'] = role
+    for event in events:
+        event['role'] = role
     events[1]['participant_ownership'] = {
         'schema': 'r2f.cyclone-participant-ownership/v2', 'complete': True,
         'status': 'observed', 'stable_sample_count': 2, 'candidate_eligible': False,
@@ -80,6 +85,7 @@ def test_process_correlation_requires_raw_native_ownership_and_independent_spdp(
     layers = reconcile(parts)['schema_check']['discovery_layers']
     row, = layers['participant']['process_correlations']
     assert row['status'] == 'endpoint_process_correlated'
+    assert row['role'] == role
     assert row['generation'] == 'generation-a'
     assert row['pid'] == 77
     assert row['participant_guid'] == participant
