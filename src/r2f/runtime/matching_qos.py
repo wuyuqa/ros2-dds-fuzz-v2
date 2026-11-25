@@ -52,7 +52,8 @@ def load_build(ref):
             or not isinstance(data.get('files'), dict) or not data['files']
             or data.get('library') not in data['files']):
         raise ValueError('native_matching_qos_build_incomplete')
-    required = [SOURCE.resolve(), Path('/opt/ros/jazzy/lib/libfastrtps.so').resolve(),
+    required = [SOURCE.resolve(), SOURCE.with_name('native_string_sample.hpp').resolve(),
+                Path('/opt/ros/jazzy/lib/libfastcdr.so').resolve(), Path('/opt/ros/jazzy/lib/libfastrtps.so').resolve(),
                 Path('/opt/ros/jazzy/lib/librmw_fastrtps_cpp.so').resolve()]
     if (any(str(path) not in data['files'] for path in required)
             or not isinstance(data.get('compiler_argv'), list) or not data['compiler_argv']

@@ -36,7 +36,7 @@ def main():
             '-MMD', '-MF', str(deps), str(SOURCE), '-o', str(library)]
     argv += ['-I' + str(p) for p in sorted((prefix / 'include').iterdir()) if p.is_dir()]
     argv += ['-L' + str(prefix / 'lib'), '-Wl,-rpath,' + str(prefix / 'lib'),
-             '-lrcl', '-lrmw_fastrtps_cpp', '-lfastrtps']
+             '-lrcl', '-lrmw_fastrtps_cpp', '-lfastrtps', '-lfastcdr']
     result = subprocess.run(argv, text=True, capture_output=True)
     (output / 'compiler.stdout').write_text(result.stdout)
     (output / 'compiler.stderr').write_text(result.stderr)
@@ -46,7 +46,7 @@ def main():
     files = {Path(p).resolve() for p in deps.read_text().replace('\\\n', '').split(':', 1)[1].split()}
     files.update([compiler, library])
     files.update((prefix / 'lib' / name).resolve(strict=True) for name in (
-        'librcl.so', 'librmw_fastrtps_cpp.so', 'librmw_fastrtps_shared_cpp.so', 'libfastrtps.so'))
+        'librcl.so', 'librmw_fastrtps_cpp.so', 'librmw_fastrtps_shared_cpp.so', 'libfastrtps.so', 'libfastcdr.so'))
     feature_headers = [prefix / 'include/fastrtps/fastdds/dds/domain/DomainParticipantListener.hpp',
                        prefix / 'include/fastrtps/fastdds/rtps/participant/RTPSParticipantListener.h']
     version_header = prefix / 'include/fastrtps/fastrtps/config.h'

@@ -95,7 +95,7 @@ extern "C" int r2f_matching_partitions(void* rcl_endpoint, int reader, int apply
 #include <fastdds/dds/topic/TypeSupport.hpp>
 #include <fastdds/dds/core/status/PublicationMatchedStatus.hpp>
 #include <fastdds/dds/core/status/SubscriptionMatchedStatus.hpp>
-#include <std_msgs/msg/string.hpp>
+#include "native_string_sample.hpp"
 #include <chrono>
 #include <thread>
 #include <iomanip>
@@ -265,15 +265,15 @@ extern "C" int r2f_native_matching(void* rcl_endpoint, int reader_role, uint32_t
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
         } while(std::chrono::steady_clock::now()<until);
         if(ws.current_count==1 && rs.current_count==1) {
-            std_msgs::msg::String message; message.data="native-matching-control";
-            int code=writer->write(&message, HANDLE_NIL)();
-            delivery="{\"write_return_code\":"+std::to_string(code)+",\"sent\":"+json_quote(message.data)+",\"received\":null}";
+            const std::string sent="native-matching-control"; r2f::NativeStringWrite message(sent);
+            int code=writer->write(message.data(), HANDLE_NIL)();
+            delivery="{\"write_return_code\":"+std::to_string(code)+",\"sent\":"+json_quote(sent)+",\"received\":null}";
             until=std::chrono::steady_clock::now()+std::chrono::duration<double>(timeout_sec);
-            do { SampleInfo info; std_msgs::msg::String received;
-                auto rc=reader->take_next_sample(&received,&info);
+            do { SampleInfo info; r2f::NativeStringRead received;
+                auto rc=reader->take_next_sample(received.data(),&info);
                 if(rc==Return::RETCODE_OK && info.valid_data) {
-                    delivery="{\"write_return_code\":"+std::to_string(code)+",\"sent\":"+json_quote(message.data)
-                      +",\"received\":"+json_quote(received.data)+",\"sample_identity_writer_guid\":"
+                    delivery="{\"write_return_code\":"+std::to_string(code)+",\"sent\":"+json_quote(sent)
+                      +",\"received\":"+json_quote(received.text())+",\"sample_identity_writer_guid\":"
                       +json_quote(guid_text(info.sample_identity.writer_guid()))+"}"; break; }
                 if(rc!=Return::RETCODE_OK && rc!=Return::RETCODE_NO_DATA) throw std::runtime_error("native_control_take_failed");
                 std::this_thread::sleep_for(std::chrono::milliseconds(20));
