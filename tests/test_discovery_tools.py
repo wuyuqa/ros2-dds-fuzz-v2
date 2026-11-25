@@ -122,3 +122,30 @@ def test_auxiliary_tool_problem_uses_existing_evidence_query_without_candidate(t
     assert packet['runner_diagnostic']['candidate_eligible'] is False
     assert packet['facts']['typed']['projection']['schema_check']['discovery_tools'] == tools
     assert packet['rules']['oracle_verdict'] == 'pass'
+
+
+@pytest.mark.parametrize('tools', [None, {'review_required': False, 'status': 'consistent'}])
+def test_native_topic_difference_reaches_existing_evidence_review_view(tmp_path, tools):
+    from r2f.campaign.anomalies import finish_evidence
+    from r2f.reports.candidate_report import query_runner_evidence
+    source = {'head': 'offline_fixture_no_execution'}
+    (tmp_path/'manifest.json').write_text(json.dumps({'run_id': 'offline-native', 'source_manifest': source}))
+    schema = {'discovery_layers': {'topic': {'field_comparisons': [
+        {'topic': 'non_control', 'status': 'mismatch_requires_review', 'candidate_eligible': False}]}}}
+    if tools is not None:
+        schema['discovery_tools'] = tools
+    row = {'run_id': 'offline-native', 'cell_id': 'rmw_cyclonedds_cpp.baseline.0',
+           'target_id': TARGET, 'target_revision': 0, 'rule_id': 'offline',
+           'effective_input_sha256': 'a'*64, 'execution_stage': 'judged', 'actual_run': False,
+           'oracle_verdict': 'pass', 'typed_facts': {'projection': {'schema_check': schema}}}
+    report = {'run_id': 'offline-native', 'rows': [row]}
+    def persist():
+        (tmp_path/'report.json').write_text(json.dumps(report))
+        return tmp_path/'report.json'
+    finish_evidence(tmp_path, report, persist, source=source)
+    result = query_runner_evidence(tmp_path)
+    assert result['evidence_valid']
+    packet, = result['packets']
+    assert packet['runner_diagnostic']['kind'] == 'observation_insufficient'
+    assert packet['runner_diagnostic']['candidate_eligible'] is False
+    assert packet['rules']['oracle_verdict'] == 'pass'

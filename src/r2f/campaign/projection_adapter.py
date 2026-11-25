@@ -531,12 +531,14 @@ def projection_facts(events, runtime, config):
             result = dict(original)
             result.update(comparison_status='mismatch' if differences else 'consistent',
                           comparisons=comparisons, differences=differences,
+                          all_endpoint_comparisons=rows,
                           unknown_reasons=sorted(set(result.get('unknown_reasons', []))),
                           projection_graph_reasons=sorted(set(graph_reasons)),
                           primary_pair=pair,
                           endpoint_count=len(roles))
             original = dict(original)
-            original.update(projection_graph_reasons=sorted(set(graph_reasons)),
+            original.update(all_endpoint_comparisons=rows,
+                            projection_graph_reasons=sorted(set(graph_reasons)),
                             primary_pair=pair, endpoint_count=len(roles))
         if config['arm']=='negative':
             receipt = projection_fault_receipt(events,config,observation)
@@ -547,6 +549,11 @@ def projection_facts(events, runtime, config):
             result = reconcile_discovery_projection(discovery,controlled,**kwargs)
             if result['comparison_status'] != 'mismatch' or len(result['differences']) != 1 or result['differences'][0]['field'] != 'reliability':
                 raise ValueError('known projection fault did not isolate one primary mismatch')
+        if layers_enabled:
+            from r2f.instrumentation.discovery_layers import summarize_discovery_obligations
+            summarize_discovery_obligations(result, discovery, observation['endpoint_bindings'])
+            if original is not result:
+                summarize_discovery_obligations(original, discovery, observation['endpoint_bindings'])
         workers = (runtime.get('execution_metadata') or runtime.get('execution') or {}).get('workers',[])
         if isinstance(workers,dict): workers=list(workers.values())
         expected_roles = set(roles) | ({'discovery_tools'} if 'projection_discovery_tools' in config else set())

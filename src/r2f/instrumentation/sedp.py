@@ -158,4 +158,8 @@ def reconcile_discovery_projection(discovery, graph_snapshot, *, endpoint_bindin
             layers=result['schema_check'].get('discovery_layers', {}),
             bindings=(endpoint_bindings if discovery_endpoint_bindings is None
                       else discovery_endpoint_bindings), field_policy=field_policy)
+    if discovery_layers is not None or discovery_tools is not None:
+        from .discovery_layers import summarize_discovery_obligations
+        summarize_discovery_obligations(result, discovery,
+            endpoint_bindings if discovery_endpoint_bindings is None else discovery_endpoint_bindings)
     return result

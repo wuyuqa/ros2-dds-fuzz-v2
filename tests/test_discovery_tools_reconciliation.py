@@ -32,7 +32,10 @@ def tools_fixture(root):
         'DCPSTopic': [sample('DcpsTopic', 'ab'*16, topic_name='demo', type_name='Msg',
             type_id_status='available', history={'status': 'observed', 'kind': 'KEEP_LAST', 'depth': 7})],
         'DCPSPublication': [sample('DcpsEndpoint', GUID, participant_key=participant,
-            topic_name='rt/test', type_name='std_msgs::msg::dds_::String_')],
+            topic_name='rt/test', type_name='std_msgs::msg::dds_::String_',
+            qos={'Reliability': {'kind': 'Reliable'}, 'Durability': {'kind': 'Volatile'},
+                 'Deadline': {'deadline': 2**63-1},
+                 'Liveliness': {'kind': 'Automatic', 'lease_duration': 2**63-1}})],
         'DCPSSubscription': [],
     }
     library = {'path': '/offline/libddsc.so', 'sha256': 'a'*64}
@@ -97,3 +100,100 @@ def test_auxiliary_comparison_covers_additional_role_without_narrowing_primary_p
     assert [row['role'] for row in result['comparisons']] == ['writer', 'writer2']
     assert result['comparisons'][1]['status'] == 'unknown'
     assert result['binding_obligations_closed'] is False
+
+
+def test_obligation_summary_retains_missing_sut_topic_despite_a_healthy_control(tmp_path):
+    parts, raw = tools_fixture(tmp_path)
+    ref = {'schema': raw['schema'], 'status': raw['status'], 'raw': jsonraw(tmp_path/'tools.json', raw)}
+    result = reconcile_discovery_projection(parts[0], parts[1], endpoint_bindings=parts[2],
+        observation_window=parts[3], discovery_layers=parts[4], discovery_tools=ref)
+    schema = result['schema_check']
+    summary = schema['observation_obligations']
+    assert schema['discovery_tools']['positive_control']['status'] == 'consistent'
+    assert summary['all_closed'] is False
+    obligations = {row['id']: row for row in summary['items']}
+    assert obligations['topic_for_selected_endpoints']['status'] == 'unknown'
+    assert obligations['topic_for_selected_endpoints']['missing'] == [GUID]
+    assert 'topic_owner_generation' in summary['api_limits']
+    assert schema['all_layer_obligations_closed'] is False
+
+
+def test_binding_endpoint_qos_difference_is_retained_for_review(tmp_path):
+    parts, raw = tools_fixture(tmp_path)
+    observation = next(event for event in raw['events'] if event['event'] == 'discovery_python_observation')
+    observation['samples']['DCPSPublication'][0]['qos']['Reliability']['kind'] = 'BestEffort'
+    result = reconcile(tmp_path, parts, raw)
+    assert result['comparisons'][0]['status'] == 'mismatch_requires_review'
+    assert result['comparisons'][0]['fields']['reliability']['equal'] is False
+    assert result['binding_obligations_closed'] is False
+
+
+def test_complete_raw_backed_observations_can_close_and_missing_fields_reopen(tmp_path):
+    from test_instrumentation_sedp_projection import cdr, param, pcap
+    from test_topic_wire import HISTORY, SENTINEL, frame, packet
+    parts, raw = tools_fixture(tmp_path)
+    capture = parts[0]['capture_receipt']
+    payload = param(5, cdr('rt/test')) + param(7, cdr('std_msgs::msg::dds_::String_')) + HISTORY + SENTINEL
+    capture['raw'] = hashed(Path(capture['raw']['path']), Path(capture['raw']['path']).read_bytes()
+                            + pcap([(BASE+127, frame(packet(payload).replace(
+                                bytes.fromhex('0102030405060708090a0b0c'), bytes.fromhex(PREFIX))))])[24:])
+    capture['ready']['timestamp_clock'] = 'kernel_SO_TIMESTAMPNS_realtime'
+    capture['receipt_raw'] = jsonraw(tmp_path/'capture.json',
+        {key: value for key, value in capture.items() if key != 'receipt_raw'})
+    parts[0] = parse_sedp_capture(capture)
+    native_path = Path(parts[-1]['raw']['path'])
+    native = json.loads(native_path.read_text())
+    sut_topic = dict(native['samples']['DCPSTopic'][0], topic_name='rt/test',
+                     type_name='std_msgs::msg::dds_::String_', topic_key='cd'*16)
+    native['samples']['DCPSTopic'].append(sut_topic)
+    for receipt in native['receipts']:
+        if receipt['operation'] == 'take:DCPSTopic' and receipt['receipt']['samples']:
+            receipt['receipt']['samples'].append(deepcopy(sut_topic))
+            receipt['receipt']['take_return_code'] += 1
+    parts[-1]['raw'] = jsonraw(native_path, native)
+    binding = parts[2][0]
+    lifecycle_path = Path(binding['return_raw_ref']['path'])
+    lifecycle = [json.loads(line) for line in lifecycle_path.read_text().splitlines()]
+    participant = PREFIX+'000001c1'
+    lifecycle[1]['participant_ownership'] = {
+        'schema': 'r2f.cyclone-participant-ownership/v2', 'complete': True, 'status': 'observed',
+        'stable_sample_count': 2, 'candidate_eligible': False, 'local_gid': GUID,
+        'participant_gid': participant, 'domain_id': native['domain_id'], 'role_kind': 'writer',
+        'local_handle': 14, 'participant_handle': 10, 'parent_chain': [14, 10],
+        'started_monotonic_ns': 1002, 'ended_monotonic_ns': 1015,
+        'participant_root_observation': {'participant_handle': 10, 'participant_self_return': 10,
+                                         'lookup_participants': [10]},
+        'entity_identities': [{'handle': 14, 'gid': GUID}, {'handle': 10, 'gid': participant}],
+        'provenance': {'abi': 'offline_fixture_no_execution'}}
+    ref = hashed(lifecycle_path, b''.join(json.dumps(event).encode()+b'\n' for event in lifecycle))
+    for key in ('begin_raw_ref', 'return_raw_ref'):
+        binding[key].update(ref)
+    observation = next(event for event in raw['events'] if event['event'] == 'discovery_python_observation')
+    python_topic = dict(observation['samples']['DCPSTopic'][0], topic_name='rt/test',
+                        type_name='std_msgs::msg::dds_::String_', key='cd'*16)
+    observation['samples']['DCPSTopic'].append(python_topic)
+    def full_result():
+        reference = {'schema': raw['schema'], 'status': raw['status'],
+                     'raw': jsonraw(tmp_path/'tools.json', raw)}
+        return reconcile_discovery_projection(parts[0], parts[1], endpoint_bindings=parts[2],
+            observation_window=parts[3], discovery_layers=parts[4], discovery_tools=reference)['schema_check']
+    schema = full_result()
+    assert schema['all_layer_obligations_closed'] is True, schema['observation_obligations']
+    # The same fields advertised by an unrelated participant cannot close it.
+    original_capture = Path(capture['raw']['path']).read_bytes()
+    tail = pcap([(BASE+127, frame(packet(payload).replace(
+        bytes.fromhex('0102030405060708090a0b0c'), bytes.fromhex(PREFIX))))])[24:]
+    def rewrite_capture(data):
+        capture['raw'] = hashed(Path(capture['raw']['path']), data)
+        capture['receipt_raw'] = jsonraw(tmp_path/'capture.json',
+            {key: value for key, value in capture.items() if key != 'receipt_raw'})
+        parts[0] = parse_sedp_capture(capture)
+    rewrite_capture(original_capture[:-len(tail)] + tail.replace(bytes.fromhex(PREFIX), bytes.fromhex('aa'*12)))
+    assert full_result()['all_layer_obligations_closed'] is False
+    rewrite_capture(original_capture)
+    # A healthy control never masks a missing actual-topic binding observation.
+    observation['samples']['DCPSTopic'].remove(python_topic)
+    schema = full_result()
+    assert schema['discovery_tools']['positive_control']['status'] == 'consistent'
+    assert schema['all_layer_obligations_closed'] is False
+    assert schema['observation_obligations']['review_required'] is True

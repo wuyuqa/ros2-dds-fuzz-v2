@@ -106,8 +106,13 @@ def _kind(row, runtime):
     if row.get('oracle_verdict') in {'unknown', 'not_applicable'}:
         return 'observation_insufficient'
     projection = (row.get('typed_facts') or {}).get('projection') or {}
-    tools = (projection.get('schema_check') or {}).get('discovery_tools') or {}
-    if tools.get('review_required') is True:
+    schema = projection.get('schema_check') or {}
+    tools = schema.get('discovery_tools') or {}
+    layers = schema.get('discovery_layers') or {}
+    native_topic = (layers.get('topic') or {}).get('field_comparisons') or []
+    if (tools.get('review_required') is True
+            or any(item.get('status') == 'mismatch_requires_review' for item in native_topic)
+            or schema.get('observation_obligations', {}).get('review_required') is True):
         return 'observation_insufficient'
     return 'normal'
 

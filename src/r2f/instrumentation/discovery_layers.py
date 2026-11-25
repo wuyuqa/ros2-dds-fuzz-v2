@@ -327,3 +327,104 @@ def _process_correlations(bindings, samples, refs, wire, domain):
             row['reasons'].append(str(exc))
         rows.append(row)
     return rows
+
+
+def summarize_discovery_obligations(result, discovery, bindings):
+    """Derive finite observation closure; controls never cover missing SUT topics.
+
+    These auxiliary obligations neither change the endpoint oracle nor grant
+    candidate/seal eligibility. API limits remain explicit, with no inferred
+    participant lifecycle, topic ownership, or direct per-sample GID claim.
+    """
+    schema = dict(result['schema_check'])
+    result['schema_check'] = schema
+    schema['layers'] = {key: dict(value) for key, value in schema['layers'].items()}
+    native = dict(schema.get('discovery_layers', {}))
+    if native:
+        native['participant'] = dict(native.get('participant', {}))
+        native['topic'] = dict(native.get('topic', {}))
+        schema['discovery_layers'] = native
+    tools = schema.get('discovery_tools', {})
+    items = []
+    def add(name, satisfied, basis, *, mismatch=False, **evidence):
+        items.append(dict(id=name, status='satisfied' if satisfied else
+                          'mismatch_requires_review' if mismatch else 'unknown',
+                          basis=basis, **evidence))
+    add('independent_endpoint_sources', schema.get('independent_sources_established') is True,
+        'schema_check.source_qualification')
+    expected = {binding['endpoint_guid'] for binding in bindings if isinstance(binding, dict)
+                and isinstance(binding.get('endpoint_guid'), str)
+                and re.fullmatch('[0-9a-f]{32}', binding['endpoint_guid']) is not None}
+    valid_bindings = len(expected) == len(bindings)
+    comparisons = result.get('all_endpoint_comparisons', result.get('comparisons', []))
+    compared = {row.get('endpoint_guid') for row in comparisons}
+    add('endpoint_fields', bool(expected) and valid_bindings and expected <= compared
+        and result.get('comparison_status') == 'consistent'
+        and bool(comparisons) and all(row.get('equal') is True for row in comparisons),
+        'existing wire/graph comparator, including full role inventory',
+        mismatch=result.get('comparison_status') == 'mismatch'
+        or any(row.get('equal') is False for row in comparisons),
+        missing=sorted(expected - compared))
+    add('native_source_identity', native.get('identity', {}).get('status') == 'established',
+        'discovery_layers.identity; hash-bound native receipt and independent capture')
+    add('native_source_timing', native.get('timing', {}).get('status') == 'qualified',
+        'discovery_layers.timing; asynchronous collection, not atomic samples')
+    participant = native.get('participant', {})
+    processes = participant.get('process_correlations', [])
+    correlated = {row.get('endpoint_guid') for row in processes
+                  if row.get('status') == 'endpoint_process_correlated'}
+    process_closed = bool(expected) and valid_bindings and expected <= correlated
+    add('participant_endpoint_process', process_closed,
+        'native ownership + exact endpoint lifecycle + participant builtin/SPDP',
+        missing=sorted(expected - correlated))
+    topic = native.get('topic', {})
+    fields = topic.get('field_comparisons', [])
+    topic_fields_closed = bool(fields) and all(row.get('status') == 'consistent' for row in fields)
+    add('native_topic_fields', topic_fields_closed,
+        'native DCPSTopic + independent topic DATA field projections, not instance identity',
+        mismatch=any(row.get('status') == 'mismatch_requires_review' for row in fields))
+    missing_topics = []
+    for guid in expected:
+        endpoints = [event for event in discovery.get('events', [])
+                     if event.get('endpoint_guid') == guid and event.get('lifecycle') == 'alive']
+        advertised = {(event.get('fields', {}).get('topic', {}).get('value'),
+                       event.get('fields', {}).get('type', {}).get('value')) for event in endpoints}
+        observed = {(row.get('topic'), row.get('type')) for row in fields if row.get('status') == 'consistent'}
+        source_topics = {(event.get('fields', {}).get('topic', {}).get('value'),
+                          event.get('fields', {}).get('type', {}).get('value'))
+                         for event in topic.get('wire', {}).get('observations', [])
+                         if event.get('source_guid_prefix') == guid[:24] and event.get('status') == 'observed'}
+        if (not advertised or any(not all(isinstance(value, str) and value for value in pair) for pair in advertised)
+                or not advertised <= observed or not advertised <= source_topics):
+            missing_topics.append(guid)
+    sut_topics_closed = bool(expected) and valid_bindings and not missing_topics
+    add('topic_for_selected_endpoints', sut_topics_closed,
+        'native name/type fields + independently captured topic DATA from each selected endpoint participant; '
+        'a separate XTypes control is insufficient', missing=sorted(missing_topics))
+    add('python_binding', tools.get('binding_obligations_closed') is True,
+        'discovery_tools participant, endpoint and topic comparisons; actual builtin take')
+    cli = tools.get('cli_comparisons', [])
+    add('cli_fields', tools.get('status') == 'consistent' and len(cli) == 2
+        and {row.get('subcommand') for row in cli} == {'ls', 'ps'}
+        and all(row.get('status') == 'consistent' for row in cli),
+        'actual version-qualified CLI text visibility, not row/instance identity')
+    if native:
+        native['participant']['reconciliation_status'] = 'process_correlated' if process_closed else 'unknown'
+        native['topic']['reconciliation_status'] = ('consistent_fields' if topic_fields_closed and sut_topics_closed
+            else 'mismatch_requires_review' if any(row.get('status') == 'mismatch_requires_review' for row in fields)
+            else 'unknown')
+        native['all_layer_obligations_closed'] = all(item['status'] == 'satisfied' for item in items[2:7])
+        for layer in ('participant', 'topic'):
+            schema['layers'][layer]['reconciliation_status'] = native[layer]['reconciliation_status']
+    closed = all(item['status'] == 'satisfied' for item in items)
+    schema['all_layer_obligations_closed'] = closed
+    schema['observation_obligations'] = {'schema': 'r2f.discovery-obligations/v1',
+        'all_closed': closed, 'review_required': not closed, 'candidate_eligible': False,
+        'items': items, 'api_limits': {
+            'participant_builtin_discovery_lease': 'unavailable_api; SPDP lease is separate',
+            'participant_lifecycle_generation': 'unknown; endpoint process correlation is not participant lifetime proof',
+            'topic_owner_generation': 'unknown; opaque16 topic key is not a wire instance GUID',
+            'publisher_gid_per_sample': 'unavailable_api; no direct sample ownership claim',
+            'cli_row_or_instance_identity': 'not_established_by_text_field_visibility'},
+        'scope': 'finite selected-endpoint observations and explicit interface limits; not full S1 completion'}
+    return result

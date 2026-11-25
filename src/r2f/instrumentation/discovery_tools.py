@@ -1,9 +1,10 @@
 """Raw-backed binding/CLI attribution, auxiliary to the existing S1 oracle."""
 from copy import deepcopy
 import json
+import re
 from pathlib import Path
 
-from .sedp_projection import _bound_json
+from .sedp_projection import _bound_json, _equal
 from .sedp_wire import parse_sedp_capture
 
 
@@ -95,16 +96,32 @@ def discovery_tools_schema(reference, capture, *, layers, bindings, field_policy
                    'wire_raw_refs': [deepcopy(event['raw_ref']) for event in advertisements]}
             if len(observed) == 1 and advertisements:
                 sample, = observed
-                projection = {'topic': sample['topic_name'], 'type': sample['type_name']}
-                for name in ('topic', 'type'):
-                    values = {event['fields'][name].get('value') for event in advertisements
-                              if event['fields'][name].get('status') == 'observed'}
-                    if len(values) == 1:
-                        value, = values
-                        row['fields'][name] = {'python': projection[name], 'wire': value, 'equal': projection[name] == value}
-                if len(row['fields']) == 2:
-                    row['status'] = ('consistent' if all(field['equal'] for field in row['fields'].values())
-                                     else 'mismatch_requires_review')
+                qos = sample.get('qos', {})
+                def enum(policy):
+                    value = qos.get(policy, {}).get('kind')
+                    return re.sub(r'(?<!^)(?=[A-Z])', '_', value).upper() if isinstance(value, str) else None
+                projection = {'topic': sample['topic_name'], 'type': sample['type_name'],
+                    'reliability': enum('Reliability'), 'durability': enum('Durability'),
+                    'deadline': qos.get('Deadline', {}).get('deadline'),
+                    'liveliness.kind': enum('Liveliness'),
+                    'liveliness.lease_duration': qos.get('Liveliness', {}).get('lease_duration')}
+                for name, python in projection.items():
+                    values = {json.dumps(event['fields'][name].get('value'), sort_keys=True)
+                              for event in advertisements if event['fields'].get(name, {}).get('status') == 'observed'}
+                    if len(values) == 1 and python is not None:
+                        value = json.loads(values.pop())
+                        equal = python == value if name in ('topic', 'type') else _equal(name, value, python)
+                        if equal is not None:
+                            row['fields'][name] = {'python': python, 'wire': value, 'equal': equal}
+                row['fields']['participant_guid'] = {'python': sample.get('participant_key'),
+                    'wire_endpoint_prefix': guid[:24]+'000001c1',
+                    'equal': sample.get('participant_key') == guid[:24]+'000001c1'}
+                row['field_applicability'] = {'history': 'not_applicable_by_endpoint_schema',
+                                              'depth': 'not_applicable_by_endpoint_schema'}
+                if any(field.get('equal') is False for field in row['fields'].values()):
+                    row['status'] = 'mismatch_requires_review'
+                elif len(row['fields']) == 8:
+                    row['status'] = 'consistent'
             rows.append(row)
         result['comparisons'] = rows
         participant_rows = []
@@ -132,8 +149,16 @@ def discovery_tools_schema(reference, capture, *, layers, bindings, field_policy
                           if sample.get('topic_name') == control['topic'] and sample.get('type_name') == control['type']
                           and sample.get('valid_data') is True and sample.get('type_id_status') == 'available']
         topic_comparisons = []
-        for sample in python_control:
-            for native in topic_matches:
+        for native in layers['topic'].get('field_comparisons', []):
+            matching = [sample for sample in observation['samples']['DCPSTopic']
+                        if sample.get('topic_name') == native.get('topic')
+                        and sample.get('type_name') == native.get('type')
+                        and sample.get('valid_data') is True and sample.get('instance_state') == 16
+                        and sample.get('type_id_status') == 'available']
+            if not matching:
+                topic_comparisons.append({'topic': native.get('topic'), 'type': native.get('type'),
+                    'status': 'unknown', 'fields': {}, 'missing': ['python_topic_observation']})
+            for sample in matching:
                 fields, missing = {}, []
                 history = sample.get('history', {})
                 for name in ('history', 'depth'):
@@ -152,19 +177,24 @@ def discovery_tools_schema(reference, capture, *, layers, bindings, field_policy
                 status = ('mismatch_requires_review' if any(field.get('equal') is False for field in fields.values())
                           else 'unknown' if missing or native.get('status') != 'consistent' else 'consistent')
                 topic_comparisons.append({'scope': 'topic_type_field_projection_not_instance_identity',
-                    'topic': control['topic'], 'type': control['type'], 'status': status,
+                    'topic': native.get('topic'), 'type': native.get('type'), 'status': status,
                     'fields': fields, 'missing': missing})
+        result['topic_comparisons'] = topic_comparisons
+        control_comparisons = [row for row in topic_comparisons
+                               if row['topic'] == control['topic'] and row['type'] == control['type']]
         control_status = ('mismatch_requires_review' if any(row['status'] == 'mismatch_requires_review'
-                          for row in topic_comparisons) else 'consistent' if topic_comparisons
-                          and all(row['status'] == 'consistent' for row in topic_comparisons) else 'unknown')
+                          for row in control_comparisons) else 'consistent' if control_comparisons
+                          and all(row['status'] == 'consistent' for row in control_comparisons) else 'unknown')
         result['positive_control'] = {'status': control_status,
             'native_wire': deepcopy(topic_matches), 'python': deepcopy(python_control),
-            'field_comparisons': topic_comparisons,
+            'field_comparisons': control_comparisons,
             'candidate_eligible': False, 'sut_observation': False}
         if not rows or any(row['status'] != 'consistent' for row in rows):
             result['reasons'].append('binding_endpoint_fields_incomplete_or_different')
         if result['positive_control']['status'] != 'consistent':
             result['reasons'].append('full_xtypes_topic_control_not_observed')
+        if not topic_comparisons or any(row['status'] != 'consistent' for row in topic_comparisons):
+            result['reasons'].append('binding_topic_fields_incomplete_or_different')
         if raw['status'] != 'observed':
             result['reasons'].extend(raw.get('reasons', []) or ['tools_producer_unknown'])
         result['binding_obligations_closed'] = not result['reasons']
