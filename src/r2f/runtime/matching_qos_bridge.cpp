@@ -191,9 +191,35 @@ template<class Endpoint> std::string native_entity(Endpoint* ep, DomainParticipa
       +",\"lease_duration_sec\":"+seconds_json(q.liveliness().lease_duration)+",\"partitions\":"+names_json(names)+"}}";
 }
 }
+// Diagnostic adapter builds only; never used to qualify normal SUT execution.
+#ifdef R2F_NATIVE_MATCHING_DIAGNOSTIC_BACKTRACE
+#include <execinfo.h>
+#include <signal.h>
+#include <unistd.h>
+namespace {
+void native_diagnostic_segv(int sig) {
+    const char text[]="R2F_NATIVE_DIAGNOSTIC_FATAL_STACK\n";
+    (void)!write(STDERR_FILENO,text,sizeof(text)-1);
+    void* frames[48]; int n=backtrace(frames,48); backtrace_symbols_fd(frames,n,STDERR_FILENO);
+    signal(sig,SIG_DFL); raise(sig);
+}
+struct NativeDiagnosticScope {
+    struct sigaction old{};
+    NativeDiagnosticScope() {
+        void* warm[4]; (void)backtrace(warm,4);
+        struct sigaction action{}; action.sa_handler=native_diagnostic_segv;
+        sigemptyset(&action.sa_mask); sigaction(SIGSEGV,&action,&old);
+    }
+    ~NativeDiagnosticScope() {sigaction(SIGSEGV,&old,nullptr);}
+};
+}
+#endif
 extern "C" int r2f_native_matching(void* rcl_endpoint, int reader_role, uint32_t domain,
     const char* topic_name, int same_participant, const R2fNativeQos* wq, const R2fNativeQos* rq,
     const char* persistence_database, double timeout_sec, char* output, size_t capacity) noexcept {
+#ifdef R2F_NATIVE_MATCHING_DIAGNOSTIC_BACKTRACE
+    NativeDiagnosticScope diagnostic_scope;
+#endif
     std::vector<std::pair<std::string,std::function<int()>>> cleanup;
     std::string status="unknown", reason, entities="[]", fresh_entities="[]", samples="[]", delivery="null", cleanup_json="[";
     bool clean=true;
