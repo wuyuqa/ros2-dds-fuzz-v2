@@ -23,6 +23,84 @@ def _one(rows, kind, **fields):
     return found[0]
 
 
+def _initial_action_evidence(action, rows):
+    """Bind actual public initial get/state results to one create action."""
+    eid, gen, aid = action.get('endpoint_id'), action.get('generation'), action.get('action_id')
+    _require(type(gen) is int and gen > 0, 'initial_generation_invalid')
+    begin = _one(rows, 'topology_action_begin', action_id=aid)
+    done = _one(rows, 'topology_action_done', action_id=aid)
+    created = _one(rows, 'endpoint_created', logical_id=eid, generation=gen)
+    scoped = [e for e in rows if e.get('logical_id') == eid and e.get('generation') == gen
+              and begin['event_index'] < e['event_index'] < done['event_index']]
+    started = _one(scoped, 'content_filter_initial_begin')
+    submitted = _one(scoped, 'content_filter_initial_submitted')
+    observed = _one(scoped, 'content_filter_initial_configuration')
+    create = _one(scoped, 'endpoint_create_begin')
+    chain = [begin, create, started, submitted, observed, created, done]
+    _require(all(type(e.get('event_index')) is int and 0 <= e['event_index'] < len(rows)
+                 and rows[e['event_index']] == e and type(e.get('monotonic_ns')) is int
+                 for e in chain)
+             and all(a['event_index'] < b['event_index'] and a['monotonic_ns'] <= b['monotonic_ns']
+                     for a, b in zip(chain, chain[1:])), 'initial_raw_chronology_invalid')
+    _require(all(created.get(k) is not None and type(e.get(k)) is type(created[k])
+                 and e.get(k) == created[k]
+                 for e in (create, started, submitted, observed)
+                 for k in (*_BINDING, 'topic', 'message_type', 'backend', 'real_ros', 'fixture')),
+             'initial_worker_identity_mismatch')
+    from .topology_worker import worker_role_kind
+    _require(worker_role_kind(created.get('role')) == 'reader', 'reader_required')
+    value = observed.get('filter_receipt')
+    _require(isinstance(value, dict) and value == created.get('initial_content_filter'),
+             'initial_receipt_not_raw_backed')
+    expected = value.get('requested')
+    from .filter_backend import validate_filter
+    _require(isinstance(expected, dict), 'initial_requested_missing')
+    validated = validate_filter(expected.get('expression'), expected.get('parameters'), {'data': 'string'})
+    _require(validated.get('ok') is True and expected == {
+        k: validated[k] for k in ('expression', 'parameters', 'enabled')}, 'initial_requested_invalid')
+    enabled = expected['enabled']
+    api = value.get('api_results') or {}
+    getter, state = api.get('get_content_filter') or {}, api.get('is_cft_enabled') or {}
+    raw = getter.get('raw_result')
+    config = {k: expected[k] for k in ('expression', 'parameters')}
+    _require(value.get('schema') == 'r2f.participant-filter/v1'
+             and value.get('scope') == 'initial_only'
+             and value.get('fixture') is created['fixture']
+             and value.get('configured') is True and value.get('configuration_status') == 'verified'
+             and value.get('submitted') is True and value.get('accepted') is True
+             and value.get('readback_status') == 'matched'
+             and getter.get('status') == state.get('status') == 'observed'
+             and isinstance(raw, dict) and raw == {'filter_expression': config['expression'],
+                                                   'expression_parameters': config['parameters']}
+             and type(state.get('raw_result')) is bool and state['raw_result'] is enabled
+             and value.get('is_cft_enabled') is enabled and value.get('observed') == config
+             and all((e.get('filter_receipt') or {}).get('requested') == expected
+                     for e in (started, submitted))
+             and submitted['filter_receipt'].get('accepted') is True
+             and submitted['filter_receipt'].get('submitted') is True,
+             'initial_public_readback_incomplete_or_mismatched')
+    times = [create['monotonic_ns'], value.get('creation_returned_monotonic_ns'),
+             getter.get('started_monotonic_ns'), getter.get('completed_monotonic_ns'),
+             state.get('started_monotonic_ns'), state.get('completed_monotonic_ns'),
+             value.get('monotonic_ns'), observed['monotonic_ns']]
+    _require(all(type(t) is int and t > 0 for t in times) and times == sorted(times)
+             and created.get('created_monotonic_ns') == times[1]
+             and created.get('create_begin_monotonic_ns') == times[0], 'initial_api_clock_invalid')
+    _require(not any(e.get('event') in {'content_filter_dynamic_update', 'endpoint_destroyed',
+                    'topology_endpoint_destroyed', 'worker_exit', 'topology_worker_exit'}
+                     and e.get('logical_id') == eid and e.get('generation') == gen
+                     for e in rows[created['event_index'] + 1:done['event_index'] + 1]),
+             'initial_creation_interrupted')
+    return dict(schema=SCHEMA, phase='initial', action_id=aid, logical_id=eid, generation=gen,
+        command_id=None, reader_gid=created['endpoint_gid'], reader_incarnation=0,
+        outcome_kind='configuration_readback', disposition='configured', satisfied=True,
+        observed=config, observed_enabled=enabled, update_ref=done['event_index'],
+        state_ref=observed['event_index'], ack_ref=done['event_index'],
+        creation_ref=created['event_index'], api_call_refs=[submitted['event_index'], observed['event_index']],
+        filter_effect_observed=None, mutation_applied=False, candidate_eligible=False,
+        scope='initial_configuration_or_public_state_only_not_filter_effect')
+
+
 def filter_action_evidence(action, events, *, before_index=None):
     """Recompute one completed update's bounded action evidence from raw.
 
@@ -32,6 +110,8 @@ def filter_action_evidence(action, events, *, before_index=None):
     limit = len(events) if before_index is None else before_index
     _require(type(limit) is int and 0 <= limit <= len(events), 'prefix_invalid')
     rows = events[:limit]
+    if action.get('op') in {'create', 'recreate'}:
+        return _initial_action_evidence(action, rows)
     _require(action.get('op') == 'update_filter', 'wrong_action')
     eid, gen, aid = action.get('endpoint_id'), action.get('generation'), action.get('action_id')
     result = _one(rows, 'topology_filter_update_result', action_id=aid, logical_id=eid, generation=gen)

@@ -228,11 +228,23 @@ def _observation(row, events, program, selected, manifest, raw_ref):
     results = [e for e in events if e.get('event') == 'topology_filter_update_result'
                and e.get('logical_id') == reader['logical_id'] and e.get('generation') == reader['generation']
                and type(e.get('monotonic_ns')) is int and e['monotonic_ns'] <= started]
-    _need(bool(results), 'enabled_action_before_capture_missing')
-    latest = max(results, key=lambda e: e['monotonic_ns'])
-    action = _one([a for a in program['actions'] if a.get('action_id') == latest.get('action_id')],
-                  'filter_action_not_in_program')
-    evidence = filter_action_evidence(action, events, before_index=latest['event_index'] + 1)
+    if results:
+        latest = max(results, key=lambda e: e['monotonic_ns'])
+        action = _one([a for a in program['actions'] if a.get('action_id') == latest.get('action_id')],
+                      'filter_action_not_in_program')
+        evidence = filter_action_evidence(action, events, before_index=latest['event_index'] + 1)
+    else:
+        action = _one([a for a in program['actions'] if a.get('op') in {'create', 'recreate'}
+                       and a.get('endpoint_id') == reader['logical_id']
+                       and a.get('generation') == reader['generation']], 'initial_filter_action_not_unique')
+        latest = _one([e for e in events if e.get('event') == 'topology_action_done'
+                       and e.get('action_id') == action['action_id']], 'initial_filter_action_not_completed')
+        evidence = filter_action_evidence(action, events, before_index=latest['event_index'] + 1)
+        spec = _one([e for e in program['endpoints'] if e['logical_id'] == reader['logical_id']],
+                    'initial_filter_spec_not_unique')
+        expected = spec.get('filter') or {}
+        _need(evidence.get('observed') == {k: expected.get(k) for k in ('expression', 'parameters')},
+              'initial_filter_configuration_differs_from_program')
     _need(evidence['outcome_kind'] == 'configuration_readback' and evidence['observed_enabled'] is True
           and evidence['reader_gid'] == current['endpoint_gid']
           and evidence['reader_incarnation'] == current['incarnation_ordinal']

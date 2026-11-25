@@ -1780,7 +1780,7 @@ def participant_refresh_episode_program():
 
 
 def corpus_v2(*, include_catalog=True, seed=0, include_concurrent=False, include_cft_matrix=False,
-              include_episode=False, include_participant_refresh=False):
+              include_episode=False, include_participant_refresh=False, include_cft_lifecycle=False):
     """Offline seed corpus: legal, boundary, environment and guard seeds.
 
     The manifest separates ``authored`` entries from ``pending`` runtime
@@ -1848,6 +1848,16 @@ def corpus_v2(*, include_catalog=True, seed=0, include_concurrent=False, include
         entries.append(entry)
         manifest.append({"seed_id": entry["seed_id"], "surface_id": "S1.topology",
             "status": "authored", "kind": "dynamic_cft_matrix",
+            "expected_disposition": "expect_pass", "content_sha256": entry["content_sha256"]})
+
+    if include_cft_lifecycle:
+        from .topology_cft_matrix import CFT_LIFECYCLE_SEED, cft_lifecycle_program
+        entry = _seed_entry("S1.topology", CFT_LIFECYCLE_SEED,
+            cft_lifecycle_program(), "cft_lifecycle", "expect_pass",
+            "authored initial/update/disable/enable CFT input; actual effects require raw evidence")
+        entries.append(entry)
+        manifest.append({"seed_id": entry["seed_id"], "surface_id": "S1.topology",
+            "status": "authored", "kind": "cft_lifecycle",
             "expected_disposition": "expect_pass", "content_sha256": entry["content_sha256"]})
 
     # Environment / guard seeds are built through topology_model's own

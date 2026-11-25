@@ -1497,6 +1497,9 @@ def facts_from_events(events, runtime, config, *, capture_source=None):
                 'observed': a.group_lineage['group_relation_observed'],
                 'supporting_diagnostic': True, 'candidate_eligible': False}
         facts["endpoint_identity_complete"] = True
+        from .topology_cft_observation import content_filter_observations
+        facts["content_filter_observations"] = content_filter_observations(
+            a.program, a.events, decisions=None, deliveries=[], ref=a.ref, fixture=a.fixture)
         facts["action_receipts"] = a.actions()
         groups = sorted({x["params"]["concurrency_group"] for x in a.program["actions"]
                          if x.get("params", {}).get("concurrency_group") is not None})
@@ -1536,6 +1539,9 @@ def facts_from_events(events, runtime, config, *, capture_source=None):
         facts["native_filter_decision_evidence"] = native_filter_decision_evidence(
             a.program, a.events, peer_reference=a.native_peer_reference, ref=a.ref)
         decision_evidence = facts["native_filter_decision_evidence"]
+        facts["content_filter_observations"] = content_filter_observations(
+            a.program, a.events, decisions=facts["native_filter_decision_evidence"],
+            deliveries=facts["deliveries"], ref=a.ref, fixture=a.fixture)
         # A declared capture with partial/broken worker provenance cannot waive
         # a historical delivery obligation using its surviving subset.
         filter_decisions = decision_evidence["observations"] if not decision_evidence["unknowns"] else []
