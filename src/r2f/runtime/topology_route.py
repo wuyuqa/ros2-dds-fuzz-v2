@@ -18,7 +18,7 @@ from r2f.modules.s1.topology_input import (
     TOPOLOGY_TARGET, TOPOLOGY_CAPABILITY, TOPOLOGY_MUTATION_KIND, TOPOLOGY_CARRIER,
     validate_topology_plan, topology_input_layer_receipts,
 )
-from .topology_worker import OFFLINE_BACKEND, ROS_BACKEND, OfflineTopologyBackend, RosTopologyBackend
+from .topology_worker import OFFLINE_BACKEND, ROS_BACKEND, OfflineTopologyBackend, RosTopologyBackend, TopologyUnsupported
 from .topology_operator_application import (
     audit_operator_application, is_deadline_configuration_delay,
 )
@@ -665,7 +665,7 @@ def _worker_configuration_proven(created, program):
     if source != "public_endpoint_actual_qos":
         return False
     from .qos_binding import validate_created_qos
-    from .topology_worker import endpoint_expressibility
+    from .topology_worker import observed_endpoint_expressibility
     try:
         specs = [e for e in program["endpoints"]
                  if e.get("logical_id") == created.get("logical_id")]
@@ -677,10 +677,10 @@ def _worker_configuration_proven(created, program):
         if (created.get("identity_source") != api or created.get("topic") != spec["topic"]
                 or created.get("message_type") != spec["type_name"]):
             return False
-        requested = endpoint_expressibility(spec, {"rmw": created.get("rmw_identifier")})["public_qos"]
+        requested = observed_endpoint_expressibility(spec, created)["public_qos"]
         validate_created_qos(created, requested)
         return True
-    except (ValueError, TypeError, KeyError, RuntimeError):
+    except (ValueError, TypeError, KeyError, RuntimeError, TopologyUnsupported):
         return False
 
 
@@ -844,8 +844,8 @@ def audit_topology_application(plan, input_layer_receipts, runtime):
                 # distinct observed schemas; neither is filled from config.
                 expected_qos = spec["qos"]
                 if created.get("backend") != OFFLINE_BACKEND:
-                    from .topology_worker import endpoint_expressibility
-                    expected_qos = endpoint_expressibility(spec, {"rmw": created.get("rmw_identifier")})["public_qos"]
+                    from .topology_worker import observed_endpoint_expressibility
+                    expected_qos = observed_endpoint_expressibility(spec, created)["public_qos"]
                 observed_qos = created.get("qos")
                 if created.get("backend") != OFFLINE_BACKEND:
                     mandatory = {"reliability", "durability", "deadline_ns", "liveliness", "liveliness_lease_duration_ns"}
@@ -961,6 +961,6 @@ def audit_topology_application(plan, input_layer_receipts, runtime):
                                             effect_observed=all_observed and all(
                                                 l.get("effect_observed", l["hit"]) for l in audit["layers"]))
         audit["receipt_reason"] = audit["status"]
-    except (OSError, ValueError, TypeError, KeyError, AttributeError) as exc:
+    except (OSError, ValueError, TypeError, KeyError, AttributeError, TopologyUnsupported) as exc:
         audit.update(status="invalid", reasons=[type(exc).__name__ + ":" + str(exc)])
     return audit

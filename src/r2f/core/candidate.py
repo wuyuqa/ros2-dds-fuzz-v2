@@ -83,7 +83,24 @@ def topology_observation_identity(row):
     return snapshot({"schema": TOPOLOGY_IDENTITY_SCHEMA, "run_id": row.get("run_id"),
                      "raw": facts.get("raw"),
                      "endpoint_lineage": facts.get("endpoint_lineage"),
-                     "pairs": facts.get("pairs")})
+                     "pairs": facts.get("pairs"),
+                     **({"participant_identity": facts["participant_identity"]}
+                        if "participant_identity" in facts else {})})
+
+
+def _topology_participant_identity(row, events):
+    from r2f.campaign.participant_identity import rebuild_participant_identity
+    program = row.get('final_input', {}).get('topology_program', {})
+    claimed = row.get('typed_facts', {}).get('participant_identity')
+    if 'identity_checks' not in program:
+        if claimed is not None:
+            raise ValueError('identity evidence without sealed identity_checks')
+        return None
+    config = {'run_id': row['run_id'], 'domain_id': events[0]['domain_id']}
+    rebuilt = rebuild_participant_identity(events, program, config, row['raw_path'], row['raw_sha256'])
+    if canonical_hash(rebuilt) != canonical_hash(claimed):
+        raise ValueError('participant identity differs from raw recomputation')
+    return rebuilt
 
 
 def _validate_topology_identity(row, identity):
@@ -177,6 +194,7 @@ def _validate_topology_identity(row, identity):
         if not re.fullmatch(roles[logical_id] + r"[0-9]*", str(event.get("role", ""))):
             raise ValueError("topology endpoint role differs from raw creation")
         tokens[key] = endpoint
+    participant_identity = _topology_participant_identity(row, events)
     pairs = identity.get("pairs")
     if not isinstance(pairs, list) or not pairs:
         raise ValueError("topology requires concrete directed pairs, not total counts")
@@ -226,7 +244,8 @@ def _validate_topology_identity(row, identity):
         # Bind the oracle's explicit anomaly objects to existing directed pairs.
         # Do not derive an anomaly from N counts, or change the primary verdict.
         closure = (row.get("oracle") or {}).get("closure", {}).get("pairs", [])
-        applicable = False
+        applicable = bool(participant_identity and participant_identity.get('status') == 'conflict'
+                          and participant_identity.get('conflicts'))
         for subject in closure:
             if not isinstance(subject, dict):
                 raise ValueError("topology anomaly subject invalid")

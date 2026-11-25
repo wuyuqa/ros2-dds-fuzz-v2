@@ -119,9 +119,9 @@ class EndpointBindingContract(unittest.TestCase):
             with self.assertRaises(TopologyUnsupported):
                 endpoint_expressibility(spec(qos={**qos(), "durability": value}),
                                         {"rmw": "rmw_cyclonedds_cpp"})
-        with self.assertRaises(TopologyUnsupported):
-            endpoint_expressibility(spec(qos={**qos(), "history": "keep_all"}),
-                                    {"rmw": "rmw_cyclonedds_cpp"})
+        prepared = endpoint_expressibility(spec(qos={**qos(), "history": "keep_all"}),
+                                           {"rmw": "rmw_cyclonedds_cpp"})
+        self.assertEqual(prepared["public_qos"]["history"], "keep_all")
         for depth in (0, 65537, True, "16"):
             with self.assertRaises(TopologyUnsupported):
                 endpoint_expressibility(spec(qos={**qos(), "depth": depth}),

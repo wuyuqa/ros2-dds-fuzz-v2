@@ -120,7 +120,7 @@ def _registered_target(capsule):
     return registry.get_target(identifier), registry.get_services(identifier), exploratory
 
 
-_OBSERVATION_KEYS = ('observation_mode', 'fastdds_peer_instrumentation', 'observe_native_peers')
+_OBSERVATION_KEYS = ('observation_mode', 'fastdds_peer_instrumentation', 'observe_native_peers', 'native_matching_qos')
 _TOPOLOGY_TARGET = 'discovery.endpoint_topology.fuzz_v1'
 
 
@@ -143,7 +143,7 @@ def _replay_observation_config(capsule):
                                for a in final.get('topology_program', {}).get('actions', []))
         hints = (declared or refresh_declared or metadata.get('observation_mode') not in (None, 'blackbox')
                  or metadata.get('fastdds_peer_instrumentation') is not None
-                 or 'observe_native_peers' in metadata)
+                 or 'observe_native_peers' in metadata or 'native_matching_qos' in metadata)
         if capsule.input['target_id'] == 'discovery.interruption_recovery' and final.get('observe_participant_leases') is True:
             from .participant_lease import replay_lease_selection
             return replay_lease_selection(capsule)
@@ -160,7 +160,11 @@ def _replay_observation_config(capsule):
                 raise ValueError('observation_original_raw_hash_mismatch')
             events = [json.loads(line) for line in raw.splitlines() if line.strip()]
             records = [event for event in events if event.get('event') == 'topology_execution_metadata']
-            native = any(event.get('event') == 'native_peer_provider_selected'
+            native_carrier = any(event.get('event') == 'native_partition_configuration'
+                                 or 'native_partition_qos' in event for event in events)
+            if native_carrier and 'native_matching_qos' not in execution:
+                raise ValueError('observation_native_matching_selection_missing')
+            native = native_carrier or any(event.get('event') == 'native_peer_provider_selected'
                          or str(event.get('event', '')).startswith(('native_pdp_', 'participant_refresh_', 'topology_participant_refresh_'))
                          for event in events)
             if len(records) > 1 or ((hints or native) and len(records) != 1):
@@ -172,7 +176,7 @@ def _replay_observation_config(capsule):
                 hints = (hints or native
                          or raw_metadata.get('observation_mode') not in (None, 'blackbox')
                          or raw_metadata.get('fastdds_peer_instrumentation') is not None
-                         or 'observe_native_peers' in raw_metadata)
+                         or 'observe_native_peers' in raw_metadata or 'native_matching_qos' in raw_metadata)
         mode = execution.get('observation_mode', 'blackbox')
         reference = execution.get('fastdds_peer_instrumentation')
         if mode not in ('blackbox', 'instrumentation'):
@@ -190,10 +194,16 @@ def _replay_observation_config(capsule):
                     or record.get('fastdds_peer_instrumentation') != reference
                     or canonical_hash(record.get('observe_native_peers', True))
                        != canonical_hash(execution.get('observe_native_peers', True))
-                    or ('observe_native_peers' in record) != ('observe_native_peers' in execution)):
+                    or ('observe_native_peers' in record) != ('observe_native_peers' in execution)
+                    or record.get('native_matching_qos') != execution.get('native_matching_qos')
+                    or ('native_matching_qos' in record) != ('native_matching_qos' in execution)):
                 raise ValueError('observation_execution_selection_mismatch')
         if mode == 'instrumentation' and not all(key in execution for key in ('observation_mode', 'fastdds_peer_instrumentation')):
             raise ValueError('observation_original_execution_selection_missing')
+        if 'native_matching_qos' in execution:
+            from r2f.runtime.matching_qos import reference as matching_reference, load_build
+            selected = matching_reference(dict(execution, rmw=capsule.input['rmw']))
+            load_build(selected)
         from r2f.core.replay import validate_replay_input, _v2_execution_input
         validate_replay_input(capsule.input)
         _v2_execution_input(execution, capsule.input)

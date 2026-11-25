@@ -57,6 +57,7 @@ _ACTION_PARAMS = {
     "update_filter": ({"expression", "parameters"}, set()),
     "snapshot": (set(), {"label", "timeout_sec"}),
     "lookup_topic": ({"scope", "name"}, {"native_type_support"}),
+    "native_matching_control": ({"control"}, set()),
     "update_participant_userdata": ({"data"}, set()),
     "barrier": ({"condition", "timeout_sec"}, {"endpoint_ids", "publish_action_ids"}),
 }
@@ -173,7 +174,7 @@ def _shape(program):
     except (ValueError, TypeError, RecursionError):
         return [{"path": "program", "code": "json", "message": "finite JSON required"}], None
     if not _object(program, {"schema", "endpoints", "actions"},
-                   {"budget", "environment", "episode", "participant_control"}, "program", errors):
+                   {"budget", "environment", "episode", "participant_control", "identity_checks"}, "program", errors):
         return errors, None
     if program["schema"] != SCHEMA:
         _error(errors, "program.schema", "schema", f"expected {SCHEMA}")
@@ -306,6 +307,12 @@ def _shape(program):
         if op == "update_participant_userdata":
             if not _userdata(p["data"]):
                 _error(errors, f"{path}.params.data", "value", "1..256 UTF-8 bytes without NUL required")
+        if op == "native_matching_control":
+            from r2f.runtime.native_matching import validate_control
+            try:
+                validate_control(p["control"])
+            except (ValueError, TypeError, KeyError) as exc:
+                _error(errors, f"{path}.params.control", "value", str(exc))
         if op == "lookup_topic":
             if "native_type_support" in p:
                 from r2f.runtime.native_lookup_support import validate_reference
@@ -407,6 +414,12 @@ def _shape(program):
             validate_control(program)
         except (ValueError, TypeError, KeyError) as exc:
             _error(errors, "program.participant_control", "participant_control_scope", str(exc))
+    if "identity_checks" in program:
+        from r2f.runtime.participant_identity import validate_identity_checks
+        try:
+            validate_identity_checks(program)
+        except (ValueError, TypeError) as exc:
+            _error(errors, "program.identity_checks", "identity_checks_scope", str(exc))
     if samples > budget["max_total_samples"]:
         _error(errors, "program.actions", "budget", "total publications exceed sample budget")
     return errors, budget
@@ -472,6 +485,8 @@ def _evaluate(program, count=None):
             requires.append(_require("runtime_normal_participant_refresh", None, kind="observation"))
         if op == "lookup_topic":
             requires.append(_require("runtime_typed_topic_lookup", None, kind="observation"))
+        if op == "native_matching_control":
+            requires.append(_require("runtime_native_matching_control", None, kind="observation"))
         if op == "snapshot":
             requires.append(_require("runtime_snapshot_receipt", None, kind="observation"))
         failed = any(r["status"] == "unsatisfied" for r in requires)
@@ -631,6 +646,8 @@ def fingerprints(program, prefix=None):
     _, states, streams, _ = _evaluate(program, count)
     control = ({"participant_control": program["participant_control"]}
                if "participant_control" in program else {})
+    if "identity_checks" in program:
+        control["identity_checks"] = program["identity_checks"]
     return {"input_sha256": _hash(program),
             "state_sha256": _hash({"endpoints": program["endpoints"], "states": states,
                                     "streams": streams, "environment": program.get("environment", {}), **control}),

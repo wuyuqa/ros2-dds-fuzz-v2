@@ -124,12 +124,13 @@ def test_harness_guard_is_not_claimed_as_sut_rejection(tmp_path):
 
     registry, original, _, _ = capsule_from_registry(1)
     parent = model.generate_program(3, writers=1, readers=1)
-    # Valid model input, independently unexpressible by the public worker API.
+    # Valid model input requiring the optional native ownership carrier, which
+    # this public-only route has not selected. KEEP_ALL is now supported.
     # The offline route emits bound before/guard/after/action receipts; a loose
     # guard event appended to a successful trace is correctly evidence-invalid.
     for endpoint in parent["endpoints"]:
         if endpoint["role"] == "writer":
-            endpoint["qos"]["history"] = "keep_all"
+            endpoint["qos"]["ownership"] = "exclusive"
     plan = make_topology_plan(parent, [{"operator_id": "action.insert"}], rng_seed=7)
     scenario = Scenario(original.target, original.rmw, "mutated", 0, 7,
         {"mutation_kind": "endpoint_program", "carrier": "ros2_endpoint",

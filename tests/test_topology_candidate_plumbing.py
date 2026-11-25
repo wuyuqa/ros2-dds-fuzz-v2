@@ -74,6 +74,28 @@ def test_provider_receipt_is_formal_pending_not_qualified(setup):
     assert not receipt['blockers'] and set(receipt['pending'])=={'canonical_ingest','formal_boundary','formal_topology_execution'}
 
 
+@pytest.mark.parametrize(('owner', 'field'), [
+    ('oracle', 'filter_false_implies_unmatch'),
+    ('facts', 'input_contract_changed'),
+])
+def test_provider_rejects_json_type_aliases_in_cft_contract(setup, owner, field):
+    from r2f.modules.s1.topology_cft_contract import predicate_contract
+    scenario, _, _, row, _ = setup
+    contract = predicate_contract()
+    row['typed_facts']['content_filter_observations'] = {
+        'declared': True, 'evidence_conflicts': [],
+        'predicate_contract': deepcopy(contract),
+    }
+    row['oracle']['cft_rule_contract'] = deepcopy(contract)
+    receipt = plumbing.provider_assessment(scenario, row['typed_facts'], row['oracle'])
+    assert 'cft_evidence_consistent' not in receipt['blockers']
+    target = (row['oracle']['cft_rule_contract'] if owner == 'oracle'
+              else row['typed_facts']['content_filter_observations']['predicate_contract'])
+    target[field] = 0
+    receipt = plumbing.provider_assessment(scenario, row['typed_facts'], row['oracle'])
+    assert 'cft_evidence_consistent' in receipt['blockers']
+
+
 def test_ingest_transports_identity_and_provenance_without_granting(setup):
     publish(setup);scenario,config,capsule,row,calls=setup
     plumbing.ingest_assessment(scenario,config,capsule,row)

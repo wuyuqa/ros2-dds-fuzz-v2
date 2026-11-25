@@ -335,3 +335,23 @@ def test_observer_control_replay_rejects_worker_raw_even_when_all_metadata_agree
     _persist_raw(bound)
     with pytest.raises(ValueError, match='native_peer_sampling_control'):
         project(bound)
+
+
+@pytest.mark.parametrize('location', ['runtime_metadata', 'raw_metadata', 'raw_event'])
+def test_native_matching_carrier_cannot_disappear_from_replay_selection(bound, location):
+    # Necessary execution-selection seam; these are unsigned, non-DDS artifacts.
+    for record in (bound.execution, bound.execution['runtime_execution_metadata'], bound.events[0]['metadata']):
+        for key in ('observation_mode', 'fastdds_peer_instrumentation'):
+            record.pop(key, None)
+    reference = {'path': '/offline/native-matching-build.json', 'sha256': 'a' * 64}
+    if location == 'runtime_metadata':
+        bound.execution['runtime_execution_metadata']['native_matching_qos'] = reference
+    elif location == 'raw_metadata':
+        bound.events[0]['metadata']['native_matching_qos'] = reference
+    else:
+        bound.events.append({'event': 'native_partition_configuration', 'fixture': True})
+    _persist_raw(bound)
+    before = bound.raw_path.read_bytes()
+    with pytest.raises(ValueError, match='observation_execution_metadata_invalid|observation_'):
+        project(bound)
+    assert bound.raw_path.read_bytes() == before

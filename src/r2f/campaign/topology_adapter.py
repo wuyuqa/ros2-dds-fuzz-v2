@@ -539,6 +539,35 @@ class _Audit:
                          and receipt["after"].get("alive") is True
                          and receipt["after"].get("next_sequence") == params["start_sequence"] + params["count"],
                          "action_publish_after_state_mismatch")
+            elif (op == "snapshot" and physical_before == {"alive": []}
+                  and not any(e["event"] == "command_done" for e in inside)):
+                # No worker exists to acknowledge this controller-only capture.
+                # The raw lifecycle replay above, not the receipt, proves emptiness.
+                captured = _one(inside, "topology_pair_observation", step_id="snapshot:" + aid)
+                state_before = _one(inside, "state_step_before", step_id="action:" + aid)
+                _require(inside == [state_before, captured, after]
+                         and all(k in captured for k in ("pairs", "delivery", "snapshot_command_id"))
+                         and captured["pairs"] == [] and captured["delivery"] == []
+                         and captured["snapshot_command_id"] is None
+                         and canonical_hash(receipt["after"]) ==
+                             canonical_hash({"complete": True, "snapshot_command_id": None})
+                         and receipt["requires"] == [{"id": "runtime_snapshot_receipt",
+                              "kind": "observation", "status": "satisfied"}],
+                         "action_empty_snapshot_not_raw_backed")
+                initial = {"step_id": "action:" + aid, "action": action, "before": physical_before,
+                           "after": None, "requires": [], "satisfied": None}
+                _require(all(k in state_before for k in initial)
+                         and canonical_hash({k: state_before[k] for k in initial}) == canonical_hash(initial)
+                         and all(k in after for k in receipt)
+                         and canonical_hash({k: after[k] for k in receipt}) == canonical_hash(receipt),
+                         "action_empty_snapshot_state_receipt_mismatch")
+                _chain(begin, state_before, captured, after, done)
+                controller = ("pid", "pgid", "role", "backend", "run_id", "domain_id",
+                              "monotonic_clock_identity")
+                _require(all(canonical_hash({k: e.get(k) for k in controller}) ==
+                             canonical_hash({k: self.begin.get(k) for k in controller})
+                             for e in (begin, state_before, captured, after, done)),
+                         "action_empty_snapshot_controller_mismatch")
             elif op in {"snapshot", "barrier"}:
                 _require(any(e["event"] == "command_done" for e in inside), "action_snapshot_ack_missing")
             elif op == "update_filter":
@@ -720,7 +749,7 @@ def _pair_facts(audit, projection, deliveries):
             if len(values) >= 2 and all(v == values[0] for v in values):
                 policies[eid] = values[0]
         row["reliable_history_contract"] = (len(policies) == 2 and all(
-            p.get("reliability") == "reliable" and (p.get("history") == "keep_all"
+            isinstance(p, dict) and p.get("reliability") == "reliable" and (p.get("history") == "keep_all"
                 or p.get("history") == "keep_last" and _integer(p.get("depth"), max(1, len(expected))))
             for p in policies.values()))
         # A dynamic update may alter filtering even when the initial spec was empty.
@@ -1496,6 +1525,10 @@ def facts_from_events(events, runtime, config, *, capture_source=None):
             facts['participant_group_relation'] = {
                 'observed': a.group_lineage['group_relation_observed'],
                 'supporting_diagnostic': True, 'candidate_eligible': False}
+        from .participant_identity import audit_participant_identity
+        identity_audit = audit_participant_identity(a)
+        if identity_audit is not None:
+            facts["participant_identity"] = identity_audit
         facts["endpoint_identity_complete"] = True
         from .topology_cft_observation import content_filter_observations
         facts["content_filter_observations"] = content_filter_observations(
@@ -1524,6 +1557,29 @@ def facts_from_events(events, runtime, config, *, capture_source=None):
                 facts["unknown_reasons"].append(str(exc))
         facts["unknown_reasons_sample_identity"] = list(facts["unknown_reasons"])
         facts["pairs"] = _pair_facts(a, projection, facts["deliveries"])
+        if config.get("native_matching_qos") is not None:
+            from r2f.runtime.matching_qos import audit_run
+            facts["matching_boundary"] = audit_run(a.program, a.events, config, fixture=a.fixture)
+            facts["matching_boundary"]["pairs"] = [{
+                "writer": pair["writer"], "reader": pair["reader"],
+                "compatibility": pair["compatibility"], "observed_match": pair["observed_match"],
+                "delivery_closure": pair["delivery_closure"],
+                "policy_scope": pair.get("proofs", {}).get("compatibility", {}).get("detail", {}).get("policy_scope"),
+                "raw_refs": pair.get("proofs", {}).get("compatibility", {}).get("refs", [])}
+                for pair in facts["pairs"]]
+            gaps = [gap for pair in facts["matching_boundary"]["pairs"]
+                    for gap in (pair.get("policy_scope") or {}).get("observation_gaps", [])]
+            facts["matching_boundary"]["observation_gaps"] = gaps
+            facts["matching_observation_incomplete"] = bool(gaps)
+            facts["unknown_reasons"].extend(gaps)
+        from r2f.runtime.native_matching import audit_run as audit_native_controls
+        controls = audit_native_controls(a.program, a.events, fixture=a.fixture, rmw=config.get("rmw"), raw_path=a.path)
+        if controls:
+            facts["native_matching_controls"] = controls
+            gaps = [c.get("reason", "native_matching_control_incomplete") for c in controls if c["status"] == "unknown"]
+            gaps.extend(gap for c in controls for gap in c.get("observation_gaps", []))
+            facts["matching_observation_incomplete"] = bool(facts.get("matching_observation_incomplete") or gaps)
+            facts["unknown_reasons"].extend(gaps)
         empty_windows = _historical_no_obligation_windows(a, facts["pairs"], projection)
         historical = _recreated_history_windows(a, facts["pairs"], projection, facts["deliveries"])
         facts["historical_live_windows"] = _live_history_windows(a, facts["pairs"], projection, facts["deliveries"])
@@ -1612,7 +1668,8 @@ def facts_from_events(events, runtime, config, *, capture_source=None):
             and facts["source_provenance_qualified"] and facts["preconditions_reached"] and not facts["control_excluded"]
             and facts["application_audit"].get("status") == "application_observed"
             and facts["application_audit"].get("execution_evidence") is True
-            and facts["application_audit"].get("canonical_receipt_matches") is True)
+            and facts["application_audit"].get("canonical_receipt_matches") is True
+            and not facts.get("matching_observation_incomplete"))
         if "episode_observation" in facts:
             observation = facts["episode_observation"]
             facts["candidate_eligible"] = (facts["candidate_eligible"] and observation["completed"]
@@ -1633,6 +1690,10 @@ def facts_from_events(events, runtime, config, *, capture_source=None):
         TOPOLOGY_FACT_GRAPH: None, TOPOLOGY_FACT_DELIVERY: None,
         TOPOLOGY_FACT_GUARDS: None,
     }
+    if "participant_identity" in facts:
+        status = facts["participant_identity"]["status"]
+        facts["fact_values"][TOPOLOGY_FACT_IDENTITY] = (True if status == "consistent" else
+            False if status == "conflict" else None)
     from r2f.modules.s1.topology_oracles import resolve_fact
     for fact_id in (TOPOLOGY_FACT_GRAPH, TOPOLOGY_FACT_DELIVERY, TOPOLOGY_FACT_GUARDS):
         facts["fact_values"][fact_id] = resolve_fact(fact_id, facts)

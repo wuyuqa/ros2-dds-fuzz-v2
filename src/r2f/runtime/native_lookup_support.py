@@ -25,6 +25,38 @@ module r2f_lookup {
   @final struct UInt8MultiArray { Layout layout; sequence<octet> data; };
 };
 """,
+    'native_matching_samples.c': """/* Generated sample layouts; public DDS APIs only. */
+#include <dds/dds.h>
+#include "LookupTypes.h"
+#include <string.h>
+int32_t r2f_matching_write(dds_entity_t writer, const char *text, int array_type)
+{
+  if (!text) return DDS_RETCODE_BAD_PARAMETER;
+  if (!array_type) { r2f_lookup_String msg = { .data = (char *) text }; return dds_write(writer, &msg); }
+  r2f_lookup_UInt8MultiArray msg = {0};
+  msg.data._length = msg.data._maximum = (uint32_t) strlen(text);
+  msg.data._buffer = (uint8_t *) text;
+  return dds_write(writer, &msg);
+}
+int32_t r2f_matching_take(dds_entity_t reader, char *output, size_t capacity, int array_type, uint64_t *publication)
+{
+  void *sample = NULL;
+  dds_sample_info_t info;
+  int32_t rc = dds_take(reader, &sample, &info, 1, 1);
+  if (rc <= 0) return rc;
+  int32_t result = 0;
+  if (info.valid_data) {
+    const char *text;
+    size_t size;
+    if (array_type) { r2f_lookup_UInt8MultiArray *msg = sample; text = (char *)msg->data._buffer; size = msg->data._length; }
+    else { r2f_lookup_String *msg = sample; text = msg->data; size = text ? strlen(text) : 0; }
+    if (text && size < capacity) { memcpy(output, text, size); output[size] = 0; *publication = info.publication_handle; result = 1; }
+    else result = DDS_RETCODE_OUT_OF_RESOURCES;
+  }
+  rc = dds_return_loan(reader, &sample, 1);
+  return rc < 0 ? rc : result;
+}
+""",
     'native_lookup_descriptors.c': """/* Compiled against the same qualified Cyclone SDK as the worker. */
 #include "LookupTypes.h"
 
@@ -74,6 +106,7 @@ def build_support(output, *, compiler, idlc=str(PREFIX / 'bin/idlc')):
         [str(Path(compiler).resolve()), '-shared', '-fPIC', '-O2',
          '-I' + str(output), '-I' + str(PREFIX / 'include/CycloneDDS'),
          str(output / 'LookupTypes.c'), str(output / 'native_lookup_descriptors.c'),
+         str(output / 'native_matching_samples.c'),
          '-L' + str(PREFIX / 'lib/x86_64-linux-gnu'), '-lddsc',
          '-Wl,-rpath,' + str(PREFIX / 'lib/x86_64-linux-gnu'),
          '-o', str(output / 'liblookup_types.so')],
@@ -139,7 +172,7 @@ class NativeLookupControl:
         self.receipt.update(library_path=manifest['library_path'],
                             library_sha256=manifest['library_sha256'],
                             manifest_source=manifest['source'])
-        # The descriptor DSO calls no DDS API. The existing observer remains the
+        # The support DSO initializes no DDS. The existing observer remains the
         # sole provider of runtime library/participant identity and functions.
         self.library = c.CDLL(manifest['library_path'], mode=os.RTLD_LOCAL)
         self.descriptor = self.library.r2f_lookup_descriptor

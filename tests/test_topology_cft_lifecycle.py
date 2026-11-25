@@ -279,6 +279,11 @@ def test_common_signature_retains_CFT_failure_and_rejects_summary_tampering(row)
     assert conformance_signature(damaged) is None
 
 
+    typed_alias = deepcopy(row)
+    typed_alias['oracle']['cft_rule_contract']['filter_false_implies_unmatch'] = 0
+    assert conformance_signature(typed_alias) is None
+
+
 def test_native_reject_and_same_occurrence_delivery_remain_review_conflict():
     from r2f.campaign.topology_cft_observation import content_filter_observations
     from r2f.campaign.anomalies import _kind

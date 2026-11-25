@@ -85,7 +85,7 @@ def build_input_receipts(program, config, *, mutation_receipts=None):
             "errors": [],
         }
         try:
-            prepared = endpoint_expressibility(spec, config)
+            prepared = endpoint_expressibility(spec, dict(config, topology_program=program))
             row["binding_status"] = "expressible"
             row["binding"] = prepared["binding"]
         except TopologyUnsupported as exc:
@@ -2083,6 +2083,12 @@ def topology_capabilities(backend=None):
         "ros_execution": real,
         "max_writers": 4, "max_readers": 4, "max_endpoints": 8,
         "variable_cardinality": True, "empty_roles": True,
+        "participant_identity_checks": {
+            "initialization_modes": ["fresh_process", "fork_before_participant"],
+            "unsupported_initialization": ["fork_after_participant"],
+            "rmw": "rmw_cyclonedds_cpp", "observation_mode": "blackbox",
+            "library_scope": "installed_verified_CycloneDDS_0.10.5",
+            "execution_evidence": False},
         "create_destroy_recreate": True,
         "fresh_endpoint_identity_per_generation": True,
         "per_pair_graph_facts": True,
@@ -2099,12 +2105,22 @@ def topology_capabilities(backend=None):
             "native_full_message_info_take": ["std_msgs/msg/String"],
         },
         "supported_bypass_fields": {"content_filter": initial_content_filter_capability(),
-                                    "ownership_non_shared": False,
-                                    "partitions_non_default": False,
+                                    "ownership_non_shared": {
+                                        "carrier": "native_matching_qos", "rmw": "rmw_fastrtps_cpp",
+                                        "scope": "endpoint_process", "activation": "explicit_build_reference",
+                                        "adoption": "requires_native_readback", "execution_evidence": False},
+                                    "partitions_non_default": {
+                                        "carrier": "native_matching_qos", "rmw": "rmw_fastrtps_cpp",
+                                        "scope": "endpoint_process", "activation": "explicit_build_reference", "adoption": "requires_native_readback",
+                                        "execution_evidence": False},
                                     "durability_transient_or_later": False,
-                                    "history_keep_all": False,
+                                    "history_keep_all": True,
                                     "assert_liveliness_public_writer_api": bool(
                                         getattr(backend, "supports_assert_liveliness", False))},
+        "native_matching_control": {
+            "carrier": "native_dds_public_api_inside_ROS_worker", "vendors": ["fastdds", "cyclonedds"],
+            "activation": "explicit_source_bound_support_reference", "same_or_separate_participant": True,
+            "ros_qos_adoption": False, "fastdds_type_scope": "String_harness", "execution_evidence": False},
         "max_batch_interval_sec": MAX_INTERVAL_SEC,
         "max_publish_batch": 1024,
         "execution_evidence": real,
@@ -2447,6 +2463,12 @@ def run_topology(program, config, output_dir, *, backend=None):
             }
     except (ValueError, TypeError) as exc:
         result["reason"] = "blocked:input_mutation_failed:" + type(exc).__name__ + ":" + str(exc)
+        return result
+    from .participant_identity import validate_identity_checks
+    try:
+        validate_identity_checks(effective_program, cfg)
+    except (ValueError, TypeError) as exc:
+        result['reason'] = 'blocked:identity_checks_scope:' + str(exc)
         return result
     validation = model.validate_program(effective_program)
     from .participant_groups import validate_control
@@ -3474,6 +3496,23 @@ def run_topology(program, config, output_dir, *, backend=None):
                                       "cross_writer_order_required": False,
                               })
                     return
+                if op == "native_matching_control":
+                    st = state[eid]
+                    if not (st["alive"] and st["generation"] == gen):
+                        record_guard(action, "native_control_target_alive_guard", "native control requires live harness", before=before)
+                        return
+                    value = backend.native_matching_control(st["handle"], params["control"])
+                    emit("native_matching_observation", action_id=aid, logical_id=eid,
+                         generation=gen, endpoint_gid=st["handle"]["endpoint_gid"],
+                         control_receipt=deepcopy(value), fixture=not backend.real_ros, candidate_eligible=False)
+                    result["observation_receipts"].append({"action_id": aid, "kind": "native_matching_control", "receipt": deepcopy(value)})
+                    observed = value.get("status") in ("observed", "unsupported") and value.get("cleanup_confirmed") is True
+                    record_action(action, before, before, disposition="effect_observed" if observed else "unknown",
+                                  satisfied=observed, effect_scope="native_DDS_control_not_RCL_QoS_adoption",
+                                  requires=[{"id": "runtime_native_matching_control", "status": "satisfied" if observed else "unknown"}])
+                    if not observed:
+                        result["unknowns"].append({"action_id": aid, "reason": value.get("reason", "native_control_incomplete")})
+                    return
                 if op == "lookup_topic":
                     st = state[eid]
                     if not (st["alive"] and st["generation"] == gen):
@@ -4050,6 +4089,8 @@ def run_topology(program, config, output_dir, *, backend=None):
             "fastdds_peer_instrumentation": deepcopy(cfg.get("fastdds_peer_instrumentation")),
             **({"observe_native_peers": cfg["observe_native_peers"]}
                if "observe_native_peers" in cfg else {}),
+            **({"native_matching_qos": deepcopy(cfg["native_matching_qos"])}
+               if "native_matching_qos" in cfg else {}),
             "workers": workers,
             "target_id": cfg.get("target_id"), "target_revision": cfg.get("target_revision"),
             "arm": cfg.get("arm"), "repeat": cfg.get("repeat"),
