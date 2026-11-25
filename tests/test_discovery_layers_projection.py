@@ -232,6 +232,7 @@ def test_opt_in_public_namespace_path_reaches_adapter_with_all_worker_profiles(t
     layers = schema['discovery_layers']
     assert layers['identity']['status'] == 'established', layers
     assert layers['status'] == 'observed'
+    assert [row['role'] for row in layers['participant']['process_correlations']] == roles
     assert layers['topic']['wire']['observations'][0]['fields']['depth']['value'] == 7
     assert layers['participant']['wire']['observations'][0]['participant_guid'] == '0102030405060708090a0b0c000001c1'
     assert layers['topic']['builtin_raw_refs'][0]['sha256'] == result['discovery_projection']['discovery_layers']['raw']['sha256']

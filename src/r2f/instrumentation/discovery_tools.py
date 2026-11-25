@@ -107,15 +107,59 @@ def discovery_tools_schema(reference, capture, *, layers, bindings, field_policy
                                      else 'mismatch_requires_review')
             rows.append(row)
         result['comparisons'] = rows
+        participant_rows = []
+        for guid in sorted({binding['endpoint_guid'][:24] + '000001c1' for binding in bindings}):
+            python = [sample for sample in observation['samples']['DCPSParticipant']
+                      if sample.get('key') == guid and sample.get('valid_data') is True
+                      and sample.get('instance_state') == 16]
+            native = [sample for sample in layers['participant']['builtin_observations']
+                      if sample.get('guid') == guid and sample.get('valid_data') is True
+                      and sample.get('instance_state') == 'ALIVE']
+            advertisements = [event for event in layers['participant']['wire']['observations']
+                              if event.get('participant_guid') == guid and event.get('status') == 'observed']
+            participant_rows.append({'participant_guid': guid,
+                'status': 'consistent' if len(python) == len(native) == 1 and advertisements else 'unknown',
+                'basis': 'participant GUID and endpoint GUID prefix; not lifecycle generation',
+                'python': deepcopy(python), 'native': deepcopy(native),
+                'wire_raw_refs': [deepcopy(event['raw_ref']) for event in advertisements]})
+        result['participant_comparisons'] = participant_rows
+        if not participant_rows or any(row['status'] != 'consistent' for row in participant_rows):
+            result['reasons'].append('binding_participant_identity_incomplete_or_different')
         control = ready['control']
         topic_matches = [row for row in layers['topic'].get('field_comparisons', [])
                          if row.get('topic') == control['topic'] and row.get('type') == control['type']]
         python_control = [sample for sample in observation['samples']['DCPSTopic']
                           if sample.get('topic_name') == control['topic'] and sample.get('type_name') == control['type']
                           and sample.get('valid_data') is True and sample.get('type_id_status') == 'available']
-        result['positive_control'] = {'status': 'consistent' if topic_matches and python_control
-            and all(row['status'] == 'consistent' for row in topic_matches) else 'unknown',
+        topic_comparisons = []
+        for sample in python_control:
+            for native in topic_matches:
+                fields, missing = {}, []
+                history = sample.get('history', {})
+                for name in ('history', 'depth'):
+                    observed = native.get('fields', {}).get(name, {})
+                    if (name == 'depth' and history.get('kind') == 'KEEP_ALL'
+                            and native.get('fields', {}).get('history', {}).get('builtin') == 'KEEP_ALL'
+                            and native.get('fields', {}).get('history', {}).get('wire') == 'KEEP_ALL'):
+                        fields[name] = {'status': 'not_applicable', 'reason': 'ignored_for_KEEP_ALL'}
+                        continue
+                    values = {'python': history.get('kind' if name == 'history' else name),
+                              'builtin': observed.get('builtin'), 'wire': observed.get('wire')}
+                    if history.get('status') != 'observed' or None in values.values():
+                        missing.append(name)
+                    else:
+                        fields[name] = dict(values, equal=len(set(values.values())) == 1)
+                status = ('mismatch_requires_review' if any(field.get('equal') is False for field in fields.values())
+                          else 'unknown' if missing or native.get('status') != 'consistent' else 'consistent')
+                topic_comparisons.append({'scope': 'topic_type_field_projection_not_instance_identity',
+                    'topic': control['topic'], 'type': control['type'], 'status': status,
+                    'fields': fields, 'missing': missing})
+        control_status = ('mismatch_requires_review' if any(row['status'] == 'mismatch_requires_review'
+                          for row in topic_comparisons) else 'consistent' if topic_comparisons
+                          and all(row['status'] == 'consistent' for row in topic_comparisons) else 'unknown')
+        result['positive_control'] = {'status': control_status,
             'native_wire': deepcopy(topic_matches), 'python': deepcopy(python_control),
+            'field_comparisons': topic_comparisons,
             'candidate_eligible': False, 'sut_observation': False}
         if not rows or any(row['status'] != 'consistent' for row in rows):
             result['reasons'].append('binding_endpoint_fields_incomplete_or_different')

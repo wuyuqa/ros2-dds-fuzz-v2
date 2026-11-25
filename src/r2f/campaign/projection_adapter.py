@@ -484,6 +484,7 @@ def projection_facts(events, runtime, config):
                   'field_policy': observation.get('field_policy')}
         if layers_enabled:
             kwargs['discovery_layers'] = observation['discovery_layers']
+            kwargs['discovery_endpoint_bindings'] = observation['endpoint_bindings']
         if 'projection_discovery_tools' in config:
             if (not observation.get('discovery_tools')
                     or raw_observation.get('discovery_tools') != observation['discovery_tools']):
