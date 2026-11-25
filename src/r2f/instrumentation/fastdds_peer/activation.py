@@ -37,6 +37,9 @@ def manifest_for_reference(reference):
 def reference_from_config(config):
     mode = config.get('observation_mode', 'blackbox')
     raw = config.get('fastdds_peer_instrumentation')
+    if 'observe_native_peers' in config and (
+            type(config['observe_native_peers']) is not bool or mode != 'instrumentation'):
+        raise ProbeError('native_peer_sampling_control_requires_explicit_instrumentation_boolean')
     if mode == 'blackbox':
         if raw is not None:
             raise ProbeError('fastdds_peer_requires_instrumentation_mode')

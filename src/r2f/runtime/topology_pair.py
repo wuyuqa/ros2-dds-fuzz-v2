@@ -4024,6 +4024,8 @@ def run_topology(program, config, output_dir, *, backend=None):
             "actual_rmws": sorted(actual_rmws), "actual_domains": sorted(actual_domains),
             "observation_mode": cfg.get("observation_mode", "blackbox"),
             "fastdds_peer_instrumentation": deepcopy(cfg.get("fastdds_peer_instrumentation")),
+            **({"observe_native_peers": cfg["observe_native_peers"]}
+               if "observe_native_peers" in cfg else {}),
             "workers": workers,
             "target_id": cfg.get("target_id"), "target_revision": cfg.get("target_revision"),
             "arm": cfg.get("arm"), "repeat": cfg.get("repeat"),

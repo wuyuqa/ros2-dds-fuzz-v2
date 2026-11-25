@@ -31,7 +31,7 @@ GIDS = {"writer": "1" * 32, "reader": "2" * 32}
 def snapshot_worker(monkeypatch):
     """Run the public worker entry with authored external API/pipe responses."""
     def launch(kind, *, rmw="rmw_fastrtps_cpp", extra_peer=False, count=1,
-               observer_case=None, count_after=None):
+               observer_case=None, count_after=None, observe_native_peers=None):
         names = ["rclpy", "rclpy.context", "rclpy.executors", "rclpy.node",
                  "rclpy.qos", "rclpy.duration", "rclpy.event_handler",
                  "std_msgs", "std_msgs.msg", "r2f.runtime.actual_qos",
@@ -131,6 +131,8 @@ def snapshot_worker(monkeypatch):
                           fastdds_peer_instrumentation={
                               "manifest_path": "/offline/peer-manifest.json",
                               "manifest_sha256": "a" * 64})
+        if observe_native_peers is not None:
+            config["observe_native_peers"] = observe_native_peers
         stdout = io.StringIO()
         with monkeypatch.context() as patch:
             for name, module in modules.items():

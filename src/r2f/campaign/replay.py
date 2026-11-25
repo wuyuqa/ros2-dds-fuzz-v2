@@ -120,7 +120,7 @@ def _registered_target(capsule):
     return registry.get_target(identifier), registry.get_services(identifier), exploratory
 
 
-_OBSERVATION_KEYS = ('observation_mode', 'fastdds_peer_instrumentation')
+_OBSERVATION_KEYS = ('observation_mode', 'fastdds_peer_instrumentation', 'observe_native_peers')
 _TOPOLOGY_TARGET = 'discovery.endpoint_topology.fuzz_v1'
 
 
@@ -140,7 +140,8 @@ def _replay_observation_config(capsule):
             raise ValueError('observation_runtime_metadata_invalid')
         declared = any(key in execution for key in _OBSERVATION_KEYS)
         hints = (declared or metadata.get('observation_mode') not in (None, 'blackbox')
-                 or metadata.get('fastdds_peer_instrumentation') is not None)
+                 or metadata.get('fastdds_peer_instrumentation') is not None
+                 or 'observe_native_peers' in metadata)
         if capsule.input['target_id'] != _TOPOLOGY_TARGET:
             if hints:
                 raise ValueError('observation_selection_unsupported_target')
@@ -163,7 +164,8 @@ def _replay_observation_config(capsule):
                     raise ValueError('observation_raw_metadata_invalid')
                 hints = (hints or native
                          or raw_metadata.get('observation_mode') not in (None, 'blackbox')
-                         or raw_metadata.get('fastdds_peer_instrumentation') is not None)
+                         or raw_metadata.get('fastdds_peer_instrumentation') is not None
+                         or 'observe_native_peers' in raw_metadata)
         mode = execution.get('observation_mode', 'blackbox')
         reference = execution.get('fastdds_peer_instrumentation')
         if mode not in ('blackbox', 'instrumentation'):
@@ -178,9 +180,12 @@ def _replay_observation_config(capsule):
         # selection, sealed input and source identity are NEVER normalized away.
         for record in (metadata, raw_metadata):
             if (record.get('observation_mode', 'blackbox') != mode
-                    or record.get('fastdds_peer_instrumentation') != reference):
+                    or record.get('fastdds_peer_instrumentation') != reference
+                    or canonical_hash(record.get('observe_native_peers', True))
+                       != canonical_hash(execution.get('observe_native_peers', True))
+                    or ('observe_native_peers' in record) != ('observe_native_peers' in execution)):
                 raise ValueError('observation_execution_selection_mismatch')
-        if mode == 'instrumentation' and not all(key in execution for key in _OBSERVATION_KEYS):
+        if mode == 'instrumentation' and not all(key in execution for key in ('observation_mode', 'fastdds_peer_instrumentation')):
             raise ValueError('observation_original_execution_selection_missing')
         from r2f.core.replay import validate_replay_input, _v2_execution_input
         validate_replay_input(capsule.input)
@@ -214,9 +219,10 @@ def _replay_observation_config(capsule):
                 if canonical_hash(record.get(key)) != canonical_hash(context[key]):
                     raise ValueError('observation_original_runtime_identity_mismatch:' + key)
         selection = {key: _copy_json(execution[key]) for key in _OBSERVATION_KEYS if key in execution}
-        if mode == 'instrumentation':
-            from r2f.instrumentation.fastdds_peer.activation import reference_from_config
-            reference_from_config(dict(selection, rmw=scenario.rmw))  # file-only validation
+        from r2f.instrumentation.fastdds_peer.activation import reference_from_config
+        reference_from_config(dict(selection, rmw=scenario.rmw))  # file-only validation
+        from r2f.instrumentation.fastdds_peer.receipt import validate_sampling_control
+        validate_sampling_control(events, selection)
         return selection
     except (ValueError, KeyError, TypeError, OSError, AttributeError) as exc:
         raise _Failure('fail_artifact', 'observation_execution_metadata_invalid',

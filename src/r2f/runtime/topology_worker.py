@@ -1257,9 +1257,10 @@ class _LivelinessPeerSampler:
     observer only reads matched endpoints through the already pinned public
     ABI. Even a complete sample cannot establish an uninterrupted peer set.
     """
-    def __init__(self, endpoint, rmw, domain, gid, *, instrumentation=None):
+    def __init__(self, endpoint, rmw, domain, gid, *, instrumentation=None, enabled=True):
         self.endpoint, self.rmw, self.domain, self.gid = endpoint, rmw, domain, gid
         self.instrumentation = instrumentation
+        self.enabled = enabled
         self.observer = None
 
     def __call__(self):
@@ -1273,7 +1274,9 @@ class _LivelinessPeerSampler:
                  'continuous_coverage': False, 'external_peers_known': None,
                  'effect_observed': None, 'candidate_eligible': False,
                  's1_mutation_hit': False, 'execution_evidence': False}
-        observation = {'complete': False, 'reason': 'rmw_has_no_public_peer_observer'}
+        observation = {'complete': False, 'reason': (
+            'rmw_has_no_public_peer_observer' if self.enabled
+            else 'native_peer_sampling_disabled_control')}
         try:
             value['public_count_before'] = self.endpoint.get_publisher_count()
             if self.rmw == 'rmw_cyclonedds_cpp':
@@ -1284,7 +1287,7 @@ class _LivelinessPeerSampler:
                 except Exception as exc:
                     observation = {'complete': False,
                                    'reason': 'native_peer_observation_failed:' + type(exc).__name__}
-            elif self.rmw == 'rmw_fastrtps_cpp' and self.instrumentation is not None:
+            elif self.rmw == 'rmw_fastrtps_cpp' and self.instrumentation is not None and self.enabled:
                 try:
                     from .fastdds_peer_observer import FastddsMatchedPeerObserver
                     if self.observer is None:
@@ -1369,6 +1372,7 @@ def _worker_main(argv, group_owner=None):
         reference_from_config, manifest_for_reference, verify_vendor_mapping,
     )
     instrumentation = reference_from_config(config)
+    observe_native_peers = config.get("observe_native_peers", True)
     if instrumentation is not None and config["type_name"] != SUPPORTED_MESSAGE_TYPE:
         raise TopologyUnsupported("instrumented_message_type_not_expressible")
     import rclpy
@@ -1455,6 +1459,8 @@ def _worker_main(argv, group_owner=None):
             "observation_mode": config.get("observation_mode", "blackbox"),
             "topic": config["topic"], "message_type": config["type_name"],
         }
+        if "observe_native_peers" in config:
+            value["observe_native_peers"] = observe_native_peers
         if group_owner is not None:
             value.update({k: config[k] for k in ('group_id', 'worker_instance_id', 'context_instance_id')})
             value['worker_role'] = role
@@ -1673,7 +1679,7 @@ def _worker_main(argv, group_owner=None):
         if kind == "reader":
             liveliness.peer_sampler = _LivelinessPeerSampler(
                 endpoint, rmw_identifier, config["domain_id"], local_gid,
-                instrumentation=instrumentation)
+                instrumentation=instrumentation, enabled=observe_native_peers)
         emit("graph_snapshot", **initial_graph)
         if group_owner is not None:
             group_owner['emit']('endpoint_group_bound', endpoint={
@@ -1788,14 +1794,17 @@ def _worker_main(argv, group_owner=None):
                              else endpoint.get_publisher_count)
                 count_before = count_api()
                 observer = None
-                observation = {"complete": False, "reason": "rmw_has_no_public_peer_observer"}
+                observation = {"complete": False, "reason": (
+                    "rmw_has_no_public_peer_observer" if observe_native_peers
+                    else "native_peer_sampling_disabled_control")}
                 if rmw_identifier == "rmw_cyclonedds_cpp":
                     try:
                         observer = CycloneMatchedPeerObserver()
                         observation = observer.sample(config["domain_id"], local_gid, kind)
                     except (ValueError, OSError, AttributeError) as exc:
                         observation = {"complete": False, "reason": str(exc)}
-                elif rmw_identifier == "rmw_fastrtps_cpp" and instrumentation is not None:
+                elif (rmw_identifier == "rmw_fastrtps_cpp" and instrumentation is not None
+                      and observe_native_peers):
                     try:
                         from .fastdds_peer_observer import FastddsMatchedPeerObserver
                         if native_peer_observer is None:
@@ -1829,7 +1838,8 @@ def _worker_main(argv, group_owner=None):
                      candidate_eligible=False, participant_ownership_observation=ownership)
                 peer_observer_selected = (
                     rmw_identifier == "rmw_cyclonedds_cpp"
-                    or (rmw_identifier == "rmw_fastrtps_cpp" and instrumentation is not None))
+                    or (rmw_identifier == "rmw_fastrtps_cpp" and instrumentation is not None
+                        and observe_native_peers))
                 if peer_observer_selected:
                     # Selection can fail before constructing an observer. Keep
                     # those attempted captures incomplete, even if observer=None.
@@ -2996,6 +3006,8 @@ class RosTopologyBackend:
             worker_config["fastdds_peer_instrumentation"] = {
                 key: self.instrumentation_reference[key]
                 for key in ("manifest_path", "manifest_sha256")}
+            if "observe_native_peers" in self.config:
+                worker_config["observe_native_peers"] = self.config["observe_native_peers"]
         if prepared["initial_content_filter"] is not None:
             worker_config["initial_content_filter"] = deepcopy(prepared["initial_content_filter"])
 

@@ -1456,9 +1456,12 @@ def facts_from_events(events, runtime, config, *, capture_source=None):
         if a.native_peer_reference is not None:
             facts.update(observation_mode="instrumentation",
                          fastdds_peer_instrumentation=a.native_peer_reference)
+            if "observe_native_peers" in config:
+                facts["observe_native_peers"] = config["observe_native_peers"]
         facts.update(raw={"path": a.path, "sha256": a.sha}, program_sha256=a.program_sha,
                      plan_hash=a.plan.plan_hash(), fixture=a.fixture, arm=config.get("arm"),
-                     control_excluded=(config.get("arm") == "negative" or bool(config.get("control_kind"))
+                     control_excluded=(config.get("observe_native_peers") is False
+                        or config.get("arm") == "negative" or bool(config.get("control_kind"))
                         or config.get("candidate_source") == "control"
                         or any(e["event"] in {"fault_control_receipt", "harness_omission", "topology_guard_reject"} for e in a.events)),
                      input_binding_ref=a.ref(a.binding))

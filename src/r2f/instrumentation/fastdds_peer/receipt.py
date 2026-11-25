@@ -131,6 +131,26 @@ def validate_observation(observation, match, token, events, request):
     return None
 
 
+def validate_sampling_control(events, config):
+    """Reject worker/capture contradictions even when summary declarations agree."""
+    sampling = config.get('observe_native_peers', True)
+    for row in events:
+        if row.get('event') in {'native_peer_provider_selected', 'endpoint_created'} or 'observe_native_peers' in row:
+            actual = row.get('observe_native_peers', True)
+            if (type(actual) is not bool or actual != sampling
+                    or ('observe_native_peers' in config and 'observe_native_peers' not in row)):
+                raise ValueError('native_peer_sampling_control_raw_selection_mismatch')
+    if not sampling:
+        def native_capture(value):
+            if isinstance(value, dict):
+                return (value.get('schema') == OBSERVATION_SCHEMA
+                        or value.get('peer_proof_source') == 'fastdds_native_stateful_peer_snapshot'
+                        or any(native_capture(child) for child in value.values()))
+            return isinstance(value, list) and any(native_capture(child) for child in value)
+        if any(native_capture(row) for row in events):
+            raise ValueError('native_peer_sampling_control_has_native_capture')
+
+
 def validate_execution_mode(events, config, *, raw_path=None):
     """Bind actual worker declarations to explicit runner selection, not labels."""
     from .activation import reference_from_config, manifest_for_reference
@@ -142,6 +162,7 @@ def validate_execution_mode(events, config, *, raw_path=None):
             raise ValueError('native_peer_actual_mode_differs_from_blackbox_config')
         return None
     manifest = manifest_for_reference(reference)
+    validate_sampling_control(events, config)
     expected_reference = dict(reference)
     if raw_path is not None:
         expected_reference['manifest_path'] = str(Path(raw_path).resolve().parent / 'native-peer-build-manifest.json')
