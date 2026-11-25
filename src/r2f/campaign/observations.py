@@ -13,6 +13,7 @@ from r2f.core.evidence import canonical_hash, verify_raw
 from r2f.core.replay import ReplayCapsule, validate_replay_input
 from r2f.instrumentation.cyclonedds import TraceConfig, collect_trace, normalize_guid
 from r2f.instrumentation.projection import reconcile_projection
+from .discovery_profile import discovery_profile_facts
 from r2f.runtime.instrumentation_bridge import (
     FASTDDS_RMW, FASTDDS_DEFAULT_XML, observation_policy, fastdds_environment_key,
     fastdds_libraries_verified, mapped_library_identity_matches,
@@ -391,6 +392,8 @@ def qualify_observation(row, runtime, config, *, capsule=None):
                               adopted_domain_settings=deepcopy(observation['adopted_domain_settings']))
             elif 'presented_configuration' in observation:
                 raise ValueError('presented_configuration present without adopted-domain audit contract')
+            result['discovery_profile'] = discovery_profile_facts(
+                config, prepared, workers, [], [], observation.get('adopted_domain_settings', {}))
             result.update(qualification='blackbox_observed', provenance_verified=True, input_binding=input_binding,
                           non_tracing_profiles=deepcopy(prepared['profiles']), profile_policy=deepcopy(policy))
             return result
@@ -500,6 +503,8 @@ def qualify_observation(row, runtime, config, *, capsule=None):
                 event=witness['vendor_event']
                 if not any(event in t['events'] for t in rebuilt):
                     raise ValueError('instrumentation witness not bound to trace')
+        result['discovery_profile'] = discovery_profile_facts(
+            config, prepared, workers, rebuilt, comparisons, observation.get('adopted_domain_settings', {}))
         result.update(qualification='qualified',provenance_verified=True,limited_contract=CONTRACT,
                       admissible_count=len(intake),qualified_intake=deepcopy(intake),zero_candidate=not intake and not excluded,
                       observation_verdict=verdict, input_binding=input_binding, non_tracing_profiles=deepcopy(prepared['profiles']), profile_policy=deepcopy(policy))
