@@ -532,8 +532,10 @@ class _Projection:
                               if key not in ("compatible", "responsibility_layer")})
                 check.setdefault("responsibility_layer", native["responsibility_layer"])
                 check["compatible"] = False if False in values else None if None in values else True
-            check.setdefault("responsibility_layer", "qos_requested_offered")
-            check.setdefault("s1_coverage_rows", ["C10", "C13", "C15"])
+                # Optional matching metadata must not rewrite canonical state
+                # receipts of ordinary captures that never selected this carrier.
+                check.setdefault("responsibility_layer", "qos_requested_offered")
+                check.setdefault("s1_coverage_rows", ["C10", "C13", "C15"])
             return ("compatible" if check["compatible"] is True else "incompatible"
                     if check["compatible"] is False else "unknown"), check
 
