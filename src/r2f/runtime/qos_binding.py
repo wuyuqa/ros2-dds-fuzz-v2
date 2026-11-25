@@ -47,6 +47,9 @@ def compare_public_qos(requested, observed):
                 mismatches.append({'field': field, 'reason': 'observed_field_missing_or_invalid'})
             elif type(actual) is type(wanted) and actual == wanted:
                 continue
+            elif field == 'depth' and requested.get('history') == observed.get('history') == 'keep_all':
+                resolutions.append({'field': field, 'requested': wanted, 'observed': actual,
+                                    'basis': 'HISTORY_KEEP_ALL_DEPTH_INACTIVE'})
             elif field in DURATIONS and wanted == 0:
                 resolutions.append({'field': field, 'requested': wanted, 'observed': actual,
                                     'basis': 'RMW_DURATION_UNSPECIFIED'})

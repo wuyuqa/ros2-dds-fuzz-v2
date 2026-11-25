@@ -964,7 +964,7 @@ def _verify_topology_binding(config, plan, row, report):
     independent. Target identity, not an optional marker, selects this contract.
     """
     profile = report.get("profile", {})
-    for key in ("observation_mode", "fastdds_peer_instrumentation", "observe_native_peers"):
+    for key in ("observation_mode", "fastdds_peer_instrumentation", "observe_native_peers", "native_matching_qos"):
         if key in config or key in row or key in profile:
             if (canonical_hash(config.get(key)) != canonical_hash(row.get(key))
                     or canonical_hash(config.get(key)) != canonical_hash(profile.get(key))):

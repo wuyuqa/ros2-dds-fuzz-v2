@@ -13,6 +13,7 @@ dependencies = []
 where = ["src"]
 
 [tool.setuptools.package-data]
+"r2f.runtime" = ["matching_qos_bridge.cpp"]
 "r2f.modules.s1" = ["s1_coverage.json", "seed_lineage.json", "fastdds_lifecycle_calibration.json"]
 
 "r2f.instrumentation.fastdds_pdp_trace" = ["hook.cpp", "refresh.cpp"]

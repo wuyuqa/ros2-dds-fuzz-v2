@@ -720,7 +720,7 @@ def _pair_facts(audit, projection, deliveries):
             if len(values) >= 2 and all(v == values[0] for v in values):
                 policies[eid] = values[0]
         row["reliable_history_contract"] = (len(policies) == 2 and all(
-            p.get("reliability") == "reliable" and (p.get("history") == "keep_all"
+            isinstance(p, dict) and p.get("reliability") == "reliable" and (p.get("history") == "keep_all"
                 or p.get("history") == "keep_last" and _integer(p.get("depth"), max(1, len(expected))))
             for p in policies.values()))
         # A dynamic update may alter filtering even when the initial spec was empty.
@@ -1525,6 +1525,29 @@ def facts_from_events(events, runtime, config, *, capture_source=None):
                 facts["unknown_reasons"].append(str(exc))
         facts["unknown_reasons_sample_identity"] = list(facts["unknown_reasons"])
         facts["pairs"] = _pair_facts(a, projection, facts["deliveries"])
+        if config.get("native_matching_qos") is not None:
+            from r2f.runtime.matching_qos import audit_run
+            facts["matching_boundary"] = audit_run(a.program, a.events, config, fixture=a.fixture)
+            facts["matching_boundary"]["pairs"] = [{
+                "writer": pair["writer"], "reader": pair["reader"],
+                "compatibility": pair["compatibility"], "observed_match": pair["observed_match"],
+                "delivery_closure": pair["delivery_closure"],
+                "policy_scope": pair.get("proofs", {}).get("compatibility", {}).get("detail", {}).get("policy_scope"),
+                "raw_refs": pair.get("proofs", {}).get("compatibility", {}).get("refs", [])}
+                for pair in facts["pairs"]]
+            gaps = [gap for pair in facts["matching_boundary"]["pairs"]
+                    for gap in (pair.get("policy_scope") or {}).get("observation_gaps", [])]
+            facts["matching_boundary"]["observation_gaps"] = gaps
+            facts["matching_observation_incomplete"] = bool(gaps)
+            facts["unknown_reasons"].extend(gaps)
+        from r2f.runtime.native_matching import audit_run as audit_native_controls
+        controls = audit_native_controls(a.program, a.events, fixture=a.fixture, rmw=config.get("rmw"))
+        if controls:
+            facts["native_matching_controls"] = controls
+            gaps = [c.get("reason", "native_matching_control_incomplete") for c in controls if c["status"] == "unknown"]
+            gaps.extend(gap for c in controls for gap in c.get("observation_gaps", []))
+            facts["matching_observation_incomplete"] = bool(facts.get("matching_observation_incomplete") or gaps)
+            facts["unknown_reasons"].extend(gaps)
         empty_windows = _historical_no_obligation_windows(a, facts["pairs"], projection)
         historical = _recreated_history_windows(a, facts["pairs"], projection, facts["deliveries"])
         facts["historical_live_windows"] = _live_history_windows(a, facts["pairs"], projection, facts["deliveries"])
@@ -1610,7 +1633,8 @@ def facts_from_events(events, runtime, config, *, capture_source=None):
             and facts["source_provenance_qualified"] and facts["preconditions_reached"] and not facts["control_excluded"]
             and facts["application_audit"].get("status") == "application_observed"
             and facts["application_audit"].get("execution_evidence") is True
-            and facts["application_audit"].get("canonical_receipt_matches") is True)
+            and facts["application_audit"].get("canonical_receipt_matches") is True
+            and not facts.get("matching_observation_incomplete"))
         if "episode_observation" in facts:
             observation = facts["episode_observation"]
             facts["candidate_eligible"] = (facts["candidate_eligible"] and observation["completed"]

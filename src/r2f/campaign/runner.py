@@ -2567,7 +2567,7 @@ def _generate_case(sequence, entry, target, contract, surface, parent, mutator_i
                       topology_generation=topology_generation)
         # Observation/build selection is explicit execution metadata, never a
         # post-hash mutation of the submitted topology program or input capsule.
-        for key in ("observation_mode", "fastdds_peer_instrumentation", "observe_native_peers"):
+        for key in ("observation_mode", "fastdds_peer_instrumentation", "observe_native_peers", "native_matching_qos"):
             if key in profile:
                 config[key] = deepcopy(profile[key])
     if runtime_windows and "environment_windows" not in plan.final_config:
@@ -2680,6 +2680,8 @@ def _generate_case(sequence, entry, target, contract, surface, parent, mutator_i
             row["fastdds_peer_instrumentation"] = deepcopy(config["fastdds_peer_instrumentation"])
         if "observe_native_peers" in config:
             row["observe_native_peers"] = config["observe_native_peers"]
+        if "native_matching_qos" in config:
+            row["native_matching_qos"] = deepcopy(config["native_matching_qos"])
 
     if execute:
         from .tool_failures import generation_recipe

@@ -57,6 +57,7 @@ _ACTION_PARAMS = {
     "update_filter": ({"expression", "parameters"}, set()),
     "snapshot": (set(), {"label", "timeout_sec"}),
     "lookup_topic": ({"scope", "name"}, {"native_type_support"}),
+    "native_matching_control": ({"control"}, set()),
     "update_participant_userdata": ({"data"}, set()),
     "barrier": ({"condition", "timeout_sec"}, {"endpoint_ids", "publish_action_ids"}),
 }
@@ -306,6 +307,12 @@ def _shape(program):
         if op == "update_participant_userdata":
             if not _userdata(p["data"]):
                 _error(errors, f"{path}.params.data", "value", "1..256 UTF-8 bytes without NUL required")
+        if op == "native_matching_control":
+            from r2f.runtime.native_matching import validate_control
+            try:
+                validate_control(p["control"])
+            except (ValueError, TypeError, KeyError) as exc:
+                _error(errors, f"{path}.params.control", "value", str(exc))
         if op == "lookup_topic":
             if "native_type_support" in p:
                 from r2f.runtime.native_lookup_support import validate_reference
@@ -478,6 +485,8 @@ def _evaluate(program, count=None):
             requires.append(_require("runtime_normal_participant_refresh", None, kind="observation"))
         if op == "lookup_topic":
             requires.append(_require("runtime_typed_topic_lookup", None, kind="observation"))
+        if op == "native_matching_control":
+            requires.append(_require("runtime_native_matching_control", None, kind="observation"))
         if op == "snapshot":
             requires.append(_require("runtime_snapshot_receipt", None, kind="observation"))
         failed = any(r["status"] == "unsatisfied" for r in requires)

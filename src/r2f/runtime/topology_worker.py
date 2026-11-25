@@ -683,9 +683,22 @@ def endpoint_expressibility(spec, config):
     qos = spec.get("qos")
     if not isinstance(qos, dict):
         raise TopologyUnsupported("invalid_qos", "qos object required")
+    from .matching_qos import reference as matching_reference, partitions as partition_names
+    try:
+        matching = matching_reference(config)
+        if matching is not None and (config.get("participant_control") is not None
+                or (config.get("topology_program") or {}).get("participant_control") is not None):
+            raise TopologyUnsupported("native_matching_qos_endpoint_process_only")
+    except ValueError as exc:
+        raise TopologyUnsupported("native_matching_qos_invalid", str(exc)) from exc
+    actions = (config.get("topology_program") or {}).get("actions", [])
+    if config.get("rmw") == "rmw_fastrtps_cpp" and any(
+            action.get("op") == "native_matching_control" and action.get("endpoint_id") == spec.get("logical_id")
+            for action in actions) and spec.get("type_name") != "std_msgs/msg/String":
+        raise TopologyUnsupported("native_matching_control_requires_String_harness")
     reliability = _required_qos(qos, "reliability", ("best_effort", "reliable"))
     durability = _required_qos(qos, "durability", ("volatile", "transient_local"))
-    history = _required_qos(qos, "history", ("keep_last",))
+    history = _required_qos(qos, "history", ("keep_last", "keep_all"))
     depth = _required_qos(qos, "depth")
     if isinstance(depth, bool) or not isinstance(depth, int) or not 1 <= depth <= 65536:
         raise TopologyUnsupported("qos_not_expressible", "depth must be 1..65536")
@@ -693,9 +706,13 @@ def endpoint_expressibility(spec, config):
                                ("automatic", "manual_by_topic"))
     deadline_ns = _finite_ns(_required_qos(qos, "deadline_sec"), "deadline_sec")
     lease_ns = _finite_ns(_required_qos(qos, "lease_duration_sec"), "lease_duration_sec")
-    ownership = _required_qos(qos, "ownership", ("shared",))
+    ownership = _required_qos(qos, "ownership", ("shared", "exclusive") if matching else ("shared",))
     partitions = _required_qos(qos, "partitions")
-    if partitions != []:
+    try:
+        partition_names(partitions)
+    except ValueError as exc:
+        raise TopologyUnsupported("native_matching_qos_invalid", str(exc)) from exc
+    if partitions != [] and matching is None:
         raise TopologyUnsupported(
             "partitions_not_expressible",
             "rclpy QoSProfile has no public partition selector",
@@ -738,6 +755,12 @@ def endpoint_expressibility(spec, config):
         "execution_evidence": False,
         "candidate_eligible": False,
     }
+    if matching is not None:
+        binding["native_matching_qos"] = {
+            "partitions": deepcopy(partitions), "ownership": ownership, "build_reference": matching,
+            "scope": "native_publisher_or_subscriber", "adoption_status": "not_observed"}
+        binding["default_equivalent_fields"] = [row for row in binding["default_equivalent_fields"]
+                                                if row["field"] not in {"partitions", "ownership"}]
     if initial_filter is not None:
         binding["initial_content_filter"] = {
             **deepcopy(initial_filter), "scope": "initial_only",
@@ -754,7 +777,7 @@ def _public_qos_kwargs(qos):
     from rclpy.duration import Duration
     kwargs = {
         "depth": qos["depth"],
-        "history": HistoryPolicy.KEEP_LAST,
+        "history": getattr(HistoryPolicy, qos["history"].upper()),
         "reliability": {
             "best_effort": ReliabilityPolicy.BEST_EFFORT,
             "reliable": ReliabilityPolicy.RELIABLE,
@@ -1456,6 +1479,9 @@ def _worker_main(argv, group_owner=None):
     from .participant_identity import emit_identity_probe
     if group_owner is None:
         emit_identity_probe(config, _monotonic_clock_identity())
+    if config.get("native_matching_qos") is not None:
+        from .matching_qos import verify_profile
+        verify_profile(config)
     import rclpy
     from rclpy.context import Context
     from rclpy.executors import SingleThreadedExecutor
@@ -1663,6 +1689,8 @@ def _worker_main(argv, group_owner=None):
         created_ns = (filter_configuration["creation_returned_monotonic_ns"]
                       if filter_configuration is not None else time.monotonic_ns())
 
+        native_partitions = None
+
         def graph(*, authenticate=True):
             def entry(info):
                 profile = info.qos_profile
@@ -1719,6 +1747,11 @@ def _worker_main(argv, group_owner=None):
                     bootstrap_diagnostic(snapshot, siblings, phase="attempt", status="bound", reason=None)
                 elif local_gid != observed:
                     raise TopologyBackendError("unreceipted_endpoint_identity_change")
+            if native_partitions is not None:
+                from .matching_qos import observe as observe_partitions
+                snapshot["native_partition_qos"] = observe_partitions(
+                    endpoint, kind, config["native_partitions"], config["native_matching_qos"],
+                    apply=False, profile=config["native_qos_profile"])
             return snapshot
 
         def bootstrap_diagnostic(snapshot, siblings, *, phase, status, reason):
@@ -1747,6 +1780,14 @@ def _worker_main(argv, group_owner=None):
                                  reason="endpoint_gid_not_observed_within_startup_timeout")
             emit("worker_error", error="endpoint_gid_not_observed_within_startup_timeout")
             return 1
+        if config.get("native_matching_qos") is not None:
+            from .matching_qos import observe as observe_partitions
+            native_partitions = observe_partitions(endpoint, kind, config["native_partitions"],
+                                                   config["native_matching_qos"], apply=True, profile=config["native_qos_profile"])
+            if (native_partitions["endpoint_gid"] != local_gid
+                    or native_partitions["ownership"] != config["native_ownership"]):
+                raise TopologyBackendError("native_matching_endpoint_gid_or_ownership_mismatch")
+            emit("native_partition_configuration", **native_partitions)
         # Graph retains the independent remote contract and GID/type. Local
         # history/depth and resolved defaults come only from the actual public
         # endpoint API; endpoint.qos_profile is merely the supplied Python object.
@@ -1766,6 +1807,7 @@ def _worker_main(argv, group_owner=None):
              graph_qos=own.get("qos"),
              identity_source="get_publishers_info_by_topic" if kind == "writer"
              else "get_subscriptions_info_by_topic",
+             **({"native_partition_qos": native_partitions} if native_partitions is not None else {}),
              initial_content_filter=filter_configuration,
              initial_content_filter_request=config.get("initial_content_filter"))
         if kind == "reader":
@@ -1855,6 +1897,16 @@ def _worker_main(argv, group_owner=None):
             if command["command"] in ("stop", "destroy"):
                 emit("worker_stopping", command_id=command_id)
                 break
+            if command["command"] == "native_matching_control":
+                from .native_matching import execute_control
+                value = execute_control(command["control"], domain=config["domain_id"],
+                    rmw=rmw_identifier, endpoint=endpoint, kind=kind)
+                emit("native_matching_result", command_id=command_id, endpoint_gid=local_gid,
+                     control_receipt=value, supporting_diagnostic=True, candidate_eligible=False)
+                if value.get("cleanup_confirmed") is not True:
+                    raise TopologyBackendError("native_matching_control_cleanup_unconfirmed")
+                emit("command_done", command_id=command_id, endpoint_gid=local_gid)
+                continue
             if command["command"] == "lookup_topic":
                 from .scoped_topic_lookup import lookup_receipt, observe_topic_lookup
                 scope, name = command.get("scope"), command.get("name")
@@ -2240,7 +2292,7 @@ def _group_worker_main(argv):
                     emit('command_done', command=op, command_id=cid, **token)
                 else:
                     token = sessions.get(eid, {}).get('token')
-                    if (op not in {'snapshot', 'publish_batch', 'lookup_topic'} or token is None
+                    if (op not in {'snapshot', 'publish_batch', 'lookup_topic', 'native_matching_control'} or token is None
                             or command['generation'] != token['generation']
                             or command.get('endpoint_generation') != token['endpoint_generation']):
                         raise TopologyBackendError('group_command_target_or_operation_invalid')
@@ -2338,6 +2390,14 @@ class _EndpointProcess:
             "PYTHONDONTWRITEBYTECODE": "1",
             "PYTHONUNBUFFERED": "1",
         })
+        if self.config.get("native_matching_qos") is not None:
+            from .matching_qos import ownership_profile, digest
+            profile = self.output_dir / "native-qos-profile.xml"
+            with profile.open("xb") as stream:
+                stream.write(ownership_profile(self.config["topic"], self.config["native_ownership"]))
+            self.config["native_qos_profile"] = {"path": str(profile), "sha256": digest(profile)}
+            env["FASTRTPS_DEFAULT_PROFILES_FILE"] = str(profile)
+            env["FASTDDS_DEFAULT_PROFILES_FILE"] = str(profile)
         attempt = 1
         stderr_path = self.output_dir / f"{self.role}.stderr.log"
         while True:
@@ -2443,6 +2503,12 @@ class _EndpointProcess:
                       concurrency_group=fields["concurrency_group"],
                       command_id=command_id if command == "prepare_concurrent_publish" else fields["prepared_command_id"],
                       **{k: created.get(k) for k in ("logical_id", "generation", "endpoint_gid", "pid", "pgid", "process_start_ticks", "endpoint_generation")})
+        if command == "native_matching_control":
+            created = next((e for e in reversed(self.events) if e.get("event") == "endpoint_created"
+                            and all(e.get(k) == fields[k] for k in ("logical_id", "generation", "endpoint_generation") if k in fields)), {})
+            self.emit("native_matching_requested", command_id=command_id, control=fields["control"],
+                      **{k: created.get(k) for k in ("logical_id", "generation", "endpoint_gid", "endpoint_generation",
+                                                    "pid", "pgid", "process_start_ticks")})
         if command == "snapshot":
             created = next((e for e in reversed(self.events) if e.get("event") == "endpoint_created"
                             and all(e.get(k) == fields[k] for k in ('logical_id', 'generation', 'endpoint_generation') if k in fields)), {})
@@ -2905,6 +2971,10 @@ class OfflineTopologyBackend:
         return {"snapshots": snapshots, "command_id": command_id,
                 "complete": all(v["complete"] for v in snapshots.values())}
 
+    def native_matching_control(self, handle, control):
+        return {"status": "unsupported", "reason": "offline_fixture_no_native_matching_control",
+                "cleanup_confirmed": True, "request": deepcopy(control), "candidate_eligible": False}
+
     def lookup_topic(self, handle, scope, name, *, native_type_support=None):
         from .scoped_topic_lookup import lookup_receipt
         receipt = lookup_receipt(scope, name, reason="offline_fixture_no_native_topic_lookup")
@@ -3013,6 +3083,15 @@ class RosTopologyBackend:
             validate_control(program, cfg)
         except (ValueError, KeyError, TypeError) as exc:
             raise TopologyUnsupported('participant_control_scope', str(exc)) from exc
+        from .matching_qos import reference as matching_reference, load_build
+        try:
+            native_reference = matching_reference(cfg)
+            if native_reference is not None:
+                load_build(native_reference)
+                if enabled(program):
+                    raise ValueError("native_matching_qos_endpoint_process_only")
+        except (ValueError, KeyError, OSError, TypeError) as exc:
+            raise TopologyUnsupported("native_matching_qos_qualification", str(exc)) from exc
         self.group_program = deepcopy(program) if enabled(program) else None
         # Hard gate: this backend must refuse to touch a live domain unless an
         # explicit owner GO was supplied.  Direct API use cannot bypass it.
@@ -3123,6 +3202,10 @@ class RosTopologyBackend:
             "startup_timeout_sec": float(self.config.get("startup_timeout_sec", 10.0)),
         }
 
+        if self.config.get("native_matching_qos") is not None:
+            worker_config["native_matching_qos"] = deepcopy(self.config["native_matching_qos"])
+            worker_config["native_partitions"] = deepcopy(spec["qos"]["partitions"])
+            worker_config["native_ownership"] = spec["qos"]["ownership"]
         identity_checks = self.config.get("topology_program", {}).get("identity_checks")
         if identity_checks is not None:
             worker_config["identity_checks"] = deepcopy(identity_checks)
@@ -3514,6 +3597,23 @@ class RosTopologyBackend:
         return {"snapshots": snapshots, "command_id": None,
                 "group_observations": group_observations,
                 "complete": all(v["complete"] for v in snapshots.values())}
+
+    def native_matching_control(self, handle, control):
+        command_id = self._batch(handle, "native_matching_control", control=control,
+                                  _timeout_sec=2 * control["timeout_sec"] + 30)
+        events = handle["process"].events
+        rows = [row for row in events if row.get("event") == "native_matching_result"
+                and row.get("command_id") == command_id]
+        acks = [row for row in events if row.get("event") == "command_done"
+                and row.get("command_id") == command_id]
+        keys = ("logical_id", "generation", "endpoint_generation", "endpoint_gid", "pid",
+                "pgid", "process_start_ticks")
+        if (len(rows) != 1 or len(acks) != 1
+                or any(rows[0].get(key) != handle.get(key) or acks[0].get(key) != handle.get(key) for key in keys)
+                or events.index(rows[0]) >= events.index(acks[0])
+                or rows[0].get("control_receipt", {}).get("request") != control):
+            raise TopologyBackendError("native_matching_control_worker_binding_invalid")
+        return deepcopy(rows[0]["control_receipt"])
 
     def lookup_topic(self, handle, scope, name, *, native_type_support=None):
         command_id = self._batch(handle, "lookup_topic", scope=scope, name=name,

@@ -519,8 +519,24 @@ class _Projection:
         return value, [w, r, *wc, *rc, *native_sources] + ([proof] if proof else []), proof
 
     def compatibility(self, w, r, wc, rc):
+        from r2f.runtime.matching_qos import pair_contract
+        native = pair_contract(w, r, wc[2], rc[2], {e["logical_id"]: e for e in self.program["endpoints"]})
+
+        def conclude(check):
+            if native is not None:
+                values = (check["compatible"], native["compatible"])
+                check.update({key: value for key, value in native.items()
+                              if key not in ("compatible", "responsibility_layer")})
+                check.setdefault("responsibility_layer", native["responsibility_layer"])
+                check["compatible"] = False if False in values else None if None in values else True
+            check.setdefault("responsibility_layer", "qos_requested_offered")
+            check.setdefault("s1_coverage_rows", ["C10", "C13", "C15"])
+            return ("compatible" if check["compatible"] is True else "incompatible"
+                    if check["compatible"] is False else "unknown"), check
+
         if w["topic"] != r["topic"]:
-            return "incompatible", {"reason": "observed_topic_mismatch", "actual_match": "not_evaluated"}
+            return conclude({"compatible": False, "reason": "observed_topic_mismatch",
+                             "responsibility_layer": "topic_matching", "actual_match": "not_evaluated"})
         contracts = {}
         for token, list_key in ((w, "publishers"), (r, "subscriptions")):
             rows = []
@@ -542,21 +558,23 @@ class _Projection:
         if writer["topic_type"] != reader["topic_type"]:
             # A known type difference is independent of missing QoS. Retain
             # the observed types; this contract does not infer actual match.
-            return "incompatible", {
-                "reason": "observed_type_mismatch", "actual_match": "not_evaluated",
+            return conclude({
+                "compatible": False, "reason": "observed_type_mismatch", "actual_match": "not_evaluated",
+                "responsibility_layer": "type_matching", "s1_coverage_rows": ["C10", "C13", "C15"],
                 "writer_type": writer["topic_type"], "reader_type": reader["topic_type"],
                 "type_scope": "observed_ros_type_names_not_xtypes_assignability",
                 "qos": "not_evaluated_type_mismatch",
-            }
+            })
         fields_by_endpoint = {}
         for eid, row in contracts.items():
-            if not isinstance(row.get("qos"), dict):
-                raise ValueError("observed_contract_fields_missing")
             fields = {}
+            raw_qos = row.get("qos")
+            if raw_qos is not None and not isinstance(raw_qos, dict):
+                raise ValueError("observed_contract_qos_not_mapping")
             for policy, key in (("reliability", "reliability"), ("durability", "durability"),
                                 ("liveliness.kind", "liveliness"), ("deadline", "deadline_ns"),
                                 ("liveliness.lease_duration", "liveliness_lease_duration_ns")):
-                value = row["qos"].get(key)
+                value = (raw_qos or {}).get(key)
                 if key.endswith("_ns"):
                     value = ({"infinite": True} if value == 9223372036854775807 else
                              {"nanoseconds": value} if _integer(value) else None)
@@ -564,8 +582,7 @@ class _Projection:
                     fields[policy] = {"status": "observed", "value": value}
             fields_by_endpoint[eid] = fields
         check = check_offered_requested(fields_by_endpoint[w["logical_id"]], fields_by_endpoint[r["logical_id"]])
-        return ("compatible" if check["compatible"] is True else "incompatible"
-                if check["compatible"] is False else "unknown"), check
+        return conclude(check)
 
     def pair_bound(self, event, w, r):
         if any(event.get(role) != t["logical_id"] or not _integer(event.get(role + "_generation"), 1)

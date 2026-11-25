@@ -155,13 +155,25 @@ def evaluate_topology(scenario, facts):
             delivery_values.append(None)
             reasons.append("finite_tail_or_delivery_contract_unknown" if closure in {"open", "closed_with_gap"}
                            else "per_writer_delivery_identity_unknown")
+    for control in facts.get("native_matching_controls", []):
+        if control["status"] == "fail":
+            graph_values.append(False)
+            residuals.append("topology.pair_graph_mismatch")
+            reasons.append(control["reason"])
+        elif control["status"] == "pass":
+            graph_values.append(True)
+        elif control["status"] == "unknown":
+            graph_values.append(None)
+            reasons.append(control.get("reason", "native_matching_control_incomplete"))
+        # Explicit vendor unsupported is retained in facts, never a SUT failure.
     values = dict(facts["fact_values"])
     values[TOPOLOGY_FACT_GRAPH] = _aggregate(graph_values)
     values[TOPOLOGY_FACT_DELIVERY] = _aggregate(delivery_values)
     values[TOPOLOGY_FACT_GUARDS] = True if facts.get("action_receipts") else None
     result["fact_values"] = values
     excluded = facts.get("fixture") is True or facts.get("control_excluded") is True or scenario.arm == "negative"
-    result["diagnostic_only"] = excluded or facts.get("source_provenance_qualified") is not True
+    result["diagnostic_only"] = (excluded or facts.get("source_provenance_qualified") is not True
+                                 or bool(facts.get("matching_observation_incomplete")))
     # Forbidden residuals outrank allowed effects AND unrelated unknown pairs.
     # A fail is a diagnostic rule violation, never by itself a natural candidate.
     if residuals:
@@ -171,10 +183,12 @@ def evaluate_topology(scenario, facts):
     elif graph_values and values[TOPOLOGY_FACT_GRAPH] is True \
             and (not delivery_values or values[TOPOLOGY_FACT_DELIVERY] is True) \
             and not facts.get("unknown_reasons_sample_identity") \
-            and not facts.get("unresolved_historical_obligations") and not identity_unknown:
+            and not facts.get("unresolved_historical_obligations") and not identity_unknown \
+            and not facts.get("matching_observation_incomplete"):
         result.update(verdict="pass", reason_codes=["bounded_observed_topology_consistency"],
                       observed_effects=["observed_consistency"], effect_id=TOPOLOGY_EFFECT)
-    elif not graph_values and not delivery_values and not facts.get("unresolved_historical_obligations") and not identity_unknown:
+    elif not graph_values and not delivery_values and not facts.get("unresolved_historical_obligations") and not identity_unknown \
+            and not facts.get("matching_observation_incomplete"):
         result.update(verdict="not_applicable", reason_codes=["no_applicable_pair_obligation"])
     else:
         result["reason_codes"] = sorted(set(reasons or ["topology_evidence_incomplete"]))

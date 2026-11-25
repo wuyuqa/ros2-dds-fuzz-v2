@@ -336,7 +336,7 @@ def validate_topology_profile(profile):
     from r2f.modules.s1 import fuzz_mutators_v2
     allowed = PROFILE_METADATA_FIELDS | {'source_schema', 'operator_whitelist', 'runtime_capability',
                                          'observation_mode', 'fastdds_peer_instrumentation',
-                                         'observe_native_peers'}
+                                         'observe_native_peers', 'native_matching_qos'}
     unknown = set(profile) - allowed
     if unknown:
         raise ValueError('unsupported topology profile field:' + ','.join(sorted(unknown)))
@@ -366,6 +366,11 @@ def validate_topology_profile(profile):
             rmw not in ('rmw_cyclonedds_cpp', 'rmw_fastrtps_cpp') for rmw in rmws) or \
             len(set(rmws)) != len(rmws):
         raise ValueError('topology_rmws_invalid')
+    if 'native_matching_qos' in profile:
+        from r2f.runtime.matching_qos import reference as matching_reference
+        if rmws != ['rmw_fastrtps_cpp']:
+            raise ValueError('native_matching_qos_requires_single_fastdds_rmw')
+        matching_reference(dict(profile, rmw=rmws[0]))
     if any(key in profile for key in ('observation_mode', 'fastdds_peer_instrumentation',
                                       'observe_native_peers')):
         from r2f.instrumentation.fastdds_peer.activation import reference_from_config
