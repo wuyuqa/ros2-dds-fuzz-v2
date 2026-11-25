@@ -213,3 +213,57 @@ def test_delayed_emission_cannot_turn_pre_expiry_acquisition_into_fresh_removal(
         sample['matches']['sampled_monotonic_ns'] = sample['request']['requested_monotonic_ns'] + 1
     result = fixture.facts()['participant_lease']
     assert all(row['public_removal_status']=='unknown' for row in result['external_correlation'])
+
+
+def test_lease_replay_persists_the_selected_mode_for_failed_attempt_audit(tmp_path, monkeypatch):
+    """Exercise capsule -> replay -> auditor; fixture dispatch is never real DDS."""
+    import json
+    from pathlib import Path
+    from r2f.campaign.replay import audit_replay, replay_cell
+    from r2f.campaign.runner import run_campaign
+    from r2f.core.evidence import raw_sha256
+
+    source = dict(source_repo=str(Path(__file__).resolve().parents[1]), head='offline-fixture-head',
+                  behavior_tree_sha256='a' * 64, source_frozen=True, dirty_behavior_paths=[])
+    monkeypatch.setattr('r2f.campaign.runner.source_manifest', lambda _: dict(source))
+    monkeypatch.setattr('r2f.campaign.replay.source_manifest', lambda _: dict(source))
+
+    def original_fixture(config, directory):
+        directory.mkdir(parents=True, exist_ok=True)
+        metadata = {key: config[key] for key in
+                    ('run_id', 'domain_id', 'target_id', 'target_revision', 'arm', 'repeat')}
+        metadata['observation_mode'] = config['observation_mode']
+        event = dict(metadata, event='participant_lease_execution_metadata', event_index=0,
+                     monotonic_ns=1, time_ns=1, effective_input_sha256=config['effective_input_sha256'])
+        ended = dict(metadata, event='runtime_end', event_index=1, monotonic_ns=2,
+                     time_ns=2, runtime_status='completed', real_execution=True)
+        raw = directory / 'raw.jsonl'
+        raw.write_text(''.join(json.dumps(row) + '\n' for row in (event, ended)))
+        return dict(runtime_status='completed', reason='offline_selection_fixture',
+                    evidence_origin='offline_fixture', real_execution=True,
+                    events=[event, ended], raw_path=str(raw),
+                    raw_sha256=raw_sha256(raw), execution_metadata=metadata)
+
+    for mode in ('instrumentation', 'blackbox'):
+        original = run_campaign(tmp_path / mode / 'original', execute=True,
+            runtime=original_fixture, max_executions=1,
+            target_id='discovery.interruption_recovery',
+            parameters={'observe_participant_leases': True},
+            observation={'observation_mode': mode, 'observe_adopted_config': False,
+                         'cell_id': 'rmw_cyclonedds_cpp.mutated.0'})
+        row = next(row for row in original['rows'] if row['execution_stage'] != 'planned')
+        capsule = Path(row['replay_path'])
+        before = capsule.read_bytes()
+
+        def failed_dispatch(config, directory):
+            assert config['observation_mode'] == mode
+            raise RuntimeError('offline deliberate worker failure')
+
+        replay = replay_cell(capsule, output_dir=tmp_path / mode / 'replay',
+                             domain_id=192, runtime=failed_dispatch)
+        assert replay['status'] == 'fail_environment', replay.get('failure_reason')
+        checked = audit_replay(replay['report_path'])
+        assert checked['valid'] is True, checked['errors']
+        assert replay['observation_replay']['selection']['observation_mode'] == mode
+        assert checked['real_ros_execution'] is False
+        assert capsule.read_bytes() == before

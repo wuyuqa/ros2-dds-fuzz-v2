@@ -1132,7 +1132,8 @@ def replay_cell(capsule_path, *, output_dir, domain_id, runtime=None,
                         if not any(ref['path'] == str(path) for ref in report['original_artifacts']):
                             report['original_artifacts'].append(_reference(path))
                 context['config'] = config
-                if capsule.input['target_id'] == _TOPOLOGY_TARGET:
+                if (capsule.input['target_id'] == _TOPOLOGY_TARGET
+                        or config.get('observe_participant_leases') is True):
                     report['observation_replay'] = _observation_replay_declaration(capsule, config)
                 _write(output / 'runtime_config.json', config)
                 runtime_dir = output / 'runtime'
