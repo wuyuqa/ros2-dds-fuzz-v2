@@ -55,10 +55,13 @@ class NativeFixture(ObservedPeers):
         return receipt
 
 
-def produce(tmp_path, *, request=None, backend=None):
+def produce(tmp_path, *, request=None, backend=None, empty_snapshot=False):
     p=model.generate_program(7,writers=1,readers=1)
     p['actions'].insert(-1, {'action_id':'native','op':'native_matching_control','endpoint_id':'w0','generation':1,
                             'params':{'control':request or control()},'depends_on':[]})
+    if empty_snapshot:
+        p['actions'].insert(0, {'action_id':'empty','op':'snapshot','endpoint_id':None,'generation':None,
+                                'params':{'label':'before_create'},'depends_on':[]})
     assert model.validate_program(p)['status']=='valid'
     cfg=config_for(p);cfg['rmw']='rmw_cyclonedds_cpp'
     runtime=run_topology_route(cfg,tmp_path/'runtime',backend=backend or NativeFixture())
@@ -72,6 +75,68 @@ def test_native_control_passes_through_existing_runner_raw_facts_and_oracle(tmp_
     assert facts['native_matching_controls'][0]['status']=='pass',facts
     assert facts['native_matching_controls'][0]['ros_qos_adoption'] is False
     assert oracle['verdict']=='pass'
+    assert facts['candidate_eligible'] is False
+
+
+def test_empty_snapshot_before_native_control_needs_no_nonexistent_worker_ack(tmp_path):
+    runtime,cfg=produce(tmp_path,empty_snapshot=True)
+    facts,oracle=consume(runtime,cfg)
+    assert facts['diagnostic_valid'],facts
+    assert facts['native_matching_controls'][0]['status']=='pass',facts
+    assert oracle['verdict']=='pass',oracle
+    assert facts['fixture'] is True and facts['execution_evidence'] is False
+    assert facts['candidate_eligible'] is False
+
+
+@pytest.mark.parametrize('damage',['missing_observation','pairs','delivery','command','controller','complete_int',
+                                   'before_alive','before_action','before_requires','before_after',
+                                   'before_satisfied','after_complete_only','after_requires'])
+def test_empty_snapshot_requires_exact_controller_capture_and_terminal(tmp_path,damage):
+    runtime,cfg=produce(tmp_path,empty_snapshot=True)
+    def corrupt(events):
+        captured=next(e for e in events if e['event']=='topology_pair_observation'
+                      and e.get('step_id')=='snapshot:empty')
+        if damage=='missing_observation':events.remove(captured)
+        elif damage in ('pairs','delivery'):captured[damage]=[{'unattributed':'endpoint'}]
+        elif damage=='command':captured.pop('snapshot_command_id')
+        elif damage=='controller':captured['pid']+=1
+        elif damage.startswith('before_'):
+            before=next(e for e in events if e['event']=='state_step_before' and e.get('step_id')=='action:empty')
+            if damage=='before_alive':before['before']['alive']=['w0']
+            elif damage=='before_action':before['action']['op']='barrier'
+            elif damage=='before_requires':before['requires']=[{'id':'unmet','status':'unsatisfied'}]
+            elif damage=='before_after':before['after']={}
+            elif damage=='before_satisfied':before['satisfied']=False
+        elif damage in ('after_complete_only','after_requires'):
+            after=next(e for e in events if e['event']=='state_step_after' and e.get('step_id')=='action:empty')
+            if damage=='after_complete_only':after['after']['complete']=1
+            else:after['requires']=[{'id':'unmet','status':'unsatisfied'}]
+        elif damage=='complete_int':
+            for e in events:
+                if e['event']=='topology_action_done' and e.get('action_id')=='empty':
+                    e['receipt']['after']['complete']=1
+                elif e['event']=='state_step_after' and e.get('step_id')=='action:empty':
+                    e['after']['complete']=1
+    rewrite(runtime,corrupt)
+    facts,oracle=consume(runtime,cfg)
+    assert facts['diagnostic_valid'] is False
+    assert oracle['verdict']!='pass'
+    assert facts['candidate_eligible'] is False
+
+
+def test_live_snapshot_cannot_use_the_empty_controller_ack_exception(tmp_path):
+    runtime,cfg=produce(tmp_path,empty_snapshot=True)
+    def corrupt(events):
+        begin=next(e for e in events if e['event']=='topology_action_begin'
+                   and e['action']['op']=='snapshot' and e['before'].get('alive'))
+        done=next(e for e in events if e['event']=='topology_action_done'
+                  and e['action_id']==begin['action_id'])
+        events[:]=[e for e in events if not (begin['event_index']<e['event_index']<done['event_index']
+                                            and e['event']=='command_done')]
+    rewrite(runtime,corrupt)
+    facts,oracle=consume(runtime,cfg)
+    assert facts['diagnostic_valid'] is False
+    assert oracle['verdict']!='pass'
     assert facts['candidate_eligible'] is False
 
 

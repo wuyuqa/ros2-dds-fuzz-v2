@@ -539,6 +539,35 @@ class _Audit:
                          and receipt["after"].get("alive") is True
                          and receipt["after"].get("next_sequence") == params["start_sequence"] + params["count"],
                          "action_publish_after_state_mismatch")
+            elif (op == "snapshot" and physical_before == {"alive": []}
+                  and not any(e["event"] == "command_done" for e in inside)):
+                # No worker exists to acknowledge this controller-only capture.
+                # The raw lifecycle replay above, not the receipt, proves emptiness.
+                captured = _one(inside, "topology_pair_observation", step_id="snapshot:" + aid)
+                state_before = _one(inside, "state_step_before", step_id="action:" + aid)
+                _require(inside == [state_before, captured, after]
+                         and all(k in captured for k in ("pairs", "delivery", "snapshot_command_id"))
+                         and captured["pairs"] == [] and captured["delivery"] == []
+                         and captured["snapshot_command_id"] is None
+                         and canonical_hash(receipt["after"]) ==
+                             canonical_hash({"complete": True, "snapshot_command_id": None})
+                         and receipt["requires"] == [{"id": "runtime_snapshot_receipt",
+                              "kind": "observation", "status": "satisfied"}],
+                         "action_empty_snapshot_not_raw_backed")
+                initial = {"step_id": "action:" + aid, "action": action, "before": physical_before,
+                           "after": None, "requires": [], "satisfied": None}
+                _require(all(k in state_before for k in initial)
+                         and canonical_hash({k: state_before[k] for k in initial}) == canonical_hash(initial)
+                         and all(k in after for k in receipt)
+                         and canonical_hash({k: after[k] for k in receipt}) == canonical_hash(receipt),
+                         "action_empty_snapshot_state_receipt_mismatch")
+                _chain(begin, state_before, captured, after, done)
+                controller = ("pid", "pgid", "role", "backend", "run_id", "domain_id",
+                              "monotonic_clock_identity")
+                _require(all(canonical_hash({k: e.get(k) for k in controller}) ==
+                             canonical_hash({k: self.begin.get(k) for k in controller})
+                             for e in (begin, state_before, captured, after, done)),
+                         "action_empty_snapshot_controller_mismatch")
             elif op in {"snapshot", "barrier"}:
                 _require(any(e["event"] == "command_done" for e in inside), "action_snapshot_ack_missing")
             elif op == "update_filter":
