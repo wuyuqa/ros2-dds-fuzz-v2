@@ -3480,14 +3480,17 @@ def run_topology(program, config, output_dir, *, backend=None):
                         record_guard(action, "lookup_target_alive_guard",
                                      "lookup requires a live current generation", before=before)
                         return
-                    value = backend.lookup_topic(st["handle"], params["scope"], params["name"])
+                    value = backend.lookup_topic(st["handle"], params["scope"], params["name"],
+                        **({"native_type_support": params["native_type_support"]}
+                           if "native_type_support" in params else {}))
                     emit("topic_lookup_observation", action_id=aid, logical_id=eid,
                          generation=gen, endpoint_gid=st["handle"]["endpoint_gid"],
                          lookup_receipt=deepcopy(value), fixture=not backend.real_ros,
                          candidate_eligible=False)
                     result["observation_receipts"].append({
                         "action_id": aid, "kind": "typed_topic_lookup", "receipt": deepcopy(value)})
-                    observed = value.get("complete") is True
+                    observed = (value.get("complete") is True
+                                and value.get("status") in ("found", "not_found"))
                     record_action(action, before, {**before, "lookup": value},
                                   disposition="effect_observed" if observed else "unknown",
                                   satisfied=observed,
