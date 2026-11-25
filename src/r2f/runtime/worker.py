@@ -241,7 +241,15 @@ def main():
     while local_gid is None and time.monotonic() < identity_deadline:
         executor.spin_once(timeout_sec=0.02)
         initial_graph = graph()
-    emit('endpoint_created', endpoint_gid=local_gid, created_monotonic_ns=created_ns,
+    ownership = {}
+    if config.get('projection_discovery_layers') and rmw == 'rmw_cyclonedds_cpp':
+        try:
+            from .topology_worker import CycloneMatchedPeerObserver
+            ownership = CycloneMatchedPeerObserver().sample_ownership(config['domain_id'], local_gid, endpoint_role)
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+            ownership = {'complete': False, 'status': 'unknown', 'reason': str(exc)}
+    emit('endpoint_created', **({'participant_ownership': ownership} if ownership else {}),
+         endpoint_gid=local_gid, created_monotonic_ns=created_ns,
          create_begin_monotonic_ns=create_begin['monotonic_ns'], create_begin_time_ns=create_begin['time_ns'],
          topic=config['topic'], qos=q, message_type='std_msgs/msg/String')
     emit('graph_snapshot', **initial_graph)

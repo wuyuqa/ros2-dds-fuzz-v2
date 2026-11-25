@@ -484,6 +484,23 @@ def projection_facts(events, runtime, config):
                   'field_policy': observation.get('field_policy')}
         if layers_enabled:
             kwargs['discovery_layers'] = observation['discovery_layers']
+        if 'projection_discovery_tools' in config:
+            if (not observation.get('discovery_tools')
+                    or raw_observation.get('discovery_tools') != observation['discovery_tools']):
+                raise ValueError('projection discovery tools raw observation differs')
+            tools = _json(observation['discovery_tools']['raw'])
+            if tools.get('manifest') != config['projection_discovery_tools']:
+                raise ValueError('projection discovery tools manifest differs')
+            for recorded in tools['events']:
+                matching = [event for event in events
+                            if event.get('namespace_event_index') == recorded.get('namespace_event_index')]
+                if len(matching) != 1 or any(matching[0].get(key) != value for key, value in recorded.items()):
+                    raise ValueError('projection discovery tools canonical event differs')
+            if _one(events, 'discovery_tools_observer_stopped').get('receipt') != observation['discovery_tools']:
+                raise ValueError('projection discovery tools stop receipt differs')
+            kwargs['discovery_tools'] = observation['discovery_tools']
+        elif 'discovery_tools' in observation or 'discovery_tools' in raw_observation:
+            raise ValueError('projection discovery tools require submitted opt-in')
         graph_for_reconcile = deepcopy(observation['graph_snapshot'])
         original = reconcile_discovery_projection(discovery,graph_for_reconcile,**kwargs)
         result = original
@@ -531,8 +548,18 @@ def projection_facts(events, runtime, config):
                 raise ValueError('known projection fault did not isolate one primary mismatch')
         workers = (runtime.get('execution_metadata') or runtime.get('execution') or {}).get('workers',[])
         if isinstance(workers,dict): workers=list(workers.values())
-        healthy = (len(workers)==len(roles) and {w.get('role') for w in workers}==set(roles)
-                   and all(w.get('returncode')==0 and w.get('pid')==tokens[w['role']]['pid'] for w in workers)
+        expected_roles = set(roles) | ({'discovery_tools'} if 'projection_discovery_tools' in config else set())
+        endpoint_workers = [worker for worker in workers if worker.get('role') in roles]
+        tools_workers = [worker for worker in workers if worker.get('role') == 'discovery_tools']
+        tools_healthy = ('projection_discovery_tools' not in config or
+                         (len(tools_workers) == 1 and len(tools.get('workers', [])) == 1
+                          and all(tools_workers[0].get(key) == tools['workers'][0].get(key)
+                                  for key in ('pid', 'start_ticks', 'role', 'worker_generation', 'returncode'))
+                          and tools_workers[0].get('cleanup_confirmed') is True))
+        healthy = (len(workers)==len(expected_roles) and {w.get('role') for w in workers}==expected_roles
+                   and all(w.get('returncode')==0 for w in workers)
+                   and all(w.get('pid')==tokens[w['role']]['pid'] for w in endpoint_workers)
+                   and tools_healthy
                    and _one(events,'namespace_controller_exited').get('returncode')==0
                    and runtime.get('runtime_status')=='completed'
                    and runtime.get('carrier_implementation')=='isolated_netns_passive_sedp_public_qos'

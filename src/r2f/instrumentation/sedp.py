@@ -18,7 +18,7 @@ from .sedp_fields import discovery_layer_schema
 
 
 def reconcile_discovery_projection(discovery, graph_snapshot, *, endpoint_bindings,
-                                   observation_window, field_policy=None, discovery_layers=None):
+                                   observation_window, field_policy=None, discovery_layers=None, discovery_tools=None):
     """Expose CP1 schema limits and asynchronous source times, without a new oracle."""
     result = _reconcile_projection(
         discovery, graph_snapshot, endpoint_bindings=endpoint_bindings,
@@ -136,7 +136,8 @@ def reconcile_discovery_projection(discovery, graph_snapshot, *, endpoint_bindin
     if discovery_layers is not None:
         from .discovery_layers import discovery_layers_schema
         layers = discovery_layers_schema(discovery_layers,
-            discovery.get('capture_receipt') or {}, field_policy=field_policy)
+            discovery.get('capture_receipt') or {}, field_policy=field_policy,
+            endpoint_bindings=endpoint_bindings)
         result['schema_check']['discovery_layers'] = layers
         for name in ('participant', 'topic'):
             result['schema_check']['layers'][name].update(
@@ -148,4 +149,10 @@ def reconcile_discovery_projection(discovery, graph_snapshot, *, endpoint_bindin
                     fields=deepcopy(layers[name]['applicability']),
                     basis='independent builtin samples and same-capture wire; instance association remains qualified separately')
         result['schema_check']['assurance'] = 'raw-backed auxiliary observations; obligations remain open'
+    if discovery_tools is not None:
+        from .discovery_tools import discovery_tools_schema
+        result['schema_check']['discovery_tools'] = discovery_tools_schema(
+            discovery_tools, discovery.get('capture_receipt') or {},
+            layers=result['schema_check'].get('discovery_layers', {}),
+            bindings=endpoint_bindings, field_policy=field_policy)
     return result

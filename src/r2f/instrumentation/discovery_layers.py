@@ -9,7 +9,7 @@ from .spdp_wire import parse_spdp_capture
 from .topic_wire import parse_topic_capture
 
 
-def discovery_layers_schema(reference, capture, *, field_policy=None):
+def discovery_layers_schema(reference, capture, *, field_policy=None, endpoint_bindings=()):
     result = {'schema': 'r2f.discovery-layers/v1',
               'identity': {'status': 'unknown', 'reasons': []},
               'responsibility_layer': 'harness', 'candidate_eligible': False,
@@ -157,6 +157,8 @@ def discovery_layers_schema(reference, capture, *, field_policy=None):
                            'history': {'builtin': 'sample.qos:dds_qget_history', 'wire': 'PID_HISTORY'},
                            'depth': {'builtin': 'sample.qos:dds_qget_history; not_applicable_keep_all',
                                      'wire': 'PID_HISTORY; not_applicable_keep_all'}})
+        result['topic']['field_comparisons'] = _topic_field_comparisons(
+            samples['DCPSTopic'], sample_refs['DCPSTopic'], topic_wire)
         timing_reasons = []
         if raw.get('timestamp_clock') != 'unix_ns_realtime':
             timing_reasons.append('native_realtime_clock_not_established')
@@ -195,12 +197,16 @@ def discovery_layers_schema(reference, capture, *, field_policy=None):
         result['participant']['association'] = {'status': 'unknown',
             'reasons': sorted(set(association_reasons)) or ['process_lifecycle_association_unavailable'],
             'guid_correlations': correlations}
+        result['participant']['process_correlations'] = _process_correlations(
+            endpoint_bindings, samples['DCPSParticipant'], sample_refs['DCPSParticipant'],
+            spdp, raw['domain_id'])
         result['topic']['association'] = {'status': 'unknown',
             'reasons': ['topic_instance_owner_generation_unavailable', 'opaque16_key_not_wire_instance_guid']}
+        native_collection_qualified = not (set(raw['reasons']) - {'builtin_samples_unavailable'})
         for layer in ('participant', 'topic'):
             result[layer]['reconciliation_status'] = 'unknown'
             result[layer]['observation_status'] = (
-                'observed' if raw['status'] == 'observed' and result[layer]['builtin_observations']
+                'observed' if native_collection_qualified and result[layer]['builtin_observations']
                 and result[layer]['wire']['status'] == 'observed' else 'unknown')
             if result[layer]['observation_status'] != 'observed':
                 result['status'] = 'unknown'
@@ -217,3 +223,107 @@ def discovery_layers_schema(reference, capture, *, field_policy=None):
         result[name].setdefault('association', {'status': 'unknown', 'reasons': ['sources_not_qualified']})
         result[name].setdefault('reconciliation_status', 'unknown')
     return result
+
+
+def _topic_field_comparisons(samples, refs, wire):
+    """Compare only stable advertised fields; name/type is not an instance ID.
+
+    Asynchronous reads cannot prove a discrepancy is in the core or binding.
+    Keep all conflicting advertisements and send a mismatch for review only.
+    """
+    rows = []
+    for sample, ref in zip(samples, refs):
+        matches = [event for event in wire['observations']
+                   if event.get('status') == 'observed'
+                   and event['fields']['topic'].get('value') == sample.get('topic_name')
+                   and event['fields']['type'].get('value') == sample.get('type_name')]
+        history = sample.get('history', {})
+        row = {'scope': 'topic_type_field_projection_not_instance_identity',
+               'topic': sample.get('topic_name'), 'type': sample.get('type_name'),
+               'builtin_raw_ref': deepcopy(ref),
+               'wire_raw_refs': [deepcopy(event['raw_ref']) for event in matches],
+               'fields': {}, 'status': 'unknown', 'reasons': [],
+               'candidate_eligible': False, 'responsibility_layer': 'unresolved'}
+        if not matches:
+            row['reasons'].append('no_same_name_type_wire_advertisement')
+        if (sample.get('valid_data') is not True or sample.get('instance_state') != 'ALIVE'
+                or history.get('status') != 'observed' or wire.get('status') != 'observed'):
+            row['reasons'].append('topic_source_or_sample_not_qualified')
+        for name in ('history', 'depth'):
+            builtin = history.get('kind' if name == 'history' else name)
+            values = {event['fields'][name].get('value') for event in matches}
+            # KEEP_ALL's depth has no semantic comparison, even if C exposes it.
+            if name == 'depth' and history.get('kind') == 'KEEP_ALL':
+                row['fields'][name] = {'status': 'not_applicable', 'reason': 'ignored_for_KEEP_ALL'}
+                continue
+            if builtin is None or len(values) != 1 or None in values:
+                row['reasons'].append('missing_or_ambiguous_topic_field:' + name)
+                continue
+            value, = values
+            row['fields'][name] = {'builtin': builtin, 'wire': value, 'equal': builtin == value}
+        if not row['reasons']:
+            row['status'] = ('mismatch_requires_review' if any(
+                field.get('equal') is False for field in row['fields'].values()) else 'consistent')
+        rows.append(row)
+    return rows
+
+
+def _process_correlations(bindings, samples, refs, wire, domain):
+    """Join an observed local parent to raw process/endpoint and SPDP identity.
+
+    An endpoint generation is never renamed a participant lifecycle generation.
+    Each link is a bounded observation; no atomicity/continuous-presence claim.
+    """
+    from .sedp_projection import _binding_times, _lifecycle_event
+    rows = []
+    for binding in bindings:
+        row = {key: deepcopy(binding.get(key)) for key in
+               ('role', 'generation', 'pid', 'process_start_ticks', 'endpoint_guid')}
+        row.update(status='unknown', reasons=[], candidate_eligible=False,
+                   participant_lifecycle_generation='unknown',
+                   lifecycle_raw_refs=[deepcopy(binding.get(key)) for key in ('begin_raw_ref', 'return_raw_ref')],
+                   wire_raw_refs=[], builtin_raw_refs=[])
+        try:
+            returned = _lifecycle_event(binding['return_raw_ref'])
+            times = _binding_times(binding, binding['endpoint_guid'], '')
+            if times is None:
+                raise ValueError('endpoint_process_lifecycle_not_bound')
+            ownership = returned.get('participant_ownership', {})
+            guid = ownership.get('participant_gid')
+            root = ownership.get('participant_root_observation', {})
+            identities = ownership.get('entity_identities', [])
+            if (ownership.get('schema') != 'r2f.cyclone-participant-ownership/v2'
+                    or ownership.get('complete') is not True or ownership.get('status') != 'observed'
+                    or ownership.get('stable_sample_count') != 2 or ownership.get('candidate_eligible') is not False
+                    or ownership.get('domain_id') != domain
+                    or ownership.get('local_gid') != binding['endpoint_guid']
+                    or ownership.get('role_kind') != binding['role']
+                    or not isinstance(guid, str) or re.fullmatch('[0-9a-f]{24}000001c1', guid) is None
+                    or ownership.get('parent_chain', [None])[0] != ownership.get('local_handle')
+                    or ownership.get('parent_chain', [None])[-1] != ownership.get('participant_handle')
+                    or root.get('participant_handle') != ownership.get('participant_handle')
+                    or root.get('participant_self_return') != ownership.get('participant_handle')
+                    or ownership.get('participant_handle') not in root.get('lookup_participants', [])
+                    or not ownership.get('provenance')
+                    or not times['begin_monotonic_ns'] <= ownership['started_monotonic_ns']
+                        <= ownership['ended_monotonic_ns'] <= times['return_monotonic_ns']
+                    or len([i for i in identities if i.get('handle') == ownership['local_handle']
+                            and i.get('gid') == binding['endpoint_guid']]) != 1
+                    or len([i for i in identities if i.get('handle') == ownership['participant_handle']
+                            and i.get('gid') == guid]) != 1):
+                raise ValueError('native_ownership_not_bound')
+            row['participant_guid'] = guid
+            row['ownership'] = deepcopy(ownership)
+            matches = [event for event in wire['observations']
+                       if event.get('participant_guid') == guid and event.get('status') == 'observed']
+            row['wire_raw_refs'] = [deepcopy(event['raw_ref']) for event in matches]
+            row['builtin_raw_refs'] = [deepcopy(ref) for sample, ref in zip(samples, refs)
+                if sample.get('guid') == guid and sample.get('valid_data') is True
+                and sample.get('instance_state') == 'ALIVE']
+            if not matches or not row['builtin_raw_refs']:
+                raise ValueError('independent_participant_observation_unavailable')
+            row['status'] = 'endpoint_process_correlated'
+        except (KeyError, IndexError, OSError, TypeError, ValueError) as exc:
+            row['reasons'].append(str(exc))
+        rows.append(row)
+    return rows

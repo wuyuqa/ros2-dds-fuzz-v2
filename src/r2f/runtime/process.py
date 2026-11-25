@@ -42,6 +42,8 @@ def _require_group_pidfd():
 
 
 class WorkerPool:
+    worker_module = 'r2f.runtime.worker'
+
     def __init__(self, config, environment, output_dir, emit, *, role_environments=None):
         self.config, self.environment, self.output_dir, self.emit = config, environment, Path(output_dir), emit
         self.selector = selectors.DefaultSelector()
@@ -84,7 +86,7 @@ class WorkerPool:
                 attempt += 1
                 stderr_path = self.output_dir / f'{role}.{attempt}.stderr.log'
         self.stderr_handles.append(stderr)
-        process = subprocess.Popen(['/usr/bin/python3', '-B', '-m', 'r2f.runtime.worker',
+        process = subprocess.Popen(['/usr/bin/python3', '-B', '-m', self.worker_module,
                                     json.dumps(self.config, sort_keys=True), role],
                                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=stderr,
                                    env=env, start_new_session=True, cwd=self.config['source_repo'])
