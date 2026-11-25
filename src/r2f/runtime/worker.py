@@ -245,7 +245,9 @@ def main():
     if config.get('projection_discovery_layers') and rmw == 'rmw_cyclonedds_cpp':
         try:
             from .topology_worker import CycloneMatchedPeerObserver
-            ownership = CycloneMatchedPeerObserver().sample_ownership(config['domain_id'], local_gid, endpoint_role)
+            native = (CycloneMatchedPeerObserver(sut_reference=config['projection_sut_environment'])
+                      if 'projection_sut_environment' in config else CycloneMatchedPeerObserver())
+            ownership = native.sample_ownership(config['domain_id'], local_gid, endpoint_role)
         except (OSError, RuntimeError, TypeError, ValueError) as exc:
             ownership = {'complete': False, 'status': 'unknown', 'reason': str(exc)}
     emit('endpoint_created', **({'participant_ownership': ownership} if ownership else {}),

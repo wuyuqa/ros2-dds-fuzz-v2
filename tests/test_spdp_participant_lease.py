@@ -480,3 +480,29 @@ def test_public_parser_rejects_malformed_reference_fields(tmp_path, prefix, key,
     assert result['status'] == 'unknown'
     assert result['observations'] == []
     assert result['diagnostics']
+
+
+def test_keyed_participant_dispose_is_preserved_without_fabricating_lease(tmp_path):
+    # Captured shape worked literally: KeyFlag+InlineQos, DISPOSE|UNREGISTER,
+    # PL_CDR participant key, no duration. This is not a lease announcement.
+    params = bytes.fromhex('50001000'+GUID+'01000000')
+    dispose = data_packet(params, flags=11,
+        inline=bytes.fromhex('710004000000000301000000'))
+    result = parse_spdp_capture(capture(tmp_path, [LE_DATA, dispose]))
+    assert result['status'] == 'observed'
+    alive, dead = result['observations']
+    assert alive['lease']['nanoseconds'] == 3500000000
+    assert dead['status'] == 'not_applicable'
+    assert dead['event_kind'] == 'participant_dispose_or_unregister'
+    assert dead['participant_guid'] == GUID
+    assert dead['lease'] is None
+    assert dead['lifecycle_status_info'] == 3
+    assert dead['candidate_eligible'] is False
+    assert dead['raw_ref']['packet_index'] == 1
+    # Silence or lifecycle-only captures cannot satisfy a lease observation.
+    assert parse_spdp_capture(capture(tmp_path, [dispose]))['status'] == 'unknown'
+    for bad in (data_packet(params, flags=11),
+                data_packet(params, flags=11, inline=bytes.fromhex('710004000000008001000000')),
+                data_packet(params, flags=11, prefix='11'*12,
+                            inline=bytes.fromhex('710004000000000301000000'))):
+        assert parse_spdp_capture(capture(tmp_path, [LE_DATA, bad]))['status'] == 'unknown'

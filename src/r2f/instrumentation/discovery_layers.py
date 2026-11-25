@@ -187,7 +187,7 @@ def discovery_layers_schema(reference, capture, *, field_policy=None, endpoint_b
                 reasons.append('observer_self_not_sut')
             if sample.get('valid_data') is not True or sample.get('instance_state') != 'ALIVE':
                 reasons.append('participant_sample_not_alive_valid_data')
-            if any(e.get('status') != 'observed' for e in matches):
+            if any(e.get('status') not in ('observed', 'not_applicable') for e in matches):
                 reasons.append('participant_wire_observation_unknown')
             association_reasons.extend(reasons)
             correlations.append({'participant_guid': guid,

@@ -777,7 +777,7 @@ def _public_qos_kwargs(qos):
 class CycloneMatchedPeerObserver:
     """Read existing process-local DDS entities; never create or instrument one.
 
-    Public CycloneDDS 0.10.5 ABI only. The library MUST already be mapped by the
+    Pinned public CycloneDDS ABI only. The library MUST already be mapped by the
     RMW in this worker. RCL pointers are never cast to vendor-private objects.
     Handles have process-local scope; only the copied GUIDs cross the worker
     boundary. Failure/incomplete/racing enumerations deliberately have no peer
@@ -791,7 +791,7 @@ class CycloneMatchedPeerObserver:
     MAX_ENTITIES = 512
     MAX_PEERS = 256
 
-    def __init__(self):
+    def __init__(self, *, sut_reference=None):
         import ctypes as c
         import hashlib
         self.c = c
@@ -810,6 +810,28 @@ class CycloneMatchedPeerObserver:
         # gap, not an excuse to dereference undocumented RMW internals.
         library = Path("/opt/ros/jazzy/lib/x86_64-linux-gnu/libddsc.so.0.10.5").resolve()
         header = Path("/opt/ros/jazzy/include/CycloneDDS/dds/dds.h")
+        verified_headers = self.VERIFIED_C_HEADERS
+        verified_abis = self.VERIFIED_C_ABIS
+        abi = "CycloneDDS-0.10.5-lp64-endpoint64"
+        probe, probe_source = self.C_ABI_PROBE_SHA256, self.C_ABI_PROBE_SOURCE_SHA256
+        if sut_reference is not None:
+            from .projection_sut import load_sut_environment
+            sut = load_sut_environment(sut_reference)
+            library = Path(sut['core']['library']).resolve()
+            header = Path(sut['core']['prefix']) / 'include/dds/dds.h'
+            # Independently compiled public-header probe, no DDS initialization.
+            # The source is scripts/probe_projection_sut_abi.c. Never infer a
+            # struct ABI from a version string or configuration alone.
+            verified_abis = ((
+                '34ef07e510d2743ed75c86861297267c78271b6f30abccabf41e139862e90257',
+                'b3fb18e23527fb7b4b09c7c5034792541a8468ef16d5590ceb7573a5ad8e21ea',
+                (64, 0, 16, 32, 40, 48, 56)),)
+            include = Path(sut['core']['prefix']) / 'include'
+            verified_headers = {path: digest for path, digest in sut['files'].items()
+                                if Path(path).is_relative_to(include)}
+            abi = "CycloneDDS-11.0.1-lp64-endpoint64"
+            probe = '9f272bb7ab3d50ec68bad1ffaa9e7cf513ae085c6579914ae8be8a961be4a07b'
+            probe_source = '3364e3ebc96c36c9723f73403a9009bcd5f78984bd571666d06cdbc4ce427e09'
         mapped = set()
         mapping_identity = []
         for row in Path("/proc/self/maps").read_text().splitlines():
@@ -830,13 +852,13 @@ class CycloneMatchedPeerObserver:
         if platform.machine() != "x86_64" or sys.byteorder != "little" or c.sizeof(c.c_ulong) != 8:
             raise ValueError("native_endpoint_c_abi_platform_unsupported")
         if any(hashlib.sha256(Path(path).read_bytes()).hexdigest() != digest
-               for path, digest in self.VERIFIED_C_HEADERS.items()):
+               for path, digest in verified_headers.items()):
             raise ValueError("native_endpoint_c_header_fingerprint_changed")
         actual_layout = (c.sizeof(Endpoint), *(getattr(Endpoint, name).offset for name in
                           ("key", "participant_key", "participant_instance_handle", "topic_name", "type_name", "qos")))
         abi_key = (hashlib.sha256(header.read_bytes()).hexdigest(),
                    hashlib.sha256(library.read_bytes()).hexdigest(), actual_layout)
-        if abi_key not in self.VERIFIED_C_ABIS:
+        if abi_key not in verified_abis:
             raise ValueError("native_endpoint_c_abi_probe_unverified")
         self.lib = c.CDLL(str(library), mode=os.RTLD_NOLOAD | os.RTLD_LOCAL)
         entity, handle = c.c_int32, c.c_uint64
@@ -862,11 +884,11 @@ class CycloneMatchedPeerObserver:
                            "library_sha256": hashlib.sha256(library.read_bytes()).hexdigest(),
                            "header": str(header),
                            "header_sha256": hashlib.sha256(header.read_bytes()).hexdigest(),
-                           "abi": "CycloneDDS-0.10.5-lp64-endpoint64",
-                           "c_probe_sha256": self.C_ABI_PROBE_SHA256,
-                           "c_probe_source_sha256": self.C_ABI_PROBE_SOURCE_SHA256,
+                           "abi": abi,
+                           "c_probe_sha256": probe,
+                           "c_probe_source_sha256": probe_source,
                            "c_probe_layout": actual_layout,
-                           "header_fingerprints": dict(self.VERIFIED_C_HEADERS),
+                           "header_fingerprints": dict(verified_headers),
                            "loaded_mapping_identity": mapping_identity,
                            "attachment": "existing_process_local_entities_no_instrumentation",
                            "creates_entities": False}

@@ -152,3 +152,38 @@ def test_binding_loader_is_pinned_independently_of_sut_paths(tmp_path):
     assert child['LD_LIBRARY_PATH'] == str(library.parent) + ':/sut/lib:/ros/lib'
     assert child['CYCLONEDDS_URI'] == 'observer.xml'
     assert original['LD_LIBRARY_PATH'] == '/sut/lib:/ros/lib'
+
+
+def test_explicit_sut_ownership_observer_uses_mapped_native_abi_without_creating_dds(tmp_path):
+    """Optional actual dependency eligibility probe; no DDS context or entities."""
+    import os
+    import subprocess
+    import sys
+    reference = os.environ.get('R2F_TEST_PROJECTION_SUT')
+    if not reference:
+        pytest.skip('explicit independently built SUT manifest not selected')
+    code = """
+import ctypes, json, os, sys
+from r2f.runtime.projection_sut import load_sut_environment
+from r2f.runtime.topology_worker import CycloneMatchedPeerObserver
+ref = json.load(open(sys.argv[1]))
+sut = load_sut_environment(ref)
+library = ctypes.CDLL(sut['core']['library'], mode=os.RTLD_LOCAL)
+try:
+    CycloneMatchedPeerObserver()
+except ValueError:
+    pass
+else:
+    raise AssertionError('unselected mapped core was accepted')
+observer = CycloneMatchedPeerObserver(sut_reference=ref)
+p = observer.provenance
+assert p['creates_entities'] is False
+assert p['library_sha256'] == sut['core']['library_sha256']
+assert p['abi'] == 'CycloneDDS-11.0.1-lp64-endpoint64'
+assert list(p['c_probe_layout']) == [64, 0, 16, 32, 40, 48, 56]
+print(json.dumps({'abi': p['abi'], 'creates_entities': p['creates_entities']}))
+"""
+    child = subprocess.run([sys.executable, '-c', code, reference], text=True,
+        capture_output=True, check=False, timeout=20)
+    assert child.returncode == 0, child.stderr
+    assert json.loads(child.stdout)['creates_entities'] is False

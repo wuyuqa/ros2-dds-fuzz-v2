@@ -46,7 +46,7 @@ def parse_topic_capture(artifact, *, field_policy=None):
         raw = {k: v for k, v in raw.items() if k not in ('final', 'file_identity')}
     except (OSError, ValueError, KeyError, TypeError) as exc:
         return _unknown(str(exc), health)
-    return _decode(raw, records, diagnostics, health)
+    return _decode(raw, records, diagnostics, health, field_policy)
 
 
 def _unknown(reason, health):
@@ -56,7 +56,7 @@ def _unknown(reason, health):
     return result
 
 
-def _decode(raw, records, diagnostics, health):
+def _decode(raw, records, diagnostics, health, field_policy=None):
     observations = []
     for record in records:
         udp, error = udp_frame(record['frame'])
@@ -78,7 +78,7 @@ def _decode(raw, records, diagnostics, health):
             ref.update(path=raw['path'], sha256=raw['sha256'], submessage_offset=pos,
                        submessage_end=end, submessage_pcap_offset=record['frame_offset']+udp['payload_offset']+pos,
                        payload_pcap_offset=record['frame_offset']+udp['payload_offset'])
-            observations.append(_topic_event(payload, sm, ref, record['unix_ns']))
+            observations.append(_topic_event(payload, sm, ref, record['unix_ns'], field_policy))
     reasons = []
     if (not health or health.get('status') != 'ok' or
             health.get('filtered_rtps_metadata_overflow', 0) > 0 or
@@ -101,7 +101,7 @@ def _decode(raw, records, diagnostics, health):
             'status': 'unknown' if reasons else 'observed', 'reasons': reasons, 'candidate_eligible': False}
 
 
-def _topic_event(payload, sm, ref, unix_ns):
+def _topic_event(payload, sm, ref, unix_ns, field_policy=None):
     pos, end = sm['offset'], sm['end']
     event = {k: copy.deepcopy(sm[k]) for k in ('source_guid_prefix', 'destination_guid_prefix',
                                               'vendor_id', 'protocol_version')}
@@ -167,8 +167,9 @@ def _topic_event(payload, sm, ref, unix_ns):
     endian = '<' if payload[cursor:cursor+2] == b'\0\3' else '>'
     pl = parse_parameter_list(payload, cursor+4, end, endian, raw_ref=ref)
     pl['endian'] = endian
+    pl['raw_ref'] = copy.deepcopy(ref)
     event['parameter_list'] = pl
-    event['fields'] = _topic_fields(pl)
+    event['fields'] = _topic_fields(pl, field_policy)
     if not pl['complete']:
         event['reasons'].append(pl['reason'])
     if any(f['status'] == 'unknown' for f in event['fields'].values()):
@@ -177,13 +178,21 @@ def _topic_event(payload, sm, ref, unix_ns):
     return event
 
 
-def _topic_fields(pl):
+def _topic_fields(pl, field_policy=None):
     fields = {}
     for name, pid in (('topic', 5), ('type', 7), ('history', 0x40), ('depth', 0x40)):
         params = [p for p in pl['parameters'] if p['pid'] == pid]
         reason = ('incomplete_parameter_list' if not pl['complete'] else
                   'absent_parameter' if not params else
                   'duplicate_singleton_parameter' if len(params) != 1 else None)
+        if (reason == 'absent_parameter' and name in ('history', 'depth')
+                and (field_policy or {}).get('protocol_defaults') is True and pl['complete']):
+            fields[name] = {'status': 'observed', 'value': 'KEEP_LAST' if name == 'history' else 1,
+                'provenance': 'protocol_default', 'parameter_present': False,
+                'parameter_list_complete': True, 'standard': 'DDS1.4 2.2.3.18',
+                'default_rule': 'DDSI-RTPS2.5 9.4.2.11 / Table9.19',
+                'raw_refs': [copy.deepcopy(pl['raw_ref'])], 'sentinel_offset': pl['sentinel_offset']}
+            continue
         if reason:
             fields[name] = {'status': 'unknown', 'value': None, 'pid': pid, 'reason': reason,
                             'raw_refs': [p['raw_ref'] for p in params]}

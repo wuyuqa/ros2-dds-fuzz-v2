@@ -182,7 +182,8 @@ def _lease_event(payload, sm, ref, unix_ns, policy):
         reasons.append('unknown_source_guid_prefix')
     if sm['flags'] & 0xf0 or payload[pos+4:pos+6] != b'\0\0':
         reasons.append('unsupported_DATA_flags')
-    if not sm['flags'] & 4 or sm['flags'] & 8:
+    key_only = bool(sm['flags'] & 8 and not sm['flags'] & 4)
+    if (not sm['flags'] & 4 or sm['flags'] & 8) and not (key_only and sm['flags'] & 2):
         reasons.append('key_only_or_no_serialized_data')
         return event
     offset = struct.unpack_from(se+'H', payload, pos+6)[0]
@@ -191,6 +192,7 @@ def _lease_event(payload, sm, ref, unix_ns, policy):
         reasons.append('invalid_octetsToInlineQos')
         return event
     inline_key = None
+    lifecycle_status = None
     if sm['flags'] & 2:
         inline = parse_parameter_list(payload, cursor, end, se, raw_ref=ref)
         event['inline_qos'] = inline
@@ -208,7 +210,9 @@ def _lease_event(payload, sm, ref, unix_ns, policy):
                 if len(value) != 4:
                     reasons.append('invalid_status_info_length')
                 elif int.from_bytes(value, 'big'):
-                    reasons.append('dispose_or_unregister_not_lease_announcement')
+                    lifecycle_status = int.from_bytes(value, 'big')
+                    if not key_only or lifecycle_status not in (1, 2, 3):
+                        reasons.append('dispose_or_unregister_not_lease_announcement')
             else:
                 inline_key = value
         if any(p['pid'] & 0x4000 for p in inline['parameters']):
@@ -233,7 +237,7 @@ def _lease_event(payload, sm, ref, unix_ns, policy):
     if any(p['pid'] & 0x4000 for p in pl['parameters']):
         reasons.append('unsupported_required_parameter')
     guid = _singleton(pl, 0x50, 'participant_guid', reasons)
-    duration = _singleton(pl, 2, 'participant_lease_duration', reasons)
+    duration = None if key_only else _singleton(pl, 2, 'participant_lease_duration', reasons)
     if guid is not None:
         event['advertised_participant_guid_hex'] = guid.hex()
         if len(guid) != 16:
@@ -246,6 +250,16 @@ def _lease_event(payload, sm, ref, unix_ns, policy):
             event['participant_guid'] = guid.hex()
         if inline_key is not None and inline_key != guid:
             reasons.append('inline_key_participant_guid_conflict')
+    if key_only:
+        if lifecycle_status not in (1, 2, 3):
+            reasons.append('key_only_without_valid_lifecycle_status')
+        if any(p['pid'] == 2 for p in pl['parameters']):
+            reasons.append('key_only_contains_lease')
+        if not reasons:
+            event.update(status='not_applicable', event_kind='participant_dispose_or_unregister',
+                lifecycle_status_info=lifecycle_status,
+                reasons=['dispose_or_unregister_not_lease_announcement'])
+        return event
     for pid, name, expected in ((0x15, 'protocol_version', bytes(sm['protocol_version'])),
                                  (0x16, 'vendor_id', bytes.fromhex(sm['vendor_id']))):
         if any(p['pid'] == pid for p in pl['parameters']):
@@ -305,9 +319,9 @@ def _decode(raw, records, diagnostics, health, policy):
         reasons.append('capture_health_degraded_or_unknown')
     if diagnostics:
         reasons.append('capture_parse_diagnostics')
-    if not observations:
+    if not any(e['status'] == 'observed' for e in observations):
         reasons.append('no_participant_lease_observation_in_finite_capture')
-    elif any(e['status'] != 'observed' for e in observations):
+    if any(e['status'] not in ('observed', 'not_applicable') for e in observations):
         reasons.append('unknown_participant_lease_observation')
     return {'schema': 'r2f.spdp-participant-lease/v1', 'raw': raw,
             'independent_source': 'passive_rtps_wire', 'observations': observations,

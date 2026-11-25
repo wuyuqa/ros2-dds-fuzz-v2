@@ -104,7 +104,7 @@ def test_encapsulation_endian_is_independent_of_data_and_inline_qos(tmp_path, en
 ])
 def test_missing_ambiguous_or_unclosed_fields_remain_unknown(tmp_path, parameters, field, reason):
     result = parse_topic_capture(capture(tmp_path, [packet(parameters)]),
-        field_policy={'protocol_defaults': True, 'topic': 'configured', 'depth': 1})
+        field_policy={'protocol_defaults': False, 'topic': 'configured', 'depth': 9})
     assert result['status'] == 'unknown'
     event, = result['observations']
     assert event['status'] == 'unknown'
@@ -374,3 +374,26 @@ def test_malformed_inline_key_hash_does_not_promote_topic_announcement(tmp_path,
     event, = result['observations']
     assert 'invalid_key_hash_length' in event['reasons']
     assert all(f['status'] == 'unknown' for f in event['fields'].values())
+
+
+def test_topic_default_history_is_explicit_protocol_derivation(tmp_path):
+    artifact = capture(tmp_path, [packet(TOPIC+TYPE+SENTINEL)])
+    result = parse_topic_capture(artifact, field_policy={'protocol_defaults': True})
+    assert result['status'] == 'observed'
+    event, = result['observations']
+    for field, value in (('history', 'KEEP_LAST'), ('depth', 1)):
+        observed = event['fields'][field]
+        assert observed['value'] == value
+        assert observed['provenance'] == 'protocol_default'
+        assert observed['raw_refs'][0]['sha256'] == artifact['raw']['sha256']
+        assert observed['parameter_present'] is False
+        assert observed['parameter_list_complete'] is True
+        assert observed['standard'] == 'DDS1.4 2.2.3.18'
+    # Explicit fields override defaults; malformed or duplicate PIDs never do.
+    assert parse_topic_capture(capture(tmp_path, [packet()]),
+        field_policy={'protocol_defaults': True})['observations'][0]['fields']['depth']['value'] == 7
+    for params in (TOPIC+TYPE+HISTORY+HISTORY+SENTINEL, TOPIC+TYPE,
+                   TOPIC+TYPE+bytes.fromhex('4000040000000000')+SENTINEL):
+        assert parse_topic_capture(capture(tmp_path, [packet(params)]),
+            field_policy={'protocol_defaults': True})['status'] == 'unknown'
+    assert parse_topic_capture(artifact, field_policy={'protocol_defaults': False})['status'] == 'unknown'
