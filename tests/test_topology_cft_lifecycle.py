@@ -229,6 +229,27 @@ def test_authenticated_unexpected_delivery_is_an_explicit_CFT_residual():
     assert value['review_required'] is True
 
 
+def test_unrelated_native_unknown_does_not_hide_authenticated_rejection():
+    from r2f.campaign.topology_cft_observation import content_filter_observations
+    value, rows, program, ref, deliveries = authored_sample_contract()
+    sample = value['sample_observations'][0]
+    decision = {key: sample[key] for key in (
+        'action_id', 'reader', 'reader_generation', 'reader_gid', 'send_ref')}
+    decision['decision'] = False
+    observed = content_filter_observations(
+        program, rows,
+        decisions={'observations': [decision],
+                   'unknowns': [{'reason': 'unrelated_native_record'}]},
+        deliveries=[item for item in deliveries if item['send_ref'] != sample['send_ref']],
+        ref=ref, fixture=False)
+    rejected = next(item for item in observed['sample_observations']
+                    if item['send_ref'] == sample['send_ref'])
+    assert rejected['status'] == 'native_rejected'
+    assert rejected['actual_decision'] is False
+    assert rejected['violation'] == 'topology.cft_predicate_mismatch'
+    assert observed['native_decision_unknowns']
+
+
 def test_CFT_replay_signature_recomputes_the_original_sample_observations():
     from copy import deepcopy
     from r2f.campaign.topology_cft_observation import replay_cft_observations

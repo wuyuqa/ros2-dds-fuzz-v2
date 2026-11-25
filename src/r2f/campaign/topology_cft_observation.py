@@ -157,14 +157,13 @@ def _sample(send, config, events, decisions, deliveries, ref, fixture):
         if decision['decision'] is False and received:
             return _outcome(value, status='evidence_conflict', actual=False,
                             delivered=received[0], conflict=True)
-        if not (decisions or {}).get('unknowns'):
-            if decision['decision'] is False:
-                return _outcome(dict(value, filter_effect_observed=True),
-                                status='native_rejected', actual=False)
-            if received:
-                return _outcome(dict(value, filter_effect_observed=True),
-                                status='native_accepted_and_delivered', actual=True, delivered=received[0])
-            return dict(value, reason='native_accept_delivery_unobserved', actual_decision=True)
+        if decision['decision'] is False:
+            return _outcome(dict(value, filter_effect_observed=True),
+                            status='native_rejected', actual=False)
+        if received:
+            return _outcome(dict(value, filter_effect_observed=True),
+                            status='native_accepted_and_delivered', actual=True, delivered=received[0])
+        return dict(value, reason='native_accept_delivery_unobserved', actual_decision=True)
     if received:
         value = _outcome(value, status='delivered_while_enabled' if proof['observed_enabled']
                          else 'delivered_while_disabled', delivered=received[0])
