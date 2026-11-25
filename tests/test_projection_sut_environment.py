@@ -95,9 +95,13 @@ def test_environment_activation_uses_only_explicit_build_and_verifies_mapped_cor
         commands.append(command)
         return SimpleNamespace(returncode=0, stdout=json.dumps(deepcopy(payload)))
     monkeypatch.setattr(subprocess, 'run', fake_external_probe)
+    setup = tmp_path / 'offline-ros-setup.bash'
+    setup.write_text('# Offline fixture; subprocess is replaced above.\n')
     config = {'target_id': TARGET, 'rmw': 'rmw_cyclonedds_cpp',
+              'ros_setup': str(setup),
               'projection_discovery_layers': 'participant_topic_v1', KEY: ref}
     result, _ = activated_environment(config)
+    assert str(setup) in commands[0]
     assert result['sut_environment']['manifest'] == ref
     assert result['sut_environment']['core'] == value['core']
     assert ':'.join(value[k]['prefix'] for k in ('rmw', 'core')) in commands[0]
