@@ -10,6 +10,45 @@ from r2f.runtime.publish_occurrence import producer_occurrence_witness
 SCHEMA = 'r2f.cft-sample-observations/v1'
 
 
+def string_filter_expectation(expression, parameters, text):
+    """Independent, deliberately narrow SQL LIKE expectation over full String.data.
+
+    Not a DDS observation. Unsupported predicates, escape syntax and '_' remain
+    unknown rather than borrowing the configured model's evaluation flag.
+    """
+    import re
+    if not isinstance(expression, str) or not isinstance(parameters, list) or not isinstance(text, str):
+        return None
+    if not expression.strip():
+        return True if not parameters else None
+    if (re.fullmatch(r"\s*data\s+LIKE\s+%0\s*", expression, re.I) is None
+            or len(parameters) != 1 or not isinstance(parameters[0], str)):
+        return None
+    literal = parameters[0]
+    if (len(literal) < 2 or literal[0] != "'" or literal[-1] != "'"
+            or not literal.isascii() or any(c in literal[1:-1] for c in "_'\\")):
+        return None
+    return re.fullmatch('.*'.join(re.escape(part) for part in literal[1:-1].split('%')),
+                        text, re.S) is not None
+
+
+def _outcome(value, *, status, actual=None, delivered=None, conflict=False):
+    """Evaluate an authenticated observation without turning absence into reject."""
+    expected = value.get('expected_decision')
+    value = dict(value, status=status, actual_decision=actual,
+                 delivery_observed=delivered is not None, reason=None,
+                 sample_effect_observed=True, violation=None)
+    if delivered is not None:
+        value['delivery_witness'] = delivered
+    if conflict:
+        return dict(value, status='evidence_conflict', reason='native_reject_conflicts_with_delivery',
+                    sample_effect_observed=None, filter_effect_observed=None)
+    if type(expected) is bool and ((type(actual) is bool and actual is not expected)
+                                   or (delivered is not None and expected is False)):
+        value['violation'] = 'topology.cft_predicate_mismatch'
+    return value
+
+
 def _configuration(action, spec, events, ref):
     initial = action['op'] != 'update_filter'
     requested = spec['filter'] if initial else action['params']
@@ -66,10 +105,12 @@ def _sample(send, config, events, decisions, deliveries, ref, fixture):
         return dict(value, reason='reader_identity_unknown:' + str(exc))
     if send.get('fixture') is True or send.get('backend') == 'offline_fake':
         return dict(value, reason='fixture_publish_not_DDS_evidence')
+    expected = string_filter_expectation(config['requested']['expression'],
+                                         config['requested']['parameters'], send.get('string_data'))
     value.update(producer_occurrence=producer, reader_gid=proof['reader_gid'],
                  reader_incarnation=proof['reader_incarnation'],
                  message_type=origins[0].get('message_type'), creation_ref=ref(origins[0]),
-                 configuration_ref=config['raw_ref'])
+                 configuration_ref=config['raw_ref'], expected_decision=expected)
     received = [d for d in deliveries if d.get('reader') == value['reader']
                 and d.get('reader_generation') == value['reader_generation']
                 and d.get('reader_gid') == proof['reader_gid']
@@ -90,26 +131,31 @@ def _sample(send, config, events, decisions, deliveries, ref, fixture):
               if d.get('action_id') == config['action_id'] and d.get('reader') == value['reader']
               and d.get('reader_generation') == value['reader_generation']
               and d.get('reader_gid') == proof['reader_gid'] and d.get('send_ref') == value['send_ref']]
-    if (decisions or {}).get('unknowns'):
-        return dict(value, reason='native_decision_evidence_incomplete')
     if len(received) > 1 or len(actual) > 1:
         return dict(value, reason='sample_evidence_ambiguous')
     if actual:
         decision = actual[0]
         value['native_decision'] = decision
-        if decision['decision'] is False:
+        # An actual false and an authenticated receive of the same occurrence
+        # conflict even when a different capture is incomplete. Preserve both.
+        if decision['decision'] is False and received:
+            return _outcome(value, status='evidence_conflict', actual=False,
+                            delivered=received[0], conflict=True)
+        if not (decisions or {}).get('unknowns'):
+            if decision['decision'] is False:
+                return _outcome(dict(value, filter_effect_observed=True),
+                                status='native_rejected', actual=False)
             if received:
-                return dict(value, reason='native_reject_conflicts_with_delivery')
-            return dict(value, status='native_rejected', reason=None,
-                        sample_effect_observed=True, filter_effect_observed=True)
-        if received:
-            return dict(value, status='native_accepted_and_delivered', reason=None,
-                        delivery_witness=received[0], sample_effect_observed=True,
-                        filter_effect_observed=True)
-        return dict(value, reason='native_accept_delivery_unobserved')
+                return _outcome(dict(value, filter_effect_observed=True),
+                                status='native_accepted_and_delivered', actual=True, delivered=received[0])
+            return dict(value, reason='native_accept_delivery_unobserved', actual_decision=True)
     if received:
-        return dict(value, status='delivered_while_enabled' if proof['observed_enabled'] else 'delivered_while_disabled',
-                    reason=None, delivery_witness=received[0], sample_effect_observed=True)
+        value = _outcome(value, status='delivered_while_enabled' if proof['observed_enabled']
+                         else 'delivered_while_disabled', delivered=received[0])
+        value['native_decision_status'] = 'incomplete' if (decisions or {}).get('unknowns') else 'not_observed'
+        return value
+    if (decisions or {}).get('unknowns'):
+        return dict(value, reason='native_decision_evidence_incomplete')
     return dict(value, reason='missing_delivery_is_not_filter_evidence')
 
 
@@ -135,5 +181,32 @@ def content_filter_observations(program, events, *, decisions, deliveries, ref, 
     return dict(schema=SCHEMA, declared=bool(configurations), fixture=fixture,
                 execution_evidence=not fixture, configuration_observations=configurations,
                 sample_observations=samples, filter_false_implies_unmatch=False,
+                review_required=any(c['configuration_status'] != 'observed' for c in configurations)
+                    or any(item['status'] in {'unknown', 'evidence_conflict'} or item.get('violation')
+                           or item.get('expected_decision') is None for item in samples),
+                evidence_conflicts=[item['send_ref'] for item in samples if item['status'] == 'evidence_conflict'],
                 native_decision_unknowns=(decisions or {}).get('unknowns', []),
                 scope='supporting_CFT_observation_not_endpoint_matching_or_candidate')
+
+
+def replay_cft_observations(program, events, claimed, *, peer_reference, ref):
+    """Recompute CFT outcomes from original raw before normalizing replay facts."""
+    from r2f.core.evidence import canonical_hash
+    from .topology_filter_decision import native_filter_decision_evidence
+    from .topology_sample_attribution import native_delivery_identity
+    decisions = native_filter_decision_evidence(program, events, peer_reference=peer_reference, ref=ref)
+    sends = [e for e in events if e.get('event') == 'send']
+    deliveries = []
+    for event in (e for e in events if e.get('event') == 'receive'):
+        value = native_delivery_identity(event, sends, events, ref=ref)
+        if value is not None:
+            deliveries.append(value)
+    rebuilt = content_filter_observations(program, events, decisions=decisions,
+                                          deliveries=deliveries, ref=ref, fixture=False)
+    if canonical_hash(rebuilt) != canonical_hash(claimed):
+        raise ValueError('CFT replay observations differ from independent raw recomputation')
+    if rebuilt['evidence_conflicts']:
+        raise ValueError('CFT reject/delivery conflict cannot qualify a conformance signature')
+    keys = ('action_id', 'writer', 'writer_generation', 'reader', 'reader_generation',
+            'sequence', 'status', 'expected_decision', 'actual_decision', 'violation')
+    return [{k: item.get(k) for k in keys} for item in rebuilt['sample_observations']]

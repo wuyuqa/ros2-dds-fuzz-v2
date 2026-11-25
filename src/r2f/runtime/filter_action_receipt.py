@@ -83,12 +83,14 @@ def _initial_action_evidence(action, rows):
              and submitted['filter_receipt'].get('submitted') is True,
              'initial_public_readback_incomplete_or_mismatched')
     times = [create['monotonic_ns'], value.get('creation_returned_monotonic_ns'),
-             getter.get('started_monotonic_ns'), getter.get('completed_monotonic_ns'),
+             submitted['monotonic_ns'], getter.get('started_monotonic_ns'), getter.get('completed_monotonic_ns'),
              state.get('started_monotonic_ns'), state.get('completed_monotonic_ns'),
              value.get('monotonic_ns'), observed['monotonic_ns']]
     _require(all(type(t) is int and t > 0 for t in times) and times == sorted(times)
              and created.get('created_monotonic_ns') == times[1]
-             and created.get('create_begin_monotonic_ns') == times[0], 'initial_api_clock_invalid')
+             and created.get('create_begin_monotonic_ns') == times[0]
+             and submitted['filter_receipt'].get('creation_returned_monotonic_ns') == times[1],
+             'initial_api_clock_invalid')
     _require(not any(e.get('event') in {'content_filter_dynamic_update', 'endpoint_destroyed',
                     'topology_endpoint_destroyed', 'worker_exit', 'topology_worker_exit'}
                      and e.get('logical_id') == eid and e.get('generation') == gen

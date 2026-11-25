@@ -63,10 +63,12 @@ def provider_assessment(scenario, facts, oracle):
         'typed_residuals': isinstance(oracle.get('forbidden_residuals'), list)
             and bool(oracle['forbidden_residuals'])
             and all(isinstance(v, str) for v in oracle['forbidden_residuals'])
-            and set(oracle['forbidden_residuals']) <= {'topology.closed_delivery_gap', 'topology.pair_graph_mismatch'},
+            and set(oracle['forbidden_residuals']) <= {'topology.closed_delivery_gap', 'topology.pair_graph_mismatch', 'topology.cft_predicate_mismatch'},
         'sample_identity_resolved': not facts.get('unknown_reasons_sample_identity')
             and not facts.get('unresolved_historical_obligations'),
     }
+    if (facts.get('content_filter_observations') or {}).get('declared') is True:
+        checks['cft_evidence_consistent'] = not facts['content_filter_observations'].get('evidence_conflicts')
     stage = _stage('provider_typed_evidence', checks,
                    ('canonical_ingest', 'formal_boundary', 'formal_topology_execution'),
                    {'facts_sha256': canonical_hash(facts), 'oracle_semantics_sha256': canonical_hash(_oracle_semantics(oracle)),

@@ -147,6 +147,16 @@ def evaluate_topology(scenario, facts):
             delivery_values.append(None)
             reasons.append("finite_tail_or_delivery_contract_unknown" if closure in {"open", "closed_with_gap"}
                            else "per_writer_delivery_identity_unknown")
+    cft = facts.get("content_filter_observations") or {}
+    checks = cft.get("sample_observations", [])
+    result["cft_sample_checks"] = [{k: item.get(k) for k in (
+        "action_id", "writer", "writer_generation", "reader", "reader_generation", "sequence",
+        "status", "expected_decision", "actual_decision", "violation", "send_ref")}
+        for item in checks]
+    result["cft_review_required"] = cft.get("review_required") is True
+    residuals.extend(item["violation"] for item in checks
+        if item.get("violation") == "topology.cft_predicate_mismatch"
+        and item.get("sample_effect_observed") is True and item.get("status") != "evidence_conflict")
     values = dict(facts["fact_values"])
     values[TOPOLOGY_FACT_GRAPH] = _aggregate(graph_values)
     values[TOPOLOGY_FACT_DELIVERY] = _aggregate(delivery_values)

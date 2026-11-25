@@ -105,6 +105,9 @@ def _kind(row, runtime):
         return 'planned'
     if row.get('oracle_verdict') in {'unknown', 'not_applicable'}:
         return 'observation_insufficient'
+    cft = (row.get('typed_facts') or {}).get('content_filter_observations') or {}
+    if cft.get('review_required') is True:
+        return 'observation_insufficient'
     projection = (row.get('typed_facts') or {}).get('projection') or {}
     schema = projection.get('schema_check') or {}
     tools = schema.get('discovery_tools') or {}

@@ -244,6 +244,23 @@ def _validate_topology_identity(row, identity):
                         pair.get("observed_match") in {"bidirectional", "writer_only", "reader_only"}
                         or bool(pair.get("communication_witnesses")))):
                 applicable = True
+        if "topology.cft_predicate_mismatch" in (row.get("oracle") or {}).get("forbidden_residuals", []):
+            from r2f.campaign.topology_cft_observation import replay_cft_observations
+            cft = facts.get("content_filter_observations") or {}
+            verified = replay_cft_observations(row["final_input"]["topology_program"], events, cft,
+                peer_reference=facts.get("fastdds_peer_instrumentation"),
+                ref=lambda ev: dict(path=row["raw_path"], sha256=row["raw_sha256"],
+                                    event_index=ev["event_index"]))
+            for sample in verified:
+                if sample.get("violation") != "topology.cft_predicate_mismatch":
+                    continue
+                key = ((sample["writer"], sample["writer_generation"]),
+                       (sample["reader"], sample["reader_generation"]))
+                claims = (row.get("oracle") or {}).get("cft_sample_checks", [])
+                if key not in seen or not any(canonical_hash(sample) == canonical_hash({
+                        k: claim.get(k) for k in sample}) for claim in claims):
+                    raise ValueError("CFT anomaly differs from raw directed sample identity")
+                applicable = True
         if not applicable:
             raise ValueError("topology anomaly requires concrete applicable pair objects")
 

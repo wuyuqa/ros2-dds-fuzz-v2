@@ -445,7 +445,7 @@ def _topology_conformance_signature(metadata, facts, rule):
         claimed = oracle.get("forbidden_residuals")
         if not isinstance(claimed, list) or any(not isinstance(v, str) for v in claimed):
             return None
-        if set(claimed) - {"topology.pair_graph_mismatch", "topology.closed_delivery_gap"}:
+        if set(claimed) - {"topology.pair_graph_mismatch", "topology.closed_delivery_gap", "topology.cft_predicate_mismatch"}:
             return None
         for pair in facts["pairs"]:
             subjects = {role: {"logical_id": pair[role], "generation": pair[role + "_generation"]}
@@ -636,6 +636,18 @@ def _topology_conformance_signature(metadata, facts, rule):
             anomalies.append(dict(subjects, residual=residual, obligation=obligation,
                                   expected=expected, missing=sorted(missing), received=sorted(received),
                                   sentinel_sequence=sentinel, reliable_history_contract=True, filter_free=True))
+        cft_signature = None
+        if (facts.get("content_filter_observations") or {}).get("declared") is True:
+            from r2f.campaign.topology_cft_observation import replay_cft_observations
+            cft_signature = replay_cft_observations(metadata["final_input"]["topology_program"],
+                events, facts["content_filter_observations"],
+                peer_reference=facts.get("fastdds_peer_instrumentation"),
+                ref=lambda ev: dict(path=metadata["raw_path"], sha256=metadata["raw_sha256"],
+                                    event_index=ev["event_index"]))
+            for item in cft_signature:
+                if item.get("violation") == "topology.cft_predicate_mismatch":
+                    residuals.add(item["violation"])
+                    anomalies.append(dict(item, residual=item["violation"]))
         if verdict == "fail" and (not anomalies or residuals != set(claimed)):
             return None
         if verdict == "pass" and (anomalies or claimed):
@@ -643,7 +655,8 @@ def _topology_conformance_signature(metadata, facts, rule):
         return {"schema": TOPOLOGY_SIGNATURE_SCHEMA, "endpoint_identity_schema": TOPOLOGY_IDENTITY_SCHEMA,
                 "rule_id": rule, "target_id": _TOPOLOGY_TARGET, "target_revision": metadata["target_revision"],
                 "effective_input_sha256": metadata["effective_input_sha256"], "oracle_verdict": verdict,
-                "typed_anomaly_signature": sorted(anomalies, key=canonical_hash)}
+                "typed_anomaly_signature": sorted(anomalies, key=canonical_hash),
+                **({"cft_sample_signature": cft_signature} if cft_signature is not None else {})}
     except (ValueError, KeyError, TypeError, OSError, IndexError, AttributeError):
         return None
 
