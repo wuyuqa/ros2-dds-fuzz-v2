@@ -144,6 +144,9 @@ def _replay_observation_config(capsule):
         hints = (declared or refresh_declared or metadata.get('observation_mode') not in (None, 'blackbox')
                  or metadata.get('fastdds_peer_instrumentation') is not None
                  or 'observe_native_peers' in metadata)
+        if capsule.input['target_id'] == 'discovery.interruption_recovery' and final.get('observe_participant_leases') is True:
+            from .participant_lease import replay_lease_selection
+            return replay_lease_selection(capsule)
         if capsule.input['target_id'] != _TOPOLOGY_TARGET:
             if hints:
                 raise ValueError('observation_selection_unsupported_target')

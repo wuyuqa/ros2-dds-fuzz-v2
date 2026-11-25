@@ -497,6 +497,8 @@ def run_discovery_pair(config, output_dir, result):
                 'precondition_receipts': result['precondition_receipts'], 'observation_receipts': result['observation_receipts'],
                 'mutation_receipt': result['mutation_receipt'], 'fault_control': bool(c['fault_id']),
                 'candidate_eligible': not bool(c['fault_id']), 'evidence_purpose': c.get('evidence_purpose', 'runtime_execution')}
+            if c.get('observe_participant_leases'):
+                result['execution']['observation_mode'] = c.get('observation_mode', 'blackbox')
             result['execution_metadata'] = result['execution']
         try:
             emit('runtime_end', runtime_status=result['runtime_status'], real_execution=result['real_execution'],
@@ -2187,6 +2189,7 @@ def _body(request, owner_channel):
               'precondition_receipts': preconditions, 'observation_receipts': observations, 'mutation_receipt': receipt,
               'effective_rmws': effective_rmws_receipt(c)}
     pool = observer = carrier = None
+    lease_observation = None
     trajectories = []
     netem_delivery = None
     netem_overlap_facts = None
@@ -2374,6 +2377,10 @@ def _body(request, owner_channel):
             # Per-role profile selectors are the only authority when any role
             # overrides the global vendor.
             base_environment = mixed_base_environment(base_environment)
+        if c.get('observe_participant_leases'):
+            from .participant_lease import ParticipantLeaseObservation
+            lease_observation = ParticipantLeaseObservation(c, output_dir, base_environment, role_env, emit)
+            base_environment, role_env = lease_observation.environment, lease_observation.role_environments
         pool = OwnerCheckedPool(c, base_environment, output_dir, emit,
                                 owner_channel=owner_channel, role_environments=role_env)
         def create():
@@ -2402,6 +2409,8 @@ def _body(request, owner_channel):
                 endpoints[role] = next(e for e in events if e['event'] == 'endpoint_created' and e.get('role') == role)
                 token = endpoints[role]
                 require_role_rmw(c, role, token)
+                if lease_observation is not None:
+                    lease_observation.capture(role, token)
                 if not token.get('endpoint_gid'):
                     raise RuntimeError('endpoint_identity_incomplete:' + role)
             if endpoints['writer']['pid'] == endpoints['reader']['pid']:
@@ -2658,6 +2667,8 @@ def _body(request, owner_channel):
             result['workers'] = pool.metadata
             if any(worker.get('returncode') != 0 for worker in pool.metadata):
                 result.update(runtime_status='failed', reason='worker_shutdown_failed')
+        if lease_observation is not None:
+            lease_observation.close()
         for trajectory in trajectories:
             emit('discovery_match_trajectory', active_drop=active, **trajectory.summary())
         if window_records:
