@@ -111,10 +111,11 @@ def test_native_publish_observer_keeps_array_bytes_and_occurrence():
         observer.close()
 
 
-def test_array_reader_uses_stock_take_and_decodes_correlated_envelope(monkeypatch):
+def test_array_reader_attempts_typed_bridge_and_preserves_explicit_unavailable_fallback(monkeypatch):
     import sys
     from types import ModuleType
     from r2f.runtime import topology_worker as worker
+    from r2f.runtime.rcl_take_bridge import BridgeUnavailable
     from test_topology_participant_control_worker import ros_fixture
 
     cfg = worker_config("offline-reader", role="reader", rmw="rmw_fastrtps_cpp")
@@ -122,10 +123,12 @@ def test_array_reader_uses_stock_take_and_decodes_correlated_envelope(monkeypatc
         monkeypatch.setattr(sys.modules["rclpy"], "get_rmw_implementation_identifier",
                             lambda: "rmw_fastrtps_cpp")
         bridge = ModuleType("r2f.runtime.rcl_take_bridge")
-        def forbidden_bridge(**kwargs):
-            raise AssertionError("String-only take bridge selected for array")
-        bridge.make_full_info_executor = forbidden_bridge
-        bridge.BridgeUnavailable = RuntimeError
+        attempted = []
+        def unavailable_bridge(**kwargs):
+            attempted.append(kwargs["message_type"])
+            raise BridgeUnavailable("array_abi_unavailable_offline")
+        bridge.make_full_info_executor = unavailable_bridge
+        bridge.BridgeUnavailable = BridgeUnavailable
         monkeypatch.setitem(sys.modules, bridge.__name__, bridge)
         executor = sys.modules["rclpy.executors"].SingleThreadedExecutor
         original = executor.spin_once
@@ -143,6 +146,7 @@ def test_array_reader_uses_stock_take_and_decodes_correlated_envelope(monkeypatc
         rc = worker.worker_main()
     rows = [json.loads(line) for line in stream.getvalue().splitlines()]
     assert rc == 0, rows
+    assert attempted == ["std_msgs/msg/UInt8MultiArray"]
     sample = next(row for row in rows if row["event"] == "receive")
     assert sample["payload_writer_id"] == "w7"
     assert sample["payload_writer_generation"] == 3

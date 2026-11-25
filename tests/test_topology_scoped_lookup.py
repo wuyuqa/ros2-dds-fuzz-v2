@@ -340,3 +340,150 @@ def test_bound_topic_without_type_information_is_unsupported_not_sut_absence():
     assert receipt['ownership_before'] == receipt['ownership_after']
     # No fallback to name-only lookup and no release of borrowed references.
     assert calls == []
+
+
+
+def test_explicit_native_support_reference_survives_public_input_without_claiming_fixture_execution(tmp_path):
+    from r2f.modules.s1.topology_model import validate_program
+    p = lookup_program()
+    support = {'manifest_path': '/qualified/native-lookup.json', 'manifest_sha256': 'a' * 64,
+               'placement': 'other_participant'}
+    p['actions'][1]['params']['native_type_support'] = support
+    assert validate_program(p)['status'] == 'valid'
+    result = run_topology(p, CFG, tmp_path)
+    events = [json.loads(line) for line in (tmp_path / 'raw.jsonl').read_text().splitlines()]
+    receipt = next(e['lookup_receipt'] for e in events if e['event'] == 'topic_lookup_observation')
+    assert receipt['native_type_support_request'] == support
+    assert receipt['status'] == 'unsupported' and receipt['execution_evidence'] is False
+    assert result['real_execution'] is False
+
+
+@pytest.mark.parametrize('support', [True, {}, {'placement': 'elsewhere'},
+    {'manifest_path': '/tmp/m', 'manifest_sha256': 'x' * 64, 'placement': 'absent'},
+    {'manifest_path': '/tmp/m', 'manifest_sha256': 'a' * 64, 'placement': 'absent', 'unknown': True}])
+def test_native_support_input_rejects_unbound_or_unbounded_references(support):
+    from r2f.modules.s1.topology_model import validate_program
+    p = lookup_program()
+    p['actions'][1]['params']['native_type_support'] = support
+    assert validate_program(p)['status'] == 'invalid'
+
+
+@pytest.mark.parametrize('scope,placement,find_result,expected', [
+    ('participant', 'same_participant', 60, 'found'),
+    ('local_domain', 'other_participant', 60, 'found'),
+    ('global', 'other_participant', 60, 'found'),
+    ('participant', 'other_participant', 0, 'not_found'),
+    ('global', 'different_type', 0, 'not_found'),
+    ('global', 'absent', 0, 'not_found'),
+    ('participant', 'other_participant', 60, 'contract_mismatch'),
+    ('local_domain', 'same_participant', 0, 'contract_mismatch'),
+    ('global', 'different_type', 60, 'contract_mismatch'),
+])
+@pytest.mark.parametrize('cleanup_failure', [False, True])
+def test_explicit_generated_control_persists_real_entity_identity_and_cleanup_at_native_seam(
+        tmp_path, monkeypatch, scope, placement, find_result, expected, cleanup_failure):
+    import ctypes as c
+    import hashlib
+    from pathlib import Path
+    from types import SimpleNamespace
+    from r2f.campaign.identity import source_manifest
+    from r2f.runtime import native_lookup_support as support
+    from r2f.runtime.scoped_topic_lookup import observe_topic_lookup
+    native, lib, calls = native_fixture()
+    native.VERIFIED_C_HEADERS = {}
+    if cleanup_failure:
+        def delete(entity):
+            calls.append(('delete', entity))
+            return -1 if entity == 51 else 0
+        lib.dds_delete = delete
+    class Guid(c.Structure):
+        _fields_ = [('v', c.c_uint8 * 16)]
+    native.Guid = Guid
+    topics = {35: (10, 'rmw_topic', 'std_msgs::msg::dds_::String_')}
+    def descriptor(array_type):
+        return 1000 + array_type
+    fake_dso = tmp_path / 'descriptors.so'
+    fake_dso.write_bytes(b'external native descriptor fixture only')
+    monkeypatch.setattr(support.c, 'CDLL', lambda *a, **kw: SimpleNamespace(r2f_lookup_descriptor=descriptor))
+    def create_topic(owner, desc, name, qos, listener):
+        assert qos is listener is None and desc in (1000, 1001)
+        topic = 51 + len(topics) - 1
+        topics[topic] = (owner, name.decode(), 'r2f_lookup::String' if desc == 1000
+                         else 'r2f_lookup::UInt8MultiArray')
+        calls.append(('create_topic', topic, owner, desc))
+        return topic
+    def create_participant(domain, qos, listener):
+        assert domain == 191 and qos is listener is None
+        calls.append(('create_participant', 20))
+        return 20
+    def guid(entity, out):
+        out._obj.v[:] = bytes.fromhex('c' * 32)
+        return 0
+    def read(column):
+        def value(entity, buf, size):
+            text = (('rt/r2f/topology/a', 'r2f_lookup::String')[column - 1]
+                    if entity == 60 else topics[entity][column]).encode()
+            buf.value = text
+            return len(text)
+        return value
+    def typeinfo(entity, out):
+        assert entity == 51
+        out._obj.value = 1234
+        return 0
+    lib.dds_create_participant = create_participant
+    lib.dds_create_topic = create_topic
+    lib.dds_get_guid = guid
+    lib.dds_get_name, lib.dds_get_type_name = read(1), read(2)
+    lib.dds_get_participant = lambda topic: 10 if topic == 60 else topics[topic][0]
+    lib.dds_get_typeinfo = typeinfo
+    def find(scope_value, participant, name, info, timeout):
+        calls.append(('find', scope_value, participant, name, info.value, timeout))
+        return find_result
+    lib.dds_find_topic = find
+    root = Path(support.__file__).resolve().parent
+    manifest = {'schema': support.SCHEMA,
+        'source': source_manifest(root.parents[2]),
+        'source_sha256': {n: hashlib.sha256(text.encode()).hexdigest() for n, text in support.SOURCES.items()},
+        'sdk_sha256': {}, 'library_path': str(fake_dso),
+        'library_sha256': hashlib.sha256(fake_dso.read_bytes()).hexdigest()}
+    path = tmp_path / 'manifest.json'
+    path.write_text(json.dumps(manifest))
+    reference = {'manifest_path': str(path), 'manifest_sha256': hashlib.sha256(path.read_bytes()).hexdigest(),
+                 'placement': placement}
+    receipt = observe_topic_lookup(native, 191, 'b' * 32, 'writer', scope,
+        'rt/r2f/topology/a', native_type_support=reference, ros_type_name='std_msgs/msg/String')
+    assert receipt['status'] == ('tool_error' if cleanup_failure else expected), receipt
+    assert receipt['complete'] is not cleanup_failure
+    assert receipt['cleanup_confirmed'] is not cleanup_failure
+    assert receipt['type_selection'] == 'native_type_info_from_explicit_generated_control'
+    assert receipt['bound_rmw_type_name'] == 'std_msgs::msg::dds_::String_'
+    assert receipt['bound_type_name'] == 'r2f_lookup::String'
+    native_receipt = receipt['native_type_support']
+    assert native_receipt['reference'] == reference
+    assert native_receipt['qualification'] == 'native_control_not_rmw_or_historical_binding'
+    assert native_receipt['cleanup_confirmed'] is not cleanup_failure
+    created = [e for e in calls if e[0].startswith('create_')]
+    deleted = [e[1] for e in calls if e[0] == 'delete']
+    owned = [e[1] for e in created]
+    assert deleted == ([60] if find_result else []) + list(reversed(owned))
+    assert 10 not in deleted and 35 not in deleted  # borrowed real endpoint/participant untouched
+    if placement == 'other_participant':
+        assert native_receipt['sibling_participant'] == {'handle': 20, 'gid': 'c' * 32}
+    if expected == 'found':
+        assert receipt['result_participant_handle'] == 10
+
+
+def test_complete_lookup_contract_mismatch_cannot_satisfy_public_runner_action(tmp_path):
+    from r2f.runtime.topology_worker import OfflineTopologyBackend
+    class ContractMismatch(OfflineTopologyBackend):
+        def lookup_topic(self, handle, scope, name):
+            return {'scope': scope, 'requested_name': name, 'complete': True,
+                    'status': 'contract_mismatch', 'execution_evidence': False,
+                    'reason': 'native_control_type_or_scope_contract_mismatch'}
+    result = run_topology(lookup_program(), CFG, tmp_path, backend=ContractMismatch())
+    lookup = next(row for row in result['precondition_receipts']
+                  if row.get('step_id') == 'action:lookup')
+    assert lookup['satisfied'] is False
+    assert any(row.get('reason') == 'native_control_type_or_scope_contract_mismatch'
+               for row in result['unknowns'])
+    assert result['real_execution'] is False

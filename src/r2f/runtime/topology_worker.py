@@ -1403,14 +1403,15 @@ def _worker_main(argv, group_owner=None):
         node = Node(node_name, context=context, enable_rosout=False, start_parameter_services=False)
         take_capability = {"status": "unavailable", "reason": "unsupported_rmw_identifier",
                            "original_rclpy_dict_provided_gid": False}
-        if kind == "reader" and config["type_name"] != SUPPORTED_MESSAGE_TYPE:
+        if kind == "reader" and config["type_name"] not in SUPPORTED_MESSAGE_TYPES:
             take_capability = {"status": "unavailable", "reason": "native_take_message_type_not_supported",
                                "original_rclpy_dict_provided_gid": False}
         if (kind == "reader" and rmw_identifier == "rmw_fastrtps_cpp"
-                and config["type_name"] == SUPPORTED_MESSAGE_TYPE):
+                and config["type_name"] in SUPPORTED_MESSAGE_TYPES):
             from .rcl_take_bridge import make_full_info_executor, BridgeUnavailable
             try:
                 executor = make_full_info_executor(context=context, rmw_identifier=rmw_identifier,
+                    **({"message_type": config["type_name"]} if config["type_name"] != SUPPORTED_MESSAGE_TYPE else {}),
                     **({"instrumentation": instrumentation} if instrumentation is not None else {}))
                 take_capability = {"status": "observed", "reason": None,
                                    "observation_basis": "single_take_owner_public_rcl_api",
@@ -1766,10 +1767,15 @@ def _worker_main(argv, group_owner=None):
                     lookup = lookup_receipt(scope, name,
                         reason="rmw_native_typed_topic_lookup_unsupported", execution_evidence=True)
                     lookup["binding"] = rmw_identifier
+                    if "native_type_support" in command:
+                        lookup["native_type_support"] = {"reference": command["native_type_support"]}
                 else:
                     try:
                         lookup = observe_topic_lookup(CycloneMatchedPeerObserver(),
-                            config["domain_id"], local_gid, kind, scope, name)
+                            config["domain_id"], local_gid, kind, scope, name,
+                            **({"native_type_support": command["native_type_support"],
+                                "ros_type_name": config["type_name"]}
+                               if "native_type_support" in command else {}))
                     except (ValueError, TypeError, OSError, AttributeError, RuntimeError) as exc:
                         lookup = lookup_receipt(scope, name,
                             reason="native_topic_lookup_adapter_unavailable:" + str(exc),
@@ -2778,9 +2784,11 @@ class OfflineTopologyBackend:
         return {"snapshots": snapshots, "command_id": command_id,
                 "complete": all(v["complete"] for v in snapshots.values())}
 
-    def lookup_topic(self, handle, scope, name):
+    def lookup_topic(self, handle, scope, name, *, native_type_support=None):
         from .scoped_topic_lookup import lookup_receipt
         receipt = lookup_receipt(scope, name, reason="offline_fixture_no_native_topic_lookup")
+        if native_type_support is not None:
+            receipt["native_type_support_request"] = deepcopy(native_type_support)
         return receipt
 
     def assert_liveliness(self, handle):
@@ -3377,8 +3385,9 @@ class RosTopologyBackend:
                 "group_observations": group_observations,
                 "complete": all(v["complete"] for v in snapshots.values())}
 
-    def lookup_topic(self, handle, scope, name):
-        command_id = self._batch(handle, "lookup_topic", scope=scope, name=name)
+    def lookup_topic(self, handle, scope, name, *, native_type_support=None):
+        command_id = self._batch(handle, "lookup_topic", scope=scope, name=name,
+            **({"native_type_support": native_type_support} if native_type_support is not None else {}))
         rows = [row for row in handle["process"].events
                 if row.get("event") == "topic_lookup_result" and row.get("command_id") == command_id]
         if len(rows) != 1:
@@ -3396,6 +3405,7 @@ class RosTopologyBackend:
             raise TopologyBackendError("topic_lookup_ack_identity_or_order_mismatch")
         value = deepcopy(row["lookup_receipt"])
         if (value.get("scope") != scope or value.get("requested_name") != name
+                or value.get("native_type_support", {}).get("reference") != native_type_support
                 or row.get("run_id") != self.config["run_id"]):
             raise TopologyBackendError("topic_lookup_request_binding_mismatch")
         value.update(command_id=command_id, worker_identity={key: row[key] for key in keys})

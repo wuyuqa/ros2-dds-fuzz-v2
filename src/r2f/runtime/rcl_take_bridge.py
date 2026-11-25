@@ -1,4 +1,4 @@
-"""Pinned Jazzy/FastDDS String take observer, NOT a second subscription/take.
+"""Pinned Jazzy/FastDDS String/UInt8MultiArray take observer, NOT a second subscription/take.
 
 Use ``make_full_info_executor(context=ctx, rmw_identifier='rmw_fastrtps_cpp')``
 INSTEAD OF the worker's SingleThreadedExecutor. Other executor behavior is inherited.
@@ -50,6 +50,9 @@ _PINS = {'include/rcl/rcl/subscription.h': '93e55501a52805a8e57c04d918fdb484d494
  'lib/librosidl_runtime_c.so': '446f57672940d74c277f353132f32f61b30ba4c83621fb1be1d97ae1cadf62aa',
  'lib/python3.12/site-packages/rclpy/subscription.py': 'b21a0f4ef3bd60583b569d912ab60a20377ba7b0f3213af43d29403382630ef9'}
 
+
+# Additional generated allocation/conversion support for the array path only.
+_ARRAY_PINS = {'lib/python3.12/site-packages/std_msgs/std_msgs_s__rosidl_typesupport_c.so': 'a9674b2533ffed903a6d321928bda76d92209dab0579affa5a83b102b7fa9c68', 'lib/python3.12/site-packages/std_msgs/msg/_u_int8_multi_array.py': '1548da44f8123c15a709936dbfa2dfab9e9c0c9e08399bc923a8a6dabd4e61f5', 'include/std_msgs/std_msgs/msg/detail/u_int8_multi_array__struct.h': '3b49cf4c400bcca26b3d4fd30af895cbaccd262e1defc1330619d846a051a22c', 'include/std_msgs/std_msgs/msg/detail/multi_array_layout__struct.h': 'a37fa4799b04609cdaedf0c25dbcaa4e5f1ff6675323e3bc73c950cd259bee14', 'include/std_msgs/std_msgs/msg/detail/multi_array_dimension__struct.h': '13b16d611524b55fc2548702bd138e6d816144a9bda9e5944c24748296fa14ce'}
 
 class BridgeError(RuntimeError):
     """A bridge failure is never grounds for a second/fallback take."""
@@ -207,7 +210,7 @@ def _bind(library, name, args, result):
 
 
 class _Bindings:
-    def __init__(self, rmw_identifier, instrumentation=None):
+    def __init__(self, rmw_identifier, instrumentation=None, message_type='std_msgs/msg/String'):
         if rmw_identifier != RMW_IDENTIFIER:
             raise BridgeUnavailable('unsupported_rmw_identifier:' + str(rmw_identifier))
         self.instrumentation = deepcopy(instrumentation)
@@ -219,13 +222,39 @@ class _Bindings:
             self.libs = {name: C.CDLL(str(PREFIX / ('lib/lib' + name + '.so')))
                          for name in ('rcl', 'rmw_fastrtps_cpp', 'rcutils', 'std_msgs__rosidl_generator_c')}
             self.take = _bind(self.libs['rcl'], 'rcl_take',
-                              [C.c_void_p, C.POINTER(_String), C.POINTER(_MessageInfo),
+                              [C.c_void_p, (C.c_void_p if message_type == 'std_msgs/msg/UInt8MultiArray'
+                                            else C.POINTER(_String)), C.POINTER(_MessageInfo),
                                C.c_void_p], C.c_int)
             generator = self.libs['std_msgs__rosidl_generator_c']
             self.init = _bind(generator, 'std_msgs__msg__String__init',
                               [C.POINTER(_String)], C.c_bool)
             self.fini = _bind(generator, 'std_msgs__msg__String__fini',
                               [C.POINTER(_String)], None)
+            if message_type == 'std_msgs/msg/UInt8MultiArray':
+                if instrumentation is not None:
+                    raise BridgeUnavailable('instrumented_array_take_not_qualified')
+                for relative, expected in _ARRAY_PINS.items():
+                    if hashlib.sha256((PREFIX / relative).read_bytes()).hexdigest() != expected:
+                        raise BridgeUnavailable('array_abi_file_hash_mismatch:' + relative)
+                from std_msgs.msg import UInt8MultiArray
+                UInt8MultiArray.__class__.__import_type_support__()
+                # Same generated converter used by rclpy. PYFUNCTYPE retains the
+                # GIL while constructing a Python message; no ctypes array ABI
+                # or manually reconstructed nested layout is assumed.
+                capsule_pointer = C.pythonapi.PyCapsule_GetPointer
+                capsule_pointer.argtypes = [C.py_object, C.c_char_p]
+                capsule_pointer.restype = C.c_void_p
+                address = capsule_pointer(UInt8MultiArray.__class__._CONVERT_TO_PY, None)
+                if not address:
+                    raise BridgeUnavailable('array_generated_converter_unavailable')
+                self.array_convert = C.PYFUNCTYPE(C.py_object, C.c_void_p)(address)
+                self.array_create = _bind(generator, 'std_msgs__msg__UInt8MultiArray__create',
+                                          [], C.c_void_p)
+                self.array_destroy = _bind(generator, 'std_msgs__msg__UInt8MultiArray__destroy',
+                                           [C.c_void_p], None)
+                self.abi['array_generated_support'] = dict(_ARRAY_PINS)
+                self.abi['pin_sha256'] = hashlib.sha256(json.dumps(
+                    [self.abi['pin_sha256'], _ARRAY_PINS], sort_keys=True).encode()).hexdigest()
             self.reset_error = _bind(self.libs['rcutils'], 'rcutils_reset_error', [], None)
             self.error_string = _bind(self.libs['rcutils'], 'rcutils_get_error_string',
                                       [], _ErrorString)
@@ -247,7 +276,7 @@ class _Bindings:
                 raise BridgeUnavailable('loaded_rmw_identifier_mismatch')
         except BridgeUnavailable:
             raise
-        except (OSError, AttributeError) as exc:
+        except (ImportError, OSError, AttributeError, TypeError, ValueError) as exc:
             raise BridgeUnavailable('native_load_or_symbol_failure:' + type(exc).__name__) from exc
 
     def error(self):
@@ -292,6 +321,19 @@ def _metadata(native, rmw_identifier):
     return info
 
 
+def _bridge_options(message_type, instrumentation):
+    if message_type not in ('std_msgs/msg/String', 'std_msgs/msg/UInt8MultiArray'):
+        raise BridgeUnavailable('native_take_message_type_not_supported')
+    if instrumentation is not None and message_type != 'std_msgs/msg/String':
+        raise BridgeUnavailable('instrumented_array_take_not_qualified')
+    options = {}
+    if instrumentation is not None:
+        options['instrumentation'] = instrumentation
+    if message_type != 'std_msgs/msg/String':
+        options['message_type'] = message_type
+    return options
+
+
 class RclTakeBridge:
     """Single take owner. Native bindings/type injection is for offline tests only.
 
@@ -300,22 +342,27 @@ class RclTakeBridge:
     any ROS entity; it prevents further reads and waits for an active take to finish.
     """
     def __init__(self, *, rmw_identifier=RMW_IDENTIFIER, instrumentation=None,
-                 _bindings=None, _string_type=None):
+                 _bindings=None, _string_type=None, _array_type=None,
+                 message_type='std_msgs/msg/String'):
+        options = _bridge_options(message_type, instrumentation)
+        self.message_type = message_type
         if rmw_identifier != RMW_IDENTIFIER:
             raise BridgeUnavailable('unsupported_rmw_identifier:' + str(rmw_identifier))
         self.instrumentation = deepcopy(instrumentation)
-        self._bindings = _bindings if _bindings is not None else (
-            _Bindings(rmw_identifier) if self.instrumentation is None else
-            _Bindings(rmw_identifier, instrumentation=self.instrumentation))
+        self._bindings = (_bindings if _bindings is not None else
+                          _Bindings(rmw_identifier, **options))
         if self._bindings.abi.get('manifest_reference') != self.instrumentation:
             raise BridgeUnavailable('bridge_bindings_instrumentation_mismatch')
-        if _string_type is None:
+        selected = _array_type if message_type == 'std_msgs/msg/UInt8MultiArray' else _string_type
+        if selected is None:
             try:
-                from std_msgs.msg import String
+                if message_type == 'std_msgs/msg/UInt8MultiArray':
+                    from std_msgs.msg import UInt8MultiArray as selected
+                else:
+                    from std_msgs.msg import String as selected
             except ImportError as exc:
                 raise BridgeUnavailable('std_msgs_python_type_unavailable') from exc
-            _string_type = String
-        self._string_type = _string_type
+        self._message_class = selected
         self.rmw_identifier = rmw_identifier
         self.abi_receipt = self._bindings.abi
         self._lock = threading.Lock()
@@ -338,8 +385,8 @@ class RclTakeBridge:
             self._closed = True
 
     def take(self, subscription):
-        if subscription.msg_type is not self._string_type or subscription.raw is not False:
-            raise BridgeUnavailable('only_std_msgs_msg_String_raw_false_supported')
+        if subscription.msg_type is not self._message_class or subscription.raw is not False:
+            raise BridgeUnavailable('only_' + self.message_type.replace('/', '_') + '_raw_false_supported')
         if not self._lock.acquire(blocking=False):
             raise BridgeError('concurrent_or_reentrant_take_not_supported')
         try:
@@ -359,7 +406,8 @@ class RclTakeBridge:
             pointer = handle.pointer
             if type(pointer) is not int or pointer <= 0 or pointer >= 1 << 64:
                 raise BridgeError('invalid_rcl_subscription_pointer')
-            message = _String()
+            is_array = self.message_type == 'std_msgs/msg/UInt8MultiArray'
+            message = None if is_array else _String()
             native = _MessageInfo()
             # Unknown values must not accidentally look like sequence 0.
             native.publication_sequence_number = UINT64_MAX
@@ -367,10 +415,15 @@ class RclTakeBridge:
             self._take_index += 1
             started = time.monotonic_ns()
             try:
-                if not self._bindings.init(C.byref(message)):
+                if is_array:
+                    message = self._bindings.array_create()
+                    if not message:
+                        raise BridgeError('UInt8MultiArray_create_failed:' + self._bindings.error())
+                elif not self._bindings.init(C.byref(message)):
                     error = self._bindings.error()
                     raise BridgeError('String_init_failed:' + error)
-                code = self._bindings.take(pointer, C.byref(message), C.byref(native), None)
+                code = self._bindings.take(pointer, message if is_array else C.byref(message),
+                                           C.byref(native), None)
                 returned = time.monotonic_ns()
                 if revalidate_after:
                     self._revalidate_instrumentation()
@@ -380,15 +433,19 @@ class RclTakeBridge:
                 if code != 0:
                     error = self._bindings.error()
                     raise BridgeError('rcl_take_failed:' + str(code) + ':' + error)
-                data = message.data
-                if not data.data or data.capacity <= data.size:
-                    raise BridgeError('invalid_native_String_size_or_capacity')
-                if C.string_at(data.data + data.size, 1) != b'\0':
-                    raise BridgeError('native_String_not_null_terminated')
-                text = C.string_at(data.data, data.size).decode('utf-8', errors='strict')
+                if is_array:
+                    result = self._bindings.array_convert(message)
+                    if type(result) is not self._message_class:
+                        raise BridgeError('array_generated_converter_type_mismatch')
+                else:
+                    data = message.data
+                    if not data.data or data.capacity <= data.size:
+                        raise BridgeError('invalid_native_String_size_or_capacity')
+                    if C.string_at(data.data + data.size, 1) != b'\0':
+                        raise BridgeError('native_String_not_null_terminated')
+                    result = self._message_class()
+                    result.data = C.string_at(data.data, data.size).decode('utf-8', errors='strict')
                 info = _metadata(native, self.rmw_identifier)
-                result = self._string_type()
-                result.data = text
                 info['rcl_take_receipt'] = {
                     'schema': 'r2f.rcl-take-receipt/v1', 'api': 'public rcl_take',
                     'observation_basis': 'single_take_owner_public_rcl_api',
@@ -396,7 +453,7 @@ class RclTakeBridge:
                     'rcl_subscription_pointer': hex(pointer),
                     'pointer_scope': 'borrowed_fresh_inside_current_subscription_handle',
                     'rmw_identifier': self.rmw_identifier, 'return_code': code,
-                    'message_type': 'std_msgs/msg/String', 'raw': False,
+                    'message_type': self.message_type, 'raw': False,
                     'take_begin_monotonic_ns': started,
                     'take_return_monotonic_ns': returned,
                     'abi_pin_sha256': self.abi_receipt['pin_sha256'],
@@ -418,7 +475,11 @@ class RclTakeBridge:
             finally:
                 # Zero-initialized String is safe even after partial init failure.
                 # All copied Python values outlive the single native buffer.
-                self._bindings.fini(C.byref(message))
+                if is_array:
+                    if message:
+                        self._bindings.array_destroy(message)
+                else:
+                    self._bindings.fini(C.byref(message))
 
     def take_batch(self, subscription, *, max_samples=64, max_duration_ns=10_000_000):
         """Bounded single-owner drain; no result escapes until full post-validation.
@@ -431,8 +492,8 @@ class RclTakeBridge:
         if (type(max_samples) is not int or not 1 <= max_samples <= 64
                 or type(max_duration_ns) is not int or not 1 <= max_duration_ns <= 50_000_000):
             raise BridgeError('invalid_take_batch_budget')
-        if subscription.msg_type is not self._string_type or subscription.raw is not False:
-            raise BridgeUnavailable('only_std_msgs_msg_String_raw_false_supported')
+        if subscription.msg_type is not self._message_class or subscription.raw is not False:
+            raise BridgeUnavailable('only_' + self.message_type.replace('/', '_') + '_raw_false_supported')
         if not self._lock.acquire(blocking=False):
             raise BridgeError('concurrent_or_reentrant_take_not_supported')
         try:
@@ -536,13 +597,14 @@ def _executor_class(base, await_or_execute, invalid_handle, callback_types):
 
 
 def make_full_info_executor(*, context=None, rmw_identifier=RMW_IDENTIFIER, bridge=None,
-                            instrumentation=None):
+                            instrumentation=None, message_type='std_msgs/msg/String'):
     """Create an opt-in executor; raises BridgeUnavailable, NEVER installs fallback.
 
     On failure main may explicitly use its old executor (GID unavailable). On success
     main must use ONLY this executor for these subscriptions. Receipts distinguish
     this public-API bridge from the unchanged stock rclpy callback dictionary.
     """
+    options = _bridge_options(message_type, instrumentation)
     # Validate installed executor source before depending on its private take hook.
     if instrumentation is None:
         verify_abi()
@@ -554,14 +616,15 @@ def make_full_info_executor(*, context=None, rmw_identifier=RMW_IDENTIFIER, brid
         from rclpy.subscription import Subscription
     except ImportError as exc:
         raise BridgeUnavailable('rclpy_executor_unavailable') from exc
+    if bridge is not None and bridge.message_type != message_type:
+        raise BridgeUnavailable('bridge_executor_message_type_mismatch')
     if bridge is not None and bridge.rmw_identifier != rmw_identifier:
         raise BridgeUnavailable('bridge_executor_rmw_identifier_mismatch')
     if bridge is not None and getattr(bridge, 'instrumentation', None) != instrumentation:
         raise BridgeUnavailable('bridge_executor_instrumentation_mismatch')
     owned = bridge is None
     if owned:
-        bridge = (RclTakeBridge(rmw_identifier=rmw_identifier) if instrumentation is None else
-                  RclTakeBridge(rmw_identifier=rmw_identifier, instrumentation=instrumentation))
+        bridge = RclTakeBridge(rmw_identifier=rmw_identifier, **options)
     elif instrumentation is not None:
         bridge._revalidate_instrumentation()
     cls = _executor_class(SingleThreadedExecutor, await_or_execute,

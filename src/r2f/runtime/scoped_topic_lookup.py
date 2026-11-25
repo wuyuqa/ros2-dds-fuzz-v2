@@ -32,7 +32,8 @@ def _text_readback(c, function, entity):
     return buffer.raw[:rc].decode('utf-8', errors='strict')
 
 
-def observe_topic_lookup(observer, domain, gid, kind, scope, name):
+def observe_topic_lookup(observer, domain, gid, kind, scope, name, *,
+                         native_type_support=None, ros_type_name=None):
     """One nonblocking typed lookup in an already qualified worker library.
 
     The supplied observer is the existing fingerprint/ABI-qualified Cyclone
@@ -50,7 +51,10 @@ def observe_topic_lookup(observer, domain, gid, kind, scope, name):
                   timeout_ns=0, cleanup_confirmed=True,
                   result_ownership='requesting_participant_not_remote_origin',
                   attribution='binding_observation')
+    if native_type_support is not None:
+        result['native_type_support'] = {'reference': native_type_support}
     topic = None
+    native_control = None
     type_info = observer.c.c_void_p()
     owns_type_info = False
     c, lib = observer.c, observer.lib
@@ -91,6 +95,15 @@ def observe_topic_lookup(observer, domain, gid, kind, scope, name):
         if type(source_topic) is not int or source_topic <= 0:
             raise ValueError('topic_lookup_source_topic_unavailable')
         result['bound_type_name'] = _text_readback(c, lib.dds_get_type_name, source_topic)
+        if native_type_support is not None:
+            from .native_lookup_support import NativeLookupControl
+            result['bound_rmw_type_name'] = result['bound_type_name']
+            native_control = NativeLookupControl(observer, native_type_support, ros_type_name)
+            result['native_type_support'] = native_control.receipt
+            source_topic = native_control.prepare(participant, domain, name)
+            result['native_source_topic'] = source_topic
+            result['bound_type_name'] = _text_readback(c, lib.dds_get_type_name, source_topic)
+            result['limitations'].append('native_control_does_not_supply_rmw_topic_typeinformation')
         rc = lib.dds_get_typeinfo(source_topic, c.byref(type_info))
         result['type_info_return_code'] = rc
         if rc != 0 or not type_info.value:
@@ -108,7 +121,9 @@ def observe_topic_lookup(observer, domain, gid, kind, scope, name):
         owns_type_info = True
         # 0.10.5 dds_public_impl.h enum, NOT the deprecated four-argument API.
         scope_value = {'global': 0, 'local_domain': 1, 'participant': 2}[scope]
-        result.update(scope_value=scope_value, type_selection='native_type_info_from_bound_endpoint')
+        result.update(scope_value=scope_value, type_selection=(
+            'native_type_info_from_explicit_generated_control' if native_control is not None
+            else 'native_type_info_from_bound_endpoint'))
         topic = lib.dds_find_topic(scope_value, participant, name.encode('utf-8'), type_info, 0)
         result['find_return_code'] = topic
         if type(topic) is not int:
@@ -131,6 +146,15 @@ def observe_topic_lookup(observer, domain, gid, kind, scope, name):
                               attribution='type_or_scope_contract_requires_review')
             else:
                 result.update(status='found', complete=True, reason=None)
+        if native_control is not None and result.get('complete') is True:
+            expected = native_control.expected_status(scope)
+            observed = result['status']
+            native_control.receipt.update(expected_status=expected, observed_status=observed,
+                                          expectation_satisfied=observed == expected)
+            if observed != expected:
+                result.update(status='contract_mismatch',
+                    reason='native_control_type_or_scope_contract_mismatch',
+                    attribution='type_or_scope_contract_requires_review')
     except (ValueError, TypeError, OSError, AttributeError, RuntimeError) as exc:
         result.update(status='unknown', complete=False, reason=str(exc),
                       attribution='binding_adaptation_or_observation_error')
@@ -149,6 +173,8 @@ def observe_topic_lookup(observer, domain, gid, kind, scope, name):
             except (ValueError, TypeError, OSError, AttributeError, RuntimeError) as exc:
                 result[api + '_error'] = str(exc)
                 result['cleanup_confirmed'] = False
+        if native_control is not None and not native_control.close():
+            result['cleanup_confirmed'] = False
         if result.get('ownership_before', {}).get('complete') is True:
             try:
                 after = observer.sample_ownership(domain, gid, kind)

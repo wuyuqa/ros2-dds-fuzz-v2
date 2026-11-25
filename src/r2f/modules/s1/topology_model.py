@@ -56,7 +56,7 @@ _ACTION_PARAMS = {
     "publish_batch": ({"count", "start_sequence"}, {"interval_sec", "payload", "repeat_data_from", "concurrency_group"}),
     "update_filter": ({"expression", "parameters"}, set()),
     "snapshot": (set(), {"label", "timeout_sec"}),
-    "lookup_topic": ({"scope", "name"}, set()),
+    "lookup_topic": ({"scope", "name"}, {"native_type_support"}),
     "barrier": ({"condition", "timeout_sec"}, {"endpoint_ids", "publish_action_ids"}),
 }
 MUTATORS = (
@@ -294,6 +294,10 @@ def _shape(program):
             if "payload" in p and not _text(p["payload"], empty=True, limit=1024):
                 _error(errors, f"{path}.params.payload", "value", "bounded payload text required")
         if op == "lookup_topic":
+            if "native_type_support" in p:
+                from r2f.runtime.native_lookup_support import validate_reference
+                if not validate_reference(p["native_type_support"]):
+                    _error(errors, f"{path}.params.native_type_support", "value", "qualified native support reference required")
             if p["scope"] not in ("participant", "local_domain", "global"):
                 _error(errors, f"{path}.params.scope", "value", "unknown native lookup scope")
             if not _text(p["name"], limit=256) or "\x00" in p["name"]:

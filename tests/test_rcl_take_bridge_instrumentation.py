@@ -319,3 +319,12 @@ def test_executor_accepts_matching_borrowed_bridge_and_revalidates_it(installati
         b.make_full_info_executor(bridge=bridge, instrumentation=installation.reference)
     assert native.calls == []
     bridge.close()
+
+
+def test_array_executor_explicitly_rejects_unqualified_instrumentation_before_native_load(monkeypatch):
+    from unittest.mock import Mock
+    monkeypatch.setattr(b, 'verify_abi', Mock(side_effect=AssertionError('must not downgrade array instrumentation')))
+    with pytest.raises(b.BridgeUnavailable, match='instrumented_array_take_not_qualified'):
+        b.make_full_info_executor(message_type='std_msgs/msg/UInt8MultiArray',
+                                  instrumentation={'manifest': 'unqualified-control'})
+    b.verify_abi.assert_not_called()
