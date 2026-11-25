@@ -200,7 +200,7 @@ def projection_input(arm, parameters=None):
     """Initial fourth-target payload; no execution/source paths enter identity."""
     from copy import deepcopy
     p = dict(parameters or {})
-    supported = {"topic", "baseline_qos", "variant_qos", "match_timeout_sec", "startup_timeout_sec", "projection_timeout_sec", "projection_discovery_layers", "projection_discovery_tools"}
+    supported = {"topic", "baseline_qos", "variant_qos", "match_timeout_sec", "startup_timeout_sec", "projection_timeout_sec", "projection_discovery_layers", "projection_discovery_tools", "projection_sut_environment"}
     if set(p) - supported:
         raise ValueError("unknown projection parameters: " + ",".join(sorted(set(p) - supported)))
     baseline = deepcopy(p.get("baseline_qos", {"reliability": "reliable", "durability": "volatile", "depth": 64,
@@ -224,5 +224,9 @@ def projection_input(arm, parameters=None):
         from r2f.runtime.discovery_tools import validate_tools_reference
         result["projection_discovery_tools"] = deepcopy(p["projection_discovery_tools"])
         validate_tools_reference(result)
+    if "projection_sut_environment" in p:
+        from r2f.runtime.projection_sut import validate_sut_reference
+        result["projection_sut_environment"] = deepcopy(p["projection_sut_environment"])
+        validate_sut_reference(result)
     reject_execution_identity(result)
     return result

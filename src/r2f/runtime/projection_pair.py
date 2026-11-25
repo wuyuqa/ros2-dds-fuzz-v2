@@ -88,6 +88,8 @@ def normalize_projection_config(config):
     c = deepcopy(config)
     from .discovery_tools import validate_tools_reference
     validate_tools_reference(c)
+    from .projection_sut import validate_sut_reference
+    validate_sut_reference(c)
     if 'projection_discovery_layers' in c:
         from .discovery_profiles import validate_discovery_layers
         validate_discovery_layers(c['projection_discovery_layers'], c['rmw'])
@@ -558,6 +560,8 @@ def namespace_body(request, owner_channel):
         if 'projection_discovery_tools' in c:
             from .discovery_tools import load_tools_environment
             load_tools_environment(c['projection_discovery_tools'])
+        from .projection_sut import KEY as SUT_KEY, load_sut_environment, verify_sut_libraries
+        sut = load_sut_environment(c[SUT_KEY]) if SUT_KEY in c else None
         layers = c.get('projection_discovery_layers')
         if layers:
             profiles, role_env = write_profiles(out, c['rmw'], discovery_layers=layers)
@@ -615,6 +619,12 @@ def namespace_body(request, owner_channel):
                 raise RuntimeError('projection_endpoint_identity_or_chronology_incomplete')
             endpoints[role] = endpoint
             library_refs[role] = capture_libraries(endpoint['pid'], endpoint['process_start_ticks'], out / (role + '-libraries.json'))
+            if sut:
+                mapped = json.loads(Path(library_refs[role]['path']).read_text())
+                verify_sut_libraries(sut, mapped['loaded_libraries'])
+                emit('projection_sut_libraries_verified', role=role, manifest=c[SUT_KEY],
+                     worker_pid=endpoint['pid'], process_start_ticks=endpoint['process_start_ticks'],
+                     libraries=library_refs[role])
         if len({endpoint['pid'] for endpoint in endpoints.values()}) != len(roles):
             raise RuntimeError('projection_requires_independent_worker_processes')
         if c['target_id'] == FUZZ_TARGET:
@@ -688,6 +698,8 @@ def namespace_body(request, owner_channel):
         writer_role = next(role for role in roles if is_writer_role(role))
         policy = {'protocol_defaults': True, 'vendor_versions': {'0110': '0.10.5', '010f': '2.14.7'},
                   'vendor_provenance': {vendor: library_refs[writer_role]}}
+        if sut:
+            policy['vendor_versions']['0110'] = sut['core']['version']
         starts = {role: next(e for e in events if e['event'] == 'endpoint_create_begin' and e['role'] == role)
                   for role in roles}
         prefixes = []
@@ -810,6 +822,13 @@ def namespace_body(request, owner_channel):
             result['workers'].extend(pool.metadata)
             if any(worker.get('returncode') != 0 for worker in pool.metadata):
                 result.update(runtime_status='failed', reason='worker_shutdown_failed')
+        if 'projection_sut_environment' in c:
+            try:
+                from .projection_sut import load_sut_environment
+                load_sut_environment(c['projection_sut_environment'])
+            except (OSError, ValueError) as exc:
+                result.update(runtime_status='failed', reason='projection_sut_identity_changed:' + str(exc))
+                emit('runtime_abort', reason=result['reason'])
         if not same_source(request['source'], execution_chain_identity()):
             result.update(runtime_status='failed', reason='source_identity_changed_during_execution')
         if not endpoints:

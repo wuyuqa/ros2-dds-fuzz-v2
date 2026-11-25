@@ -40,6 +40,10 @@ for package in ('rclpy', 'std_msgs', 'rmw_cyclonedds_cpp', 'rmw_fastrtps_cpp'):
         if package.startswith('rmw_'): result['rmw'][package] = record
 for module in ('rclpy', 'std_msgs.msg'):
     __import__(module)
+result['core_libraries'] = [{'path': str(path), 'sha256': hashlib.sha256(path.read_bytes()).hexdigest()}
+    for path in sorted({pathlib.Path(line.split(maxsplit=5)[5]).resolve()
+        for line in pathlib.Path('/proc/self/maps').read_text().splitlines()
+        if len(line.split(maxsplit=5)) == 6 and 'libddsc.so' in line.split(maxsplit=5)[5]})]
 print(json.dumps(result, sort_keys=True))
 '''
 
@@ -64,10 +68,20 @@ def activated_environment(config):
     overlay = str(config.get('overlay_setup') or (REPO / 'scripts/setup_overlay.bash'))
     if not setup.is_file() or (overlay and not Path(overlay).is_file()):
         raise RuntimeError('blocked:ros_setup_missing')
+    from .projection_sut import KEY, validate_sut_reference, load_sut_environment
+    validate_sut_reference(config)
+    sut = load_sut_environment(config[KEY]) if KEY in config else None
+    prefixes = os.pathsep.join(sut[key]['prefix'] for key in ('rmw', 'core')) if sut else ''
+    libraries = os.pathsep.join(str(Path(sut[key]['prefix']) / 'lib') for key in ('rmw', 'core')) if sut else ''
     code = 'KEYS=' + repr(ENV_KEYS) + '\n' + PROBE_CODE
     command = ['bash', '--noprofile', '--norc', '-c',
-               'source "$1" >/dev/null && { test -z "$2" || source "$2" >/dev/null; } && exec /usr/bin/python3 -c "$3"',
-               'r2f-environment', str(setup), overlay, code]
+               'source "$1" >/dev/null && { test -z "$2" || source "$2" >/dev/null; } && '
+               '{ if test -n "$4"; then '
+               'export AMENT_PREFIX_PATH="$4${AMENT_PREFIX_PATH:+:$AMENT_PREFIX_PATH}"; '
+               'export CMAKE_PREFIX_PATH="$4${CMAKE_PREFIX_PATH:+:$CMAKE_PREFIX_PATH}"; '
+               'export LD_LIBRARY_PATH="$5${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"; fi; } && '
+               'exec /usr/bin/python3 -c "$3"',
+               'r2f-environment', str(setup), overlay, code, prefixes, libraries]
     env = {k: v for k, v in os.environ.items() if k in ('HOME', 'USER', 'LANG', 'LC_ALL', 'TMPDIR', 'PATH')}
     env['PYTHONDONTWRITEBYTECODE'] = '1'
     p = subprocess.run(command, env=env, text=True, capture_output=True, timeout=30)
@@ -75,6 +89,17 @@ def activated_environment(config):
         # Setup/import errors can contain paths; do not expose the caller's environment.
         raise RuntimeError(f'blocked:ros_environment_probe_failed:exit={p.returncode}')
     data = json.loads(p.stdout)
+    if sut:
+        actual = data.get('rmw', {}).get('rmw_cyclonedds_cpp', {})
+        if (not actual.get('available') or any(actual.get(key) != value for key, value in sut['rmw'].items())):
+            raise RuntimeError('blocked:projection_sut_loaded_rmw_mismatch')
+        expected_core = {'path': str(Path(sut['core']['library']).resolve()),
+                         'sha256': sut['core']['library_sha256']}
+        if data.get('core_libraries') != [expected_core]:
+            raise RuntimeError('blocked:projection_sut_loaded_core_mismatch')
+        load_sut_environment(config[KEY])
+        data['sut_environment'] = {'manifest': config[KEY], **{
+            key: sut[key] for key in ('rmw', 'core', 'source', 'build')}}
     child_env = dict(env)
     activation = data.pop('activation_environment')
     data['overlay_activation'] = {'kind': activation.get('R2F_OVERLAY_KIND'), 'source_repo': activation.get('R2F_OVERLAY_SOURCE')}
@@ -145,7 +170,10 @@ def check_environment(config=None, *, probe_ports=True):
         lock = json.loads(LOCK_FILE.read_text())
         result['dependency_lock_sha256'] = hashlib.sha256(LOCK_FILE.read_bytes()).hexdigest()
         mismatch = []
-        for name, pin in lock.get('packages', {}).items():
+        pins = dict(lock.get('packages', {}))
+        if 'sut_environment' in result:
+            pins['rmw_cyclonedds_cpp'] = result['sut_environment']['rmw']
+        for name, pin in pins.items():
             actual = result['packages'].get(name, {})
             for key in ('version', 'library_sha256', 'package_xml_sha256'):
                 if key in pin and pin[key] != actual.get(key):

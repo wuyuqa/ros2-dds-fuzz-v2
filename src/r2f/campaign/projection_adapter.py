@@ -460,6 +460,21 @@ def projection_facts(events, runtime, config):
             raise ValueError('projection discovery layers require submitted opt-in')
         tokens = _lifecycle(events,runtime,config,observation)
         roles = tuple(tokens)
+        if 'projection_sut_environment' in config:
+            from r2f.runtime.projection_sut import load_sut_environment, verify_sut_libraries
+            ref = config['projection_sut_environment']
+            sut = load_sut_environment(ref)
+            if runtime.get('environment', {}).get('sut_environment', {}).get('manifest') != ref:
+                raise ValueError('projection_sut_environment_receipt_mismatch')
+            for role, token in tokens.items():
+                receipt = _one(events, 'projection_sut_libraries_verified', role=role)
+                mapped = _json(receipt['libraries'])
+                if (receipt.get('manifest') != ref or receipt.get('worker_pid') != token['pid']
+                        or mapped.get('pid') != token['pid']
+                        or receipt.get('process_start_ticks') != token['process_start_ticks']
+                        or mapped.get('process_start_ticks') != token['process_start_ticks']):
+                    raise ValueError('projection_sut_worker_identity_mismatch')
+                verify_sut_libraries(sut, mapped['loaded_libraries'])
         facts.update(tokens)
         # The canonical ProjectionFacts contract compares one independent
         # writer/reader pair. Select that pair from the observed facts after

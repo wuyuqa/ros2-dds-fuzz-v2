@@ -59,6 +59,15 @@ def load_tools_environment(ref):
     return manifest
 
 
+def tools_process_environment(manifest, environment):
+    # The helper's independently pinned core may differ from the selected SUT.
+    # Set the search path before exec: changing it after dlopen is too late.
+    result = dict(environment)
+    result['LD_LIBRARY_PATH'] = str(Path(manifest['library']['path']).parent) + (
+        os.pathsep + result['LD_LIBRARY_PATH'] if result.get('LD_LIBRARY_PATH') else '')
+    return result
+
+
 class DiscoveryToolsObserver:
     """A helper pool inside the canonical controller, with the same ownership.
 
@@ -85,7 +94,8 @@ class DiscoveryToolsObserver:
             self.records.append(deepcopy(token))
             return token
 
-        self.pool = ToolsPool(config, dict(os.environ), self.out, capture,
+        process_environment = tools_process_environment(load_tools_environment(config[KEY]), os.environ)
+        self.pool = ToolsPool(config, process_environment, self.out, capture,
             owner_channel=owner_channel, role_environments={'discovery_tools': environment})
 
     def start(self):

@@ -55,7 +55,7 @@ F2_SURFACE_MUTATORS = {'E02': 'M07', 'E03': 'M06'}
 F2_TIMING_FIELDS = frozenset({'runtime_capability', 'anchor_timing_policy',
                               'anchor_lateness_tolerance_sec'})
 
-PROJECTION_FIELDS = frozenset({'projection_roles', 'projection_role_qos', 'projection_discovery_layers', 'projection_discovery_tools'})
+PROJECTION_FIELDS = frozenset({'projection_roles', 'projection_role_qos', 'projection_discovery_layers', 'projection_discovery_tools', 'projection_sut_environment'})
 CONTROL_FIELDS = RECOVERY_FIELDS | PROJECTION_FIELDS | F2_TIMING_FIELDS | {'rmws'}
 PROFILE_CONTROL_FIELDS = (CONTROL_FIELDS - {'rmws'}) | {'role_rmws'}
 # These are declarations/provenance, never a blanket runtime passthrough.
@@ -265,6 +265,9 @@ def _controls(config, backend):
     if 'projection_discovery_tools' in present:
         from r2f.runtime.discovery_tools import validate_tools_reference
         validate_tools_reference(config)
+    if 'projection_sut_environment' in present:
+        from r2f.runtime.projection_sut import validate_sut_reference
+        validate_sut_reference(config)
     if present & PROJECTION_FIELDS:
         from r2f.runtime.projection_pair import projection_roles, validate_qos
         roles = projection_roles(config)
