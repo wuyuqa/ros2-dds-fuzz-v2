@@ -17,6 +17,8 @@ KEY = 'native_matching_qos'
 SCHEMA = 'r2f.native-matching-qos/v1'
 BUILD_SCHEMA = 'r2f.native-matching-qos-build/v1'
 SOURCE = Path(__file__).with_name('matching_qos_bridge.cpp')
+CPP_RUNTIME = Path('/usr/lib/x86_64-linux-gnu/libstdc++.so.6').resolve()
+CPP_ABI_EXPECTED = {'guid':'01.02.03.04.05.06.07.08.09.0a.0b.0c|00.00.01.02', 'stream_guid':'01.02.03.04.05.06.07.08.09.0a.0b.0c|0.0.1.2', 'finite_duration_sec':1.25}
 
 
 def digest(path):
@@ -49,10 +51,11 @@ def load_build(ref):
     data = json.loads(Path(ref['path']).read_text())
     if (data.get('schema') != BUILD_SCHEMA or data.get('sut_modified') is not False
             or data.get('source_sha256') != digest(SOURCE)
+            or data.get('cpp_abi_probe') != CPP_ABI_EXPECTED
             or not isinstance(data.get('files'), dict) or not data['files']
             or data.get('library') not in data['files']):
         raise ValueError('native_matching_qos_build_incomplete')
-    required = [SOURCE.resolve(), SOURCE.with_name('native_string_sample.hpp').resolve(),
+    required = [SOURCE.resolve(), SOURCE.with_name('native_string_sample.hpp').resolve(), CPP_RUNTIME,
                 Path('/opt/ros/jazzy/lib/libfastcdr.so').resolve(), Path('/opt/ros/jazzy/lib/libfastrtps.so').resolve(),
                 Path('/opt/ros/jazzy/lib/librmw_fastrtps_cpp.so').resolve()]
     if (any(str(path) not in data['files'] for path in required)
@@ -63,6 +66,17 @@ def load_build(ref):
         if not Path(path).is_absolute() or digest(path) != expected:
             raise ValueError('native_matching_qos_dependency_changed:' + path)
     return data
+
+
+
+def cpp_runtime_provenance(build):
+    rows=[line.split(maxsplit=5) for line in Path('/proc/self/maps').read_text().splitlines()
+          if len(line.split(maxsplit=5))==6
+          and Path(line.split(maxsplit=5)[5]).name.startswith('libstdc++.so.')]
+    if (not rows or any(Path(row[5]).resolve()!=CPP_RUNTIME or int(row[4])!=CPP_RUNTIME.stat().st_ino
+                        for row in rows)):
+        raise ValueError('native_matching_cpp_runtime_mapping_mismatch')
+    return {'path':str(CPP_RUNTIME),'sha256':build['files'][str(CPP_RUNTIME)]}
 
 
 def observe(endpoint, kind, requested, ref, *, apply, profile):
@@ -79,6 +93,7 @@ def observe(endpoint, kind, requested, ref, *, apply, profile):
         raise ValueError('native_matching_qos_vendor_mapping_mismatch')
     requested = partitions(requested)
     lib = C.CDLL(build['library'])
+    cpp_runtime=cpp_runtime_provenance(build)
     function = lib.r2f_matching_partitions
     function.argtypes = [C.c_void_p, C.c_int, C.c_int, C.c_size_t,
                          C.POINTER(C.c_char_p), C.c_void_p, C.c_size_t]
@@ -100,7 +115,7 @@ def observe(endpoint, kind, requested, ref, *, apply, profile):
             'requested': requested, **result, 'pid': os.getpid(),
             'sampled_monotonic_ns': sampled, 'build_reference': dict(ref),
             'library': {'path': build['library'], 'sha256': build['files'][build['library']]},
-            'mapped_api_libraries': maps, 'ownership_profile': dict(profile), 'sut_modified': False,
+            'mapped_api_libraries': maps, 'cpp_runtime':cpp_runtime, 'ownership_profile': dict(profile), 'sut_modified': False,
             'semantic_effect': 'not_inferred_from_configuration', 'candidate_eligible': False}
 
 
@@ -187,6 +202,8 @@ def audit_run(program, events, config, *, fixture):
         if build and (receipt['library']['path'] != build['library']
                 or receipt['library']['sha256'] != build['files'][build['library']]):
             raise ValueError('native_partition_selected_binary_mismatch')
+        if build and receipt.get('cpp_runtime')!={'path':str(CPP_RUNTIME),'sha256':build['files'][str(CPP_RUNTIME)]}:
+            raise ValueError('native_partition_cpp_runtime_provenance_missing_or_changed')
         profile = receipt['ownership_profile']
         if not fixture and (digest(profile['path']) != profile['sha256']
                 or Path(profile['path']).read_bytes() != ownership_profile(

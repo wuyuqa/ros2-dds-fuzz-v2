@@ -154,16 +154,23 @@ std::string seconds_json(const eprosima::fastrtps::Duration_t& d) {
     if (d == eprosima::fastrtps::c_TimeInfinite) return "\"infinite\"";
     std::ostringstream out; out << std::setprecision(17) << (double(d.seconds) + double(d.nanosec)/1e9); return out.str();
 }
+std::string persistence_guid_string(const eprosima::fastrtps::rtps::GUID_t& guid) {
+    auto compact=guid_text(guid); std::string text;
+    for(size_t i=0;i<32;i+=2) {
+        if(i)text+=(i==24?"|":".");text+=compact.substr(i,2);
+    }
+    return text;
+}
 template<class Qos> void persistence_qos(Qos& q, DomainParticipant* pp, bool writer,
         const char* database) {
     if(q.durability().kind!=TRANSIENT_DURABILITY_QOS) return;
     if(!database || database[0]!='/') throw std::runtime_error("native_control_persistence_database_required");
     auto guid=pp->guid(); guid.entityId.value[3]=writer?0x02:0x07;
-    std::ostringstream text; text<<guid;
+    auto text=persistence_guid_string(guid);
     auto& props=q.properties().properties();
     props.emplace_back("dds.persistence.plugin","builtin.SQLITE3");
     props.emplace_back("dds.persistence.sqlite3.filename",database);
-    props.emplace_back("dds.persistence.guid",text.str());
+    props.emplace_back("dds.persistence.guid",text);
 }
 template<class Qos> std::string persistence_json(const Qos& q) {
     std::string out="{"; bool first=true;
@@ -191,35 +198,24 @@ template<class Endpoint> std::string native_entity(Endpoint* ep, DomainParticipa
       +",\"lease_duration_sec\":"+seconds_json(q.liveliness().lease_duration)+",\"partitions\":"+names_json(names)+"}}";
 }
 }
-// Diagnostic adapter builds only; never used to qualify normal SUT execution.
-#ifdef R2F_NATIVE_MATCHING_DIAGNOSTIC_BACKTRACE
-#include <execinfo.h>
-#include <signal.h>
-#include <unistd.h>
-namespace {
-void native_diagnostic_segv(int sig) {
-    const char text[]="R2F_NATIVE_DIAGNOSTIC_FATAL_STACK\n";
-    (void)!write(STDERR_FILENO,text,sizeof(text)-1);
-    void* frames[48]; int n=backtrace(frames,48); backtrace_symbols_fd(frames,n,STDERR_FILENO);
-    signal(sig,SIG_DFL); raise(sig);
+// Build qualification only: no participant/context/entity is created here.
+extern "C" int r2f_matching_cpp_abi_probe(char* output, size_t capacity) noexcept {
+    try {
+        eprosima::fastrtps::rtps::GUID_t guid;
+        for(int i=0;i<12;++i)guid.guidPrefix.value[i]=static_cast<unsigned char>(i+1);
+        guid.entityId.value[0]=0;guid.entityId.value[1]=0;
+        guid.entityId.value[2]=1;guid.entityId.value[3]=2;
+        std::ostringstream streamed; streamed<<guid;
+        std::string result="{\"guid\":"+json_quote(persistence_guid_string(guid))
+            +",\"stream_guid\":"+json_quote(streamed.str())
+            +",\"finite_duration_sec\":"+seconds_json({1,250000000})+"}";
+        if(!output || result.size()+1>capacity)return 1;
+        std::memcpy(output,result.c_str(),result.size()+1);return 0;
+    }catch(...){return 2;}
 }
-struct NativeDiagnosticScope {
-    struct sigaction old{};
-    NativeDiagnosticScope() {
-        void* warm[4]; (void)backtrace(warm,4);
-        struct sigaction action{}; action.sa_handler=native_diagnostic_segv;
-        sigemptyset(&action.sa_mask); sigaction(SIGSEGV,&action,&old);
-    }
-    ~NativeDiagnosticScope() {sigaction(SIGSEGV,&old,nullptr);}
-};
-}
-#endif
 extern "C" int r2f_native_matching(void* rcl_endpoint, int reader_role, uint32_t domain,
     const char* topic_name, int same_participant, const R2fNativeQos* wq, const R2fNativeQos* rq,
     const char* persistence_database, double timeout_sec, char* output, size_t capacity) noexcept {
-#ifdef R2F_NATIVE_MATCHING_DIAGNOSTIC_BACKTRACE
-    NativeDiagnosticScope diagnostic_scope;
-#endif
     std::vector<std::pair<std::string,std::function<int()>>> cleanup;
     std::string status="unknown", reason, entities="[]", fresh_entities="[]", samples="[]", delivery="null", cleanup_json="[";
     bool clean=true;

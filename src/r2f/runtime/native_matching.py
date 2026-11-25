@@ -256,7 +256,7 @@ def execute_control(request, *, domain, rmw, endpoint, kind, output_dir=None):
 
 
 def _fastdds(request, domain, endpoint, kind, output_dir):
-    from .matching_qos import load_build
+    from .matching_qos import load_build,cpp_runtime_provenance
     from .fastdds_peer_observer import verify_abi, _verify_api_maps
     verify_abi(); maps=_verify_api_maps()
     build=load_build(request['support'])
@@ -281,6 +281,7 @@ def _fastdds(request, domain, endpoint, kind, output_dir):
     database=str(persistence_dir/'native.db') if persistence_dir else ''
     w,r=qos(request['writer_qos']),qos(request['reader_qos'])
     library=c.CDLL(build['library'])
+    cpp_runtime=cpp_runtime_provenance(build)
     layout=_function(library,'r2f_native_matching_qos_layout',[c.c_int],c.c_size_t)
     expected=[c.sizeof(Qos)]+[getattr(Qos,field).offset for field,_ in Qos._fields_]
     if [layout(i) for i in range(len(expected))]!=expected:raise ValueError('native_control_qos_abi_mismatch')
@@ -304,7 +305,7 @@ def _fastdds(request, domain, endpoint, kind, output_dir):
     for fresh, original in zip(value.get('fresh_entities', []), value['entities']):
         fresh['generation']=original['generation']
     value.update(vendor='fastdds',version=build['fastdds_version'],support=deepcopy(request['support']),
-                 api_provenance={'mapped_api_libraries':maps,'library':build['library'],
+                 api_provenance={'mapped_api_libraries':maps,'cpp_runtime':cpp_runtime,'library':build['library'],
                      'library_sha256':build['files'][build['library']]},
                  isolation='canonical_isolated_domain_unique_native_topic_owned_pair')
     return value
@@ -379,10 +380,12 @@ def audit_control(request, value, *, pid, fixture, artifact_root=None):
         if not fixture:
             if not isinstance(value.get('api_provenance'),dict):raise ValueError('native_control_api_provenance_not_object')
             if value['vendor']=='fastdds':
-                from .matching_qos import load_build
+                from .matching_qos import load_build,CPP_RUNTIME
                 build=load_build(request['support'])
                 if (value.get('api_provenance') or {}).get('library_sha256')!=build['files'][build['library']]:
                     raise ValueError('native_control_api_build_mismatch')
+                if value['api_provenance'].get('cpp_runtime')!={'path':str(CPP_RUNTIME),'sha256':build['files'][str(CPP_RUNTIME)]}:
+                    raise ValueError('native_control_cpp_runtime_provenance_missing_or_changed')
             else:
                 ref=request['support']; manifest=json.loads(Path(ref['path']).read_text())
                 from .native_lookup_support import SOURCES,SCHEMA as SUPPORT_SCHEMA
