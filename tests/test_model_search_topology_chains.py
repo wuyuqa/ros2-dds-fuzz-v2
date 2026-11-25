@@ -262,17 +262,18 @@ def test_standard_cli_exact_plan_split_resume_and_capsule_null(cli,length,tmp_pa
             assert capsule['execution'] is None and row['input_search']['execution'] is None
 
 
-def test_old_single_golden_and_no_checkpoint_schema_migration():
+def test_cft_rule_extension_rebinds_single_golden_without_schema_migration():
     from r2f.campaign.corpus import CONTENT_IDENTITY_SCHEMA, TOPOLOGY_CONTENT_IDENTITY_SCHEMA
     assert CONTENT_IDENTITY_SCHEMA == 'r2f.corpus-content/v2'
     assert TOPOLOGY_CONTENT_IDENTITY_SCHEMA == 'r2f.corpus-content/topology-v4'
     # The old ac3143bb frontier used generic-v2, not topology-v3.
-    # Descriptor/applicability stay fixed; only topology root/task/RNG identities change.
+    # Issue19 extends the CFT rule contract: descriptor/frontier must rebind,
+    # while the input schema and sampling applicability remain unchanged.
     doc = single_profile(); state = fresh(doc)
-    assert dsc(doc)['descriptor_sha256'] == '9689aec389dd801ba8eaff00a7b4fdc3b9a22ef7604eb9af1c790e24e6cd894b'
+    assert dsc(doc)['descriptor_sha256'] == '5ce584d542f4901a9860131bb47be50a85e61427a77d8a00bfe3a8f892d45d9e'
     ledger = next(iter(state['scheduler'].frontier.nodes.values()))['sampling_applicability']
     assert canonical_hash(ledger) == 'a20db8636a3ea853e85f8a5465fca44e4961270b3b0d8afffb36616fe91064a0'
-    assert canonical_hash(state['scheduler'].frontier.to_dict()) == 'de1021858c6e60f93ad8200be593dc147d80d998d539ab2a064917b4963646ff'
+    assert canonical_hash(state['scheduler'].frontier.to_dict()) == '3fd62ef7bd04426e23b098a93e9fcf566ccf686e6602a2f15406ce698fb77594'
     data = fresh(multiface(2))['scheduler'].frontier.to_dict()
     data['schema'] = 'r2f.input-search-frontier/topology-v1'
     with pytest.raises(ValueError): InputSearchFrontier.from_dict(data)

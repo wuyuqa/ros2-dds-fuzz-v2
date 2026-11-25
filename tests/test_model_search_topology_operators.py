@@ -157,12 +157,13 @@ def test_chain_remains_explicitly_unsupported(length):
     with pytest.raises(ValueError,match='chain_length=1'):validate_profile_fields(doc)
 
 
-def test_old_descriptor_and_ledger_remain_identical_to_frozen_card():
+def test_cft_rule_extension_rebinds_descriptor_but_preserves_ledger():
     from r2f.campaign.corpus import CONTENT_IDENTITY_SCHEMA, TOPOLOGY_CONTENT_IDENTITY_SCHEMA
     assert CONTENT_IDENTITY_SCHEMA == 'r2f.corpus-content/v2'
     assert TOPOLOGY_CONTENT_IDENTITY_SCHEMA == 'r2f.corpus-content/topology-v4'
     # The old ac3143bb frontier used generic-v2, not topology-v3.
-    # Descriptor/applicability stay fixed; only topology root/task/RNG identities change.
+    # Issue19 extends the CFT rule contract: descriptor/frontier must rebind,
+    # while the input schema and sampling applicability remain unchanged.
     # The old schema must not silently acquire classes or change applicability.
     doc=original_profile();f=fresh(doc)['scheduler'].frontier
     ledger=next(iter(f.nodes.values()))['sampling_applicability']
@@ -170,11 +171,22 @@ def test_old_descriptor_and_ledger_remain_identical_to_frozen_card():
     assert any(r['reason']=='handler_not_supported_in_first_slice' for r in ledger)
     assert not any('sampling_scope' in r for r in ledger)
     assert f.topology_descriptor['sampler']=='explicit-consumed-context/v1'
-    # Frozen descriptor/ledger retained; frontier explicitly binds topology-v4.
+    # Pin the extended contract identity; do not silently restore the old contract.
     from r2f.core.evidence import canonical_hash
-    assert f.topology_descriptor['descriptor_sha256']=='9689aec389dd801ba8eaff00a7b4fdc3b9a22ef7604eb9af1c790e24e6cd894b'
+    assert f.topology_descriptor['descriptor_sha256']=='5ce584d542f4901a9860131bb47be50a85e61427a77d8a00bfe3a8f892d45d9e'
     assert canonical_hash(ledger)=='a20db8636a3ea853e85f8a5465fca44e4961270b3b0d8afffb36616fe91064a0'
-    assert canonical_hash(f.to_dict())=='de1021858c6e60f93ad8200be593dc147d80d998d539ab2a064917b4963646ff'
+    assert canonical_hash(f.to_dict())=='3fd62ef7bd04426e23b098a93e9fcf566ccf686e6602a2f15406ce698fb77594'
+    from r2f.campaign.topology_search import validate_descriptor
+    stale = deepcopy(f.topology_descriptor)
+    stale['contract_hash'] = 'e39c5f03c796003379715a9d07748c1e65c4c9db0514102eb6a513f294656aa6'
+    stale['descriptor_sha256'] = canonical_hash({k: v for k, v in stale.items() if k != 'descriptor_sha256'})
+    assert stale['descriptor_sha256'] == '9689aec389dd801ba8eaff00a7b4fdc3b9a22ef7604eb9af1c790e24e6cd894b'
+    with pytest.raises(ValueError, match='descriptor/model drift'):
+        validate_descriptor(stale)
+    checkpoint = f.to_dict()
+    checkpoint['topology_descriptor'] = stale
+    with pytest.raises(ValueError):
+        InputSearchFrontier.from_dict(checkpoint)
 
 
 def test_task_tamper_rejected_and_rejection_reason_regenerated():
