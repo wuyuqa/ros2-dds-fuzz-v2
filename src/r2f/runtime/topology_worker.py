@@ -770,6 +770,22 @@ def endpoint_expressibility(spec, config):
             "initial_content_filter": initial_filter}
 
 
+def observed_endpoint_expressibility(spec, created):
+    """Map the public request using an independently bound native selector.
+
+    This only reconstructs input mapping for raw application audits. Native
+    adoption and semantic matching remain separately audited observations.
+    """
+    from .matching_qos import KEY, validate_readback
+    config = {"rmw": created.get("rmw_identifier")}
+    native = created.get("native_partition_qos")
+    if native is not None:
+        qos = spec.get("qos") or {}
+        validate_readback(created, qos.get("partitions"), ownership=qos.get("ownership"))
+        config[KEY] = native["build_reference"]
+    return endpoint_expressibility(spec, config)
+
+
 def _public_qos_kwargs(qos):
     from rclpy.qos import (
         DurabilityPolicy, HistoryPolicy, LivelinessPolicy, ReliabilityPolicy,

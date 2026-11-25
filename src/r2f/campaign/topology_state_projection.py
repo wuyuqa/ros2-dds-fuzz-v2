@@ -521,8 +521,11 @@ class _Projection:
     def compatibility(self, w, r, wc, rc):
         from r2f.runtime.matching_qos import pair_contract
         native = pair_contract(w, r, wc[2], rc[2], {e["logical_id"]: e for e in self.program["endpoints"]})
+        annotations = []
 
         def conclude(check):
+            if annotations:
+                check["graph_annotation_differences"] = deepcopy(annotations)
             if native is not None:
                 values = (check["compatible"], native["compatible"])
                 check.update({key: value for key, value in native.items()
@@ -546,8 +549,17 @@ class _Projection:
                 if len(members) != 1:
                     raise ValueError("observed_endpoint_contract_missing_from_graph")
                 rows.append(members[0])
-            if rows[0] != rows[1]:
+            # ROS node annotations can be unknown on a remote non-default
+            # partition. Preserve them, but compare every actual contract field.
+            annotation_fields = {"node_name", "node_namespace"}
+            contracts_only = [{k: v for k, v in row.items() if k not in annotation_fields} for row in rows]
+            if contracts_only[0] != contracts_only[1]:
                 raise ValueError("observed_contract_sources_contradict")
+            differences = {key: [row.get(key) for row in rows] for key in sorted(annotation_fields)
+                           if rows[0].get(key) != rows[1].get(key)}
+            if differences:
+                annotations.append({"logical_id": token["logical_id"], "fields": differences,
+                                    "scope": "node_metadata_not_matching_policy"})
             row = rows[0]
             if not _text(row.get("topic_type")):
                 raise ValueError("observed_contract_fields_missing")

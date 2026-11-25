@@ -311,3 +311,39 @@ def test_independent_refusal_retains_native_freshness_gap(tmp_path, mismatch):
     assert facts['matching_observation_incomplete'] is True
     assert oracle['verdict'] == 'unknown'
     assert facts['candidate_eligible'] is False
+
+
+@pytest.mark.parametrize('damage',[None,'missing_selection','bad_native_identity'])
+def test_public_application_audit_retains_native_carrier_selection(tmp_path,damage):
+    """Synthetic public-schema raw reuses the real route auditor, no live credit."""
+    from r2f.core.mutation_plan import MutationPlan
+    from r2f.runtime.topology_route import audit_topology_application
+    from r2f.runtime.topology_worker import endpoint_expressibility
+    from r2f.runtime.qos_binding import compare_public_qos
+    runtime,cfg=produce(tmp_path,program=partition_program(),backend=ObservedPeers(auto_match=False))
+    add_native_readbacks(runtime)
+    specs={e['logical_id']:e for e in cfg['topology_program']['endpoints']}
+    def public_schema(events):
+        for token in events:
+            if token['event']!='endpoint_created':continue
+            q=endpoint_expressibility(specs[token['logical_id']],cfg)['public_qos']
+            token.update(backend='ros2_public_api',real_ros=True,rmw_identifier='rmw_fastrtps_cpp',
+                configuration_source='public_endpoint_actual_qos',qos=deepcopy(q),requested_qos=deepcopy(q),
+                identity_source='get_publishers_info_by_topic' if token['role']=='writer' else 'get_subscriptions_info_by_topic',
+                created_monotonic_ns=token['monotonic_ns']-2,
+                actual_endpoint_qos={'schema':'r2f.public-endpoint-qos/v1','status':'observed',
+                    'api':'rcl_publisher_get_actual_qos' if token['role']=='writer' else 'rcl_subscription_get_actual_qos',
+                    'qos':deepcopy(q),'pid':token['pid'],'sampled_monotonic_ns':token['monotonic_ns']-1,
+                    'library':{'path':'/fixture/librcl.so','sha256':'a'*64},'abi':{'verified':True,'fixture':True}},
+                qos_request_comparison=compare_public_qos(q,q))
+            if damage=='missing_selection':token.pop('native_partition_qos')
+            elif damage=='bad_native_identity':token['native_partition_qos']['pid']=-1
+    rewrite(runtime,public_schema)
+    audit=audit_topology_application(MutationPlan.from_dict(cfg['mutation_plan']),cfg['input_layer_receipts'],runtime)
+    if damage is None:
+        assert audit['status']!='invalid',audit
+        assert all(not layer['reasons'] for layer in audit['layers']),audit
+    else:
+        assert audit['status'] in ('invalid','incomplete'),audit
+        assert not audit['mutation_receipt']['hit']
+    assert audit['execution_evidence'] is False

@@ -35,7 +35,7 @@ import math
 
 from r2f.core.evidence import canonical_hash
 from .topology_worker import (
-    OFFLINE_BACKEND, ROS_BACKEND, TopologyUnsupported, endpoint_expressibility,
+    OFFLINE_BACKEND, ROS_BACKEND, TopologyUnsupported, endpoint_expressibility, observed_endpoint_expressibility,
     worker_role_for, worker_role_kind,
 )
 
@@ -141,9 +141,9 @@ def expected_qos(spec, program_field, created):
     if public is None:
         return None, False, "qos_field_not_publicly_expressible:" + str(program_field)
     try:
-        prepared = endpoint_expressibility(spec, {"rmw": created.get("rmw_identifier")})
-    except TopologyUnsupported as exc:
-        return None, False, "endpoint_not_expressible:" + exc.code
+        prepared = observed_endpoint_expressibility(spec, created)
+    except (TopologyUnsupported, ValueError, TypeError, KeyError) as exc:
+        return None, False, "endpoint_not_expressible:" + str(getattr(exc, "code", exc))
     values = prepared.get("public_qos") or {}
     if public not in values:
         return None, False, "public_qos_field_not_reflected:" + public
@@ -222,7 +222,7 @@ def _record(layer_index, operator, slot_key):
             "candidate_eligible": False}
 
 
-def _public_configuration_intervention(record, receipt, program):
+def _public_configuration_intervention(record, receipt, program, events):
     """Compare actual API inputs, never program spelling alone or raw echoes.
 
     Use the same mapper as endpoint creation (not the fixture's rounded-ns
@@ -245,9 +245,12 @@ def _public_configuration_intervention(record, receipt, program):
             record["reasons"].append("layer_endpoint_overridden_or_missing:" + eid)
             continue
         try:
-            mapped = [endpoint_expressibility(s, {}) for s in specs]
-        except TopologyUnsupported as exc:
-            record["reasons"].append("public_configuration_not_expressible:" + eid + ":" + exc.code)
+            created = next((e for e in reversed(events) if e.get("event") == "endpoint_created"
+                            and e.get("logical_id") == eid), None)
+            mapped = [(observed_endpoint_expressibility(s, created) if created is not None
+                       else endpoint_expressibility(s, {})) for s in specs]
+        except (TopologyUnsupported, ValueError, TypeError, KeyError) as exc:
+            record["reasons"].append("public_configuration_not_expressible:" + eid + ":" + str(getattr(exc, "code", exc)))
             continue
         if field == "filter":
             # A missing/blank filter both create without content_filter_options.
@@ -358,7 +361,7 @@ def _bound_creations(record, endpoint_id, spec, events, program, *, fixture):
             try:
                 if fixture:
                     raise ValueError("fixture_cannot_claim_public_actual_qos")
-                public = endpoint_expressibility(spec, {"rmw": token.get("rmw_identifier")})["public_qos"]
+                public = observed_endpoint_expressibility(spec, token)["public_qos"]
                 comparison = validate_created_qos(token, public)
                 if comparison["default_resolutions"]:
                     record.setdefault("qos_default_resolutions", []).append({
@@ -638,7 +641,7 @@ def _audit_filter_operator(layer_index, receipt, events, program, *, fixture):
                   dynamic_update_covered=False, lease_covered=False,
                   effect_observed=False,
                   effect_observation="unknown_filter_sample_effect_not_measured")
-    _public_configuration_intervention(record, receipt, program)
+    _public_configuration_intervention(record, receipt, program, events)
     before = {e.get("logical_id"): e for e in receipt["input_before"].get("endpoints", [])}
     after = {e.get("logical_id"): e for e in receipt["input_after"].get("endpoints", [])}
     changed = [eid for eid, spec in after.items() if eid in before
@@ -828,7 +831,7 @@ def audit_operator_application(plan_receipts, events, program, *, fixture):
                 record["effect_scope"] = "endpoint_public_configuration_only_not_timed_lifecycle"
             records[index] = record
         if intervention and operator != "filter.expr":
-            _public_configuration_intervention(records[index], receipt, program)
+            _public_configuration_intervention(records[index], receipt, program, events)
         if (not records[index]["reasons"] and records[index]["status"] == "unknown"
                 and operator not in FILTER_OPERATORS):
             records[index]["configuration_application_observed"] = True
