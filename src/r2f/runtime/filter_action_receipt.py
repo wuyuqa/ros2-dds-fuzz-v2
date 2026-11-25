@@ -45,8 +45,11 @@ def _initial_action_evidence(action, rows):
     _require(all(created.get(k) is not None and type(e.get(k)) is type(created[k])
                  and e.get(k) == created[k]
                  for e in (create, started, submitted, observed)
-                 for k in (*_BINDING, 'topic', 'message_type', 'backend', 'real_ros', 'fixture')),
+                 for k in (*_BINDING, 'topic', 'message_type', 'backend', 'real_ros')),
              'initial_worker_identity_mismatch')
+    fixture = created.get('fixture') is True or created.get('backend') == 'offline_fake'
+    _require(all((e.get('fixture') is True) == (created.get('fixture') is True)
+                 for e in (create, started, submitted, observed)), 'initial_fixture_marker_mismatch')
     from .topology_worker import worker_role_kind
     _require(worker_role_kind(created.get('role')) == 'reader', 'reader_required')
     value = observed.get('filter_receipt')
@@ -65,7 +68,7 @@ def _initial_action_evidence(action, rows):
     config = {k: expected[k] for k in ('expression', 'parameters')}
     _require(value.get('schema') == 'r2f.participant-filter/v1'
              and value.get('scope') == 'initial_only'
-             and value.get('fixture') is created['fixture']
+             and value.get('fixture') is fixture
              and value.get('configured') is True and value.get('configuration_status') == 'verified'
              and value.get('submitted') is True and value.get('accepted') is True
              and value.get('readback_status') == 'matched'

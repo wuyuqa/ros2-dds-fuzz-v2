@@ -3,6 +3,8 @@ import json
 from pathlib import Path
 from unittest.mock import Mock
 
+import pytest
+
 from r2f.runtime.ros2_pair import run_pair
 from r2f.runtime.topology_worker import OfflineTopologyBackend
 from test_topology_cycle import run_cycle, profile
@@ -34,7 +36,7 @@ def test_runner_persists_initial_and_dynamic_filter_observation_gaps(tmp_path):
     assert report['rows'][0]['typed_facts']['content_filter_observations'] == evidence
 
 
-def initial_rows():
+def initial_rows(*, real_envelope=False):
     """Public creation API double; explicitly NON-DDS and not persisted evidence."""
     from copy import deepcopy
     import time
@@ -47,6 +49,9 @@ def initial_rows():
                    rmw_identifier='offline-fixture', monotonic_clock_identity={'boot_id': 'fixture'},
                    topic='/fixture/cft', message_type='std_msgs/msg/String',
                    backend='offline_fake', fixture=True, real_ros=False)
+    if real_envelope:
+        lineage.pop('fixture')
+        lineage.update(backend='ros2_public_api', real_ros=True)
     def emit(event, **fields):
         row = dict(lineage, event=event, event_index=len(rows), monotonic_ns=time.monotonic_ns())
         row.update(fields)
@@ -59,7 +64,7 @@ def initial_rows():
     _, receipt = _create_reader_with_initial_filter(
         FakeNode(), object, lineage['topic'], lambda _: None, object,
         {'expression': 'data = %0', 'parameters': ['keep']},
-        options_factory=FakeOptions, emit=emit, fixture=True)
+        options_factory=FakeOptions, emit=emit, fixture=not real_envelope)
     emit('endpoint_created', endpoint_gid='01' * 16, initial_content_filter=deepcopy(receipt),
          created_monotonic_ns=receipt['creation_returned_monotonic_ns'],
          create_begin_monotonic_ns=create['monotonic_ns'])
@@ -67,9 +72,10 @@ def initial_rows():
     return rows, action
 
 
-def test_initial_public_readback_is_independently_bound_to_creation():
+@pytest.mark.parametrize('real_envelope', [False, True])
+def test_initial_public_readback_is_independently_bound_to_creation(real_envelope):
     from r2f.runtime.filter_action_receipt import filter_action_evidence
-    rows, action = initial_rows()
+    rows, action = initial_rows(real_envelope=real_envelope)
     proof = filter_action_evidence(action, rows)
     assert proof['phase'] == 'initial'
     assert proof['observed_enabled'] is True
@@ -77,9 +83,6 @@ def test_initial_public_readback_is_independently_bound_to_creation():
     assert proof['observed'] == {'expression': 'data = %0', 'parameters': ['keep']}
     assert proof['filter_effect_observed'] is None
     assert proof['candidate_eligible'] is False
-
-
-import pytest
 
 
 @pytest.mark.parametrize('damage', ['getter', 'state', 'bool_alias', 'identity', 'clock', 'raw_ref'])
