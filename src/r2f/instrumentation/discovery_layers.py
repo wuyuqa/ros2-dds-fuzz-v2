@@ -352,6 +352,9 @@ def summarize_discovery_obligations(result, discovery, bindings):
                           basis=basis, **evidence))
     add('independent_endpoint_sources', schema.get('independent_sources_established') is True,
         'schema_check.source_qualification')
+    add('endpoint_source_timing',
+        schema.get('source_qualification', {}).get('timing', {}).get('status') == 'qualified',
+        'schema_check.source_qualification.timing; capture and graph clock provenance')
     expected = {binding['endpoint_guid'] for binding in bindings if isinstance(binding, dict)
                 and isinstance(binding.get('endpoint_guid'), str)
                 and re.fullmatch('[0-9a-f]{32}', binding['endpoint_guid']) is not None}
@@ -413,7 +416,10 @@ def summarize_discovery_obligations(result, discovery, bindings):
         native['topic']['reconciliation_status'] = ('consistent_fields' if topic_fields_closed and sut_topics_closed
             else 'mismatch_requires_review' if any(row.get('status') == 'mismatch_requires_review' for row in fields)
             else 'unknown')
-        native['all_layer_obligations_closed'] = all(item['status'] == 'satisfied' for item in items[2:7])
+        native_ids = {'native_source_identity', 'native_source_timing', 'participant_endpoint_process',
+                      'native_topic_fields', 'topic_for_selected_endpoints'}
+        native['all_layer_obligations_closed'] = all(item['status'] == 'satisfied' for item in items
+                                                      if item['id'] in native_ids)
         for layer in ('participant', 'topic'):
             schema['layers'][layer]['reconciliation_status'] = native[layer]['reconciliation_status']
     closed = all(item['status'] == 'satisfied' for item in items)

@@ -177,8 +177,23 @@ def test_complete_raw_backed_observations_can_close_and_missing_fields_reopen(tm
                      'raw': jsonraw(tmp_path/'tools.json', raw)}
         return reconcile_discovery_projection(parts[0], parts[1], endpoint_bindings=parts[2],
             observation_window=parts[3], discovery_layers=parts[4], discovery_tools=reference)['schema_check']
+    parts[1]['timestamp_clock'] = 'unix_ns_realtime'
+    parts[1]['raw'] = jsonraw(tmp_path/'graph.json',
+        {key: value for key, value in parts[1].items() if key != 'raw'})
     schema = full_result()
     assert schema['all_layer_obligations_closed'] is True, schema['observation_obligations']
+    # Numeric timestamps alone cannot establish graph clock provenance.
+    for clock in (None, 'monotonic_ns'):
+        if clock is None:
+            parts[1].pop('timestamp_clock', None)
+        else:
+            parts[1]['timestamp_clock'] = clock
+        parts[1]['raw'] = jsonraw(tmp_path/'graph.json',
+            {key: value for key, value in parts[1].items() if key != 'raw'})
+        assert full_result()['all_layer_obligations_closed'] is False
+    parts[1]['timestamp_clock'] = 'unix_ns_realtime'
+    parts[1]['raw'] = jsonraw(tmp_path/'graph.json',
+        {key: value for key, value in parts[1].items() if key != 'raw'})
     # The same fields advertised by an unrelated participant cannot close it.
     original_capture = Path(capture['raw']['path']).read_bytes()
     tail = pcap([(BASE+127, frame(packet(payload).replace(
