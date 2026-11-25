@@ -7,6 +7,8 @@ from r2f.runtime.endpoint_incarnation import endpoint_identity_at
 from r2f.runtime.filter_action_receipt import filter_action_evidence
 from r2f.runtime.publish_occurrence import producer_occurrence_witness
 
+from r2f.modules.s1.topology_cft_contract import predicate_contract
+
 SCHEMA = 'r2f.cft-sample-observations/v1'
 
 
@@ -193,7 +195,8 @@ def content_filter_observations(program, events, *, decisions, deliveries, ref, 
             _, config = max((pair for pair in attempted if pair[1]['logical_id'] == reader), key=lambda pair: pair[0])
             samples.append(_sample(send, config, events, decisions, deliveries, ref, fixture))
     return dict(schema=SCHEMA, declared=bool(configurations), fixture=fixture,
-                execution_evidence=not fixture, configuration_observations=configurations,
+                execution_evidence=not fixture, predicate_contract=predicate_contract(),
+                configuration_observations=configurations,
                 sample_observations=samples, filter_false_implies_unmatch=False,
                 review_required=any(c['configuration_status'] != 'observed' for c in configurations)
                     or any(item['status'] in {'unknown', 'evidence_conflict'} or item.get('violation')

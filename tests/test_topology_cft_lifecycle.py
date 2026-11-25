@@ -267,6 +267,8 @@ def test_common_signature_retains_CFT_failure_and_rejects_summary_tampering(row)
     row['oracle_verdict'] = row['oracle']['verdict'] = 'fail'
     row['oracle']['forbidden_residuals'] = ['topology.cft_predicate_mismatch']
     row['oracle']['cft_sample_checks'] = deepcopy(row['typed_facts']['content_filter_observations']['sample_observations'])
+    from r2f.modules.s1.topology_cft_contract import predicate_contract
+    row['oracle']['cft_rule_contract'] = predicate_contract()
     rewrite(row, rows)
     signature = conformance_signature(row)
     assert signature is not None
@@ -309,3 +311,21 @@ def test_percent_wildcards_have_bounded_negative_matching():
         "assert match('data LIKE %0', [\"'a%%b%c'\"], 'axbyc') is True"],
         capture_output=True, text=True, timeout=2, check=True)
     assert result.returncode == 0
+
+
+def test_CFT_supporting_rule_uses_the_registered_owner_without_input_manifest_drift():
+    from r2f.core.registry import Registry
+    from r2f.modules.s1.module import register_exploratory, S1Module
+    from r2f.core.evidence import canonical_hash
+    from r2f.modules.s1.topology_cft_contract import RULE, predicate_contract
+    registry = Registry()
+    register_exploratory(registry, include_required=True, runtime_capability='topology_v1')
+    target = registry.get_target('discovery.endpoint_topology.fuzz_v1')
+    assert canonical_hash(target.to_dict()) == '0c4815b9b1b9b70ad639089ac3cdbf6a6ae9c4ba3997bcb4eba4ec8b09ab8234'
+    assert canonical_hash(S1Module().to_dict()) == '947757406e7a23662b576b5cf5ab615773f36a83ccdff9a1e19579fe569e4eb6'
+    lineage = registry.get_rule_lineage(target.target_id, RULE)
+    assert lineage['rule_role'] == 'supporting' and lineage['independent_verdict'] is False
+    assert lineage['execution_observation_contract'] == predicate_contract()
+    assert lineage['verdict_rule_ids'] == ['s1.topology.program_consistency.v1']
+    with pytest.raises(KeyError):
+        registry.get_rule_lineage('discovery.late_endpoint', RULE)

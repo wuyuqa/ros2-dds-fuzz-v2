@@ -639,6 +639,9 @@ def _topology_conformance_signature(metadata, facts, rule):
         cft_signature = None
         if (facts.get("content_filter_observations") or {}).get("declared") is True:
             from r2f.campaign.topology_cft_observation import replay_cft_observations
+            from r2f.modules.s1.topology_cft_contract import predicate_contract
+            if oracle.get('cft_rule_contract') != predicate_contract():
+                return None
             cft_signature = replay_cft_observations(metadata["final_input"]["topology_program"],
                 events, facts["content_filter_observations"],
                 peer_reference=facts.get("fastdds_peer_instrumentation"),
@@ -656,7 +659,9 @@ def _topology_conformance_signature(metadata, facts, rule):
                 "rule_id": rule, "target_id": _TOPOLOGY_TARGET, "target_revision": metadata["target_revision"],
                 "effective_input_sha256": metadata["effective_input_sha256"], "oracle_verdict": verdict,
                 "typed_anomaly_signature": sorted(anomalies, key=canonical_hash),
-                **({"cft_sample_signature": cft_signature} if cft_signature is not None else {})}
+                **({"cft_sample_signature": cft_signature,
+                    "cft_rule_contract_sha256": canonical_hash(predicate_contract())}
+                   if cft_signature is not None else {})}
     except (ValueError, KeyError, TypeError, OSError, IndexError, AttributeError):
         return None
 

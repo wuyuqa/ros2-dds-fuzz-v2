@@ -44,7 +44,7 @@ TOPOLOGY_EFFECT = "s1.topology.program_consistent.v1"
 TOPOLOGY_EVALUATOR = "s1.topology.program_consistency.evaluate.v1"
 TOPOLOGY_FORBIDDEN_RESIDUALS = (
     "topology.identity_mismatch", "topology.pair_graph_mismatch",
-    "topology.closed_delivery_gap", "topology.guard_side_effect", "topology.cft_predicate_mismatch",
+    "topology.closed_delivery_gap", "topology.guard_side_effect",
 )
 
 
@@ -83,7 +83,7 @@ def topology_effect_spec():
 def topology_rule_spec():
     return RuleSpec(
         id=TOPOLOGY_RULE, version=1,
-        spec_refs=[topology_model.SCHEMA, "D009", "D013", "D019", "S1-C14/T10"],
+        spec_refs=[topology_model.SCHEMA, "D009", "D013", "D019"],
         applies_when={"target_id": TOPOLOGY_TARGET, "runtime_capability": TOPOLOGY_CAPABILITY,
                       "requires": "raw-backed applicable pair/generation obligations"},
         required_fact_ids=list(TOPOLOGY_FACT_IDS), evaluator_id=TOPOLOGY_EVALUATOR,
@@ -94,9 +94,7 @@ def topology_rule_spec():
                      "Missing per-writer identity or raw chronology stays unknown. Finite trailing missing "
                      "delivery is not a violation; an interior gap requires a later same-generation sentinel. "
                      "Guard negatives, fixtures and tool failures are not SUT candidates. Forbidden residuals "
-                     "take precedence over allowed observations. CFT predicate checks use only the independently "
-                     "supported full String.data LIKE subset and authenticated sample observations; "
-                     "configuration is not a match expectation. No live or maturity qualification implied."),
+                     "take precedence over allowed observations; no live or maturity qualification implied."),
         responsibility_layer="s1", primary_or_supporting="primary")
 
 

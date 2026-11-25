@@ -149,6 +149,9 @@ def evaluate_topology(scenario, facts):
                            else "per_writer_delivery_identity_unknown")
     cft = facts.get("content_filter_observations") or {}
     checks = cft.get("sample_observations", [])
+    if cft.get("declared") is True:
+        from .topology_cft_contract import predicate_contract
+        result["cft_rule_contract"] = predicate_contract()
     result["cft_sample_checks"] = [{k: item.get(k) for k in (
         "action_id", "writer", "writer_generation", "reader", "reader_generation", "sequence",
         "status", "expected_decision", "actual_decision", "violation", "send_ref")}

@@ -30,8 +30,11 @@ def _stage(scope, checks, pending=(), binding=None):
 
 
 def _oracle_semantics(oracle):
-    return {k: oracle.get(k) for k in ('rule_id', 'rule_role', 'evaluator_id', 'verdict',
+    result = {k: oracle.get(k) for k in ('rule_id', 'rule_role', 'evaluator_id', 'verdict',
             'reason_codes', 'forbidden_residuals', 'closure', 'diagnostic_only')}
+    if 'cft_rule_contract' in oracle:
+        result['cft_rule_contract'] = oracle['cft_rule_contract']
+    return result
 
 
 def provider_assessment(scenario, facts, oracle):
@@ -68,7 +71,11 @@ def provider_assessment(scenario, facts, oracle):
             and not facts.get('unresolved_historical_obligations'),
     }
     if (facts.get('content_filter_observations') or {}).get('declared') is True:
-        checks['cft_evidence_consistent'] = not facts['content_filter_observations'].get('evidence_conflicts')
+        from r2f.modules.s1.topology_cft_contract import predicate_contract
+        cft = facts['content_filter_observations']
+        checks['cft_evidence_consistent'] = (not cft.get('evidence_conflicts')
+            and cft.get('predicate_contract') == predicate_contract()
+            and oracle.get('cft_rule_contract') == predicate_contract())
     stage = _stage('provider_typed_evidence', checks,
                    ('canonical_ingest', 'formal_boundary', 'formal_topology_execution'),
                    {'facts_sha256': canonical_hash(facts), 'oracle_semantics_sha256': canonical_hash(_oracle_semantics(oracle)),

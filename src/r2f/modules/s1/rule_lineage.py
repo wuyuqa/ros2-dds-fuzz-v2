@@ -152,6 +152,17 @@ def resolve(target, rule_id, *, scope):
     contract = target.rule_contract
     runtime_id = contract.get("primary_rule") or contract.get("compatibility_rule")
     specs = {r.id: r for r in target.exploration_contract.rules} if target.exploration_contract else {}
+    from .topology_cft_contract import RULE as CFT_RULE, predicate_contract
+    if runtime_id == _TOPOLOGY and rule_id == CFT_RULE:
+        result = resolve(target, _TOPOLOGY, scope=scope)
+        result.update(rule_id=CFT_RULE, rule_role="supporting", independent_verdict=False,
+                      verdict_semantics="shared_evaluator_not_independent",
+                      execution_observation_contract=predicate_contract(),
+                      fact_fields=["content_filter_observations.configuration_observations",
+                                   "content_filter_observations.sample_observations",
+                                   "content_filter_observations.evidence_conflicts"])
+        result["scope"]["semantic_scope"] = "source-bound CFT sample predicate observation, independent of endpoint matching"
+        return result
     if rule_id != runtime_id and rule_id not in specs:
         raise KeyError("rule not declared for target: " + rule_id)
     runtime = _RUNTIME[runtime_id]  # Unknown runtime rule has no lineage fallback.
