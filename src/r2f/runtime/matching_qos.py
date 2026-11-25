@@ -217,7 +217,7 @@ def ownership_profile(topic, ownership):
     profiles = ET.SubElement(root, 'profiles')
     for role in ('publisher', 'subscriber'):
         qos = ET.SubElement(ET.SubElement(profiles, role, profile_name=topic), 'qos')
-        ET.SubElement(ET.SubElement(qos, 'ownership'), 'kind').text = ownership.upper() + '_OWNERSHIP_QOS'
+        ET.SubElement(ET.SubElement(qos, 'ownership'), 'kind').text = ownership.upper()
     return ET.tostring(root, encoding='utf-8', xml_declaration=True)
 
 

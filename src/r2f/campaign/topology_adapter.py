@@ -1541,7 +1541,7 @@ def facts_from_events(events, runtime, config, *, capture_source=None):
             facts["matching_observation_incomplete"] = bool(gaps)
             facts["unknown_reasons"].extend(gaps)
         from r2f.runtime.native_matching import audit_run as audit_native_controls
-        controls = audit_native_controls(a.program, a.events, fixture=a.fixture, rmw=config.get("rmw"))
+        controls = audit_native_controls(a.program, a.events, fixture=a.fixture, rmw=config.get("rmw"), raw_path=a.path)
         if controls:
             facts["native_matching_controls"] = controls
             gaps = [c.get("reason", "native_matching_control_incomplete") for c in controls if c["status"] == "unknown"]

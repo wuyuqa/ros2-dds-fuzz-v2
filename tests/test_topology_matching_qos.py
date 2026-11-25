@@ -347,3 +347,12 @@ def test_public_application_audit_retains_native_carrier_selection(tmp_path,dama
         assert audit['status'] in ('invalid','incomplete'),audit
         assert not audit['mutation_receipt']['hit']
     assert audit['execution_evidence'] is False
+
+
+@pytest.mark.parametrize('ownership,expected', [('shared','SHARED'), ('exclusive','EXCLUSIVE')])
+def test_ownership_profile_uses_pinned_fastdds_xml_grammar(ownership,expected):
+    import xml.etree.ElementTree as ET
+    from r2f.runtime.matching_qos import ownership_profile
+    root=ET.fromstring(ownership_profile('/r2f/test',ownership))
+    ns={'d':'http://www.eprosima.com/XMLSchemas/fastRTPS_Profiles'}
+    assert [node.text for node in root.findall('.//d:ownership/d:kind',ns)]==[expected,expected]

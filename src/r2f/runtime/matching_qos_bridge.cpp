@@ -154,6 +154,26 @@ std::string seconds_json(const eprosima::fastrtps::Duration_t& d) {
     if (d == eprosima::fastrtps::c_TimeInfinite) return "\"infinite\"";
     std::ostringstream out; out << std::setprecision(17) << (double(d.seconds) + double(d.nanosec)/1e9); return out.str();
 }
+template<class Qos> void persistence_qos(Qos& q, DomainParticipant* pp, bool writer,
+        const char* database) {
+    if(q.durability().kind!=TRANSIENT_DURABILITY_QOS) return;
+    if(!database || database[0]!='/') throw std::runtime_error("native_control_persistence_database_required");
+    auto guid=pp->guid(); guid.entityId.value[3]=writer?0x02:0x07;
+    std::ostringstream text; text<<guid;
+    auto& props=q.properties().properties();
+    props.emplace_back("dds.persistence.plugin","builtin.SQLITE3");
+    props.emplace_back("dds.persistence.sqlite3.filename",database);
+    props.emplace_back("dds.persistence.guid",text.str());
+}
+template<class Qos> std::string persistence_json(const Qos& q) {
+    std::string out="{"; bool first=true;
+    for(const auto& property:q.properties().properties()) {
+        if(property.name().compare(0,16,"dds.persistence.")!=0) continue;
+        if(!first)out+=","; first=false;
+        out+=json_quote(property.name())+":"+json_quote(property.value());
+    }
+    return out+"}";
+}
 template<class Endpoint> std::string native_entity(Endpoint* ep, DomainParticipant* pp,
         const std::string& role, const std::string& topic, const std::string& type,
         const std::vector<std::string>& names) {
@@ -163,7 +183,7 @@ template<class Endpoint> std::string native_entity(Endpoint* ep, DomainParticipa
     const char* liveliness[]={"automatic", "manual_by_participant", "manual_by_topic"};
     return "{\"role\":"+json_quote(role)+",\"endpoint_gid\":"+json_quote(guid_text(ep->guid()))
       +",\"participant_gid\":"+json_quote(guid_text(pp->guid()))+",\"domain_id\":"+std::to_string(pp->get_domain_id())+",\"observed_monotonic_ns\":"+std::to_string(native_now())+",\"topic\":"+json_quote(topic)
-      +",\"type_name\":"+json_quote(type)+",\"qos\":{\"reliability\":"+json_quote(reliabilities[q.reliability().kind])
+      +",\"type_name\":"+json_quote(type)+",\"persistence\":"+persistence_json(q)+",\"qos\":{\"reliability\":"+json_quote(reliabilities[q.reliability().kind])
       +",\"durability\":"+json_quote(durabilities[q.durability().kind])+",\"liveliness\":"+json_quote(liveliness[q.liveliness().kind])
       +",\"ownership\":"+json_quote(q.ownership().kind == EXCLUSIVE_OWNERSHIP_QOS ? "exclusive":"shared")
       +",\"history\":"+json_quote(q.history().kind == KEEP_ALL_HISTORY_QOS ? "keep_all":"keep_last")
@@ -173,7 +193,7 @@ template<class Endpoint> std::string native_entity(Endpoint* ep, DomainParticipa
 }
 extern "C" int r2f_native_matching(void* rcl_endpoint, int reader_role, uint32_t domain,
     const char* topic_name, int same_participant, const R2fNativeQos* wq, const R2fNativeQos* rq,
-    double timeout_sec, char* output, size_t capacity) noexcept {
+    const char* persistence_database, double timeout_sec, char* output, size_t capacity) noexcept {
     std::vector<std::pair<std::string,std::function<int()>>> cleanup;
     std::string status="unknown", reason, entities="[]", fresh_entities="[]", samples="[]", delivery="null", cleanup_json="[";
     bool clean=true;
@@ -217,6 +237,7 @@ extern "C" int r2f_native_matching(void* rcl_endpoint, int reader_role, uint32_t
         auto* sub=rp->create_subscriber(sq); if(!sub) throw std::runtime_error("native_control_subscriber_create_failed");
         cleanup.push_back({"subscriber",[rp,sub](){return rp->delete_subscriber(sub)();}});
         DataWriterQos w; native_qos(w,*wq); DataReaderQos r; native_qos(r,*rq);
+        persistence_qos(w,wp,true,persistence_database); persistence_qos(r,rp,false,persistence_database);
         auto* writer=pub->create_datawriter(wt,w);
         if(!writer) { status=(wq->durability==3?"unsupported":"unknown"); throw std::runtime_error("native_control_create_datawriter_returned_null"); }
         cleanup.push_back({"writer",[pub,writer](){return pub->delete_datawriter(writer)();}});

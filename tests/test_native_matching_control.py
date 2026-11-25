@@ -269,3 +269,103 @@ def test_proven_native_forbidden_match_survives_later_observation_gaps(tmp_path,
     assert oracle['diagnostic_only'] is True
     assert oracle['candidate_eligible'] is False
     assert 'topology.pair_graph_mismatch' in oracle['forbidden_residuals']
+
+
+def fast_transient_receipt(tmp_path):
+    from r2f.runtime.matching_qos import digest
+    request=control()
+    for role in ('writer','reader'): request[role+'_qos']['durability']='transient'
+    value=native_receipt(request,1);value.update(vendor='fastdds',version='2.14.7')
+    tmp_path.mkdir(parents=True,exist_ok=True)
+    db=tmp_path/'native.db';db.write_bytes(b'offline persistence artifact')
+    value['persistence_artifacts']={'directory':str(tmp_path),'creator_pid':1,
+        'recorded_monotonic_ns':value['finished_monotonic_ns'],
+        'files':[{'path':str(db),'sha256':digest(db),'size':db.stat().st_size}]}
+    for key in ('entities','fresh_entities'):
+        for e in value[key]:
+            e['type_name']='std_msgs::msg::dds_::String_';e['qos']['durability']='transient'
+            prefix=e['participant_gid'][:24];suffix='00000102' if e['role']=='writer' else '00000107'
+            gid=prefix+suffix
+            text='.'.join(gid[i:i+2] for i in range(0,24,2))+'|'+'.'.join(gid[i:i+2] for i in range(24,32,2))
+            e['persistence']={'dds.persistence.plugin':'builtin.SQLITE3',
+                'dds.persistence.sqlite3.filename':str(db),'dds.persistence.guid':text}
+    sample=value['samples'][0];sample.pop('peer_gids');sample.update(writer_count=1,reader_count=1,
+        writer_total_count=1,reader_total_count=1,writer_last_peer_gid='2'*32,reader_last_peer_gid='1'*32)
+    return request,value
+
+
+@pytest.mark.parametrize('damage',['missing_properties','changed_fresh','missing_artifact','changed_artifact','other_guid'])
+def test_transient_control_requires_fresh_persistence_readback_and_preserved_artifact(tmp_path,damage):
+    request,value=fast_transient_receipt(tmp_path)
+    if damage=='missing_properties':
+        for key in ('entities','fresh_entities'):
+            for e in value[key]:e.pop('persistence')
+    elif damage=='changed_fresh':value['fresh_entities'][0]['persistence']['dds.persistence.plugin']='other'
+    elif damage=='missing_artifact':value.pop('persistence_artifacts')
+    elif damage=='changed_artifact':(tmp_path/'native.db').write_bytes(b'changed')
+    else:
+        for key in ('entities','fresh_entities'):
+            value[key][0]['persistence']['dds.persistence.guid']='01.'*11+'01|00.00.01.02'
+    result=audit_control(request,value,pid=1,fixture=True)
+    assert result['status']=='unknown',result
+    assert 'persistence' in result['reason']
+
+
+def test_transient_control_preserves_verified_database_and_fresh_properties(tmp_path):
+    request,value=fast_transient_receipt(tmp_path)
+    result=audit_control(request,value,pid=1,fixture=True)
+    assert result['status']=='pass',result
+    assert result['limitation']=='bounded_native_control_not_ROS_QoS_or_persistence_service_proof'
+
+
+@pytest.mark.parametrize('damage',['missing_artifact','changed_artifact','missing_properties','malformed_artifact'])
+def test_native_forbidden_match_survives_persistence_evidence_gaps(tmp_path,damage):
+    request,value=fast_transient_receipt(tmp_path)
+    request['writer_qos']['partitions']=['alpha'];value['request']=deepcopy(request)
+    for key in ('entities','fresh_entities'):value[key][0]['qos']['partitions']=['alpha']
+    if damage=='missing_artifact':value.pop('persistence_artifacts')
+    elif damage=='changed_artifact':(tmp_path/'native.db').write_bytes(b'changed')
+    elif damage=='malformed_artifact':value['persistence_artifacts']['directory']=None
+    else:
+        for key in ('entities','fresh_entities'):value[key][0].pop('persistence')
+    result=audit_control(request,value,pid=1,fixture=True)
+    assert result['status']=='fail',result
+    assert result['reason']=='native_incompatible_pair_matched'
+    assert result['observation_gaps']
+    assert result['candidate_eligible'] is False
+
+
+def test_transient_control_rejects_database_outside_trusted_worker_directory(tmp_path):
+    request,value=fast_transient_receipt(tmp_path/'outside')
+    result=audit_control(request,value,pid=1,fixture=True,artifact_root=tmp_path/'worker'/'native-controls')
+    assert result['status']=='unknown',result
+    assert 'persistence' in result['reason']
+
+
+def test_transient_control_accepts_canonical_worker_owned_database(tmp_path):
+    root=tmp_path/'native-controls'
+    request,value=fast_transient_receipt(root/('a'*32))
+    result=audit_control(request,value,pid=1,fixture=True,artifact_root=root)
+    assert result['status']=='pass',result
+
+
+def test_transient_control_rejects_ancestor_symlink_for_database(tmp_path):
+    real=tmp_path/'real';real.mkdir()
+    link=tmp_path/'native-controls';link.symlink_to(real,target_is_directory=True)
+    request,value=fast_transient_receipt(link/('a'*32))
+    result=audit_control(request,value,pid=1,fixture=True,artifact_root=link)
+    assert result['status']=='unknown',result
+    assert 'persistence' in result['reason']
+
+
+@pytest.mark.parametrize('forbidden',[False,True])
+def test_persistence_symlink_loop_is_an_observation_gap(tmp_path,forbidden):
+    request,value=fast_transient_receipt(tmp_path/'original')
+    if forbidden:
+        request['writer_qos']['partitions']=['alpha'];value['request']=deepcopy(request)
+        for key in ('entities','fresh_entities'):value[key][0]['qos']['partitions']=['alpha']
+    root=tmp_path/'native-controls';root.symlink_to(root,target_is_directory=True)
+    value['persistence_artifacts']['directory']=str(root/('a'*32))
+    result=audit_control(request,value,pid=1,fixture=True,artifact_root=root)
+    assert result['status']==('fail' if forbidden else 'unknown'),result
+    if forbidden:assert result['observation_gaps']

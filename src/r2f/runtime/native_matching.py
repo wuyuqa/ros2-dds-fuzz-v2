@@ -239,14 +239,14 @@ def _cyclone(request, domain, observer):
     return receipt
 
 
-def execute_control(request, *, domain, rmw, endpoint, kind):
+def execute_control(request, *, domain, rmw, endpoint, kind, output_dir=None):
     request=validate_control(request)
     start=time.monotonic_ns()
     if rmw == 'rmw_cyclonedds_cpp':
         from .topology_worker import CycloneMatchedPeerObserver
         value=_cyclone(request, domain, CycloneMatchedPeerObserver())
     elif rmw == 'rmw_fastrtps_cpp':
-        value=_fastdds(request, domain, endpoint, kind)
+        value=_fastdds(request, domain, endpoint, kind, output_dir)
     else:
         value={'status':'unsupported','reason':'native_matching_vendor_not_implemented','cleanup_confirmed':True}
     value.update(schema=SCHEMA, request=deepcopy(request), started_monotonic_ns=start,
@@ -255,7 +255,7 @@ def execute_control(request, *, domain, rmw, endpoint, kind):
     return value
 
 
-def _fastdds(request, domain, endpoint, kind):
+def _fastdds(request, domain, endpoint, kind, output_dir):
     from .matching_qos import load_build
     from .fastdds_peer_observer import verify_abi, _verify_api_maps
     verify_abi(); maps=_verify_api_maps()
@@ -272,21 +272,33 @@ def _fastdds(request, domain, endpoint, kind):
         names=(c.c_char_p*len(q['partitions']))(*(s.encode() for s in q['partitions']));keep.append(names)
         return Qos(*(ENUMS[key].index(q[key]) for key in ('reliability','durability','liveliness','ownership','history')),
                    q['depth'],ns(q['deadline_sec']),ns(q['lease_duration_sec']),len(names),names)
+    persistence_dir=None
+    if any(request[role+'_qos']['durability']=='transient' for role in ('writer','reader')):
+        if output_dir is None or not Path(output_dir).is_absolute():
+            raise ValueError('native_control_persistence_output_directory_required')
+        persistence_dir=Path(output_dir)/uuid.uuid4().hex
+        persistence_dir.mkdir(parents=True,exist_ok=False)
+    database=str(persistence_dir/'native.db') if persistence_dir else ''
     w,r=qos(request['writer_qos']),qos(request['reader_qos'])
     library=c.CDLL(build['library'])
     layout=_function(library,'r2f_native_matching_qos_layout',[c.c_int],c.c_size_t)
     expected=[c.sizeof(Qos)]+[getattr(Qos,field).offset for field,_ in Qos._fields_]
     if [layout(i) for i in range(len(expected))]!=expected:raise ValueError('native_control_qos_abi_mismatch')
     fn=_function(library,'r2f_native_matching',[c.c_void_p,c.c_int,c.c_uint32,c.c_char_p,c.c_int,
-        c.POINTER(Qos),c.POINTER(Qos),c.c_double,c.c_void_p,c.c_size_t],c.c_int)
+        c.POINTER(Qos),c.POINTER(Qos),c.c_char_p,c.c_double,c.c_void_p,c.c_size_t],c.c_int)
     output=c.create_string_buffer(262144)
     with endpoint.handle as handle:
         # rclpy handle context returns the implementation, matching observe().
         pointer=endpoint.handle.pointer
         code=fn(pointer,int(kind=='reader'),domain,request['topic'].encode(),int(request['same_participant']),
-                c.byref(w),c.byref(r),request['timeout_sec'],output,len(output))
+                c.byref(w),c.byref(r),database.encode(),request['timeout_sec'],output,len(output))
     if code:raise ValueError('native_fastdds_control_bridge_error:'+str(code))
     value=json.loads(output.value)
+    if persistence_dir is not None:
+        value['persistence_artifacts']={'directory':str(persistence_dir),'creator_pid':os.getpid(),
+            'recorded_monotonic_ns':time.monotonic_ns(),
+            'files':[{'path':str(path),'sha256':digest(path),'size':path.stat().st_size}
+                     for path in sorted(persistence_dir.iterdir()) if path.is_file()]}
     for row in value['entities']:
         row.update(generation=uuid.uuid4().hex)
     for fresh, original in zip(value.get('fresh_entities', []), value['entities']):
@@ -298,7 +310,56 @@ def _fastdds(request, domain, endpoint, kind):
     return value
 
 
-def audit_control(request, value, *, pid, fixture):
+
+def _audit_persistence(value, entities, fresh, pid, artifact_root, fixture):
+    transient=[(initial,current) for initial,current in zip(entities,fresh)
+               if initial['qos']['durability']=='transient']
+    if value['vendor']!='fastdds' or not transient:
+        return
+    artifacts=value.get('persistence_artifacts')
+    if not isinstance(artifacts,dict):raise ValueError('native_control_persistence_artifacts_missing')
+    directory=Path(artifacts['directory'])
+    if artifact_root is None:
+        if not fixture:raise ValueError('native_control_persistence_trusted_worker_directory_missing')
+    elif (directory.parent!=Path(artifact_root) or not re.fullmatch('[0-9a-f]{32}',directory.name)
+            or directory.resolve(strict=True)!=directory
+            or Path(artifact_root).resolve(strict=True)!=Path(artifact_root)):
+        raise ValueError('native_control_persistence_directory_not_canonical_worker_owned')
+    recorded=artifacts.get('recorded_monotonic_ns')
+    if (not directory.is_absolute() or directory.is_symlink() or not directory.is_dir()
+            or artifacts.get('creator_pid')!=pid or type(recorded) is not int
+            or not max(e['observed_monotonic_ns'] for e in fresh)<=recorded<=value['finished_monotonic_ns']):
+        raise ValueError('native_control_persistence_artifact_identity_invalid')
+    rows=artifacts.get('files')
+    if not isinstance(rows,list) or not rows:raise ValueError('native_control_persistence_artifacts_empty')
+    paths=[]
+    for row in rows:
+        if not isinstance(row,dict):raise ValueError('native_control_persistence_artifact_not_object')
+        path=Path(row['path'])
+        if (path.parent!=directory or path.is_symlink() or not path.is_file()
+                or digest(path)!=row.get('sha256') or path.stat().st_size!=row.get('size')):
+            raise ValueError('native_control_persistence_artifact_changed')
+        paths.append(str(path))
+    if (len(paths)!=len(set(paths))
+            or set(paths)!={str(path) for path in directory.iterdir()}):
+        raise ValueError('native_control_persistence_artifact_inventory_changed')
+    guids=[]
+    for initial,current in transient:
+        props=initial.get('persistence')
+        if (not isinstance(props,dict) or current.get('persistence')!=props
+                or props.get('dds.persistence.plugin')!='builtin.SQLITE3'
+                or props.get('dds.persistence.sqlite3.filename') not in paths):
+            raise ValueError('native_control_persistence_properties_missing_or_changed')
+        guid=props.get('dds.persistence.guid')
+        if (not isinstance(guid,str) or not re.fullmatch(r'(?:[0-9a-f]{2}\.){11}[0-9a-f]{2}\|(?:[0-9a-f]{2}\.){3}[0-9a-f]{2}',guid)):
+            raise ValueError('native_control_persistence_guid_invalid')
+        compact=guid.replace('.','').replace('|','')
+        if compact[:24]!=initial['participant_gid'][:24] or compact in guids:
+            raise ValueError('native_control_persistence_guid_not_owned_or_duplicate')
+        guids.append(compact)
+
+
+def audit_control(request, value, *, pid, fixture, artifact_root=None):
     """Audit a reopened raw result, with matching expected from actual QoS only."""
     validate_control(request)
     result={'status':'unknown','workload_path':'native_dds_public_api', 'ros_qos_adoption':False,
@@ -387,10 +448,15 @@ def audit_control(request, value, *, pid, fixture):
             if not (value['started_monotonic_ns']<=initial.get('observed_monotonic_ns',0)
                     <=current.get('observed_monotonic_ns',0)<=value['finished_monotonic_ns']):
                 raise ValueError('native_control_readback_chronology_invalid')
+        persistence_gaps=[]
+        try:
+            _audit_persistence(value,entities,fresh,pid,artifact_root,fixture)
+        except (ValueError,KeyError,TypeError,OSError,IndexError,RuntimeError) as exc:
+            persistence_gaps.append('persistence:'+str(exc))
         expected,reasons=compatibility(*entities,vendor=value['vendor'])
         samples=value.get('samples')
         if not isinstance(samples,list) or not samples:raise ValueError('native_control_match_samples_absent')
-        flags_by_sample=[]; ever_by_sample=[]; times=[]; gaps=[]; forbidden=[]
+        flags_by_sample=[]; ever_by_sample=[]; times=[]; gaps=list(persistence_gaps); forbidden=[]
         for index,sample in enumerate(samples):
             flags_by_sample.append(None);ever_by_sample.append(None)
             try:
@@ -451,7 +517,7 @@ def audit_control(request, value, *, pid, fixture):
         return dict(result,reason=str(exc))
 
 
-def audit_run(program, events, *, fixture, rmw):
+def audit_run(program, events, *, fixture, rmw, raw_path=None):
     """Bind each native action to one requested/result/ack worker chronology."""
     observations=[]
     actions=[a for a in program['actions'] if a['op']=='native_matching_control']
@@ -485,7 +551,10 @@ def audit_run(program, events, *, fixture, rmw):
                 raise ValueError('native_control_entities_not_object_array')
             if any(e.get('domain_id') != result.get('domain_id') for e in entities):
                 raise ValueError('native_control_entity_domain_mismatch')
-            row.update(audit_control(action['params']['control'],value,pid=result['pid'],fixture=fixture))
+            artifact_root=(Path(raw_path).parent/'endpoints'/re.sub(r'[^A-Za-z0-9_.-]','_',eid)
+                           /('g'+str(gen))/'native-controls') if raw_path else None
+            row.update(audit_control(action['params']['control'],value,pid=result['pid'],fixture=fixture,
+                                     artifact_root=artifact_root))
             row['raw_refs']=[e['event_index'] for e in (created[0],requested[0],result,acks[0],output)]
             row['vendor']=value.get('vendor');row['version']=value.get('version')
         except (ValueError,TypeError,KeyError) as exc:

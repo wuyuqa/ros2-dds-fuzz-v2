@@ -1916,7 +1916,8 @@ def _worker_main(argv, group_owner=None):
             if command["command"] == "native_matching_control":
                 from .native_matching import execute_control
                 value = execute_control(command["control"], domain=config["domain_id"],
-                    rmw=rmw_identifier, endpoint=endpoint, kind=kind)
+                    rmw=rmw_identifier, endpoint=endpoint, kind=kind,
+                    output_dir=config.get("native_control_output_dir"))
                 emit("native_matching_result", command_id=command_id, endpoint_gid=local_gid,
                      control_receipt=value, supporting_diagnostic=True, candidate_eligible=False)
                 if value.get("cleanup_confirmed") is not True:
@@ -3215,6 +3216,7 @@ class RosTopologyBackend:
             "logical_id": spec["logical_id"], "generation": generation,
             "topic": spec["topic"], "type_name": spec["type_name"],
             "qos": prepared["public_qos"],
+            "native_control_output_dir": str(endpoint_dir / "native-controls"),
             "startup_timeout_sec": float(self.config.get("startup_timeout_sec", 10.0)),
         }
 
