@@ -1121,6 +1121,8 @@ def ingest_execution(scenario, config, runtime, capsule, *, services=None):
                raw_path=runtime.get("raw_path"), raw_sha256=runtime.get("raw_sha256"),
                runtime_execution_metadata=runtime.get("execution_metadata") or runtime.get("execution"),
                observation_receipts=runtime.get("observation_receipts", []), environment=runtime.get("environment", {}))
+    if config.get('observe_participant_leases'):
+        row['observation_mode'] = config.get('observation_mode', 'blackbox')
     if "observation" in runtime:
         from .observations import qualify_observation
         row["instrumentation_observation"] = qualify_observation(row, runtime, config, capsule=capsule)

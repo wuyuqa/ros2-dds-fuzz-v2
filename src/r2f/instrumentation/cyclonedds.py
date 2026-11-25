@@ -72,13 +72,16 @@ class TraceConfig:
         return dict(asdict(self), categories=list(self.categories))
 
 
-def build_trace_config(output_file, *, domain_id, base_xml=None, observe_adopted_config=False):
+def build_trace_config(output_file, *, domain_id, base_xml=None, observe_adopted_config=False,
+                       observe_participant_lifecycle=False):
     """Preserve transport config, replace only Tracing; use one file per process.
 
     Inline XML avoids changing an already referenced file. Fresh output is required
     by the collector/probe owner, and '$' is rejected because Cyclone expands env
     variables in config values. Multiple Domain sections are deliberately rejected.
     """
+    if type(observe_participant_lifecycle) is not bool:
+        raise ValueError('observe_participant_lifecycle must be boolean')
     if type(observe_adopted_config) is not bool:
         raise ValueError('observe_adopted_config must be boolean')
     if isinstance(domain_id, bool) or not isinstance(domain_id, int) or not 0 <= domain_id <= 231:
@@ -104,10 +107,16 @@ def build_trace_config(output_file, *, domain_id, base_xml=None, observe_adopted
         if _tag(e) == 'Tracing':
             domain.remove(e)
     tracing = ET.SubElement(domain, ns + 'Tracing')
-    categories = ('discovery', 'plist') + (('config',) if observe_adopted_config else ())
+    categories = (('discovery', 'plist') + (('config',) if observe_adopted_config else ())
+                  + (('trace',) if observe_participant_lifecycle else ()))
     for name, value in (('Verbosity', 'none'), ('Category', ','.join(categories)),
                         ('OutputFile', str(output)), ('AppendToFile', 'false')):
         ET.SubElement(tracing, ns + name).text = value
+    if observe_participant_lifecycle:
+        # Cyclone 0.10.x's configuration reader accepts unqualified names, not
+        # ElementTree's generated ns0 prefixes. Preserve the actual settings.
+        for element in root.iter():
+            element.tag = _tag(element)
     xml = ET.tostring(root, encoding='unicode', short_empty_elements=True)
     return TraceConfig(xml, hashlib.sha256(xml.encode()).hexdigest(), str(output), domain_id, categories)
 

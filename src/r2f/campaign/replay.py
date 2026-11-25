@@ -144,6 +144,9 @@ def _replay_observation_config(capsule):
         hints = (declared or refresh_declared or metadata.get('observation_mode') not in (None, 'blackbox')
                  or metadata.get('fastdds_peer_instrumentation') is not None
                  or 'observe_native_peers' in metadata)
+        if capsule.input['target_id'] == 'discovery.interruption_recovery' and final.get('observe_participant_leases') is True:
+            from .participant_lease import replay_lease_selection
+            return replay_lease_selection(capsule)
         if capsule.input['target_id'] != _TOPOLOGY_TARGET:
             if hints:
                 raise ValueError('observation_selection_unsupported_target')
@@ -280,11 +283,11 @@ def _replay_config(capsule, replay_id, domain, source):
         evidence_purpose='normal_conformance_replay',
         control_kind='fault' if scenario.arm == 'negative' else None)
     execution.update(observation)  # execution-only; never part of effective input
-    reject_execution_identity(final)
     if set(final) & set(execution):
         raise ValueError('submitted input shadows replay execution metadata: '
                          + ','.join(sorted(set(final) & set(execution))))
     if not exploratory:
+        reject_execution_identity(final)
         return runtime_config(final, **execution)
 
     from r2f.core.evidence import INPUT_SCHEMA_V2
@@ -331,8 +334,21 @@ def _replay_config(capsule, replay_id, domain, source):
     # affected window must bind to the saved operation's requested offset.
     from .runner import _plan_surface_bindings
     surfaces, submitted = _plan_surface_bindings(plan, target.exploration_contract)
-    config = dict(execution, **runtime_input(final, backend=spec['backend'],
-                                                runtime_capability=TOPOLOGY_CAPABILITY if topology else None))
+    submitted_input = runtime_input(final, backend=spec['backend'],
+                                    runtime_capability=TOPOLOGY_CAPABILITY if topology else None)
+    metadata_check = _copy_json(submitted_input)
+    if topology:
+        # runtime_input validated the complete program and exact hash-bound
+        # reference shape. This locator identifies a pre-execution build INPUT,
+        # not an output execution manifest. Exempt only this validated location
+        # from the transient-key check; never change the sealed input or hash.
+        for action in metadata_check['topology_program']['actions']:
+            if action['op'] == 'lookup_topic':
+                reference = action['params'].get('native_type_support')
+                if reference is not None:
+                    reference.pop('manifest_path')
+    reject_execution_identity(metadata_check)
+    config = dict(execution, **submitted_input)
     config.update(input_identity_schema=INPUT_SCHEMA_V2, effective_input=_copy_json(effective),
                   mutation_parameters=_copy_json(scenario.mutation_parameters),
                   mutation_plan=plan.to_dict(), mutation_plan_sha256=canonical_hash(plan.to_dict()),
@@ -1135,7 +1151,8 @@ def replay_cell(capsule_path, *, output_dir, domain_id, runtime=None,
                         if not any(ref['path'] == str(path) for ref in report['original_artifacts']):
                             report['original_artifacts'].append(_reference(path))
                 context['config'] = config
-                if capsule.input['target_id'] == _TOPOLOGY_TARGET:
+                if (capsule.input['target_id'] == _TOPOLOGY_TARGET
+                        or config.get('observe_participant_leases') is True):
                     report['observation_replay'] = _observation_replay_declaration(capsule, config)
                 _write(output / 'runtime_config.json', config)
                 runtime_dir = output / 'runtime'

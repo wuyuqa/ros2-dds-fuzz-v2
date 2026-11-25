@@ -242,7 +242,7 @@ def main():
         executor.spin_once(timeout_sec=0.02)
         initial_graph = graph()
     ownership = {}
-    if config.get('projection_discovery_layers') and rmw == 'rmw_cyclonedds_cpp':
+    if (config.get('projection_discovery_layers') or config.get('observe_participant_leases')) and rmw == 'rmw_cyclonedds_cpp':
         try:
             from .topology_worker import CycloneMatchedPeerObserver
             native = (CycloneMatchedPeerObserver(sut_reference=config['projection_sut_environment'])

@@ -38,7 +38,7 @@ def main(argv=None):
     parser.add_argument("--target", dest="target_id", choices=("discovery.late_endpoint", "discovery.late_join_delivery", "discovery.interruption_recovery", "builtin.discovery_projection_reconciliation"), default="discovery.late_endpoint")
     parser.add_argument("--parameters-json", type=Path)
     parser.add_argument("--observation-json", type=Path,
-                        help="CP1 execution-only observer declaration for Cyclone baseline0; no adoption/replay audit")
+                        help="execution-only observer selection: legacy Cyclone baseline0, or explicit recovery cell_id with participant lease opt-in")
     parser.add_argument("--max-executions", type=int, default=None,
                         help="required original carrier dispatch cap; observation execution requires 1")
     parser.add_argument("--exploratory-profile", type=Path,
