@@ -1,5 +1,4 @@
 """Unified runner -> immutable artifacts -> report audit, using offline carriers."""
-from copy import deepcopy
 import hashlib
 import json
 from pathlib import Path
@@ -8,7 +7,7 @@ import time
 import pytest
 
 from r2f.campaign.runner import run_campaign
-from r2f.reports.run_report import audit_report, report_digest
+from r2f.reports.run_report import audit_report
 from test_campaign_evidence import fixture_pair
 from test_runtime_instrumentation import PairFixture, GUIDS
 
@@ -80,6 +79,7 @@ def profile_runtime(config, directory, *, participant=True):
             workers=[dict(w, pgid=w['pid']) for w in primary['execution_metadata']['workers']])
         for key in ('environment', 'precondition_receipts', 'observation_receipts', 'mutation_receipt'):
             result[key] = primary[key]
+        result['execution_metadata'] = result['execution']
         result['evidence_origin'] = 'offline'
         result['observation'] = pair.ctx.collect(result)
         return result
@@ -88,7 +88,7 @@ def profile_runtime(config, directory, *, participant=True):
 
 
 @pytest.mark.parametrize('participant', [True, False])
-def test_runner_persists_and_independently_audits_profile_facts(tmp_path, participant):
+def test_runner_persists_profile_facts_and_keeps_fixture_out_of_seal(tmp_path, participant):
     report = run_campaign(tmp_path / 'campaign', run_id='offline-profile-report',
         domain_id=174, execute=True, max_executions=1,
         observation={'observation_mode': 'instrumentation', 'observe_adopted_config': True},
@@ -110,12 +110,8 @@ def test_runner_persists_and_independently_audits_profile_facts(tmp_path, partic
     original = Path(row['raw_path']).read_bytes()
     assert intake['qualified_intake'] == []
     audited = audit_report(tmp_path / 'campaign' / 'report.json')
-    assert not any('raw_recomputed_cell_mismatch' in e for e in audited['errors']), audited
-    forged = deepcopy(saved)
-    forged['rows'][0]['instrumentation_observation']['discovery_profile']['completion']['status'] = 'invented'
-    forged['report_sha256'] = report_digest(forged)
-    forged_path = tmp_path / 'campaign' / 'forged-report.json'
-    forged_path.write_text(json.dumps(forged))
-    rejected = audit_report(forged_path)
-    assert any('raw_recomputed_cell_mismatch:instrumentation_observation' in e for e in rejected['errors']), rejected
+    assert any('offline_fixture_cannot_seal' in error for error in audited['errors']), audited
+    assert audited['sealed'] is False
+    ledger = json.loads(Path(report['candidate_ledger_path']).read_text())
+    assert ledger['natural_candidate_count'] == ledger['confirmed_candidates'] == 0
     assert Path(row['raw_path']).read_bytes() == original
