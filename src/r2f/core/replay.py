@@ -445,8 +445,18 @@ def _topology_conformance_signature(metadata, facts, rule):
         claimed = oracle.get("forbidden_residuals")
         if not isinstance(claimed, list) or any(not isinstance(v, str) for v in claimed):
             return None
-        if set(claimed) - {"topology.pair_graph_mismatch", "topology.closed_delivery_gap"}:
+        if set(claimed) - {"topology.pair_graph_mismatch", "topology.closed_delivery_gap", "topology.identity_mismatch"}:
             return None
+        from .candidate import _topology_participant_identity
+        identity = _topology_participant_identity(metadata, events)
+        if identity is not None and identity.get("status") == "conflict":
+            residuals.add("topology.identity_mismatch")
+            for conflict in identity["conflicts"]:
+                subjects = sorted([conflict[side]["subject"] for side in ("first", "second")], key=canonical_hash)
+                anomaly = {"residual": "topology.identity_mismatch", "kind": conflict["kind"],
+                           "subjects": subjects, "initialization": identity["contract"]["initialization"]}
+                if anomaly not in anomalies:
+                    anomalies.append(anomaly)
         for pair in facts["pairs"]:
             subjects = {role: {"logical_id": pair[role], "generation": pair[role + "_generation"]}
                         for role in ("writer", "reader")}

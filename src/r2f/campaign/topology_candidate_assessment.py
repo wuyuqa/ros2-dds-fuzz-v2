@@ -63,7 +63,7 @@ def provider_assessment(scenario, facts, oracle):
         'typed_residuals': isinstance(oracle.get('forbidden_residuals'), list)
             and bool(oracle['forbidden_residuals'])
             and all(isinstance(v, str) for v in oracle['forbidden_residuals'])
-            and set(oracle['forbidden_residuals']) <= {'topology.closed_delivery_gap', 'topology.pair_graph_mismatch'},
+            and set(oracle['forbidden_residuals']) <= {'topology.closed_delivery_gap', 'topology.pair_graph_mismatch', 'topology.identity_mismatch'},
         'sample_identity_resolved': not facts.get('unknown_reasons_sample_identity')
             and not facts.get('unresolved_historical_obligations'),
     }

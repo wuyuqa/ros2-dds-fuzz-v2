@@ -2083,6 +2083,12 @@ def topology_capabilities(backend=None):
         "ros_execution": real,
         "max_writers": 4, "max_readers": 4, "max_endpoints": 8,
         "variable_cardinality": True, "empty_roles": True,
+        "participant_identity_checks": {
+            "initialization_modes": ["fresh_process", "fork_before_participant"],
+            "unsupported_initialization": ["fork_after_participant"],
+            "rmw": "rmw_cyclonedds_cpp", "observation_mode": "blackbox",
+            "library_scope": "installed_verified_CycloneDDS_0.10.5",
+            "execution_evidence": False},
         "create_destroy_recreate": True,
         "fresh_endpoint_identity_per_generation": True,
         "per_pair_graph_facts": True,
@@ -2447,6 +2453,12 @@ def run_topology(program, config, output_dir, *, backend=None):
             }
     except (ValueError, TypeError) as exc:
         result["reason"] = "blocked:input_mutation_failed:" + type(exc).__name__ + ":" + str(exc)
+        return result
+    from .participant_identity import validate_identity_checks
+    try:
+        validate_identity_checks(effective_program, cfg)
+    except (ValueError, TypeError) as exc:
+        result['reason'] = 'blocked:identity_checks_scope:' + str(exc)
         return result
     validation = model.validate_program(effective_program)
     from .participant_groups import validate_control

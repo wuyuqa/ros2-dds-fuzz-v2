@@ -1496,6 +1496,10 @@ def facts_from_events(events, runtime, config, *, capture_source=None):
             facts['participant_group_relation'] = {
                 'observed': a.group_lineage['group_relation_observed'],
                 'supporting_diagnostic': True, 'candidate_eligible': False}
+        from .participant_identity import audit_participant_identity
+        identity_audit = audit_participant_identity(a)
+        if identity_audit is not None:
+            facts["participant_identity"] = identity_audit
         facts["endpoint_identity_complete"] = True
         facts["action_receipts"] = a.actions()
         groups = sorted({x["params"]["concurrency_group"] for x in a.program["actions"]
@@ -1627,6 +1631,10 @@ def facts_from_events(events, runtime, config, *, capture_source=None):
         TOPOLOGY_FACT_GRAPH: None, TOPOLOGY_FACT_DELIVERY: None,
         TOPOLOGY_FACT_GUARDS: None,
     }
+    if "participant_identity" in facts:
+        status = facts["participant_identity"]["status"]
+        facts["fact_values"][TOPOLOGY_FACT_IDENTITY] = (True if status == "consistent" else
+            False if status == "conflict" else None)
     from r2f.modules.s1.topology_oracles import resolve_fact
     for fact_id in (TOPOLOGY_FACT_GRAPH, TOPOLOGY_FACT_DELIVERY, TOPOLOGY_FACT_GUARDS):
         facts["fact_values"][fact_id] = resolve_fact(fact_id, facts)

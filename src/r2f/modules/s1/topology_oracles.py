@@ -96,12 +96,20 @@ def evaluate_topology(scenario, facts):
     if facts.get("endpoint_identity_complete") is not True:
         result["reason_codes"] = ["topology_endpoint_identity_incomplete"]
         return _assessed_result(scenario, facts, result)
+    identity = facts.get("participant_identity")
+    identity_unknown = identity is not None and identity.get("status") not in {"consistent", "conflict"}
+    if identity is not None:
+        result["participant_identity"] = identity
     # Supporting diagnostics only: no ordering residual is declared in the
     # frozen target rule. Do not fold this observation into its verdict/facts.
     result["ordering_observations"] = [pair["ordering_observation"]
         for pair in facts.get("pairs", []) if "ordering_observation" in pair]
     result["ordering_oracle_coverage"] = "not_declared_by_target_rule"
     graph_values, delivery_values, reasons, residuals = [], [], [], []
+    if identity is not None and identity.get("status") == "conflict":
+        residuals.append("topology.identity_mismatch")
+    if identity_unknown:
+        reasons.append("participant_identity_observation_incomplete")
     for pair in facts.get("pairs", []):
         detail = {"writer": pair["writer"], "reader": pair["reader"],
                   "writer_generation": pair.get("writer_generation"), "reader_generation": pair.get("reader_generation"),
@@ -163,10 +171,10 @@ def evaluate_topology(scenario, facts):
     elif graph_values and values[TOPOLOGY_FACT_GRAPH] is True \
             and (not delivery_values or values[TOPOLOGY_FACT_DELIVERY] is True) \
             and not facts.get("unknown_reasons_sample_identity") \
-            and not facts.get("unresolved_historical_obligations"):
+            and not facts.get("unresolved_historical_obligations") and not identity_unknown:
         result.update(verdict="pass", reason_codes=["bounded_observed_topology_consistency"],
                       observed_effects=["observed_consistency"], effect_id=TOPOLOGY_EFFECT)
-    elif not graph_values and not delivery_values and not facts.get("unresolved_historical_obligations"):
+    elif not graph_values and not delivery_values and not facts.get("unresolved_historical_obligations") and not identity_unknown:
         result.update(verdict="not_applicable", reason_codes=["no_applicable_pair_obligation"])
     else:
         result["reason_codes"] = sorted(set(reasons or ["topology_evidence_incomplete"]))

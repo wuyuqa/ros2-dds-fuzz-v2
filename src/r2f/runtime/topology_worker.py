@@ -1198,6 +1198,47 @@ class CycloneMatchedPeerObserver:
             if result.get("inventory_diagnostics"):
                 result["inventory_diagnostics"][-1]["failure_category"] = str(exc)
             result.update(complete=False, reason=str(exc))
+        if result.get("complete") is True:
+            result["instance_identity"] = self.sample_instance_identity(
+                [result["participant_handle"], result["local_handle"]])
+        result["ended_monotonic_ns"] = time.monotonic_ns()
+        return result
+
+    def sample_instance_identity(self, handles):
+        """Copy entity IIDs separately from process-local DDS entity handles.
+
+        This is a Cyclone public-API observation, not a portable wire IID or
+        participant generation. Missing symbols never invalidate GUID ownership.
+        """
+        result = {"schema": "r2f.cyclone-entity-instance-identity/v1",
+                  "api": "dds_get_instance_handle+dds_get_guid",
+                  "scope": "cyclonedds_entity_instance_id", "samples": [],
+                  "status": "unknown", "started_monotonic_ns": time.monotonic_ns()}
+        try:
+            function = getattr(self.lib, "dds_get_instance_handle", None)
+            if function is None:
+                result["status"] = "unavailable"
+                raise ValueError("dds_get_instance_handle_unavailable")
+            function.argtypes = [self.c.c_int32, self.c.POINTER(self.c.c_uint64)]
+            function.restype = self.c.c_int32
+            for _ in range(2):
+                rows = []
+                result["samples"].append(rows)
+                for handle in handles:
+                    value, guid = self.c.c_uint64(), self.Guid()
+                    rc = function(handle, self.c.byref(value))
+                    grc = self.lib.dds_get_guid(handle, self.c.byref(guid))
+                    row = {"entity_handle": handle, "instance_id": value.value,
+                           "return_code": rc, "guid_return_code": grc,
+                           "guid": bytes(guid.v).hex() if grc == 0 else None}
+                    rows.append(row)
+                    if rc != 0 or grc != 0 or value.value == 0 or row["guid"] == "0" * 32:
+                        raise ValueError("entity_instance_identity_readback_failed")
+            if result["samples"][0] != result["samples"][1]:
+                raise ValueError("entity_instance_identity_changed")
+            result["status"] = "observed"
+        except (ValueError, TypeError, OSError, AttributeError, RuntimeError) as exc:
+            result["reason"] = str(exc)
         result["ended_monotonic_ns"] = time.monotonic_ns()
         return result
 
@@ -1412,6 +1453,9 @@ def _worker_main(argv, group_owner=None):
         raise TopologyUnsupported("pdp_trace_requires_one_context_and_consumer_per_worker_process")
     if instrumentation is not None and config["type_name"] != SUPPORTED_MESSAGE_TYPE:
         raise TopologyUnsupported("instrumented_message_type_not_expressible")
+    from .participant_identity import emit_identity_probe
+    if group_owner is None:
+        emit_identity_probe(config, _monotonic_clock_identity())
     import rclpy
     from rclpy.context import Context
     from rclpy.executors import SingleThreadedExecutor
@@ -2088,6 +2132,8 @@ def _group_worker_main(argv):
             or len({e.get('topic') for e in members.values()}) != 1):
         raise TopologyBackendError('group_worker_members_invalid')
     aliases = _group_worker_roles(config)
+    from .participant_identity import emit_identity_probe
+    emit_identity_probe(config, _monotonic_clock_identity())
     import rclpy
     from rclpy.context import Context
     from rclpy.node import Node
@@ -3077,6 +3123,9 @@ class RosTopologyBackend:
             "startup_timeout_sec": float(self.config.get("startup_timeout_sec", 10.0)),
         }
 
+        identity_checks = self.config.get("topology_program", {}).get("identity_checks")
+        if identity_checks is not None:
+            worker_config["identity_checks"] = deepcopy(identity_checks)
         if self.group_program is not None:
             declared = [e for e in self.group_program['endpoints'] if e == spec]
             previous = self.handles.get(spec['logical_id'])

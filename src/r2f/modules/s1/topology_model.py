@@ -173,7 +173,7 @@ def _shape(program):
     except (ValueError, TypeError, RecursionError):
         return [{"path": "program", "code": "json", "message": "finite JSON required"}], None
     if not _object(program, {"schema", "endpoints", "actions"},
-                   {"budget", "environment", "episode", "participant_control"}, "program", errors):
+                   {"budget", "environment", "episode", "participant_control", "identity_checks"}, "program", errors):
         return errors, None
     if program["schema"] != SCHEMA:
         _error(errors, "program.schema", "schema", f"expected {SCHEMA}")
@@ -407,6 +407,12 @@ def _shape(program):
             validate_control(program)
         except (ValueError, TypeError, KeyError) as exc:
             _error(errors, "program.participant_control", "participant_control_scope", str(exc))
+    if "identity_checks" in program:
+        from r2f.runtime.participant_identity import validate_identity_checks
+        try:
+            validate_identity_checks(program)
+        except (ValueError, TypeError) as exc:
+            _error(errors, "program.identity_checks", "identity_checks_scope", str(exc))
     if samples > budget["max_total_samples"]:
         _error(errors, "program.actions", "budget", "total publications exceed sample budget")
     return errors, budget
@@ -631,6 +637,8 @@ def fingerprints(program, prefix=None):
     _, states, streams, _ = _evaluate(program, count)
     control = ({"participant_control": program["participant_control"]}
                if "participant_control" in program else {})
+    if "identity_checks" in program:
+        control["identity_checks"] = program["identity_checks"]
     return {"input_sha256": _hash(program),
             "state_sha256": _hash({"endpoints": program["endpoints"], "states": states,
                                     "streams": streams, "environment": program.get("environment", {}), **control}),
