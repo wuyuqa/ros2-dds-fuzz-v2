@@ -84,7 +84,7 @@ def cft_lifecycle_program():
         actions.append(topology_model._action(aid, op, eid, 1 if eid else None,
                        params, depends_on=[actions[-1]['action_id']]))
 
-    append('matched', 'barrier', params={'condition': 'matched', 'timeout_sec': 5.0,
+    append('matched', 'barrier', params={'condition': 'matched', 'timeout_sec': 15.0,
            'endpoint_ids': ['w0', 'r0', 'r1']})
     phases = [
         ('initial', None, ORIGINAL_TOKEN, SENTINEL_TOKEN),

@@ -28,8 +28,22 @@ def string_filter_expectation(expression, parameters, text):
     if (len(literal) < 2 or literal[0] != "'" or literal[-1] != "'"
             or not literal.isascii() or any(c in literal[1:-1] for c in "_'\\")):
         return None
-    return re.fullmatch('.*'.join(re.escape(part) for part in literal[1:-1].split('%')),
-                        text, re.S) is not None
+    parts = literal[1:-1].split('%')
+    if len(parts) == 1:
+        return text == parts[0]
+    if not text.startswith(parts[0]) or not text.endswith(parts[-1]):
+        return False
+    position, end = len(parts[0]), len(text) - len(parts[-1])
+    # Literal chunks consume disjoint input left to right. Unlike a sequence
+    # of '.*' regexes, even adversarial wildcard runs cannot backtrack.
+    for part in parts[1:-1]:
+        if position > end:
+            return False
+        found = text.find(part, position, end)
+        if found < 0:
+            return False
+        position = found + len(part)
+    return position <= end
 
 
 def _outcome(value, *, status, actual=None, delivered=None, conflict=False):

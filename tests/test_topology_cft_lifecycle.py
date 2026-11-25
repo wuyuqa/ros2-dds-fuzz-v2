@@ -295,3 +295,17 @@ def test_native_reject_and_same_occurrence_delivery_remain_review_conflict():
     assert observed['review_required'] and observed['evidence_conflicts']
     assert _kind({'execution_stage': 'judged', 'oracle_verdict': 'pass',
                   'typed_facts': {'content_filter_observations': observed}}, None) == 'observation_insufficient'
+
+
+def test_percent_wildcards_have_bounded_negative_matching():
+    import subprocess
+    import sys
+    # Execute the public matcher under a watchdog: accepted filter input must
+    # not block synchronous facts/replay when its final literal does not match.
+    result = subprocess.run([sys.executable, '-c',
+        "from r2f.campaign.topology_cft_observation import string_filter_expectation as match; "
+        "assert match('data LIKE %0', [\"'\" + '%' * 32 + \"X'\"], 'a' * 4096) is False; "
+        "assert match('data LIKE %0', [\"'a%a'\"], 'a') is False; "
+        "assert match('data LIKE %0', [\"'a%%b%c'\"], 'axbyc') is True"],
+        capture_output=True, text=True, timeout=2, check=True)
+    assert result.returncode == 0
