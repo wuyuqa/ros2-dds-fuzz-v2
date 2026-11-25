@@ -106,7 +106,11 @@ def test_public_worker_persists_native_lookup_with_endpoint_and_command_identity
         assert found[key] == created[key]
     assert found['endpoint_gid'] == created['endpoint_gid']
     assert calls[-2:] == [('delete', 40), ('free', 1234)]
-    assert any(row['event'] == 'command_done' and row['command_id'] == 7 for row in rows)
+    ack = next(row for row in rows if row['event'] == 'command_done' and row['command_id'] == 7)
+    for key in ('logical_id', 'generation', 'endpoint_generation', 'endpoint_gid',
+                'run_id', 'pid', 'pgid', 'process_start_ticks'):
+        assert ack.get(key) == found[key]
+    assert rows.index(ack) > rows.index(found)
 
 
 def test_missing_modern_api_is_unsupported_and_never_calls_deprecated_scoped_api():
@@ -318,3 +322,21 @@ def test_worker_distinguishes_adapter_failure_from_named_capability_rejection(
     assert str(failure) in lookup['reason']
     assert lookup['exception_type'] == type(failure).__name__
     assert lookup['candidate_eligible'] is False
+
+
+def test_bound_topic_without_type_information_is_unsupported_not_sut_absence():
+    from r2f.runtime.scoped_topic_lookup import observe_topic_lookup
+    native, lib, calls = native_fixture()
+    # Cyclone 0.10.5 ddsrt/retcode.h: DDS_XRETCODE(10) == -60.
+    lib.dds_get_typeinfo = lambda *args: -60
+    receipt = observe_topic_lookup(native, 191, 'b' * 32, 'writer',
+                                   'participant', 'rt/r2f/topology/a')
+    assert receipt['status'] == 'unsupported'
+    assert receipt['reason'] == 'topic_lookup_bound_type_info_unavailable'
+    assert receipt['attribution'] == 'capability_unsupported_not_sut_defect'
+    assert receipt['type_info_return_code'] == -60
+    assert receipt['complete'] is False and receipt['candidate_eligible'] is False
+    assert receipt['cleanup_confirmed'] is True
+    assert receipt['ownership_before'] == receipt['ownership_after']
+    # No fallback to name-only lookup and no release of borrowed references.
+    assert calls == []

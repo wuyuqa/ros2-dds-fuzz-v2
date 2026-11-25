@@ -94,8 +94,16 @@ def observe_topic_lookup(observer, domain, gid, kind, scope, name):
         rc = lib.dds_get_typeinfo(source_topic, c.byref(type_info))
         result['type_info_return_code'] = rc
         if rc != 0 or not type_info.value:
-            result.update(status='unsupported' if rc == -2 else 'unknown',
-                          reason='topic_lookup_type_info_unavailable')
+            # Qualified 0.10.5 ddsrt/retcode.h: NOT_FOUND = DDS_XRETCODE(10)
+            # = -60. A real RMW topic can lack XTypes metadata even though it
+            # serializes and matches normally. Do not retry name-only lookup:
+            # without type_info the API may return an arbitrary same-name type.
+            unsupported = rc in (-2, -60)
+            result.update(status='unsupported' if unsupported else 'unknown',
+                          reason='topic_lookup_bound_type_info_unavailable' if rc == -60
+                          else 'topic_lookup_type_info_unavailable',
+                          attribution='capability_unsupported_not_sut_defect' if unsupported
+                          else 'binding_adaptation_or_observation_error')
             return result
         owns_type_info = True
         # 0.10.5 dds_public_impl.h enum, NOT the deprecated four-argument API.

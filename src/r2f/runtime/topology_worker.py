@@ -1787,7 +1787,7 @@ def _worker_main(argv, group_owner=None):
                      supporting_diagnostic=True, candidate_eligible=False, lookup_receipt=lookup)
                 if lookup.get("cleanup_confirmed") is False:
                     raise TopologyBackendError("topic_lookup_cleanup_unconfirmed")
-                emit("command_done", command_id=command_id)
+                emit("command_done", command_id=command_id, endpoint_gid=local_gid)
                 continue
             if command["command"] == "snapshot":
                 count_api = (endpoint.get_subscription_count if kind == "writer"
