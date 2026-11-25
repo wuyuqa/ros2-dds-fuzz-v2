@@ -130,7 +130,10 @@ class _Bindings:
     def __init__(self, reference):
         self.reference = _reference(reference)
         self.manifest = manifest_for_reference(self.reference)
-        from r2f.instrumentation.fastdds_filter_trace.activation import verify_loader_selection
+        if self.manifest.get('pdp_trace') is not None:
+            from r2f.instrumentation.fastdds_pdp_trace.activation import verify_loader_selection
+        else:
+            from r2f.instrumentation.fastdds_filter_trace.activation import verify_loader_selection
         verify_loader_selection(self.manifest)
         self.abi = verify_abi()
         self._check_manifest_abi(self.manifest)

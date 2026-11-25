@@ -1446,7 +1446,11 @@ def _live_history_send_coverage(audit, windows, send, *, filter_decisions=()):
 
 def facts_from_events(events, runtime, config, *, capture_source=None):
     """Produce typed facts from persisted raw. All missing evidence is explicit."""
+    pdp_control = isinstance(events, list) and any(
+        isinstance(event, dict) and event.get("event") == "native_pdp_provider_selected"
+        and event.get("capture_enabled") is False for event in events)
     facts = {"schema": SCHEMA, "producer_id": TOPOLOGY_FACT_PRODUCER, "target_id": TOPOLOGY_TARGET,
+             "control_excluded": pdp_control,
              "environment_healthy": False, "process_healthy": False, "preconditions_reached": False,
              "endpoint_identity_complete": False, "observed_effects": [], "candidate_eligible": False,
              "seal_eligible": False, "execution_evidence": False, "diagnostic_valid": False,
@@ -1460,7 +1464,7 @@ def facts_from_events(events, runtime, config, *, capture_source=None):
                 facts["observe_native_peers"] = config["observe_native_peers"]
         facts.update(raw={"path": a.path, "sha256": a.sha}, program_sha256=a.program_sha,
                      plan_hash=a.plan.plan_hash(), fixture=a.fixture, arm=config.get("arm"),
-                     control_excluded=(config.get("observe_native_peers") is False
+                     control_excluded=(pdp_control or config.get("observe_native_peers") is False
                         or config.get("arm") == "negative" or bool(config.get("control_kind"))
                         or config.get("candidate_source") == "control"
                         or any(e["event"] in {"fault_control_receipt", "harness_omission", "topology_guard_reject"} for e in a.events)),

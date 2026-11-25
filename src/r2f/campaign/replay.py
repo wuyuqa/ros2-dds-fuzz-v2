@@ -155,7 +155,8 @@ def _replay_observation_config(capsule):
                 raise ValueError('observation_original_raw_hash_mismatch')
             events = [json.loads(line) for line in raw.splitlines() if line.strip()]
             records = [event for event in events if event.get('event') == 'topology_execution_metadata']
-            native = any(event.get('event') == 'native_peer_provider_selected' for event in events)
+            native = any(event.get('event') == 'native_peer_provider_selected'
+                         or str(event.get('event', '')).startswith('native_pdp_') for event in events)
             if len(records) > 1 or ((hints or native) and len(records) != 1):
                 raise ValueError('observation_raw_metadata_not_unique')
             if records:
@@ -223,6 +224,14 @@ def _replay_observation_config(capsule):
         reference_from_config(dict(selection, rmw=scenario.rmw))  # file-only validation
         from r2f.instrumentation.fastdds_peer.receipt import validate_sampling_control
         validate_sampling_control(events, selection)
+        from r2f.instrumentation.fastdds_peer.activation import manifest_for_reference
+        from r2f.instrumentation.fastdds_pdp_trace.receipt import validate_raw
+        selected_reference = reference_from_config(dict(selection, rmw=scenario.rmw))
+        raw_reference = dict(selected_reference) if selected_reference else None
+        if raw_reference is not None:
+            raw_reference['manifest_path'] = str(Path(execution['raw_path']).resolve().parent / 'native-peer-build-manifest.json')
+        validate_raw(events, manifest_for_reference(selected_reference) if selected_reference else None,
+                     peer_reference=raw_reference)
         return selection
     except (ValueError, KeyError, TypeError, OSError, AttributeError) as exc:
         raise _Failure('fail_artifact', 'observation_execution_metadata_invalid',

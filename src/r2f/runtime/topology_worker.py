@@ -1336,6 +1336,18 @@ def _drain_filter_decisions(observer, emit, *, final=False):
     return stats
 
 
+def _drain_pdp_lifecycle(observer, emit, *, final=False):
+    records, stats = observer.drain()
+    for receipt in records:
+        emit("native_pdp_lifecycle", receipt=receipt, candidate_eligible=False)
+    if records or final:
+        emit("native_pdp_trace_health", manifest_reference=observer.reference,
+             stats=stats, final=final, capture_complete=stats["dropped"] == 0,
+             candidate_eligible=False)
+    if final and stats["pending"]:
+        raise TopologyBackendError("native_pdp_trace_final_pending")
+
+
 def _drive_endpoint_session(session_factory):
     """Preserve the legacy blocking entry; expose sessions only to the group owner."""
     from functools import wraps
@@ -1373,6 +1385,9 @@ def _worker_main(argv, group_owner=None):
     )
     instrumentation = reference_from_config(config)
     observe_native_peers = config.get("observe_native_peers", True)
+    if (group_owner is not None and instrumentation is not None
+            and manifest_for_reference(instrumentation).get("pdp_trace") is not None):
+        raise TopologyUnsupported("pdp_trace_requires_one_context_and_consumer_per_worker_process")
     if instrumentation is not None and config["type_name"] != SUPPORTED_MESSAGE_TYPE:
         raise TopologyUnsupported("instrumented_message_type_not_expressible")
     import rclpy
@@ -1439,6 +1454,7 @@ def _worker_main(argv, group_owner=None):
     local_gid = None
     native_peer_observer = None
     filter_decision_observer = None
+    pdp_lifecycle_observer = None
     incarnation_ordinal = 0
     receive_sequence = 0
     endpoint_generation = node_token
@@ -1446,6 +1462,8 @@ def _worker_main(argv, group_owner=None):
     def emit(event, **fields):
         if event == "command_done" and filter_decision_observer is not None:
             _drain_filter_decisions(filter_decision_observer, emit)
+        if event == "command_done" and pdp_lifecycle_observer is not None:
+            _drain_pdp_lifecycle(pdp_lifecycle_observer, emit)
         value = {
             "event": event, "time_ns": time.time_ns(), "monotonic_ns": time.monotonic_ns(),
             "monotonic_clock_identity": _monotonic_clock_identity(),
@@ -1487,6 +1505,7 @@ def _worker_main(argv, group_owner=None):
                  hook_source_sha256=filter_decision_observer.manifest["hook_source_sha256"],
                  abi=filter_decision_observer.manifest["abi"],
                  capture_scope="actual_evaluate_calls_only", candidate_eligible=False)
+
 
     def gid_bytes(value):
         return bytes(value).hex() if value is not None else None
@@ -1540,6 +1559,16 @@ def _worker_main(argv, group_owner=None):
         publish_observer = PublishOccurrenceObserver(emit, rmw_identifier)
     endpoint_creation_returned = False
     try:
+        if instrumentation is not None and selected.get("pdp_trace") is not None:
+            from r2f.instrumentation.fastdds_pdp_trace.observer import PdpLifecycleObserver
+            pdp_lifecycle_observer = PdpLifecycleObserver(selected)
+            emit("native_pdp_provider_selected", manifest_reference=pdp_lifecycle_observer.reference,
+                 peer_manifest_reference=instrumentation,
+                 binary=pdp_lifecycle_observer.manifest["binary"],
+                 capture_enabled=pdp_lifecycle_observer.manifest["capture_enabled"],
+                 provider_mapping=pdp_lifecycle_observer.mapping,
+                 vendor_binary=selected["binaries"]["vendor"], abi=pdp_lifecycle_observer.manifest["abi"],
+                 candidate_eligible=False)
         try:
             codec = RosMessageCodec(config["type_name"])
         except MessageTypeBindingError as exc:
@@ -1965,9 +1994,20 @@ def _worker_main(argv, group_owner=None):
         # context teardown, so secondary close/telemetry errors cannot mask
         # an original worker failure or skip remaining resource cleanup.
         if group_owner is None:
-            _audit_worker_cleanup(executor, node, context, emit,
-                                  endpoint_creation_returned=endpoint_creation_returned,
-                                  primary_error=primary_error, close_error=close_error)
+            try:
+                _audit_worker_cleanup(executor, node, context, emit,
+                                      endpoint_creation_returned=endpoint_creation_returned,
+                                      primary_error=primary_error, close_error=close_error)
+            except BaseException:
+                if pdp_lifecycle_observer is not None:
+                    try:
+                        _drain_pdp_lifecycle(pdp_lifecycle_observer, emit, final=True)
+                    except BaseException as exc:
+                        emit("native_pdp_trace_close_error", error=str(exc), candidate_eligible=False)
+                raise
+            else:
+                if pdp_lifecycle_observer is not None:
+                    _drain_pdp_lifecycle(pdp_lifecycle_observer, emit, final=True)
         else:
             cleanup_error = None
             if endpoint_creation_returned:

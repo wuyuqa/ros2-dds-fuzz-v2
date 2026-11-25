@@ -31,7 +31,7 @@ GIDS = {"writer": "1" * 32, "reader": "2" * 32}
 def snapshot_worker(monkeypatch):
     """Run the public worker entry with authored external API/pipe responses."""
     def launch(kind, *, rmw="rmw_fastrtps_cpp", extra_peer=False, count=1,
-               observer_case=None, count_after=None, observe_native_peers=None):
+               observer_case=None, count_after=None, observe_native_peers=None, expected_code=0):
         names = ["rclpy", "rclpy.context", "rclpy.executors", "rclpy.node",
                  "rclpy.qos", "rclpy.duration", "rclpy.event_handler",
                  "std_msgs", "std_msgs.msg", "r2f.runtime.actual_qos",
@@ -161,6 +161,12 @@ def snapshot_worker(monkeypatch):
                             "provider_source_sha256": "f" * 64,
                             "patch": {"abi": {"fixture": True}}}
                 patch.setattr(activation, "manifest_for_reference", lambda _: manifest)
+                if observer_case == "pdp_init_error":
+                    manifest["pdp_trace"] = {"fixture": True}
+                    from r2f.instrumentation.fastdds_pdp_trace import observer as pdp
+                    def fail_pdp(*_):
+                        raise ValueError("offline_pdp_initialization_failed")
+                    patch.setattr(pdp, "PdpLifecycleObserver", fail_pdp)
                 schema = "r2f.fastdds-native-matched-peer-observation/v1"
                 class Observer:
                     SCHEMA = schema
@@ -190,7 +196,7 @@ def snapshot_worker(monkeypatch):
             with redirect_stdout(stdout):
                 code = worker.worker_main()
         rows = [json.loads(line) for line in stdout.getvalue().splitlines()]
-        assert code == 0, rows
+        assert code == expected_code, rows
         return rows
     return launch
 

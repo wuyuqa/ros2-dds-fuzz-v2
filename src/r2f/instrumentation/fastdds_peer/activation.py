@@ -31,6 +31,9 @@ def manifest_for_reference(reference):
     if manifest.get('filter_trace') is not None:
         from r2f.instrumentation.fastdds_filter_trace.activation import selected_manifest
         selected_manifest(manifest)
+    if manifest.get('pdp_trace') is not None:
+        from r2f.instrumentation.fastdds_pdp_trace.activation import selected_manifest
+        selected_manifest(manifest)
     return manifest
 
 
@@ -71,6 +74,11 @@ def environment_for_reference(base_env, reference):
     if manifest.get('filter_trace') is not None:
         from r2f.instrumentation.fastdds_filter_trace.activation import selected_manifest
         env['LD_PRELOAD'] = selected_manifest(manifest)['binary']['path']
+    if manifest.get('pdp_trace') is not None:
+        from r2f.instrumentation.fastdds_pdp_trace.activation import selected_manifest
+        trace = selected_manifest(manifest)
+        env['LD_PRELOAD'] = trace['binary']['path']
+        env['R2F_FASTDDS_PDP_TRACE_ENABLED'] = '1' if trace['capture_enabled'] else '0'
     return env
 
 

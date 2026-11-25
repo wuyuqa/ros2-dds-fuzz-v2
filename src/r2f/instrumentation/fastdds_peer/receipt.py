@@ -157,6 +157,8 @@ def validate_execution_mode(events, config, *, raw_path=None):
     reference = reference_from_config(config)
     selected = [row for row in events if row.get('event') == 'native_peer_provider_selected']
     if reference is None:
+        from r2f.instrumentation.fastdds_pdp_trace.receipt import validate_raw
+        validate_raw(events, None)
         if selected or any(row.get('event') == 'endpoint_created'
                            and row.get('observation_mode', 'blackbox') != 'blackbox' for row in events):
             raise ValueError('native_peer_actual_mode_differs_from_blackbox_config')
@@ -190,4 +192,6 @@ def validate_execution_mode(events, config, *, raw_path=None):
                 or row.get('provider_abi') != manifest['patch']['abi']
                 or row['event_index'] >= worker['event_index']):
             raise ValueError('native_peer_actual_selection_differs_from_config')
+    from r2f.instrumentation.fastdds_pdp_trace.receipt import validate_raw
+    validate_raw(events, manifest, peer_reference=expected_reference)
     return reference
