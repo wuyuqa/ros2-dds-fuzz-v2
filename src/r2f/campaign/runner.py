@@ -38,11 +38,16 @@ _OBSERVATION_CELL = "rmw_cyclonedds_cpp.baseline.0"
 
 
 def _observation_selection(observation, target_id):
-    """CP1 declaration only; not adoption, effect or replay evidence."""
+    """Validate an execution-only observation selection, never an evidence claim."""
     if observation is _OBSERVATION_UNSET:
         return None
     keys = {"observation_mode", "observe_adopted_config"}
+    recovery = target_id == EXECUTION_ORDER[2]
+    if recovery:
+        keys.add("cell_id")
     if not isinstance(observation, dict) or set(observation) != keys:
+        if recovery:
+            raise ValueError("observation CP1 recovery extension requires cell_id")
         raise ValueError("observation must contain exactly observation_mode and observe_adopted_config")
     mode, adopted = observation["observation_mode"], observation["observe_adopted_config"]
     if type(mode) is not str or mode not in ("blackbox", "instrumentation"):
@@ -51,6 +56,13 @@ def _observation_selection(observation, target_id):
         raise ValueError("observe_adopted_config must be boolean")
     if adopted and mode != "instrumentation":
         raise ValueError("observe_adopted_config requires instrumentation mode")
+    if recovery:
+        selected = observation['cell_id']
+        allowed = {c['cell_id'] for c in first_slice_cells(target_id)
+                   if c['rmw'] == 'rmw_cyclonedds_cpp'}
+        if type(selected) is not str or selected not in allowed or adopted:
+            raise ValueError('participant lease observation requires a Cyclone cell and no adoption claim')
+        return {"observation_mode": mode, "observe_adopted_config": False, "cell_id": selected}
     if target_id != EXECUTION_ORDER[0]:
         raise ValueError("observation CP1 supports only discovery.late_endpoint")
     return {"observation_mode": mode, "observe_adopted_config": adopted}
@@ -69,14 +81,17 @@ def plan_campaign(output_dir, *, repo=None, run_id=None, domain_id=173, seed=0,
 
     An optional expected_source_manifest must equal the entire measured intake
     source; a mismatch raises before any plan artifacts are written.
-    observation is an optional exact mode/bool pair, scoped to Cyclone baseline0
-    on the first target in CP1. Its declaration is execution metadata only;
+    observation is an execution-only mode/bool pair for first-target baseline0,
+    or includes an explicit Cyclone cell_id for opt-in participant lease recovery.
+    Its declaration is execution metadata only;
     omission preserves legacy artifacts, and explicit null is invalid.
     rmws optionally selects a nonempty, unique subset of target-applicable RMWs.
     Partial plans list uncovered cells; the frozen required scope and its audit
     are unchanged. None preserves the complete plan and legacy artifact shape.
     """
     selection = _observation_selection(observation, target_id)
+    if selection is not None and "cell_id" in selection and (parameters or {}).get("observe_participant_leases") is not True:
+        raise ValueError("participant lease observation requires observe_participant_leases=true")
     if isinstance(parameters, dict) and {"observation_mode", "observe_adopted_config"}.intersection(parameters):
         semantic_input("baseline", parameters, target_id=target_id)
     repo = Path(repo or Path(__file__).resolve().parents[3]).resolve()
@@ -102,7 +117,7 @@ def plan_campaign(output_dir, *, repo=None, run_id=None, domain_id=173, seed=0,
             raise ValueError("rmws must be a nonempty unique list of target-applicable RMWs")
         uncovered = [cell["cell_id"] for cell in first_slice_cells(target_id)
                      if cell["rmw"] not in rmws]
-        if selection is not None and _OBSERVATION_CELL in uncovered:
+        if selection is not None and selection.get("cell_id", _OBSERVATION_CELL) in uncovered:
             raise ValueError("rmws selection excludes observation cell: " + _OBSERVATION_CELL)
         rmw_selection = {"plan_kind": "partial_rmw_plan" if uncovered else "full_rmw_plan",
                          "selected_rmws": [rmw for rmw in target.rmw_applicability if rmw in rmws],
@@ -116,7 +131,7 @@ def plan_campaign(output_dir, *, repo=None, run_id=None, domain_id=173, seed=0,
                 "execution_order": list(EXECUTION_ORDER), "requested_domain": domain_id,
                 "maturity_denominator_changed": False, "applicable_rmws_requested": list(target.rmw_applicability)}
     if selection is not None:
-        manifest["observation"] = dict(selection, cell_id=_OBSERVATION_CELL)
+        manifest["observation"] = dict(selection, cell_id=selection.get("cell_id", _OBSERVATION_CELL))
     if rmw_selection is not None:
         manifest["rmw_selection"] = rmw_selection
     identity = identity_hashes(manifest)
@@ -156,7 +171,7 @@ def plan_campaign(output_dir, *, repo=None, run_id=None, domain_id=173, seed=0,
                                 final_input=submitted, effective_input_sha256=capsule.input["effective_input_sha256"],
                                 input_layer_receipts=capsule.input["effective_input"]["input_layer_receipts"],
                                 control_kind=cell.get("control_kind"))
-        if selection is not None and cell["cell_id"] == _OBSERVATION_CELL:
+        if selection is not None and cell["cell_id"] == selection.get("cell_id", _OBSERVATION_CELL):
             config.update(selection)
         directory = output_dir / "cells" / cell["cell_id"]
         replay_path = directory / "capsule.json"
@@ -347,13 +362,15 @@ def run_campaign(output_dir, *, runtime=None, execute=False,
     It does not bound replay: an explicit budget conflicts with auto_replay,
     whose separate policy may dispatch additional executions. None preserves
     historical behavior. Planning never dispatches, even with a budget.
-    Explicit CP1 observation execution requires max_executions=1, so the
-    unchanged canonical order dispatches only Cyclone baseline0. This intake
-    does not establish adoption, effect, replay or audit qualification.
+    Explicit observation execution requires max_executions=1. The legacy
+    declaration dispatches Cyclone baseline0; the lease extension dispatches its
+    named cell, leaving all other cells planned. A declaration is not evidence.
     query_runner_evidence exposes associations without revising this report.
     """
     selection = _observation_selection(
         options.get("observation", _OBSERVATION_UNSET), options.get("target_id", EXECUTION_ORDER[0]))
+    if selection is not None and "cell_id" in selection and (options.get("parameters") or {}).get("observe_participant_leases") is not True:
+        raise ValueError("participant lease observation requires observe_participant_leases=true")
     if selection is not None and execute and (type(max_executions) is not int or max_executions != 1):
         raise ValueError("observation CP1 execution requires max_executions=1")
     if max_executions is not None:
@@ -426,6 +443,8 @@ def run_campaign(output_dir, *, runtime=None, execute=False,
     register(registry)
     services = registry.get_services(report["target_id"])
     for index, planned in enumerate(report["rows"]):
+        if selection is not None and "cell_id" in selection and planned["cell_id"] != selection["cell_id"]:
+            continue
         if max_executions is not None and report["execution_budget"]["attempts"] >= max_executions:
             report["execution_budget"]["stop_reason"] = "max_executions_reached"
             break
