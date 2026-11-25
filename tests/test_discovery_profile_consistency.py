@@ -172,3 +172,49 @@ def test_rehashed_untrusted_profile_projection_cannot_supply_a_missing_fact(tmp_
         assert result['admissible_count'] == 0
     finally:
         pair.close()
+
+
+@pytest.mark.parametrize('retirement', ['gc', 'expired'])
+def test_retired_participant_announcement_cannot_close_a_later_graph(tmp_path, retirement):
+    def retire(raw):
+        lines = raw.splitlines(keepends=True)
+        spdp = next(line for line in lines if 'SPDP ST0' in line)
+        stamp, rest = spdp.split(' ', 1)
+        guid = rest.split('SPDP ST0 ', 1)[1].split(' ', 1)[0]
+        if retirement == 'gc':
+            body = f'gc_delete_proxy_participant(0x1234, {guid})'
+        else:
+            body = f'lease expired: l 0x1234 guid {guid} tend 1 < now 2'
+        return raw + f'{stamp} [174] gc: {body}\n'
+
+    pair, runtime, row, capsule = profile_pair(tmp_path, transform=retire)
+    try:
+        result = qualify_observation(row, runtime, pair.c, capsule=capsule)
+        assert result['qualification'] == 'qualified', result
+        facts = result['discovery_profile']
+        assert facts['announcements']['status'] == 'observed'
+        assert facts['completion']['status'] == facts['status'] == 'unknown'
+        assert 'participant_retired_before_snapshot:writer' in facts['reasons']
+        assert result['qualified_intake'] == []
+    finally:
+        pair.close()
+
+
+@pytest.mark.parametrize('reannounce', [False, True])
+def test_rediscovery_requires_a_new_endpoint_announcement_for_pair_completion(tmp_path, reannounce):
+    def rediscover(raw):
+        spdp = next(line for line in raw.splitlines(keepends=True) if 'SPDP ST0' in line)
+        endpoint = next(line for line in raw.splitlines(keepends=True) if 'SEDP ST0' in line)
+        return raw + spdp + (endpoint if reannounce else '')
+
+    pair, runtime, row, capsule = profile_pair(tmp_path, transform=rediscover)
+    try:
+        result = qualify_observation(row, runtime, pair.c, capsule=capsule)
+        assert result['qualification'] == 'qualified', result
+        facts = result['discovery_profile']
+        assert facts['announcements']['status'] == 'observed'
+        assert facts['completion']['status'] == ('observed' if reannounce else 'unknown')
+        if not reannounce:
+            assert 'endpoint_not_announced_in_current_participant_incarnation:writer' in facts['reasons']
+    finally:
+        pair.close()

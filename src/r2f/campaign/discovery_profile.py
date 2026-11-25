@@ -111,23 +111,36 @@ def discovery_profile_facts(config, prepared, workers, traces, comparisons, adop
             'remote_process_start_ticks': peer['process']['process_start_ticks'],
             'participant': None, 'endpoint': None}
         if participant:
-            witness['participant'] = dict(deepcopy(participant[0]),
+            witness['participant'] = dict(deepcopy(participant[-1]),
                 raw_path=trace['raw_path'], raw_sha256=trace['raw_sha256'])
         else:
             result['reasons'].append('participant_announcement_unobserved:' + observer)
         if endpoints:
-            witness['endpoint'] = deepcopy(endpoints[0])
+            witness['endpoint'] = deepcopy(endpoints[-1])
         else:
             result['reasons'].append('endpoint_announcement_unobserved:' + observer)
+        retired = [event for event in lifecycle['events']
+                   if participant and event['participant_guid'] == participant_guid
+                   and event['kind'] in ('expired', 'gc_deleted')
+                   and event['offset'] > participant[-1]['offset']
+                   and start <= event['unix_ns'] <= end]
+        witness['retirements_before_snapshot'] = [dict(deepcopy(event),
+            raw_path=trace['raw_path'], raw_sha256=trace['raw_sha256']) for event in retired]
+        current_endpoint = bool(participant and endpoints
+                                and endpoints[-1]['raw_byte_offset'] > participant[-1]['offset'])
+        if retired:
+            result['reasons'].append('participant_retired_before_snapshot:' + observer)
+        if participant and endpoints and not current_endpoint:
+            result['reasons'].append('endpoint_not_announced_in_current_participant_incarnation:' + observer)
         result['announcements']['roles'][observer] = witness
-        if (witness['participant'] and witness['endpoint']
+        if (current_endpoint and not retired
                 and witness['participant']['thread'] == witness['endpoint']['thread'] == 'dq.builtin'):
             result['asynchronous_discovery']['roles'][observer] = {
                 'observer_pid': local['pid'],
                 'participant': deepcopy(witness['participant']),
                 'endpoint': deepcopy(witness['endpoint']),
                 'basis': 'source_pinned_SPDP_and_SEDP_receive_logs_on_dq.builtin'}
-        if participant and endpoints and comparison['comparison']['verdict'] == 'pass':
+        if current_endpoint and not retired and comparison['comparison']['verdict'] == 'pass':
             result['completion']['roles'][observer] = {
                 'graph': deepcopy(graph), 'remote_endpoint_guid': peer['endpoint_guid'],
                 'remote_endpoint_generation': peer['endpoint_event']['endpoint_generation'],
