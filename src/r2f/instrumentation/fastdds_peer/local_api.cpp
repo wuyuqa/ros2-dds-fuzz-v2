@@ -19,7 +19,6 @@
 #include <fastdds/dds/publisher/Publisher.hpp>
 #include <fastdds/dds/subscriber/Subscriber.hpp>
 #include <fastdds/dds/topic/Topic.hpp>
-#include <sstream>
 #include <string>
 
 namespace {
@@ -58,19 +57,20 @@ extern "C" R2F_LOCAL_EXPORT int32_t r2f_fastdds_local_v1(void* endpoint, int32_t
         if (!output || capacity < 2 || domain > 231 || (reader != 0 && reader != 1)) return 1;
         auto roots = dds::DomainParticipantFactory::get_instance()->lookup_participants(domain);
         if (roots.size() > 256) return 2;
-        std::ostringstream out;
-        out << "{\"schema_version\":1,\"domain_id\":" << domain << ",\"roots\":[";
+        // Avoid locale/facet-backed iostreams across the provider/ROS DSOs.
+        // Integer conversion and JSON escaping must not share stream state.
+        std::string out = "{\"schema_version\":1,\"domain_id\":" + std::to_string(domain) + ",\"roots\":[";
         bool first = true;
         for (auto* root : roots)
         {
             if (!root || root->get_domain_id() != domain) return 3;
-            if (!first) out << ',';
+            if (!first) out += ',';
             first = false;
-            out << "{\"participant_handle\":" << local_address(root)
-                << ",\"participant_gid\":" << local_quote(local_guid(root->guid()))
-                << ",\"domain_id\":" << root->get_domain_id() << '}';
+            out += "{\"participant_handle\":" + std::to_string(local_address(root))
+                + ",\"participant_gid\":" + local_quote(local_guid(root->guid()))
+                + ",\"domain_id\":" + std::to_string(root->get_domain_id()) + '}';
         }
-        out << ']';
+        out += ']';
         if (endpoint)
         {
             const dds::DomainParticipant* participant;
@@ -98,14 +98,14 @@ extern "C" R2F_LOCAL_EXPORT int32_t r2f_fastdds_local_v1(void* endpoint, int32_t
                 gid = local_guid(object->guid());
             }
             if (!participant || !parent || !source || participant->get_domain_id() != domain) return 4;
-            out << ",\"local_handle\":" << local_address(endpoint)
-                << ",\"local_gid\":" << local_quote(gid)
-                << ",\"role_kind\":" << local_quote(reader ? "reader" : "writer")
-                << ",\"parent_handle\":" << local_address(parent)
-                << ",\"participant_handle\":" << local_address(participant)
-                << ",\"participant_gid\":" << local_quote(local_guid(participant->guid()))
-                << ",\"source_name\":" << local_quote(source->get_name())
-                << ",\"source_type_name\":" << local_quote(source->get_type_name());
+            out += ",\"local_handle\":" + std::to_string(local_address(endpoint))
+                + ",\"local_gid\":" + local_quote(gid)
+                + ",\"role_kind\":" + local_quote(reader ? "reader" : "writer")
+                + ",\"parent_handle\":" + std::to_string(local_address(parent))
+                + ",\"participant_handle\":" + std::to_string(local_address(participant))
+                + ",\"participant_gid\":" + local_quote(local_guid(participant->guid()))
+                + ",\"source_name\":" + local_quote(source->get_name())
+                + ",\"source_type_name\":" + local_quote(source->get_type_name());
             if (query)
             {
                 if (std::strlen(query) > 256) return 1;
@@ -120,16 +120,16 @@ extern "C" R2F_LOCAL_EXPORT int32_t r2f_fastdds_local_v1(void* endpoint, int32_t
                           found_owner = local_address(found->get_participant()); }
                     catch (...) { owner->delete_topic(found); throw; }
                     const int release = owner->delete_topic(found)();
-                    out << ",\"lookup_status\":\"found\",\"actual_name\":" << local_quote(name)
-                        << ",\"actual_type_name\":" << local_quote(type)
-                        << ",\"result_participant_handle\":" << found_owner
-                        << ",\"delete_topic_return_code\":" << release;
+                    out += ",\"lookup_status\":\"found\",\"actual_name\":" + local_quote(name)
+                        + ",\"actual_type_name\":" + local_quote(type)
+                        + ",\"result_participant_handle\":" + std::to_string(found_owner)
+                        + ",\"delete_topic_return_code\":" + std::to_string(release);
                 }
-                else { out << ",\"lookup_status\":\"not_found\",\"delete_topic_return_code\":null"; }
+                else { out += ",\"lookup_status\":\"not_found\",\"delete_topic_return_code\":null"; }
             }
         }
-        out << '}';
-        const auto value = out.str();
+        out += '}';
+        const auto& value = out;
         if (value.size() + 1 > capacity) return 5;
         std::memcpy(output, value.c_str(), value.size() + 1);
         return 0;
