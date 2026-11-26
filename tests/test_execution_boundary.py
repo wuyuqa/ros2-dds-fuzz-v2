@@ -538,11 +538,16 @@ class KernelNonDDSLifecycle(unittest.TestCase):
 
     def wait_cleanup(self, audit):
         deadline = time.monotonic() + 15
-        while not (audit / 'manifest.json').exists():
-            if time.monotonic() > deadline:
-                self.fail('guardian did not record cleanup after caller termination')
-            time.sleep(.02)
-        manifest = json.loads((audit / 'manifest.json').read_text())
+        # The guardian creates the file before its JSON write completes.
+        # Completion is a readable manifest, not merely a directory entry.
+        while True:
+            try:
+                manifest = json.loads((audit / 'manifest.json').read_text())
+                break
+            except (FileNotFoundError, json.JSONDecodeError):
+                if time.monotonic() > deadline:
+                    self.fail('guardian did not record complete cleanup manifest after caller termination')
+                time.sleep(.02)
         # Guardian writes manifest before closing its inherited copies.
         while time.monotonic() < deadline:
             try:
