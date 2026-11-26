@@ -18,6 +18,7 @@ def local_response(observer, native, **changes):
         assert pointer==0x1200 and reader==0 and domain==215
         payload=json.dumps(value).encode()+b'\0';C.memmove(output,payload,len(payload));return 0
     native.libs={'provider':SimpleNamespace(r2f_fastdds_local_v1=call)}
+    native.local_api=lambda: call  # explicit labelled C-ABI boundary double
     return value
 
 

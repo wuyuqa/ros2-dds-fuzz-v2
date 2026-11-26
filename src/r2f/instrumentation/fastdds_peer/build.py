@@ -87,7 +87,7 @@ def build_environment(toolchain, base=None):
     return env
 
 
-def provider_command(source, build, install, compiler, provider, output):
+def provider_command(source, build, install, compiler, provider, output, *, local_api=None):
     """Use the real vendor target's flags, not guessed compile-time ABI flags."""
     import shlex
     rows = json.loads((Path(build) / 'compile_commands.json').read_text())
@@ -111,6 +111,7 @@ def provider_command(source, build, install, compiler, provider, output):
     # A standalone DSO has its own export list; keep vendor ABI definitions and
     # generated config/includes, but do not inherit its linker version script.
     command = [str(compiler), *flags, '-shared', '-fPIC', str(provider),
+               *([str(local_api)] if local_api is not None else []),
                '-L' + str(Path(install) / 'lib'), '-lfastrtps',
                '-Wl,-rpath,' + str(Path(install) / 'lib'),
                '-Wl,-z,defs', '-o', str(output)]
@@ -121,10 +122,12 @@ def provider_source():
     return Path(__file__).with_name('provider.cpp')
 
 
-def run_build(*, archive, source, root, toolchain, jobs=8):
+def run_build(*, archive, source, root, toolchain, jobs=8, include_local_api=False):
     source, root, toolchain = (Path(p).resolve() for p in (source, root, toolchain))
     if type(jobs) is not int or not 1 <= jobs <= 32:
         raise ValueError('jobs_must_be_1_to_32')
+    if type(include_local_api) is not bool:
+        raise ValueError('include_local_api_must_be_bool')
     if root == source or root.is_relative_to(source):
         raise ValueError('build_root_must_be_outside_source')
     root.mkdir(parents=True, exist_ok=True)
@@ -176,6 +179,11 @@ def run_build(*, archive, source, root, toolchain, jobs=8):
             frozen_provider = attempt / 'provider.cpp'
             frozen_provider.write_bytes(provider.read_bytes())
             receipt['provider_source_sha256'] = digest(frozen_provider)
+            frozen_local = None
+            if include_local_api:
+                from .local_api import source_path
+                frozen_local = attempt / 'local_api.cpp'
+                frozen_local.write_bytes(source_path().read_bytes())
             receipt['builder_sha256'] = digest(__file__)
             receipt['stage'] = 'toolchain_identity'
             c = toolchain / 'usr/bin/x86_64-linux-gnu-gcc-13'
@@ -199,7 +207,7 @@ def run_build(*, archive, source, root, toolchain, jobs=8):
             execute('vendor-install', ['cmake', '--build', build, '--target', 'install',
                                        '--parallel', str(jobs)])
             output = install / 'lib/libr2f_fastdds_peer.so'
-            command, reference = provider_command(source, build, install, cxx, frozen_provider, output)
+            command, reference = provider_command(source, build, install, cxx, frozen_provider, output, local_api=frozen_local)
             receipt['vendor_reference_command'] = reference
             execute('provider-build', command, cwd=reference['directory'])
             receipt['stage'] = 'final_identity'
@@ -210,6 +218,12 @@ def run_build(*, archive, source, root, toolchain, jobs=8):
             receipt.update(status='built', stage='complete', source_after=after,
                            binaries={'vendor': {'path': str(vendor), 'sha256': digest(vendor)},
                                      'provider': {'path': str(output), 'sha256': digest(output)}})
+            if include_local_api:
+                from .local_api import build_receipt, source_path, validate_extension
+                if digest(source_path()) != digest(frozen_local):
+                    raise RuntimeError('local_api_source_changed_during_build')
+                receipt['local_api'] = build_receipt(frozen_local, output)
+                validate_extension(receipt)
             receipt['compile_commands_sha256'] = digest(build / 'compile_commands.json')
             receipt['cmake_cache_sha256'] = digest(build / 'CMakeCache.txt')
             receipt['verification']['compilation'] = 'passed'
@@ -228,10 +242,11 @@ def main(argv=None):
     parser.add_argument('--build-root', required=True, type=Path)
     parser.add_argument('--toolchain-root', required=True, type=Path)
     parser.add_argument('--jobs', type=int, default=8)
+    parser.add_argument('--include-local-api', action='store_true', help='compile and qualify the optional public local-API companion')
     args = parser.parse_args(argv)
     try:
         manifest = run_build(archive=args.archive, source=args.source_root,
-                             root=args.build_root, toolchain=args.toolchain_root, jobs=args.jobs)
+                             root=args.build_root, toolchain=args.toolchain_root, jobs=args.jobs, include_local_api=args.include_local_api)
         print(str(manifest))
         return 0
     except (ValueError, OSError, RuntimeError, PatchError) as exc:

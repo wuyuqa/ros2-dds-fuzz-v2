@@ -216,3 +216,28 @@ def test_lock_conflict_does_not_make_an_attempt_or_touch_other_owner(tmp_path, m
             b.run_build(archive=tmp_path / 'archive', source=source, root=root,
                         toolchain=toolchain, jobs=2)
     assert not list(root.glob('attempt-*')) and commands == []
+
+
+def test_local_api_is_explicitly_compiled_and_receipted_without_changing_peer_source(tmp_path, monkeypatch):
+    source, toolchain, commands = fake_build_setup(tmp_path, monkeypatch)
+    peer_before = b.provider_source().read_bytes()
+    path = b.run_build(archive=tmp_path / 'archive', source=source, root=tmp_path / 'root',
+                       toolchain=toolchain, jobs=2, include_local_api=True)
+    receipt = json.loads(path.read_text())
+    extension = receipt['local_api']
+    assert extension['schema'] == 'r2f.fastdds-local-api-build/v1'
+    assert extension['source_sha256'] == hashlib.sha256(Path(extension['source_snapshot']).read_bytes()).hexdigest()
+    assert extension['provider_sha256'] == receipt['binaries']['provider']['sha256']
+    command = next(c for c in receipt['commands'] if c['name'] == 'provider-build')
+    assert extension['source_snapshot'] in command['argv']
+    assert str(path.parent / 'provider.cpp') in command['argv']
+    assert b.provider_source().read_bytes() == peer_before
+    assert receipt['provider_source_sha256'] == hashlib.sha256(peer_before).hexdigest()
+
+
+def test_default_peer_build_does_not_grant_local_api(tmp_path, monkeypatch):
+    source, toolchain, commands = fake_build_setup(tmp_path, monkeypatch)
+    path = b.run_build(archive=tmp_path / 'archive', source=source, root=tmp_path / 'root',
+                       toolchain=toolchain, jobs=2)
+    assert 'local_api' not in json.loads(path.read_text())
+    assert not any('local_api.cpp' in str(arg) for command in commands for arg in command)

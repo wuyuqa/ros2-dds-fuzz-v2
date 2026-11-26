@@ -105,8 +105,7 @@ def _topology_participant_identity(row, events):
 
 def _topology_topic_lookup(row, events):
     """Authenticate declared query objects independently of directed pair edges."""
-    from r2f.campaign.topology_lookup_observation import lookup_observations, semantic_checks
-    from r2f.modules.s1.topology_lookup_contract import predicate_contract
+    from r2f.campaign.topology_lookup_observation import lookup_observations, semantic_checks, predicate_contract
     program = row.get("final_input", {}).get("topology_program", {})
     claimed = row.get("typed_facts", {}).get("topic_lookup_observations")
     declared = any(a.get("op") == "lookup_topic" for a in program.get("actions", []))

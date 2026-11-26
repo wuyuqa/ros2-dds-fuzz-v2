@@ -29,7 +29,7 @@ def _pointer(value):
 def _call(native, domain, pointer=0, kind='writer', name=None):
     _require(type(domain) is int and 0 <= domain <= 231, 'domain_invalid')
     _require(kind in ('writer', 'reader'), 'role_invalid')
-    function = native.libs['provider'].r2f_fastdds_local_v1
+    function = native.local_api()
     function.argtypes = [C.c_void_p, C.c_int, C.c_uint32, C.c_char_p, C.c_void_p, C.c_uint64]
     function.restype = C.c_int32
     output = C.create_string_buffer(131072)
