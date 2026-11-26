@@ -165,6 +165,23 @@ def verify_abi(instrumentation=None):
             'pin_sha256': hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()}
 
 
+def _message_abi(message_type, instrumentation=None):
+    """One receipt constructor for binding assembly and per-take revalidation."""
+    abi = verify_abi() if instrumentation is None else verify_abi(instrumentation=instrumentation)
+    if message_type == 'std_msgs/msg/UInt8MultiArray':
+        for relative, expected in _ARRAY_PINS.items():
+            try:
+                actual = hashlib.sha256((PREFIX / relative).read_bytes()).hexdigest()
+            except OSError as exc:
+                raise BridgeUnavailable('array_abi_file_unavailable:' + relative) from exc
+            if actual != expected:
+                raise BridgeUnavailable('array_abi_file_hash_mismatch:' + relative)
+        abi['array_generated_support'] = dict(_ARRAY_PINS)
+        abi['pin_sha256'] = hashlib.sha256(json.dumps(
+            [abi['pin_sha256'], _ARRAY_PINS], sort_keys=True).encode()).hexdigest()
+    return abi
+
+
 def _verify_loaded_libraries(instrumentation=None):
     """Keep every installed path gate; only explicit vendor selection differs."""
     _, paths, reference, _ = _pin_selection(instrumentation)
@@ -211,12 +228,12 @@ def _bind(library, name, args, result):
 
 class _Bindings:
     def __init__(self, rmw_identifier, instrumentation=None, message_type='std_msgs/msg/String'):
+        _bridge_options(message_type, instrumentation)
         if rmw_identifier != RMW_IDENTIFIER:
             raise BridgeUnavailable('unsupported_rmw_identifier:' + str(rmw_identifier))
         self.instrumentation = deepcopy(instrumentation)
         # Preserve the blackbox call shape as well as its unchanged pin digest.
-        self.abi = (verify_abi() if self.instrumentation is None else
-                    verify_abi(instrumentation=self.instrumentation))
+        self.abi = _message_abi(message_type, self.instrumentation)
         try:
             # Absolute paths; retain CDLLs throughout the bridge's lifetime.
             self.libs = {name: C.CDLL(str(PREFIX / ('lib/lib' + name + '.so')))
@@ -231,11 +248,6 @@ class _Bindings:
             self.fini = _bind(generator, 'std_msgs__msg__String__fini',
                               [C.POINTER(_String)], None)
             if message_type == 'std_msgs/msg/UInt8MultiArray':
-                if instrumentation is not None:
-                    raise BridgeUnavailable('instrumented_array_take_not_qualified')
-                for relative, expected in _ARRAY_PINS.items():
-                    if hashlib.sha256((PREFIX / relative).read_bytes()).hexdigest() != expected:
-                        raise BridgeUnavailable('array_abi_file_hash_mismatch:' + relative)
                 from std_msgs.msg import UInt8MultiArray
                 UInt8MultiArray.__class__.__import_type_support__()
                 # Same generated converter used by rclpy. PYFUNCTYPE retains the
@@ -252,9 +264,6 @@ class _Bindings:
                                           [], C.c_void_p)
                 self.array_destroy = _bind(generator, 'std_msgs__msg__UInt8MultiArray__destroy',
                                            [C.c_void_p], None)
-                self.abi['array_generated_support'] = dict(_ARRAY_PINS)
-                self.abi['pin_sha256'] = hashlib.sha256(json.dumps(
-                    [self.abi['pin_sha256'], _ARRAY_PINS], sort_keys=True).encode()).hexdigest()
             self.reset_error = _bind(self.libs['rcutils'], 'rcutils_reset_error', [], None)
             self.error_string = _bind(self.libs['rcutils'], 'rcutils_get_error_string',
                                       [], _ErrorString)
@@ -325,7 +334,16 @@ def _bridge_options(message_type, instrumentation):
     if message_type not in ('std_msgs/msg/String', 'std_msgs/msg/UInt8MultiArray'):
         raise BridgeUnavailable('native_take_message_type_not_supported')
     if instrumentation is not None and message_type != 'std_msgs/msg/String':
-        raise BridgeUnavailable('instrumented_array_take_not_qualified')
+        # Only the explicit, independently qualified local-API build is in the
+        # array scope. Legacy peer/filter/PDP builds retain their String scope.
+        from r2f.instrumentation.fastdds_peer.activation import manifest_for_reference
+        try:
+            manifest = manifest_for_reference(instrumentation)
+            if ('local_api' not in manifest or manifest.get('filter_trace') is not None
+                    or manifest.get('pdp_trace') is not None):
+                raise ValueError('array_requires_local_api_without_trace_extensions')
+        except (ValueError, OSError, TypeError, KeyError) as exc:
+            raise BridgeUnavailable('instrumented_array_take_not_qualified:' + str(exc)) from exc
     options = {}
     if instrumentation is not None:
         options['instrumentation'] = instrumentation
@@ -374,7 +392,7 @@ class RclTakeBridge:
     def _revalidate_instrumentation(self):
         if self.instrumentation is None:
             return
-        fresh = verify_abi(instrumentation=self.instrumentation)
+        fresh = _message_abi(self.message_type, self.instrumentation)
         if (fresh['pin_sha256'] != self.abi_receipt['pin_sha256']
                 or fresh['manifest_reference'] != self.abi_receipt['manifest_reference']):
             raise BridgeUnavailable('bridge_instrumentation_identity_changed')

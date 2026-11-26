@@ -85,3 +85,32 @@ def test_explicit_binding_rechecks_companion_source_before_returning_function(bu
     Path(value['local_api']['source_snapshot']).write_bytes(b'labelled source drift')
     with pytest.raises(ValueError, match='local_api'):
         binding.local_api()
+
+
+def test_explicit_local_api_array_binds_public_topology_input(build_manifest):
+    from r2f.runtime.topology_pair import build_input_receipts
+    from test_topology_pair import CFG, action, endpoint, program
+    path, _ = extension_manifest(build_manifest)
+    config = dict(CFG, rmw='rmw_fastrtps_cpp', observation_mode='instrumentation',
+                  fastdds_peer_instrumentation={'manifest_path': str(path),
+                                               'manifest_sha256': probe.file_hash(path)})
+    spec = endpoint('w0', 'writer', type_name='std_msgs/msg/UInt8MultiArray')
+    receipts = build_input_receipts(program([spec], [action('create', 'create', 'w0', 1)]), config)
+    row, = receipts['endpoints']
+    assert row['binding_status'] == 'expressible', row
+    assert row['binding']['message_type_support']['type_name'] == 'std_msgs/msg/UInt8MultiArray'
+    assert receipts['execution_evidence'] is False
+
+
+def test_legacy_peer_array_remains_outside_public_instrumentation_scope(build_manifest):
+    from r2f.runtime.topology_pair import build_input_receipts
+    from test_topology_pair import CFG, action, endpoint, program
+    path, _ = build_manifest
+    config = dict(CFG, rmw='rmw_fastrtps_cpp', observation_mode='instrumentation',
+                  fastdds_peer_instrumentation={'manifest_path': str(path),
+                                               'manifest_sha256': probe.file_hash(path)})
+    spec = endpoint('r0', 'reader', type_name='std_msgs/msg/UInt8MultiArray')
+    receipts = build_input_receipts(program([spec], [action('create', 'create', 'r0', 1)]), config)
+    row, = receipts['endpoints']
+    assert row['binding_status'] == 'not_expressible'
+    assert row['reason'] == 'instrumented_message_type_not_expressible'

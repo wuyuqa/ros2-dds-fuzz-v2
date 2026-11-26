@@ -328,3 +328,94 @@ def test_array_executor_explicitly_rejects_unqualified_instrumentation_before_na
         b.make_full_info_executor(message_type='std_msgs/msg/UInt8MultiArray',
                                   instrumentation={'manifest': 'unqualified-control'})
     b.verify_abi.assert_not_called()
+
+
+def test_explicit_local_api_array_uses_one_take_and_revalidates_source(installation, monkeypatch):
+    """The generated array body and native identity survive the existing bridge."""
+    from test_fastdds_local_api_build import extension_manifest
+    from test_rcl_take_bridge import ArrayNative, UInt8MultiArray
+    i = installation
+    extension_manifest((i.manifest_path, i.manifest))
+    reference = dict(i.reference, manifest_sha256=digest(i.manifest_path))
+    array_pins = {}
+    for relative in b._ARRAY_PINS:
+        path = i.prefix / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(('offline-generated-array:' + relative).encode())
+        array_pins[relative] = digest(path)
+    monkeypatch.setattr(b, '_ARRAY_PINS', array_pins)
+    handle = Handle()
+    native = ArrayNative(handle)
+    native.abi = b._message_abi('std_msgs/msg/UInt8MultiArray', reference)
+    bridge = b.RclTakeBridge(message_type='std_msgs/msg/UInt8MultiArray',
+                             instrumentation=reference, _bindings=native,
+                             _array_type=UInt8MultiArray)
+    subscription = SimpleNamespace(handle=handle, msg_type=UInt8MultiArray, raw=False)
+    message, info = bridge.take(subscription)
+    assert message.data == [0, 255, 97, 114, 114, 97, 121, 32, 112, 97, 121, 108, 111, 97, 100]
+    assert info['publisher_gid'] == bytes.fromhex('010f7f014c00961e0000000000000603')
+    assert info['publication_sequence_number'] == 3
+    assert info['rcl_take_receipt']['instrumentation']['manifest_reference'] == reference
+    assert native.calls == ['array_create', ('take', 0x1000), 'array_convert', 'array_destroy']
+    before = list(native.calls)
+    Path(i.manifest['local_api']['source_snapshot']).write_bytes(b'labelled changed local API source')
+    with pytest.raises(b.BridgeUnavailable, match='instrumentation_manifest_unavailable'):
+        bridge.take(subscription)
+    assert native.calls == before
+    bridge.close()
+
+
+def test_local_array_native_loader_receipt_matches_revalidation(installation, monkeypatch):
+    """Exercise real binding assembly; replace only loader/generated C boundaries."""
+    from test_fastdds_local_api_build import extension_manifest
+    from test_rcl_take_bridge import ArrayNative, UInt8MultiArray
+    i = installation
+    extension_manifest((i.manifest_path, i.manifest))
+    reference = dict(i.reference, manifest_sha256=digest(i.manifest_path))
+    array_pins = {}
+    for relative in b._ARRAY_PINS:
+        path = i.prefix / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(('offline-generated-array:' + relative).encode())
+        array_pins[relative] = digest(path)
+    monkeypatch.setattr(b, '_ARRAY_PINS', array_pins)
+    handle = Handle()
+    boundary = ArrayNative(handle)
+    loader, functions = fake_loader(monkeypatch)
+    functions['rcl_take'].side_effect = boundary.take
+    functions['std_msgs__msg__UInt8MultiArray__create'] = Mock(side_effect=boundary.array_create)
+    functions['std_msgs__msg__UInt8MultiArray__destroy'] = Mock(side_effect=boundary.array_destroy)
+    loader.return_value = SimpleNamespace(**functions)
+    class Meta(type):
+        _CONVERT_TO_PY = object()
+        @classmethod
+        def __import_type_support__(cls):
+            return None
+    class Array(UInt8MultiArray, metaclass=Meta):
+        pass
+    module = ModuleType('std_msgs.msg')
+    module.UInt8MultiArray = Array
+    monkeypatch.setitem(sys.modules, 'std_msgs', ModuleType('std_msgs'))
+    monkeypatch.setitem(sys.modules, 'std_msgs.msg', module)
+    capsule_pointer = Mock(return_value=0x3000)
+    monkeypatch.setattr(b.C.pythonapi, 'PyCapsule_GetPointer', capsule_pointer)
+    def convert(pointer):
+        observed = boundary.array_convert(pointer)
+        value = Array()
+        value.data, value.layout = observed.data, observed.layout
+        return value
+    monkeypatch.setattr(b.C, 'PYFUNCTYPE', Mock(return_value=Mock(return_value=convert)))
+    bridge = b.RclTakeBridge(message_type='std_msgs/msg/UInt8MultiArray',
+                             instrumentation=reference, _array_type=Array)
+    assert bridge.abi_receipt['array_generated_support'] == array_pins
+    subscription = SimpleNamespace(handle=handle, msg_type=Array, raw=False)
+    message, info = bridge.take(subscription)
+    assert message.data == [0, 255, 97, 114, 114, 97, 121, 32, 112, 97, 121, 108, 111, 97, 100]
+    assert info['publisher_gid'] == bytes.fromhex('010f7f014c00961e0000000000000603')
+    assert boundary.calls == ['array_create', ('take', 0x1000), 'array_convert', 'array_destroy']
+    before = list(boundary.calls)
+    (i.prefix / next(iter(array_pins))).write_bytes(b'labelled generated support drift')
+    with pytest.raises(b.BridgeUnavailable, match='array_abi_file_hash_mismatch'):
+        bridge.take(subscription)
+    assert boundary.calls == before
+    bridge.close()

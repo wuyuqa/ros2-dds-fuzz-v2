@@ -652,6 +652,19 @@ def _create_reader_with_initial_filter(node, message_type, topic, callback, qos,
     return endpoint, observed
 
 
+def _require_instrumented_message_type(type_name, config):
+    if config.get("observation_mode") != "instrumentation" or type_name == SUPPORTED_MESSAGE_TYPE:
+        return
+    try:
+        if config.get("rmw") != "rmw_fastrtps_cpp":
+            raise ValueError("instrumented_array_requires_fastdds")
+        from r2f.instrumentation.fastdds_peer.activation import reference_from_config
+        from .rcl_take_bridge import _bridge_options
+        _bridge_options(type_name, reference_from_config(config))
+    except (ValueError, RuntimeError, OSError, TypeError) as exc:
+        raise TopologyUnsupported("instrumented_message_type_not_expressible", str(exc)) from exc
+
+
 def endpoint_expressibility(spec, config):
     """Translate model endpoint fields into the exact public-rclpy input.
 
@@ -675,9 +688,7 @@ def endpoint_expressibility(spec, config):
     if "filter" in spec and type_name != SUPPORTED_MESSAGE_TYPE:
         raise TopologyUnsupported("content_filter_message_type_not_expressible",
                                   "content filters require std_msgs/msg/String.data")
-    if config.get("observation_mode") == "instrumentation" and type_name != SUPPORTED_MESSAGE_TYPE:
-        raise TopologyUnsupported("instrumented_message_type_not_expressible",
-                                  "pinned instrumented take requires std_msgs/msg/String")
+    _require_instrumented_message_type(type_name, config)
     initial_filter = (_initial_content_filter(spec["filter"], role)
                       if "filter" in spec else None)
     qos = spec.get("qos")
@@ -1490,8 +1501,7 @@ def _worker_main(argv, group_owner=None):
     if (group_owner is not None and instrumentation is not None
             and manifest_for_reference(instrumentation).get("pdp_trace") is not None):
         raise TopologyUnsupported("pdp_trace_requires_one_context_and_consumer_per_worker_process")
-    if instrumentation is not None and config["type_name"] != SUPPORTED_MESSAGE_TYPE:
-        raise TopologyUnsupported("instrumented_message_type_not_expressible")
+    _require_instrumented_message_type(config["type_name"], config)
     from .participant_identity import emit_identity_probe
     if group_owner is None:
         emit_identity_probe(config, _monotonic_clock_identity())
