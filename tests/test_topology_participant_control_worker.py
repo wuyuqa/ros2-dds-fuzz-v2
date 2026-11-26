@@ -504,3 +504,74 @@ def test_public_worker_rejects_future_snapshot_identity_without_rebinding(monkey
     created = [e for e in events if e['event'] == 'endpoint_created']
     assert len(created) == 1 and created[0]['generation'] == 1
     assert not any(e['event'] == 'command_done' and e.get('command_id') == 2 for e in events)
+
+
+@pytest.mark.parametrize('mapping_valid,bridge_available', [(True, True), (False, True), (True, False)])
+def test_fastdds_group_keeps_verified_vendor_identity_in_endpoint_raw(monkeypatch, mapping_valid, bridge_available):
+    """Public worker JSONL seam; ROS, mappings and manifest are external doubles."""
+    cfg = group_config()
+    cfg.update(rmw='rmw_fastrtps_cpp', observation_mode='instrumentation',
+               fastdds_peer_instrumentation={'manifest_path': '/fixture/peer.json',
+                                             'manifest_sha256': 'a' * 64})
+    reference = {'observation_mode': 'instrumentation', **cfg['fastdds_peer_instrumentation']}
+    identity = {'schema': 'r2f.fastdds-worker-vendor-identity/v1',
+                'observation_mode': 'instrumentation', 'manifest_reference': reference,
+                'path': '/fixture/libfastrtps.so', 'sha256': 'b' * 64,
+                'device': '08:02', 'inode': 7, 'identity_verified': True,
+                'membership_verified': False, 'candidate_eligible': False}
+    selected = {'binaries': {'vendor': {'path': identity['path'], 'sha256': identity['sha256']},
+                             'provider': {'path': '/fixture/peer.so', 'sha256': 'c' * 64}},
+                'provider_source_sha256': 'd' * 64, 'patch': {'abi': {'fixture': True}}}
+    commands = [create('w0', 1), create('r0', 2), {'command': 'stop', 'command_id': 3}]
+    with ros_fixture(monkeypatch, commands) as (calls, entities, stream):
+        activation = sys.modules['r2f.instrumentation.fastdds_peer.activation']
+        activation.reference_from_config = lambda config: reference
+        activation.manifest_for_reference = lambda ref: selected
+        def verify(ref):
+            assert ref == reference
+            calls.append('verified_vendor_mapping')
+            if not mapping_valid:
+                raise RuntimeError('fixture_selected_vendor_mapping_mismatch')
+            return dict(identity)
+        activation.verify_vendor_mapping = verify
+        from r2f.runtime import rcl_take_bridge
+        abi = {'fixture': True, 'pin_sha256': 'e' * 64}
+        def full_info_executor(**kwargs):
+            assert kwargs['context'].get_domain_id() == 173
+            assert set(kwargs) == {'context', 'rmw_identifier', 'instrumentation'}
+            assert kwargs['rmw_identifier'] == cfg['rmw']
+            assert kwargs['instrumentation'] == reference
+            calls.append('full_info_executor')
+            if not bridge_available:
+                raise rcl_take_bridge.BridgeUnavailable('fixture_group_take_abi_unavailable')
+            executor = sys.modules['rclpy.executors'].SingleThreadedExecutor(context=kwargs['context'])
+            executor.take_bridge = SimpleNamespace(abi_receipt=abi, close=lambda: calls.append('bridge_close'))
+            return executor
+        monkeypatch.setattr(rcl_take_bridge, 'make_full_info_executor', full_info_executor)
+        monkeypatch.setattr(sys.modules['rclpy'], 'get_rmw_implementation_identifier',
+                            lambda: 'rmw_fastrtps_cpp')
+        monkeypatch.setattr(sys, 'argv', ['worker', json.dumps(cfg), 'writer'])
+        rc = worker.worker_main()
+    events = [json.loads(line) for line in stream.getvalue().splitlines()]
+    declarations = [e for e in events if e['event'] == 'native_peer_provider_selected']
+    assert calls.count('verified_vendor_mapping') == 1
+    assert calls.count('context') == calls.count('shutdown') == 1
+    assert calls.count('full_info_executor') == int(mapping_valid)
+    if mapping_valid and bridge_available:
+        assert rc == 0, events
+        assert calls.count('bridge_close') == 1
+        assert [e['logical_id'] for e in declarations] == ['w0', 'r0']
+        assert all(e['vendor_identity'] == identity for e in declarations)
+        assert all(e['candidate_eligible'] is False for e in declarations)
+        assert len({e['endpoint_generation'] for e in declarations}) == 2
+        info = [e for e in events if e['event'] == 'topology_message_info_capability']
+        assert len(info) == 1 and info[0]['status'] == 'observed'
+        assert info[0]['abi'] == abi
+        assert info[0]['original_rclpy_dict_provided_gid'] is False
+    else:
+        assert rc == 1
+        assert not declarations
+        assert not any(e['event'] == 'endpoint_created' for e in events)
+        reason = ('fixture_selected_vendor_mapping_mismatch' if not mapping_valid
+                  else 'fixture_group_take_abi_unavailable')
+        assert reason in events[-1]['error']

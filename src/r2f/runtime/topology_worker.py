@@ -1567,9 +1567,8 @@ def _worker_main(argv, group_owner=None):
         start_ticks = group_owner['process_start_ticks']
         node_name = group_owner['node_name']
         node_token = uuid.uuid4().hex
-        take_capability = {'status': 'unavailable', 'reason': 'cyclone_public_message_info',
-                           'original_rclpy_dict_provided_gid': False}
-        vendor_identity = None
+        take_capability = group_owner['take_capability']
+        vendor_identity = group_owner['vendor_identity']
     local_gid = None
     native_peer_observer = None
     filter_decision_observer = None
@@ -2227,7 +2226,7 @@ def _group_worker_main(argv):
     sessions, errors = {}, []
     generations = {}
     ticks = int(Path('/proc/self/stat').read_text().rsplit(')', 1)[1].split()[19])
-    rmw = observed_domain = None
+    rmw = observed_domain = vendor_identity = None
     def emit(event, **fields):
         row = {'event': event, 'pid': os.getpid(), 'pgid': os.getpgrp(),
                'process_start_ticks': ticks, 'run_id': config['run_id'],
@@ -2247,15 +2246,30 @@ def _group_worker_main(argv):
             raise TopologyBackendError('group_context_observed_rmw_domain_mismatch')
         if rmw == 'rmw_fastrtps_cpp':
             from r2f.instrumentation.fastdds_peer.activation import reference_from_config, verify_vendor_mapping
-            verify_vendor_mapping(reference_from_config(config))
+            vendor_identity = verify_vendor_mapping(reference_from_config(config))
         emit('group_context_created', api='rclpy.context.Context+rclpy.init', ros_context_created=True)
         node_name = 'r2f_group_' + uuid.uuid4().hex[:16]
         node = Node(node_name, context=context, enable_rosout=False, start_parameter_services=False)
-        executor = SingleThreadedExecutor(context=context)
+        take_capability = {'status': 'unavailable', 'reason': 'cyclone_public_message_info',
+                           'original_rclpy_dict_provided_gid': False}
+        if rmw == 'rmw_fastrtps_cpp':
+            from .rcl_take_bridge import make_full_info_executor, BridgeUnavailable
+            try:
+                executor = make_full_info_executor(context=context, rmw_identifier=rmw,
+                    instrumentation=reference_from_config(config))
+            except BridgeUnavailable as exc:
+                raise TopologyBackendError('instrumented_take_bridge_unavailable:' + str(exc)) from exc
+            take_capability = {'status': 'observed', 'reason': None,
+                               'observation_basis': 'single_take_owner_public_rcl_api',
+                               'original_rclpy_dict_provided_gid': False,
+                               'abi': executor.take_bridge.abi_receipt}
+        else:
+            executor = SingleThreadedExecutor(context=context)
         executor.add_node(node)
         owner = dict(context=context, node=node, executor=executor, rmw_identifier=rmw,
                      observed_domain_id=observed_domain, process_start_ticks=ticks,
-                     node_name=node_name, emit=emit, sessions=sessions, retired_gids=set())
+                     node_name=node_name, emit=emit, sessions=sessions, retired_gids=set(),
+                     vendor_identity=vendor_identity, take_capability=take_capability)
         emit('group_worker_ready', node_name=node_name)
         buffer = b''
         serial = 0
