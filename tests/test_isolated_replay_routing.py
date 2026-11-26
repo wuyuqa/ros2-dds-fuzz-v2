@@ -50,6 +50,66 @@ class IsolatedReplayRouting(_ReplayFixtures):
         self.assertFalse(report['real_ros_execution'])
         self.assertTrue(replay.audit_replay(report['report_path'])['valid'])
 
+    def test_explicit_boundary_budget_is_fresh_audited_metadata(self):
+        capsule, path = self.case()
+        options = {'timeout_sec': 600, 'startup_timeout_sec': 40}
+        before = copy.deepcopy(capsule.input)
+        with patch('r2f.runtime.execution_boundary.run_isolated_runtime', side_effect=blocked) as runtime:
+            report = replay.replay_cell(
+                path, output_dir=self.root / 'budget-replay', domain_id=81,
+                runtime_boundary='isolated_netns', boundary_options=options)
+        self.assertEqual(runtime.call_args.args[0]['execution_boundary'], dict(options, enabled=True))
+        self.assertEqual(report['boundary_options'], options)
+        self.assertEqual(capsule.input, before)
+        self.assertTrue(replay.audit_replay(report['report_path'])['valid'])
+        self.assert_immutable()
+        root = Path(report['report_path']).parent
+        request = json.loads((root / 'request.json').read_text())
+        request['boundary_options']['timeout_sec'] = 999
+        (root / 'request.json').write_text(json.dumps(request))
+        self.assertFalse(replay.audit_replay(report['report_path'])['valid'])
+
+    def test_invalid_boundary_budgets_are_rejected_before_reserving_output(self):
+        _, path = self.case()
+        cases = [('host', {'timeout_sec': 600}), ('isolated_netns', '600'),
+                 ('isolated_netns', {'enabled': False}),
+                 ('isolated_netns', {'timeout_sec': False}),
+                 ('isolated_netns', {'timeout_sec': 0}),
+                 ('isolated_netns', {'timeout_sec': float('inf')}),
+                 ('isolated_netns', {'unknown': 1})]
+        for i, (boundary, options) in enumerate(cases):
+            with self.subTest(boundary=boundary, options=options):
+                output = self.root / ('bad-budget-' + str(i))
+                with self.assertRaises(ValueError):
+                    replay.replay_cell(path, output_dir=output, domain_id=81,
+                                       runtime_boundary=boundary, boundary_options=options)
+                self.assertFalse(output.exists())
+        self.assert_immutable()
+
+    def test_resigned_request_budget_type_aliases_are_rejected(self):
+        for key, original_value, forged_value in [('enabled', True, 1), ('timeout_sec', 1, True)]:
+            with self.subTest(key=key):
+                _, path = self.case()
+                options = {'enabled': True, 'timeout_sec': 600}
+                options[key] = original_value
+                with patch('r2f.runtime.execution_boundary.run_isolated_runtime', side_effect=blocked):
+                    report = replay.replay_cell(
+                        path, output_dir=self.root / ('alias-' + key), domain_id=81,
+                        runtime_boundary='isolated_netns', boundary_options=options)
+                self.assertTrue(replay.audit_replay(report['report_path'])['valid'])
+                root = Path(report['report_path']).parent
+                request_path = root / 'request.json'
+                request = json.loads(request_path.read_text())
+                request['boundary_options'][key] = forged_value
+                request_path.write_text(json.dumps(request))
+                report['artifacts']['request.json'] = raw_sha256(request_path)
+                report['report_sha256'] = replay._digest(report)
+                Path(report['report_path']).write_text(json.dumps(report))
+                audited = replay.audit_replay(report['report_path'])
+                self.assertFalse(audited['valid'])
+                self.assertIn('request/report identity mismatch:boundary_options', audited['errors'])
+                self.assert_immutable()
+
     def test_explicit_exact_isolated_callable_is_not_mislabelled_injected(self):
         _, path = self.case()
         report, _ = self.isolated(path, explicit=True)

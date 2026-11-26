@@ -52,9 +52,11 @@ def model_profile():
 
 
 @pytest.fixture
-def four_rows(model_profile, tmp_path, monkeypatch):
+def four_rows(model_profile, tmp_path, monkeypatch, request):
     root = tmp_path / 'report'
     doc = deepcopy(model_profile)
+    if hasattr(request, "param"):
+        doc["execution_boundary"] = deepcopy(request.param)
     source = dict(source_repo=str(repo_root()), head='a' * 40, behavior_tree_sha256='b' * 64,
                   source_frozen=True, dirty_behavior_paths=[])
     corpus = corpus_from_profile(doc, cycle_id='topology-authored')
@@ -87,7 +89,9 @@ def four_rows(model_profile, tmp_path, monkeypatch):
                 continue
             cfgpath = Path(row['runtime_config_path'])
             cfg = read(cfgpath)
-            cfg.update(execution_boundary={'enabled': True}, live_execution_go=True)
+            options = doc.get('execution_boundary')
+            cfg.update(execution_boundary=dict(options if isinstance(options, dict) else {}, enabled=True),
+                       live_execution_go=True)
             write(cfgpath, cfg)
             runtime = Path(row['runtime_result_path']).parent
             runtime.mkdir()
@@ -390,3 +394,17 @@ def test_malformed_resigned_checkpoint_is_invalid_not_exception(four_rows, damag
     row = report['rows'][3] if damage == 'cyclic_parent' else report['rows'][0]
     assert not audit._verify_exploratory_row(root, row, report, errors)
     assert errors
+
+
+@pytest.mark.parametrize('four_rows', [
+    {'enabled': True, 'timeout_sec': 600, 'startup_timeout_sec': 40},
+], indirect=True)
+def test_declared_profile_boundary_budget_is_audited(four_rows):
+    result = run_audit(four_rows)
+    assert result['evidence_valid'], result['errors']
+    root, report = four_rows
+    row = report['rows'][1]
+    config = read(row['runtime_config_path'])
+    config['execution_boundary']['timeout_sec'] = 999
+    write(row['runtime_config_path'], config)
+    assert not run_audit(four_rows)['evidence_valid']

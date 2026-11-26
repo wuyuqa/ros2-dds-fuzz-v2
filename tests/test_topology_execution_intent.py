@@ -278,3 +278,25 @@ def test_required_canonical_path_keeps_default_non_topology_config(tmp_path, bou
     assert len(seen) == 1 and "live_execution_go" not in seen[0]
     if boundary == runner.ISOLATED_RUNTIME:
         assert seen[0]["execution_boundary"] == {"enabled": True}
+
+
+def test_profile_boundary_budget_reaches_persisted_execution_copy(tmp_path):
+    """A declared isolation budget is metadata; the capsule stays deterministic."""
+    options = {"enabled": True, "timeout_sec": 600, "startup_timeout_sec": 40}
+    doc = profile(1)
+    plain = cycle(tmp_path / "plain", runner.ISOLATED_RUNTIME, execute=False,
+                  runtime=runner.runtime_for_boundary(runner.ISOLATED_RUNTIME))
+    doc["execution_boundary"] = deepcopy(options)
+    with patch.object(runner, "source_manifest", return_value=deepcopy(SOURCE)), \
+         patch("r2f.reports.run_report.source_manifest", return_value=deepcopy(SOURCE)):
+        result = runner.run_exploratory_cycle(
+            tmp_path / "budget", **fresh(doc), profile=doc, max_inputs=1,
+            runtime=runner.runtime_for_boundary(runner.ISOLATED_RUNTIME), execute=False,
+            run_id="topology-intent-offline", domain_id=80,
+            runtime_boundary=runner.ISOLATED_RUNTIME)
+    row, = result["rows"]
+    config = json.loads(Path(row["runtime_config_path"]).read_text())
+    assert config["execution_boundary"] == options
+    assert Path(row["replay_path"]).read_bytes() == Path(plain["rows"][0]["replay_path"]).read_bytes()
+    assert row["effective_input_sha256"] == plain["rows"][0]["effective_input_sha256"]
+    assert doc["execution_boundary"] == options

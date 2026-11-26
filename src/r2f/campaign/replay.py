@@ -267,7 +267,23 @@ def _observation_replay_declaration(capsule, config):
             'input_identity_unchanged': True}
 
 
-def _replay_config(capsule, replay_id, domain, source):
+def _validated_boundary_options(value, runtime_boundary):
+    """Validate fresh execution metadata identically at entry and artifact audit."""
+    if value is None:
+        return None
+    if runtime_boundary != 'isolated_netns' or not isinstance(value, dict):
+        raise ValueError('boundary_options requires isolated_netns and an options object')
+    from .runner import _boundary_execution_config
+    from r2f.runtime.execution_boundary import BoundaryError, _options
+    checked = _boundary_execution_config({'execution_boundary': value}, runtime_boundary)
+    try:
+        _options(checked['execution_boundary'])  # pure; no runtime or namespace entry
+    except BoundaryError as exc:
+        raise ValueError(str(exc)) from exc
+    return _copy_json(value)
+
+
+def _replay_config(capsule, replay_id, domain, source, *, boundary_options=None):
     """Project sealed input/plan plus verified original observation execution mode.
 
     The default run_pair is already the exact-id dispatcher for endpoint,
@@ -293,6 +309,8 @@ def _replay_config(capsule, replay_id, domain, source):
         evidence_purpose='normal_conformance_replay',
         control_kind='fault' if scenario.arm == 'negative' else None)
     execution.update(observation)  # execution-only; never part of effective input
+    if boundary_options is not None:
+        execution["execution_boundary"] = _copy_json(boundary_options)
     if set(final) & set(execution):
         raise ValueError('submitted input shadows replay execution metadata: '
                          + ','.join(sorted(set(final) & set(execution))))
@@ -1067,7 +1085,7 @@ def _qualification(origin, config, result, row, *, output_root=None):
 
 
 def replay_cell(capsule_path, *, output_dir, domain_id, runtime=None,
-                runtime_boundary='host', episode_checkpoint=None) -> dict:
+                runtime_boundary='host', episode_checkpoint=None, boundary_options=None) -> dict:
     """Replay an unchanged capsule into a fresh evidence directory and domain.
 
     output_dir must be empty and outside the original run. Source must match the
@@ -1078,6 +1096,7 @@ def replay_cell(capsule_path, *, output_dir, domain_id, runtime=None,
     if runtime_boundary not in ('host', 'isolated_netns'):
         raise ValueError('unsupported runtime_boundary: ' + repr(runtime_boundary))
     from .runner import _resolve_execution_runtime, _runtime_execution_config
+    boundary_options = _validated_boundary_options(boundary_options, runtime_boundary)
     runtime, formal = _resolve_execution_runtime(runtime, runtime_boundary)
     origin = (ISOLATED_RUNTIME if runtime_boundary == 'isolated_netns' else DEFAULT_RUNTIME) \
         if formal else 'injected_runtime'
@@ -1086,6 +1105,8 @@ def replay_cell(capsule_path, *, output_dir, domain_id, runtime=None,
     request = {'schema': SCHEMA, 'replay_id': replay_id, 'capsule_path': str(capsule_path),
                'domain_id': domain_id, 'execution_origin': origin,
                'runtime_boundary': runtime_boundary, 'timestamp': utc_now()}
+    if boundary_options is not None:
+        request['boundary_options'] = boundary_options
     if episode_checkpoint is not None:
         if not isinstance(episode_checkpoint, str) or not episode_checkpoint.strip():
             raise ValueError('episode_checkpoint must be a nonempty action id')
@@ -1143,7 +1164,7 @@ def replay_cell(capsule_path, *, output_dir, domain_id, runtime=None,
         def runner(scenario, domain):
             try:
                 config = _runtime_execution_config(
-                    _replay_config(capsule, replay_id, domain, before), execute=True,
+                    _replay_config(capsule, replay_id, domain, before, boundary_options=boundary_options), execute=True,
                     runtime=runtime, runtime_boundary=runtime_boundary)
                 if episode_checkpoint is not None:
                     if capsule.input['target_id'] != _TOPOLOGY_TARGET:
@@ -1325,8 +1346,8 @@ def audit_replay(report_path) -> dict:
         request = _json(root / 'request.json')
         if report.get('episode_checkpoint') != request.get('episode_checkpoint'):
             errors.append('request/report identity mismatch:episode_checkpoint')
-        for key in ('replay_id', 'domain_id', 'execution_origin'):
-            if report.get(key) != request.get(key):
+        for key in ('replay_id', 'domain_id', 'execution_origin', 'boundary_options'):
+            if canonical_hash(report.get(key)) != canonical_hash(request.get(key)):
                 errors.append('request/report identity mismatch:' + key)
         # Missing boundary fields in historical host reports mean host only.
         boundary = report.get('runtime_boundary', 'host')
@@ -1475,8 +1496,10 @@ def _check_audit_config(root, original, report, errors):
     # invocation. Intent is reconstructed from report/request canonical origin,
     # not a user-supplied config bool; audit_replay separately binds request,
     # attempt, source snapshots and runtime artifacts/qualification.
+    boundary_options = _validated_boundary_options(report.get('boundary_options'), boundary)
     expected = _runtime_execution_config(
-        _replay_config(original, report['replay_id'], report['domain_id'], original.input['source_manifest']),
+        _replay_config(original, report['replay_id'], report['domain_id'], original.input['source_manifest'],
+                       boundary_options=boundary_options),
         execute=True, runtime=runtime_for_boundary(boundary) if formal else None,
         runtime_boundary=boundary)
     if report.get('episode_checkpoint') is not None:

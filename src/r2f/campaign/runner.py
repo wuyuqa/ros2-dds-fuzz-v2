@@ -2690,6 +2690,10 @@ def _generate_case(sequence, entry, target, contract, surface, parent, mutator_i
             runtime_boundary=runtime_boundary, profile=profile, sampling_kind=sampling_kind,
             selection=selection, observation_mode=config.get("observation_mode", "black_box"))
         row["recipe_tool_failure_policy"] = scheduler.recipe_submission_policy(row["generation_recipe"])
+    if runtime_boundary == ISOLATED_RUNTIME and "execution_boundary" in profile:
+        # Execution budgets are profile metadata, outside the deterministic
+        # submitted-input binding. The boundary helper validates their shape.
+        config["execution_boundary"] = deepcopy(profile["execution_boundary"])
     config = _runtime_execution_config(
         config, execute=execute, runtime=runtime, runtime_boundary=runtime_boundary)
     qualification = execution_boundary_qualification(runtime_boundary, config=config)

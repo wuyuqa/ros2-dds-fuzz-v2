@@ -979,7 +979,16 @@ def _verify_topology_binding(config, plan, row, report):
     normalized = dict(config)
     boundary = report.get("runtime_boundary", "host")
     if boundary == "isolated_netns":
-        if normalized.pop("execution_boundary", None) != {"enabled": True}:
+        declared = profile.get("execution_boundary")
+        expected_boundary = {"enabled": True}
+        if isinstance(declared, dict):
+            allowed = {"enabled", "timeout_sec", "term_grace_sec", "kill_wait_sec", "startup_timeout_sec"}
+            if set(declared) - allowed or declared.get("enabled", True) is not True:
+                raise ValueError("topology_binding_execution_boundary_mismatch")
+            expected_boundary.update(declared)
+        elif declared is not None and not isinstance(declared, str):
+            raise ValueError("topology_binding_execution_boundary_mismatch")
+        if canonical_hash(normalized.pop("execution_boundary", None)) != canonical_hash(expected_boundary):
             raise ValueError("topology_binding_execution_boundary_mismatch")
     elif boundary != "host" or "execution_boundary" in normalized:
         raise ValueError("topology_binding_execution_boundary_mismatch")
