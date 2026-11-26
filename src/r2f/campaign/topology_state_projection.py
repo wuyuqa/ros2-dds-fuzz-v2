@@ -460,8 +460,9 @@ class _Projection:
                     from r2f.runtime.participant_groups import (
                         LINK_KEYS, _validate_shared_process, validate_control,
                     )
-                    if (native_declared or source != "dds_matched_endpoint_api"
-                            or validate_control(self.program) is None):
+                    # Native membership is already qualified above; sharing a
+                    # PID separately requires the same bounded group lineage.
+                    if validate_control(self.program) is None:
                         raise ValueError("direct_peer_scope_identity_alias_or_missing:pid")
                     # Authenticate only the raw prefix through this snapshot ACK.
                     # A later group binding or clean shutdown cannot repair it.
