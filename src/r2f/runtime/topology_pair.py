@@ -440,6 +440,16 @@ def _occurrence_pair_with_control(pair, receive, events):
                and not strictly_after_sample(row, receive) for row in events):
             continue
         controls.append(created)
+    if receive is not None:
+        # An explicitly unfiltered receiver can authenticate its own sample;
+        # this is one receive, not an independent filtering control. Other
+        # unfiltered readers do not make that identity ambiguous. Filtered
+        # targets and receive-free callers still need a unique external control.
+        self_controls = [created for created in controls
+                         if created.get("logical_id") == pair.get("reader") == receive.get("logical_id")
+                         and created.get("generation") == pair.get("reader_generation") == receive.get("generation")]
+        if len(self_controls) == 1:
+            controls = self_controls
     if len(controls) != 1:
         return pair
     control = controls[0]

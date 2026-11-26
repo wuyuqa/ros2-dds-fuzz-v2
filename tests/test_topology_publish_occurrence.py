@@ -60,7 +60,16 @@ def test_no_unfiltered_control_is_inferred_from_reader_order(change):
     elif change == 'updated':
         row = dict(rows[2], event='content_filter_dynamic_update', event_index=len(rows))
         rows.append(row)
-    else: rows[1]['initial_content_filter'] = None
+    else:
+        # A filtered target still cannot choose between two external controls.
+        # Two unfiltered targets each have their own self-measurement identity.
+        alternate = dict(deepcopy(rows[2]), logical_id='r2', role='reader3',
+                         endpoint_gid='06' * 16, pid=203, pgid=203,
+                         process_start_ticks=13, endpoint_generation='offline-worker-3',
+                         node_name='r2')
+        rows.insert(3, alternate)
+        for index, row in enumerate(rows):
+            row['event_index'] = index
     sample = next(e for e in rows if e['event'] == 'receive' and e['logical_id'] == 'r0')
     value, reason = payload_delivery_witness(pair, sample, rows)
     assert value is None
