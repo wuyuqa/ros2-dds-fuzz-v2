@@ -1035,6 +1035,9 @@ def test_topology_writer_and_empty_interval_preserve_groups_and_new_delivery(tmp
     ]
     assert model.validate_program(p)['status'] == 'valid'
     backend = prepared_backend(tmp_path/'carrier', p)
+    # A successful integration workload must tolerate bounded host scheduling;
+    # keep the short budgets in explicit timeout tests, never in real runtime.
+    backend.config.update(snapshot_timeout_sec=1.0,publish_timeout_sec=1.0)
     backend.real_ros = False
     result = run_topology(p, dict(backend.config), tmp_path/'runtime', backend=backend)
     assert result['status'] != 'aborted', (result['reason'], result['unknowns'])
@@ -1207,3 +1210,27 @@ def test_worker_rejects_identity_change_after_binding_without_bootstrap_retry(mo
     created = [e for e in events if e['event'] == 'endpoint_created' and e['logical_id'] == 'r0']
     assert created and all(e['endpoint_gid'] in {'0'*31+'2', '0'*31+'3'} for e in created)
     assert not any(e['event'] == 'endpoint_identity_bootstrap' and e['status'] == 'unknown' for e in events)
+
+
+def test_generation_delivery_survives_bounded_fake_process_scheduling_pause(tmp_path,transport,monkeypatch):
+    """No real process/ROS: delay one queued ACK at the existing OS double."""
+    import time
+    from r2f.runtime import topology_worker as worker
+    spawn=worker.subprocess.Popen;pauses=[]
+    def delayed_spawn(*args,**kwargs):
+        child=spawn(*args,**kwargs);handle=child.handle;poll=child.poll
+        child.scheduling_pause_pending=False;child.scheduling_pause_done=False
+        def delayed_handle(command):
+            handle(command)
+            if (not child.scheduling_pause_done and command['command']=='group_snapshot'
+                    and command.get('logical_id')=='w0' and command.get('generation')==2):
+                child.scheduling_pause_pending=True
+        def delayed_poll():
+            if child.scheduling_pause_pending:
+                child.scheduling_pause_pending=False;child.scheduling_pause_done=True
+                pauses.append('queued_snapshot_ack');time.sleep(0.15)
+            return poll()
+        child.handle=delayed_handle;child.poll=delayed_poll;return child
+    monkeypatch.setattr(worker.subprocess,'Popen',delayed_spawn)
+    test_topology_writer_and_empty_interval_preserve_groups_and_new_delivery(tmp_path,transport,'roles',2)
+    assert pauses==['queued_snapshot_ack']

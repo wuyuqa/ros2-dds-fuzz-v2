@@ -1840,6 +1840,7 @@ def _worker_main(argv, group_owner=None):
                 'logical_id': config['logical_id'], 'generation': config['generation'],
                 'endpoint_generation': endpoint_generation, 'endpoint_gid': local_gid,
                 'worker_role': role})
+            group_owner['sessions'][config['logical_id']]['endpoint'] = endpoint
             group_owner['sessions'][config['logical_id']]['token'] = {
                 'logical_id': config['logical_id'], 'generation': config['generation'],
                 'endpoint_generation': endpoint_generation, 'endpoint_gid': local_gid,
@@ -1927,7 +1928,13 @@ def _worker_main(argv, group_owner=None):
             if command["command"] == "lookup_topic":
                 from .scoped_topic_lookup import lookup_receipt, observe_topic_lookup
                 scope, name = command.get("scope"), command.get("name")
-                if rmw_identifier != "rmw_cyclonedds_cpp":
+                if (rmw_identifier == "rmw_fastrtps_cpp" and instrumentation is not None
+                        and "native_type_support" not in command):
+                    from .fastdds_peer_observer import FastddsMatchedPeerObserver
+                    if native_peer_observer is None:
+                        native_peer_observer = FastddsMatchedPeerObserver(endpoint, instrumentation=instrumentation)
+                    lookup = native_peer_observer.lookup_topic(config["domain_id"], local_gid, kind, scope, name)
+                elif rmw_identifier != "rmw_cyclonedds_cpp":
                     lookup = lookup_receipt(scope, name,
                         reason="rmw_native_typed_topic_lookup_unsupported", execution_evidence=True)
                     lookup["binding"] = rmw_identifier
@@ -2003,7 +2010,7 @@ def _worker_main(argv, group_owner=None):
                              "domain_id": config["domain_id"], "local_gid": local_gid,
                              "role_kind": kind,
                              "reason": "rmw_participant_ownership_observer_unavailable"}
-                if rmw_identifier == "rmw_cyclonedds_cpp":
+                if observer is not None and hasattr(observer, "sample_ownership"):
                     try:
                         if observer is None:
                             raise ValueError("cyclone_ownership_observer_unavailable:"
@@ -2185,11 +2192,10 @@ def selectors_for_stdin():
 
 def _group_worker_main(argv):
     """The existing endpoint implementation, cooperatively addressed by one owner."""
-    from .participant_groups import CONTROL, LINK_KEYS
+    from .participant_groups import CONTROL, LINK_KEYS, runtime_supported
     config = json.loads(argv[1])
     if (config.get('participant_control') != CONTROL
-            or config.get('rmw') != 'rmw_cyclonedds_cpp'
-            or config.get('observation_mode', 'blackbox') != 'blackbox'):
+            or not runtime_supported(config)):
         raise TopologyBackendError('group_worker_admission_invalid')
     members = {e['logical_id']: e for e in config['group_members']}
     if (not 1 <= len(members) <= 8 or len(members) != len(config['group_members'])
@@ -2227,8 +2233,11 @@ def _group_worker_main(argv):
         rclpy.init(context=context)
         rmw = rclpy.get_rmw_implementation_identifier()
         observed_domain = context.get_domain_id()
-        if rmw != 'rmw_cyclonedds_cpp' or observed_domain != config['domain_id']:
+        if rmw != config['rmw'] or observed_domain != config['domain_id']:
             raise TopologyBackendError('group_context_observed_rmw_domain_mismatch')
+        if rmw == 'rmw_fastrtps_cpp':
+            from r2f.instrumentation.fastdds_peer.activation import reference_from_config, verify_vendor_mapping
+            verify_vendor_mapping(reference_from_config(config))
         emit('group_context_created', api='rclpy.context.Context+rclpy.init', ros_context_created=True)
         node_name = 'r2f_group_' + uuid.uuid4().hex[:16]
         node = Node(node_name, context=context, enable_rosout=False, start_parameter_services=False)
@@ -2347,14 +2356,26 @@ def _capture_group_ownership(config, sessions):
               'roots_before': None, 'roots_after': None, 'endpoints': [],
               'actual_local_root_count': None, 'unknown_reasons': []}
     try:
-        observer = CycloneMatchedPeerObserver()
-        result['roots_before'] = observer.sample_roots(config['domain_id'])
+        if config.get('rmw') == 'rmw_fastrtps_cpp':
+            from .fastdds_local_api import sample_roots
+            from .fastdds_peer_observer import FastddsMatchedPeerObserver
+            from r2f.instrumentation.fastdds_peer.activation import reference_from_config
+            reference = reference_from_config(config)
+            result['qualification_scope'] = 'owned_FastDDS_process_public_parent_and_factory_roots_serial_not_atomic'
+            roots = lambda: sample_roots(reference, config['domain_id'])
+            observer_for = lambda item: FastddsMatchedPeerObserver(item['endpoint'], instrumentation=reference)
+        else:
+            observer = CycloneMatchedPeerObserver()
+            roots = lambda: observer.sample_roots(config['domain_id'])
+            observer_for = lambda item: observer
+        result['roots_before'] = roots()
         for item in sessions.values():
             token = item['token']
+            observer = observer_for(item)
             samples = [observer.sample_ownership(config['domain_id'], token['endpoint_gid'], token['kind'])
                        for _ in range(2)]
             result['endpoints'].append({**token, 'samples': samples})
-        result['roots_after'] = observer.sample_roots(config['domain_id'])
+        result['roots_after'] = roots()
         from .participant_groups import qualify_observation
         result.update(qualify_observation(result, [v['token'] for v in sessions.values()]))
     except (ValueError, TypeError, OSError, AttributeError, RuntimeError) as exc:

@@ -41,6 +41,18 @@ def enabled(program):
     return isinstance(program, dict) and 'participant_control' in program
 
 
+def runtime_supported(config):
+    """Admission scope only; actual native ownership must still be measured."""
+    if config.get('environment_mutation') is not None:
+        return False
+    mode = config.get('observation_mode', 'blackbox')
+    rmw = config.get('rmw', 'rmw_cyclonedds_cpp')
+    reference = config.get('fastdds_peer_instrumentation')
+    return ((rmw == 'rmw_cyclonedds_cpp' and mode == 'blackbox' and reference is None)
+            or (rmw == 'rmw_fastrtps_cpp' and mode == 'instrumentation'
+                and isinstance(reference, dict) and set(reference) == {'manifest_path', 'manifest_sha256'}))
+
+
 def validate_control(program, config=None):
     """Return declared groups or fail before any resources are acquired."""
     if not enabled(program):
@@ -99,16 +111,16 @@ def validate_control(program, config=None):
     if sorted(creates) != sorted(ids):
         raise ValueError('participant_control_scope:exactly_one_create_per_endpoint')
     if config is not None:
-        if (config.get('rmw', 'rmw_cyclonedds_cpp') != 'rmw_cyclonedds_cpp'
-                or config.get('observation_mode', 'blackbox') != 'blackbox'
-                or config.get('environment_mutation') is not None
-                or config.get('fastdds_peer_instrumentation') is not None):
+        if not runtime_supported(config):
             raise ValueError('participant_control_scope:rmw_mode_or_environment')
     return groups
 
 
 def qualify_observation(observation, tokens):
     """Derive supporting status from captures; never trust supplied status flags."""
+    if (observation.get('roots_before') or {}).get('schema') == 'r2f.fastdds-local-participant-roots/v1':
+        from .fastdds_local_api import qualify_group
+        return qualify_group(observation, tokens)
     from .topology_worker import worker_role_kind
     reasons = []
     before, after = observation.get('roots_before'), observation.get('roots_after')
@@ -363,6 +375,8 @@ def project_lineage(program, events, raw_path, *, config=None):
 
     Caller owns SHA/path authentication and exact sealed input selection. A
     malformed group trace never falls back to legacy or relaxes a legacy gate.
+    Without execution config, reconstruct the unanimous raw-observed RMW only;
+    this supporting projection never admits runtime mode, binaries or candidates.
     """
     import hashlib
     import json
@@ -413,6 +427,9 @@ def project_lineage(program, events, raw_path, *, config=None):
     require(len(starts) == len(exits) == len(groups), 'actual_process_inventory_count')
     for key in ('pid', 'worker_instance_id', 'context_instance_id'):
         require(len({e.get(key) for e in starts}) == len(groups), 'process_or_context_reuse:' + key)
+    observed_rmws={e.get('rmw_identifier') for e in events if e.get('event')=='group_context_created'}
+    require(len(observed_rmws)==1 and observed_rmws <= {'rmw_cyclonedds_cpp','rmw_fastrtps_cpp'}, 'context_rmw_domain')
+    expected_rmw=config.get('rmw','rmw_cyclonedds_cpp') if config is not None else next(iter(observed_rmws))
     processes, contexts, workers, observations = [], [], [], []
     all_gids = set()
     for label, ids in groups.items():
@@ -432,7 +449,7 @@ def project_lineage(program, events, raw_path, *, config=None):
                 < shut['event_index'] < ex['event_index'] and shut.get('closed') is True
                 and shut.get('errors') == [] and ctx.get('ros_context_created') is True
                 and ctx.get('api') == 'rclpy.context.Context+rclpy.init', 'context_chronology_or_cleanup')
-        require(ctx.get('rmw_identifier') == 'rmw_cyclonedds_cpp'
+        require(ctx.get('rmw_identifier') == expected_rmw
                 and (config is None or ctx.get('observed_domain_id') == config.get('domain_id')), 'context_rmw_domain')
         require(st['worker_instance_id'] != st['context_instance_id'], 'process_context_nonce_alias')
         requests = [e for e in owned if e.get('event') == 'group_command_requested']

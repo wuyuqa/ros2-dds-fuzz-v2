@@ -87,6 +87,25 @@ def validate_reference(value):
             and value['placement'] in PLACEMENTS)
 
 
+def validate_build_reference(reference, *, expected_source, sdk_sha256):
+    """Read-only build qualification shared by the carrier and raw auditor."""
+    if not validate_reference(reference):
+        raise ValueError('native_lookup_support_reference_invalid')
+    payload = Path(reference['manifest_path']).read_bytes()
+    if hashlib.sha256(payload).hexdigest() != reference['manifest_sha256']:
+        raise ValueError('native_lookup_support_manifest_hash_mismatch')
+    manifest = json.loads(payload)
+    if (manifest.get('schema') != SCHEMA
+            or manifest.get('source_sha256') != {name: hashlib.sha256(text.encode()).hexdigest() for name, text in SOURCES.items()}
+            or manifest.get('sdk_sha256') != sdk_sha256
+            or any(_sha(name) != digest for name, digest in sdk_sha256.items())
+            or _sha(manifest['library_path']) != manifest.get('library_sha256')):
+        raise ValueError('native_lookup_support_identity_mismatch')
+    if manifest.get('source') != expected_source:
+        raise ValueError('native_lookup_support_source_changed')
+    return manifest
+
+
 def build_support(output, *, compiler, idlc=str(PREFIX / 'bin/idlc')):
     """Build descriptor-only support, never initialize or execute DDS/ROS."""
     output = Path(output).resolve()
@@ -154,21 +173,10 @@ class NativeLookupControl:
         self.receipt = {'reference': dict(reference), 'entities': [], 'cleanup': [],
                         'qualification': 'native_control_not_rmw_or_historical_binding',
                         'bound_ros_type_name': ros_type_name, 'candidate_eligible': False}
-        path = Path(reference['manifest_path'])
-        payload = path.read_bytes()
-        if hashlib.sha256(payload).hexdigest() != reference['manifest_sha256']:
-            raise ValueError('native_lookup_support_manifest_hash_mismatch')
-        manifest = json.loads(payload)
-        source = Path(__file__).resolve().parent
-        if (manifest.get('schema') != SCHEMA
-                or manifest.get('source_sha256') != {name: hashlib.sha256(text.encode()).hexdigest() for name, text in SOURCES.items()}
-                or manifest.get('sdk_sha256') != observer.VERIFIED_C_HEADERS
-                or any(_sha(name) != digest for name, digest in manifest['sdk_sha256'].items())
-                or _sha(manifest['library_path']) != manifest.get('library_sha256')):
-            raise ValueError('native_lookup_support_identity_mismatch')
         from r2f.campaign.identity import source_manifest
-        if manifest.get('source') != source_manifest(source.parents[2]):
-            raise ValueError('native_lookup_support_source_changed')
+        manifest = validate_build_reference(reference,
+            expected_source=source_manifest(Path(__file__).resolve().parents[3]),
+            sdk_sha256=observer.VERIFIED_C_HEADERS)
         self.receipt.update(library_path=manifest['library_path'],
                             library_sha256=manifest['library_sha256'],
                             manifest_source=manifest['source'])

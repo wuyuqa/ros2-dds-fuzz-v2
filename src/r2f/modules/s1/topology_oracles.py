@@ -155,6 +155,17 @@ def evaluate_topology(scenario, facts):
             delivery_values.append(None)
             reasons.append("finite_tail_or_delivery_contract_unknown" if closure in {"open", "closed_with_gap"}
                            else "per_writer_delivery_identity_unknown")
+    lookup = facts.get("topic_lookup_observations") or {}
+    lookup_unknown = bool(lookup.get("unknown_reasons"))
+    if lookup.get("declared") is True:
+        from .topology_lookup_contract import predicate_contract as lookup_contract, RESIDUAL as LOOKUP_RESIDUAL
+        from r2f.campaign.topology_lookup_observation import semantic_checks
+        result["lookup_rule_contract"] = lookup_contract()
+        result["lookup_checks"] = semantic_checks(lookup)
+        residuals.extend(c["violation"] for c in lookup.get("checks", [])
+                         if c.get("status") == "mismatch" and c.get("violation") == LOOKUP_RESIDUAL)
+        if lookup_unknown:
+            reasons.append("topic_lookup_observation_incomplete")
     cft = facts.get("content_filter_observations") or {}
     checks = cft.get("sample_observations", [])
     if cft.get("declared") is True:
@@ -197,11 +208,11 @@ def evaluate_topology(scenario, facts):
             and (not delivery_values or values[TOPOLOGY_FACT_DELIVERY] is True) \
             and not facts.get("unknown_reasons_sample_identity") \
             and not facts.get("unresolved_historical_obligations") and not identity_unknown \
-            and not facts.get("matching_observation_incomplete"):
+            and not facts.get("matching_observation_incomplete") and not lookup_unknown:
         result.update(verdict="pass", reason_codes=["bounded_observed_topology_consistency"],
                       observed_effects=["observed_consistency"], effect_id=TOPOLOGY_EFFECT)
     elif not graph_values and not delivery_values and not facts.get("unresolved_historical_obligations") and not identity_unknown \
-            and not facts.get("matching_observation_incomplete"):
+            and not facts.get("matching_observation_incomplete") and not lookup_unknown:
         result.update(verdict="not_applicable", reason_codes=["no_applicable_pair_obligation"])
     else:
         result["reason_codes"] = sorted(set(reasons or ["topology_evidence_incomplete"]))

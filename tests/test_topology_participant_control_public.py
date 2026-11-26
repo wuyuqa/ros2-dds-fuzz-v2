@@ -14,9 +14,10 @@ from r2f.modules.s1.topology_targets import topology_target_declaration, TOPOLOG
 from r2f.campaign.topology_adapter import TopologyFactProducer
 from r2f.runtime.participant_groups import CONTROL, OBSERVATION_SCHEMA, project_lineage
 from test_topology_adapter import RawFixture
+from test_fastdds_peer_probe import build_manifest
 
 
-def group_fixture(root, shared=True):
+def group_fixture(root, shared=True, *, rmw="rmw_cyclonedds_cpp", peer_reference=None):
     """Adapt the established raw protocol fixture, preserving all action evidence.
 
     Only supporting captures are unavailable. These rows are NOT measurements.
@@ -27,12 +28,15 @@ def group_fixture(root, shared=True):
     for i,e in enumerate(parent['endpoints']): e['participant_id']='a' if shared or i==0 else 'b'
     f.plan=make_topology_plan(parent,[{'operator_id':'action.insert'}],rng_seed=7)
     f.program=f.plan.final_config['topology_program']
-    f.scenario=Scenario(topology_target_declaration(),'rmw_cyclonedds_cpp','mutated',0,seed=7,mutation_plan=f.plan)
+    f.scenario=Scenario(topology_target_declaration(),rmw,'mutated',0,seed=7,mutation_plan=f.plan)
     f.layers=topology_input_layer_receipts(f.plan)
     eff=f.scenario.effective_input_v2(final_input=f.plan.final_config,input_layer_receipts=f.layers,
         source_manifest={'source_repo':'/nonexistent/offline/fixture','head':None,'source_frozen':False})
     f.config.update(**deepcopy(eff),effective_input=eff,effective_input_sha256=effective_input_hash(eff,schema=INPUT_SCHEMA_V2),
                     plan_hash=f.plan.plan_hash(),topology_program=deepcopy(f.program))
+    if rmw=='rmw_fastrtps_cpp':
+        f.config.update(observation_mode='instrumentation',fastdds_peer_instrumentation=peer_reference or {
+            'manifest_path':'/labelled/offline/peer.json','manifest_sha256':'a'*64})
     f.route.update(plan_hash=f.plan.plan_hash(),final_input_sha256=canonical_hash(f.plan.final_config),
                    input_layer_receipts_sha256=canonical_hash(f.layers),effective_input_sha256=f.config['effective_input_sha256'])
     f.events[0]['receipt'].update(program_sha256=canonical_hash(f.program),participant_control=dict(CONTROL),route_binding=deepcopy(f.route))
@@ -56,12 +60,12 @@ def group_fixture(root, shared=True):
             for v in value:update(v)
     update(f.events)
     for eid,t in tokens.items():
-        t.update(worker_role=t['role'],rmw_identifier='rmw_cyclonedds_cpp',observed_domain_id=191,
+        t.update(worker_role=t['role'],rmw_identifier=rmw,observed_domain_id=191,
                  domain_observation_source='offline_fixture',**identities[labels[eid]])
     additions=[]
     def row(kind,g,**kw):
         return dict(event=kind,fixture=True,backend='offline_fake',real_ros=False,run_id='fixture-topology',
-                    domain_id=191,observed_domain_id=191,rmw_identifier='rmw_cyclonedds_cpp',**identities[g],**kw)
+                    domain_id=191,observed_domain_id=191,rmw_identifier=rmw,**identities[g],**kw)
     started=set()
     pending={}
     def request(g,command,eid=None,**kw):
@@ -396,3 +400,42 @@ def test_public_snapshot_requests_remain_consumable_with_exact_worker_identity(
     # A consumer must never rewrite its input transcript or the independent control.
     assert fixture.raw.read_bytes() == consumed_raw
     assert control_raw.read_bytes() == original
+
+
+@pytest.mark.parametrize('shared',[True,False])
+def test_fast_group_raw_lineage_uses_selected_rmw_without_granting_fixture_authority(tmp_path,shared,build_manifest):
+    path,_=build_manifest
+    reference={'manifest_path':str(path),'manifest_sha256':hashlib.sha256(path.read_bytes()).hexdigest()}
+    f=group_fixture(tmp_path/'group-raw',shared,rmw='rmw_fastrtps_cpp',peer_reference=reference)
+    lineage=project_lineage(f.program,f.events,str(f.raw),config=f.config)
+    assert len(lineage['contexts'])==(1 if shared else 2)
+    assert all(not w['real_ros'] for w in lineage['workers'])
+    # This fixture has group protocol rows but no native provider selection or
+    # bounded peer snapshots. The complete fact consumer must still deny it.
+    (f.raw.parent/'native-peer-build-manifest.json').write_bytes(path.read_bytes())
+    result=facts(f)
+    assert not result['diagnostic_valid'] and result['evidence_error']
+    assert not result['candidate_eligible'] and not result['execution_evidence']
+    for update in ({'observation_mode':'blackbox'},{'fastdds_peer_instrumentation':None}):
+        with pytest.raises(ValueError,match='participant_control_scope'):
+            project_lineage(f.program,f.events,str(f.raw),config={**f.config,**update})
+    next(e for e in f.events if e['event']=='group_context_created')['rmw_identifier']='rmw_cyclonedds_cpp'
+    with pytest.raises(ValueError,match='context_rmw_domain'):
+        project_lineage(f.program,f.events,str(f.raw),config=f.config)
+
+
+@pytest.mark.parametrize('shared',[True,False])
+def test_fast_group_saved_consumers_reconstruct_raw_observed_rmw_without_admission(tmp_path,shared,build_manifest):
+    from r2f.runtime.topology_pair import group_termination_rows,_execution_workers
+    from r2f.runtime.topology_route import audit_topology_application
+    path,_=build_manifest;reference={'manifest_path':str(path),'manifest_sha256':hashlib.sha256(path.read_bytes()).hexdigest()}
+    f=group_fixture(tmp_path/'raw',shared,rmw='rmw_fastrtps_cpp',peer_reference=reference)
+    lineage=project_lineage(f.program,f.events,str(f.raw))
+    assert len(lineage['contexts'])==(1 if shared else 2)
+    assert _execution_workers(f.events,str(f.raw),f.program)==lineage['workers']
+    token=next(e for e in f.events if e['event']=='endpoint_created' and e['logical_id']=='w0')
+    closed=group_termination_rows(f.program,f.events,str(f.raw),[token],token)
+    assert any(e['event']=='endpoint_destroyed' for e in closed)
+    audit=audit_topology_application(f.plan,f.layers,f.runtime)
+    assert not any('context_rmw_domain' in reason for reason in audit['reasons'])
+    assert not audit['candidate_eligible']

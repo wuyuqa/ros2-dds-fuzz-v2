@@ -103,6 +103,26 @@ def _topology_participant_identity(row, events):
     return rebuilt
 
 
+def _topology_topic_lookup(row, events):
+    """Authenticate declared query objects independently of directed pair edges."""
+    from r2f.campaign.topology_lookup_observation import lookup_observations, semantic_checks
+    from r2f.modules.s1.topology_lookup_contract import predicate_contract
+    program = row.get("final_input", {}).get("topology_program", {})
+    claimed = row.get("typed_facts", {}).get("topic_lookup_observations")
+    declared = any(a.get("op") == "lookup_topic" for a in program.get("actions", []))
+    if not declared and claimed is None:
+        return None
+    verified = lookup_observations(program, events,
+        ref=lambda ev: dict(path=row["raw_path"], sha256=row["raw_sha256"], event_index=ev["event_index"]))
+    if canonical_hash(verified) != canonical_hash(claimed):
+        raise ValueError("topic lookup anomaly differs from raw endpoint identity")
+    oracle = row.get("oracle") or {}
+    if (canonical_hash(oracle.get("lookup_rule_contract")) != canonical_hash(predicate_contract())
+            or canonical_hash(oracle.get("lookup_checks")) != canonical_hash(semantic_checks(verified))):
+        raise ValueError("topic lookup oracle claim differs from raw observation")
+    return verified
+
+
 def _validate_topology_identity(row, identity):
     facts = row.get("typed_facts", {})
     if row.get("target_id") != _TOPOLOGY_TARGET or facts.get("schema") != _TOPOLOGY_FACTS_SCHEMA:
@@ -195,8 +215,9 @@ def _validate_topology_identity(row, identity):
             raise ValueError("topology endpoint role differs from raw creation")
         tokens[key] = endpoint
     participant_identity = _topology_participant_identity(row, events)
+    lookup = _topology_topic_lookup(row, events)
     pairs = identity.get("pairs")
-    if not isinstance(pairs, list) or not pairs:
+    if not isinstance(pairs, list) or (not pairs and not (lookup and lookup.get("checks"))):
         raise ValueError("topology requires concrete directed pairs, not total counts")
     seen = set()
     for pair in pairs:
@@ -280,6 +301,10 @@ def _validate_topology_identity(row, identity):
                         k: claim.get(k) for k in sample}) for claim in claims):
                     raise ValueError("CFT anomaly differs from raw directed sample identity")
                 applicable = True
+        if "topology.topic_lookup_mismatch" in (row.get("oracle") or {}).get("forbidden_residuals", []):
+            if lookup is None or not any(c.get("violation") == "topology.topic_lookup_mismatch" for c in lookup["checks"]):
+                raise ValueError("topic lookup anomaly lacks raw query evidence")
+            applicable = True
         if not applicable:
             raise ValueError("topology anomaly requires concrete applicable pair objects")
 

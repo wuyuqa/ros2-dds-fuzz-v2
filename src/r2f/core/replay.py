@@ -446,7 +446,7 @@ def _topology_conformance_signature(metadata, facts, rule):
         if not isinstance(claimed, list) or any(not isinstance(v, str) for v in claimed):
             return None
         if set(claimed) - {"topology.pair_graph_mismatch", "topology.closed_delivery_gap",
-                           "topology.identity_mismatch", "topology.cft_predicate_mismatch"}:
+                           "topology.identity_mismatch", "topology.cft_predicate_mismatch", "topology.topic_lookup_mismatch"}:
             return None
         from .candidate import _topology_participant_identity
         identity = _topology_participant_identity(metadata, events)
@@ -664,6 +664,18 @@ def _topology_conformance_signature(metadata, facts, rule):
                 if item.get("violation") == "topology.cft_predicate_mismatch":
                     residuals.add(item["violation"])
                     anomalies.append(dict(item, residual=item["violation"]))
+        lookup_signature = None
+        from .candidate import _topology_topic_lookup
+        verified = _topology_topic_lookup(metadata, events)
+        if verified is not None:
+            from r2f.campaign.topology_lookup_observation import semantic_checks
+            if verified.get("unknown_reasons"):
+                return None
+            lookup_signature = semantic_checks(verified)
+            for item in lookup_signature:
+                if item.get("violation") == "topology.topic_lookup_mismatch":
+                    residuals.add(item["violation"])
+                    anomalies.append(dict(item, residual=item["violation"]))
         if verdict == "fail" and (not anomalies or residuals != set(claimed)):
             return None
         if verdict == "pass" and (anomalies or claimed):
@@ -674,7 +686,10 @@ def _topology_conformance_signature(metadata, facts, rule):
                 "typed_anomaly_signature": sorted(anomalies, key=canonical_hash),
                 **({"cft_sample_signature": cft_signature,
                     "cft_rule_contract_sha256": canonical_hash(oracle["cft_rule_contract"])}
-                   if cft_signature is not None else {})}
+                   if cft_signature is not None else {}),
+                **({"topic_lookup_signature": lookup_signature,
+                    "lookup_rule_contract_sha256": canonical_hash(oracle["lookup_rule_contract"])}
+                   if lookup_signature is not None else {})}
     except (ValueError, KeyError, TypeError, OSError, IndexError, AttributeError):
         return None
 

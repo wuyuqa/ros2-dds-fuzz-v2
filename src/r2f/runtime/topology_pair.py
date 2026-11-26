@@ -2128,14 +2128,14 @@ def topology_capabilities(backend=None):
     }
 
 
-def group_termination_rows(program, events, raw_path, tokens, boundary):
+def group_termination_rows(program, events, raw_path, tokens, boundary, *, config=None):
     """Audit group shutdown once, preserving actual process and endpoint rows.
 
     This consumes a closed capture, not a lifecycle transition. Group processes
     have no endpoint identity; each endpoint keeps its own cleanup receipt.
     """
     from .participant_groups import project_lineage
-    lineage = project_lineage(program, events, raw_path)
+    lineage = project_lineage(program, events, raw_path, config=config)
     selected = {}
     fields = ("logical_id", "generation", "endpoint_generation", "endpoint_gid",
               "group_id", "worker_instance_id", "context_instance_id", "pid", "pgid", "process_start_ticks")
@@ -3529,7 +3529,10 @@ def run_topology(program, config, output_dir, *, backend=None):
                     result["observation_receipts"].append({
                         "action_id": aid, "kind": "typed_topic_lookup", "receipt": deepcopy(value)})
                     observed = (value.get("complete") is True
-                                and value.get("status") in ("found", "not_found"))
+                                and (value.get("status") in ("found", "not_found")
+                                     or backend.real_ros and value.get("execution_evidence") is True
+                                     and value.get("cleanup_confirmed") is True
+                                     and value.get("status") == "contract_mismatch"))
                     record_action(action, before, {**before, "lookup": value},
                                   disposition="effect_observed" if observed else "unknown",
                                   satisfied=observed,
@@ -4027,7 +4030,7 @@ def run_topology(program, config, output_dir, *, backend=None):
                 valid = cleanup_complete and basis is not None and all(claim.get(k) == v for k, v in basis.items())
                 from .participant_groups import enabled as group_control_enabled
                 if group_control_enabled(effective_program):
-                    group_termination_rows(effective_program, events, raw_path, (writer, reader), claim)
+                    group_termination_rows(effective_program, events, raw_path, (writer, reader), claim, config=cfg)
                 else:
                     for token in (writer, reader):
                         exits = [e for e in events if e.get("event") == "topology_worker_exit"
@@ -4117,7 +4120,7 @@ def run_topology(program, config, output_dir, *, backend=None):
             raw.flush()
             provisional = {"raw_path": str(raw_path),
                            "raw_sha256": hashlib.sha256(raw_path.read_bytes()).hexdigest()}
-            application = audit_topology_application(cfg["mutation_plan"], cfg["input_layer_receipts"], provisional)
+            application = audit_topology_application(cfg["mutation_plan"], cfg["input_layer_receipts"], provisional, config=cfg)
             result["mutation_receipt"] = application["mutation_receipt"]
             emit("topology_application_audited", status=application["status"],
                  layers=[{"op_id": r["op_id"], "status": r["status"], "reasons": r["reasons"]}

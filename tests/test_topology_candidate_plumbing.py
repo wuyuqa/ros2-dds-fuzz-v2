@@ -305,3 +305,44 @@ def test_fact_resolver_diagnostic_namespace_still_supported(setup):
     facts = setup[3]['typed_facts']
     facts.update(producer_id=TOPOLOGY_FACT_PRODUCER, fact_values={})
     assert resolve_fact(TOPOLOGY_FACT_GRAPH, facts) in (True, False, None)
+
+
+def lookup_only_setup(setup):
+    from test_topology_lookup_candidate_replay import lookup_model
+    scenario,config,capsule,row,_=setup
+    lookup_model(row)
+    row['oracle']['rule_role']='primary'
+    row['typed_facts'].update(target_id=plumbing.TARGET,preconditions_reached=True,pairs=[])
+    row['oracle'].update(forbidden_residuals=['topology.topic_lookup_mismatch'],closure={'pairs':[]})
+    row['mutation_receipt'].update(planned=True,submitted=True)
+    final=deepcopy(row['final_input']);scenario.mutation_plan=SimpleNamespace(final_config=final)
+    config['final_input']=deepcopy(final);capsule.input['effective_input']['final_input']=deepcopy(final)
+    row['typed_facts']['program_sha256']=canonical_hash(final['topology_program'])
+    return setup
+
+
+def test_raw_lookup_only_flows_from_provider_to_existing_deferred_lifecycle(setup):
+    lookup_only_setup(setup)
+    scenario,_,_,row,_=setup
+    receipt=plumbing.provider_assessment(scenario,row['typed_facts'],row['oracle'])
+    assert not receipt['blockers'],receipt
+    publish(setup);finalize(setup)
+    assert row['candidate_eligible'] is True,row['candidate_assessment']
+    ledger=exploratory_candidate_ledger([row]);candidate,=ledger['candidates']
+    assert candidate['candidate_status']=='deferred' and candidate['admission_error'] is None
+    assert [h['event'] for h in candidate['history']][:3]==['observed','admitted','triaged']
+    assert ledger['natural_candidate_count']==ledger['confirmed_candidates']==0
+
+
+@pytest.mark.parametrize('damage',['missing_declaration','raw_ack','forged_query','unknown','extra_residual'])
+def test_lookup_only_provider_never_substitutes_summary_claims_for_concrete_raw(setup,damage):
+    from test_topology_conformance_signature import read,rewrite
+    lookup_only_setup(setup);scenario,_,_,row,_=setup
+    if damage=='missing_declaration':scenario.mutation_plan.final_config['topology_program']['actions']=[]
+    elif damage=='raw_ack':
+        events=read(row);next(e for e in events if e['event']=='command_done')['command_id']+=1;rewrite(row,events)
+    elif damage=='forged_query':row['typed_facts']['topic_lookup_observations']['checks'][0]['detail']=['invented']
+    elif damage=='unknown':row['typed_facts']['topic_lookup_observations']['unknown_reasons']=['missing native observation']
+    else:row['oracle']['forbidden_residuals'].append('topology.pair_graph_mismatch')
+    receipt=plumbing.provider_assessment(scenario,row['typed_facts'],row['oracle'])
+    assert receipt['blockers'] and not receipt['eligible_at_scope']

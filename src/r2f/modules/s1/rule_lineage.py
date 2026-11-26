@@ -152,6 +152,15 @@ def resolve(target, rule_id, *, scope):
     contract = target.rule_contract
     runtime_id = contract.get("primary_rule") or contract.get("compatibility_rule")
     specs = {r.id: r for r in target.exploration_contract.rules} if target.exploration_contract else {}
+    from .topology_lookup_contract import RULE as LOOKUP_RULE, predicate_contract as lookup_contract
+    if runtime_id == _TOPOLOGY and rule_id == LOOKUP_RULE:
+        result = resolve(target, _TOPOLOGY, scope=scope)
+        result.update(rule_id=LOOKUP_RULE, rule_role="supporting", independent_verdict=False,
+                      verdict_semantics="shared_evaluator_not_independent",
+                      execution_observation_contract=lookup_contract(),
+                      fact_fields=["topic_lookup_observations.checks", "topic_lookup_observations.unknown_reasons"])
+        result["scope"]["semantic_scope"] = "qualified raw-bound native topic lookup; vendor-specific scope semantics"
+        return result
     from .topology_cft_contract import RULE as CFT_RULE, predicate_contract
     if runtime_id == _TOPOLOGY and rule_id == CFT_RULE:
         result = resolve(target, _TOPOLOGY, scope=scope)

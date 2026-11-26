@@ -208,7 +208,7 @@ def run_topology_route(config, output_dir, *, backend=None):
     result = run_topology(deepcopy(plan.final_config["topology_program"]), cfg, output_dir, backend=backend)
     result["runtime_capability"] = TOPOLOGY_CAPABILITY
     result["route_binding"] = cfg["topology_route_binding"]
-    result["application_audit"] = audit_topology_application(plan, cfg["input_layer_receipts"], result)
+    result["application_audit"] = audit_topology_application(plan, cfg["input_layer_receipts"], result, config=cfg)
     # These are separate artifact/application observations, not a candidate or
     # oracle verdict. Preserve the original scenario receipt and all failures.
     result.setdefault("scenario_mutation_receipt", deepcopy(result["mutation_receipt"]))
@@ -684,7 +684,7 @@ def _worker_configuration_proven(created, program):
         return False
 
 
-def audit_topology_application(plan, input_layer_receipts, runtime):
+def audit_topology_application(plan, input_layer_receipts, runtime, *, config=None):
     """Audit per-layer input→application, retaining unsupported/unknown gaps.
 
     Endpoint count: exact created configuration/generation identities for all
@@ -737,12 +737,12 @@ def audit_topology_application(plan, input_layer_receipts, runtime):
         expected_source_phases = ["before_preflight", "after_preflight", "before_presteps"] + ["before_action:" + a["action_id"] for a in program["actions"]] + ["after_actions", "after_cleanup"]
         source_phases_complete = [e.get("phase") for e in sources] == expected_source_phases
         from .topology_pair import _execution_workers
-        workers = _execution_workers(events, path, program)
+        workers = _execution_workers(events, path, program, config=config)
         from .participant_groups import enabled, project_lineage
         grouped = enabled(program)
         group_context = None
         if grouped:
-            project_lineage(program, events, path)  # exact raw-bound opt-in only
+            project_lineage(program, events, path, config=config)  # exact raw-bound opt-in only
             group_context = _group_application_context(program, events)
         worker_provenance = bool(created_workers) and all(
             e.get("backend") == ROS_BACKEND and e.get("real_ros") is True

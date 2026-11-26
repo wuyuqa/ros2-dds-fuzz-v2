@@ -711,7 +711,7 @@ def _application(audit):
         from r2f.runtime.topology_route import audit_topology_application
     except ImportError:
         return {"status": "unknown", "reason": "topology_application_auditor_unavailable"}
-    application = audit_topology_application(audit.plan, audit.layers, audit.runtime)
+    application = audit_topology_application(audit.plan, audit.layers, audit.runtime, config=audit.config)
     computed = application.get("mutation_receipt")
     application["canonical_receipt_matches"] = (isinstance(computed, dict)
         and {k: computed.get(k) for k in MutationReceipt.field_names()} == audit.mutation.to_dict())
@@ -1534,6 +1534,10 @@ def facts_from_events(events, runtime, config, *, capture_source=None):
         facts["content_filter_observations"] = content_filter_observations(
             a.program, a.events, decisions=None, deliveries=[], ref=a.ref, fixture=a.fixture)
         facts["action_receipts"] = a.actions()
+        if any(action["op"] == "lookup_topic" for action in a.program["actions"]):
+            from .topology_lookup_observation import lookup_observations
+            facts["topic_lookup_observations"] = lookup_observations(a.program, a.events, ref=a.ref)
+
         groups = sorted({x["params"]["concurrency_group"] for x in a.program["actions"]
                          if x.get("params", {}).get("concurrency_group") is not None})
         if groups:

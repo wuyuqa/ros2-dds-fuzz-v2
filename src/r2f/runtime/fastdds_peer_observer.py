@@ -235,6 +235,14 @@ class FastddsMatchedPeerObserver:
         self._lock = threading.Lock()
         self._last_ordinal = 0  # only serial freshness; NEVER endpoint generation
 
+    def lookup_topic(self, domain, gid, kind, scope, name):
+        from .fastdds_local_api import lookup_topic
+        return lookup_topic(self, domain, gid, kind, scope, name)
+
+    def sample_ownership(self, domain, gid, kind):
+        from .fastdds_local_api import sample_ownership
+        return sample_ownership(self, domain, gid, kind)
+
     @staticmethod
     def _check_handle(handle, kind):
         expected = 'Publisher' if kind == 'writer' else 'Subscription'
