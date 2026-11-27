@@ -350,7 +350,7 @@ def _resolve_execution_runtime(runtime=None, runtime_boundary=HOST_RUNTIME):
 
 def run_campaign(output_dir, *, runtime=None, execute=False,
                  runtime_boundary=HOST_RUNTIME, auto_replay=None, replay_runtime=None,
-                 max_executions=None, **options):
+                 max_executions=None, stop_on_unexpected_result=False, **options):
     """Sequential cells, never parallel campaigns. Default is offline plan only.
 
     The owner coordinates actual execution; execute=True is an explicit action.
@@ -365,8 +365,16 @@ def run_campaign(output_dir, *, runtime=None, execute=False,
     Explicit observation execution requires max_executions=1. The legacy
     declaration dispatches Cyclone baseline0; the lease extension dispatches its
     named cell, leaving all other cells planned. A declaration is not evidence.
+    stop_on_unexpected_result optionally stops after the first non-judged,
+    non-actual or unexpected primary verdict (pass normally, fail for negative).
+    It preserves the full planned denominator and failing artifacts; it is an
+    execution policy, not semantic input, and cannot enable automatic replay.
     query_runner_evidence exposes associations without revising this report.
     """
+    if type(stop_on_unexpected_result) is not bool:
+        raise ValueError("stop_on_unexpected_result must be a boolean")
+    if stop_on_unexpected_result and auto_replay is not None:
+        raise ValueError("stop_on_unexpected_result requires auto_replay=None")
     selection = _observation_selection(
         options.get("observation", _OBSERVATION_UNSET), options.get("target_id", EXECUTION_ORDER[0]))
     if selection is not None and "cell_id" in selection and (options.get("parameters") or {}).get("observe_participant_leases") is not True:
@@ -391,6 +399,13 @@ def run_campaign(output_dir, *, runtime=None, execute=False,
         runtime, formal = _resolve_execution_runtime(runtime, runtime_boundary)
     report = plan_campaign(output_dir, **options)
     report.update(runtime_boundary=runtime_boundary, formal_runtime=formal)
+    if stop_on_unexpected_result:
+        report["execution_stop_policy"] = {
+            "schema": "r2f.campaign-cell-stop/v1", "enabled": True,
+            "expected_verdict_by_arm": {arm: "fail" if arm == "negative" else "pass"
+                                        for arm in ("baseline", "transparent", "mutated", "negative")},
+            "stopped_cell_id": None,
+        }
     if max_executions is not None:
         report["execution_budget"] = {
             "max_executions": max_executions,
@@ -509,6 +524,15 @@ def run_campaign(output_dir, *, runtime=None, execute=False,
         if source_manifest(repo) != manifest["source_manifest"]:
             report["abort_reason"] = "source_repo_HEAD_or_behavior_tree_changed"
             break
+        if stop_on_unexpected_result:
+            expected = "fail" if row["arm"] == "negative" else "pass"
+            if (row.get("execution_stage") != "judged" or row.get("actual_run") is not True
+                    or row.get("oracle_verdict") != expected):
+                report["execution_stop_policy"].update(
+                    stopped_cell_id=row["cell_id"], execution_stage=row.get("execution_stage"),
+                    oracle_verdict=row.get("oracle_verdict"), expected_verdict=expected)
+                report["abort_reason"] = "unexpected_cell_result"
+                break
     # Attribute only after all independent control evidence exists; no early
     # candidate attribution from a promised future control.
     from r2f.core.oracle import validate_control
