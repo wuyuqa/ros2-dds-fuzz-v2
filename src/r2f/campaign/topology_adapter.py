@@ -1234,6 +1234,75 @@ def _history_windows_for_pairs(audit, projection, deliveries, live_pairs, scope)
 
 
 
+
+def _retired_reader_history_windows(audit, pairs, projection, deliveries):
+    """Reconcile a replaced process reader only through its own retirement.
+
+    The writer must remain in the same live generation. A closed window needs
+    the old reader's authenticated cleanup, successful worker exit, and fresh
+    successor before the final boundary. Missing closes/proofs stay explicit.
+    Participant-control and both-peer episode paths keep their own contracts.
+    """
+    if audit.group_lineage is not None:
+        return []
+    boundary = audit.resolve(projection["receipt"]["after"]["boundary_ref"])
+    if boundary.get("lifecycle_complete") is not True:
+        return []
+    final = {e["logical_id"]: e for e in projection["state_after"]["endpoints"]}
+    live_writers = {(p["writer"], p.get("writer_generation")) for p in pairs
+                    if final.get(p["writer"], {}).get("liveness") == "alive"}
+    keys, retirement_refs = set(), {}
+    for event in audit.events[:boundary["event_index"] + 1]:
+        if event["event"] not in {"topology_delivery_window_open", "topology_delivery_window_closed"}:
+            continue
+        w, wg, r, rg = (event.get(k) for k in ("writer", "writer_generation", "reader", "reader_generation"))
+        if ((w, wg) not in live_writers or final.get(r, {}).get("generation") == rg
+                or (r, rg + 1) not in audit.tokens):
+            continue
+        key = (w, wg, r, rg)
+        keys.add(key)
+        if event["event"] != "topology_delivery_window_closed":
+            continue
+        try:
+            token, successor = audit.tokens[(r, rg)], audit.tokens[(r, rg + 1)]
+            retired = [e for e in audit.events[:boundary["event_index"] + 1]
+                       if e["event"] in {"endpoint_destroyed", "topology_endpoint_destroyed"}
+                       and e.get("logical_id") == r and e.get("generation") == rg]
+            exited = [e for e in audit.events[:boundary["event_index"] + 1]
+                      if e["event"] == "topology_worker_exit"
+                      and e.get("logical_id") == r and e.get("generation") == rg]
+            _require(len(retired) == len(exited) == 1, "reader_history_retirement_or_exit_missing")
+            retired, exited = retired[0], exited[0]
+            _chain(token, event, retired, successor, boundary)
+            _chain(token, event, exited, successor, boundary)
+            identity = endpoint_identity_at(audit.events, token, before_index=retired["event_index"] + 1)
+            _require(retired.get("cleanup_status") == "closed" and exited.get("returncode") == 0
+                     and all(all(e.get(k) == identity.get(k) for k in (*_LINEAGE, "endpoint_gid"))
+                             for e in (retired, exited)), "reader_history_retirement_identity_incomplete")
+            fresh = endpoint_identity_at(audit.events, successor, before_index=boundary["event_index"] + 1)
+            _require(fresh["endpoint_gid"] != identity["endpoint_gid"]
+                     and (fresh["pid"], fresh["process_start_ticks"])
+                         != (identity["pid"], identity["process_start_ticks"]),
+                     "reader_history_successor_not_fresh")
+            retirement_refs[event["event_index"]] = {
+                "retirement": audit.ref(retired), "worker_exit": audit.ref(exited),
+                "successor": audit.ref(successor), "successor_identity": audit.ref(audit.events[fresh["identity_valid_after_ref"]])}
+        except (ValueError, KeyError, TypeError, IndexError):
+            continue
+    windows = _history_windows_for_pairs(audit, projection, deliveries, keys,
+                                        "verified_replaced_reader_historical_window")
+    for row in windows:
+        proof = retirement_refs.get((row.get("close_ref") or {}).get("event_index"))
+        row["reader_retirement_refs"] = proof
+        if proof is None:
+            row.update(window_projection_valid=False, delivery_closure="unknown",
+                       delivery_window_identity_complete=False, delivery_witnesses=[],
+                       reason="reader_history_close_without_qualified_retirement")
+            if "proofs" in row:
+                row["proofs"]["delivery_closure"].update(status="unknown", value="unknown")
+    return windows
+
+
 def _participant_group_history_windows(audit, projection, deliveries):
     """Reconcile group history only through authenticated, pre-boundary cleanup.
 
@@ -1587,6 +1656,7 @@ def facts_from_events(events, runtime, config, *, capture_source=None):
         empty_windows = _historical_no_obligation_windows(a, facts["pairs"], projection)
         historical = _recreated_history_windows(a, facts["pairs"], projection, facts["deliveries"])
         facts["historical_live_windows"] = _live_history_windows(a, facts["pairs"], projection, facts["deliveries"])
+        facts["historical_retired_reader_windows"] = _retired_reader_history_windows(a, facts["pairs"], projection, facts["deliveries"])
         facts["historical_participant_group_windows"] = _participant_group_history_windows(
             a, projection, facts["deliveries"])
         if "episode" in a.program:
@@ -1617,6 +1687,9 @@ def facts_from_events(events, runtime, config, *, capture_source=None):
                              or (_participant_group_send_coverage(a, facts["historical_participant_group_windows"],
                                                                  facts["historical_live_windows"], send)
                                  if send["event_index"] not in current_window_sends else None)
+                             or (_live_history_send_coverage(a, facts["historical_retired_reader_windows"]
+                                                                 + facts["historical_live_windows"], send)
+                                 if facts["historical_retired_reader_windows"] and send["event_index"] not in current_window_sends else None)
                              or (_retired_episode_send_coverage(a, facts["retired_episode_history_windows"], send)
                                  if "episode_observation" in facts else None)
                              or (_live_history_send_coverage(a, facts["historical_live_windows"], send,
@@ -1628,9 +1701,11 @@ def facts_from_events(events, runtime, config, *, capture_source=None):
         covered_history = {c["send_ref"]["event_index"] for c in facts["historical_send_coverage"]}
         # A current label avoids double-counting, not the obligations to every
         # reader alive at send time (including retired peers and overlaps).
-        qualified_current_window_sends = current_window_sends if a.group_lineage is None else {
+        qualified_current_window_sends = current_window_sends if (a.group_lineage is None
+            and not facts["historical_retired_reader_windows"]) else {
             s["event_index"] for s in sends if s["event_index"] in current_window_sends
             and _live_history_send_coverage(a, facts["historical_participant_group_windows"]
+                                           + facts["historical_retired_reader_windows"]
                                            + facts["historical_live_windows"], s) is not None}
         facts["unresolved_historical_obligations"] = [a.ref(s) for s in sends
             if s["event_index"] not in qualified_current_window_sends and not _no_obligation_send_covered(a, empty_windows, s)
