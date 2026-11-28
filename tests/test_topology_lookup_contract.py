@@ -113,6 +113,18 @@ def test_native_placement_echo_without_created_entities_is_not_lookup_failure():
     assert observed['unknown_reasons'] and not observed['checks']
 
 
+@pytest.fixture
+def native_control_sdk(tmp_path,monkeypatch):
+    """Authored SDK bytes for offline hash binding, never a real native ABI."""
+    import hashlib
+    from r2f.runtime.topology_worker import CycloneMatchedPeerObserver
+    header=tmp_path/'authored-dds.h'
+    header.write_bytes(b'/* offline SDK artifact fixture; never compiled or loaded */\n')
+    monkeypatch.setattr(CycloneMatchedPeerObserver,'VERIFIED_C_HEADERS',
+        {str(header):hashlib.sha256(header.read_bytes()).hexdigest()})
+    return header
+
+
 def native_control_trace(tmp_path,placement='same_participant',scope='participant'):
     """Authored readback + immutable descriptor-artifact fixture, never dlopen."""
     import hashlib,json
@@ -159,7 +171,7 @@ def native_control_trace(tmp_path,placement='same_participant',scope='participan
 @pytest.mark.parametrize('placement,scope,mismatch',[
     ('same_participant','participant',True),('other_participant','participant',False),
     ('other_participant','local_domain',True),('different_type','participant',False),('absent','global',False)])
-def test_native_scope_expectations_require_independent_entity_and_cleanup_readbacks(tmp_path,placement,scope,mismatch):
+def test_native_scope_expectations_require_independent_entity_and_cleanup_readbacks(tmp_path,native_control_sdk,placement,scope,mismatch):
     from r2f.campaign.topology_lookup_observation import lookup_observations
     program,events=native_control_trace(tmp_path,placement,scope)
     observed=lookup_observations(program,events,ref=lambda e:{'event_index':e['event_index']})
@@ -168,7 +180,7 @@ def test_native_scope_expectations_require_independent_entity_and_cleanup_readba
 
 
 @pytest.mark.parametrize('damage',['source','target_owner','target_name','target_type','entity_count','cleanup','sibling','manifest_source','library'])
-def test_native_control_claim_cannot_replace_missing_or_conflicting_readbacks(tmp_path,damage):
+def test_native_control_claim_cannot_replace_missing_or_conflicting_readbacks(tmp_path,native_control_sdk,damage):
     from r2f.campaign.topology_lookup_observation import lookup_observations
     program,events=native_control_trace(tmp_path,'other_participant','global')
     for event in events:
@@ -183,6 +195,16 @@ def test_native_control_claim_cannot_replace_missing_or_conflicting_readbacks(tm
         elif damage=='sibling':control['sibling_participant']['gid']='a'*32
         elif damage=='manifest_source':control['manifest_source']['head']='f'*40
         else:control['library_sha256']='f'*64
+    observed=lookup_observations(program,events,ref=lambda e:{'event_index':e['event_index']})
+    assert observed['unknown_reasons'] and not observed['checks']
+
+
+def test_native_control_still_rejects_changed_sdk_bytes(tmp_path,native_control_sdk):
+    from r2f.campaign.topology_lookup_observation import lookup_observations
+    program,events=native_control_trace(tmp_path)
+    observed=lookup_observations(program,events,ref=lambda e:{'event_index':e['event_index']})
+    assert not observed['unknown_reasons'] and len(observed['checks'])==1
+    native_control_sdk.write_bytes(b'changed authored SDK bytes')
     observed=lookup_observations(program,events,ref=lambda e:{'event_index':e['event_index']})
     assert observed['unknown_reasons'] and not observed['checks']
 
