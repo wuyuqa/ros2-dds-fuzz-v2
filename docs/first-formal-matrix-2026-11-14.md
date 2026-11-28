@@ -1,3 +1,5 @@
+> **当前导航（2026-11-23）**：先读 [S1 接续入口](s1-current.md)。本页保留原规格/工程决定/历史截面；下文“当前”、旧 source、owner、GO 和待批准边界均按其记录日期解释。用户确认的 #6 完整 S1 规格覆盖旧 MAIN-only／公共 API 正常互操作执行限制，不能据此缩小范围；历史通过不迁移到新 source。修改前全文及 dirty 内容见 [逐字节归档](history/issue26-before-2026-11-23/INDEX.md)。
+
 # 第一份正式 matrix：未封存及工具时序纠错
 
 记录时间：2026-11-15T00:01:03+08:00（Asia/Shanghai，TZ=Asia/Shanghai date --iso-8601=seconds实测）。文件名及原run目录的20261114沿用历史运行日期；run_id中的20261114T155220Z为UTC时间（2026-11-14 23:52:20 Asia/Shanghai），不随本地日历进入11月15日重命名。

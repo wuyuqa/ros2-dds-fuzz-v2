@@ -1,0 +1,122 @@
+{
+  "base_head": "4be53e9e92dd5b91a27f06a1ae5d63511298a761",
+  "capture": "2026-11-23, before issue26 edits; original bytes including copied dirty overlay",
+  "overlay_patch": {
+    "path": "/tmp/s1-retro-implementation-20261123/issue26-overlay-before.patch",
+    "sha256": "334f49402c014ce3f17ccc1a549b3e753b2dd3a81870c67548f9196b1bffe6ae"
+  },
+  "files": [
+    {
+      "path": "AGENTS.md",
+      "archive": "docs/history/issue26-before-2026-11-23/AGENTS.md",
+      "bytes": 89152,
+      "sha256": "282e17e052573daac1b9bad8f622c61ddd0c2965c31db2a71259041c12c0320a",
+      "protected_overlay_match": true
+    },
+    {
+      "path": "README.md",
+      "archive": "docs/history/issue26-before-2026-11-23/README.md",
+      "bytes": 8150,
+      "sha256": "d912c0cd0f4d844347641a6f5d77b322185be885f1336cb18e28a4a8bb8856ce",
+      "protected_overlay_match": null
+    },
+    {
+      "path": "docs/acceptance.md",
+      "archive": "docs/history/issue26-before-2026-11-23/docs/acceptance.md",
+      "bytes": 63533,
+      "sha256": "0173b9d7aad27df044037a8695afa3bd3f544db6796f4c84bbd3b75e1f0bcdc2",
+      "protected_overlay_match": true
+    },
+    {
+      "path": "docs/decisions.md",
+      "archive": "docs/history/issue26-before-2026-11-23/docs/decisions.md",
+      "bytes": 78960,
+      "sha256": "8e4e526e40ad0c2fafcc2bfa3c62d926a725134e0f5f859d2f30be40df320493",
+      "protected_overlay_match": true
+    },
+    {
+      "path": "docs/first-formal-matrix-2026-11-14.md",
+      "archive": "docs/history/issue26-before-2026-11-23/docs/first-formal-matrix-2026-11-14.md",
+      "bytes": 5662,
+      "sha256": "072ff8aa5d954b8019c930178530814c22f5eec6afcb21d8dcbb6995c4f0b92a",
+      "protected_overlay_match": null
+    },
+    {
+      "path": "docs/formal-target-snapshots-2026-11-15.md",
+      "archive": "docs/history/issue26-before-2026-11-23/docs/formal-target-snapshots-2026-11-15.md",
+      "bytes": 6904,
+      "sha256": "e5b7ea482f29fa1c9d8fdbf7a85085d706c5a78128e7188b8a0ae95db06fdd6a",
+      "protected_overlay_match": null
+    },
+    {
+      "path": "docs/open-items.md",
+      "archive": "docs/history/issue26-before-2026-11-23/docs/open-items.md",
+      "bytes": 199849,
+      "sha256": "958ed3e48d072fbf1b20988939b9687b81be7a0006fdd51a52a837fb02d8c294",
+      "protected_overlay_match": true
+    },
+    {
+      "path": "docs/read-only-review-2026-11-14.md",
+      "archive": "docs/history/issue26-before-2026-11-23/docs/read-only-review-2026-11-14.md",
+      "bytes": 9107,
+      "sha256": "3c99ec269652e5231c1f8bfa166276ab91fcd49686b968d8e8dc433b6ed56a10",
+      "protected_overlay_match": null
+    },
+    {
+      "path": "docs/s1-acceptance-ledger.md",
+      "archive": "docs/history/issue26-before-2026-11-23/docs/s1-acceptance-ledger.md",
+      "bytes": 176979,
+      "sha256": "fe2e65d17401947097ef14c509a383ef81f91c509b9052e9f8f85d23aafffc89",
+      "protected_overlay_match": true
+    },
+    {
+      "path": "docs/s1-expanded-scope-and-maturity-2026-11-16.md",
+      "archive": "docs/history/issue26-before-2026-11-23/docs/s1-expanded-scope-and-maturity-2026-11-16.md",
+      "bytes": 18302,
+      "sha256": "184031b7a15a5e035c90b6b7d12df7f41a03e799c5f7dd57ad1bfd0a198e6d5c",
+      "protected_overlay_match": null
+    },
+    {
+      "path": "docs/s1-fuzz-expansion-implementation-plan-2026-11-16.md",
+      "archive": "docs/history/issue26-before-2026-11-23/docs/s1-fuzz-expansion-implementation-plan-2026-11-16.md",
+      "bytes": 78585,
+      "sha256": "6b9dd95cbfe9416214724b5e81ccc8d9405bc8051085f3878ef73a95ab94b63c",
+      "protected_overlay_match": true
+    },
+    {
+      "path": "docs/s1-fuzz-gap-review-2026-11-16.md",
+      "archive": "docs/history/issue26-before-2026-11-23/docs/s1-fuzz-gap-review-2026-11-16.md",
+      "bytes": 10322,
+      "sha256": "7ef12fd7b2d680dcede4d51f94aadb128e874f3b44d8b731cf321717ca4438fb",
+      "protected_overlay_match": null
+    },
+    {
+      "path": "docs/s1-issue6-implementation-2026-11-21.md",
+      "archive": "docs/history/issue26-before-2026-11-23/docs/s1-issue6-implementation-2026-11-21.md",
+      "bytes": 81579,
+      "sha256": "cfc46aaa385d6f51bf8ce289d4be11f94f8ad7681200dbe2016cf0e5c275a3f5",
+      "protected_overlay_match": null
+    },
+    {
+      "path": "docs/s1-model-guided-exploration-plan-2026-11-16.md",
+      "archive": "docs/history/issue26-before-2026-11-23/docs/s1-model-guided-exploration-plan-2026-11-16.md",
+      "bytes": 40363,
+      "sha256": "661d5b6fa8c41240966d0f78e7393b5e5565c1f4bf771760d5d56938634e0a68",
+      "protected_overlay_match": null
+    },
+    {
+      "path": "docs/taskbook.md",
+      "archive": "docs/history/issue26-before-2026-11-23/docs/taskbook.md",
+      "bytes": 25925,
+      "sha256": "a8507e93d7bcf6028d8e69f719f382f0d1969002e8dd69f4e994485ab83aa564",
+      "protected_overlay_match": null
+    },
+    {
+      "path": "docs/verification-snapshot-2026-11-14.md",
+      "archive": "docs/history/issue26-before-2026-11-23/docs/verification-snapshot-2026-11-14.md",
+      "bytes": 15606,
+      "sha256": "a298062927e35ec320a09fd473c5a95d1f68e051da56307bd4dcc80ce94e2c28",
+      "protected_overlay_match": null
+    }
+  ]
+}

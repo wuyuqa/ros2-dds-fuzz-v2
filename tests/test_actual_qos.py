@@ -133,11 +133,31 @@ def test_bad_kind():
         aq.read_public_endpoint_qos(None, 'publisher')
 
 
-def test_installed_public_header_abi():
-    receipt = aq._verify_abi()
-    assert receipt['verified'] is True
-    assert receipt['size'] == 88
-    assert receipt['offsets']['liveliness_lease_duration'] == 64
+def test_public_header_abi_fixture(tmp_path):
+    # Synthetic allowlisted bytes exercise hashing and ctypes layout offline;
+    # this is not evidence for an installed ROS header or native ABI.
+    headers = {'types.h': b'/* offline types header fixture */\n',
+               'time.h': b'/* offline time header fixture */\n'}
+    hashes = {name: hashlib.sha256(data).hexdigest() for name, data in headers.items()}
+    for name, data in headers.items():
+        (tmp_path / name).write_bytes(data)
+    with patch.object(aq, '_HEADER_ROOT', tmp_path), \
+            patch.object(aq, '_HEADER_SHA256', hashes):
+        receipt = aq._verify_abi()
+        assert receipt['verified'] is True
+        assert receipt['size'] == 88
+        assert receipt['offsets']['liveliness_lease_duration'] == 64
+        assert receipt['headers'] == {
+            name: {'path': str(tmp_path / name), 'sha256': digest}
+            for name, digest in hashes.items()}
+        for name, data in headers.items():
+            (tmp_path / name).write_bytes(data + b'changed')
+            with pytest.raises(aq.ActualQoSReadbackError, match='header not allowlisted'):
+                aq._verify_abi()
+            (tmp_path / name).write_bytes(data)
+        (tmp_path / 'time.h').unlink()
+        with pytest.raises(FileNotFoundError):
+            aq._verify_abi()
 
 
 def test_unknown_headers_rejected(tmp_path):

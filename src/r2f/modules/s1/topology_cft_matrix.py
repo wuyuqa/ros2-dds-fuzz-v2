@@ -64,3 +64,53 @@ def cft_matrix_program():
     if topology_model.validate_program(program)["status"] != "valid":
         raise ValueError("CFT matrix seed violated the topology contract")
     return program
+
+
+CFT_LIFECYCLE_SEED = "topology.cft_lifecycle"
+UPDATED_TOKEN = "L04UPDATED6E4F"
+
+
+def cft_lifecycle_program():
+    """Opt-in initial/update/disable/enable input; no authored sample verdicts."""
+    program = cft_matrix_program()
+    for endpoint in program['endpoints']:
+        if endpoint['logical_id'] == 'r0':
+            endpoint['filter'] = {'expression': 'data LIKE %0',
+                                  'parameters': ["'%" + SENTINEL_TOKEN + "%'"],
+                                  'evaluation': None}
+    actions = [a for a in program['actions'] if a['op'] == 'create']
+
+    def append(aid, op, eid=None, params=None):
+        actions.append(topology_model._action(aid, op, eid, 1 if eid else None,
+                       params, depends_on=[actions[-1]['action_id']]))
+
+    append('matched', 'barrier', params={'condition': 'matched', 'timeout_sec': 15.0,
+           'endpoint_ids': ['w0', 'r0', 'r1']})
+    phases = [
+        ('initial', None, ORIGINAL_TOKEN, SENTINEL_TOKEN),
+        ('updated', ('update_parameters', 'data LIKE %0', ["'%" + UPDATED_TOKEN + "%'"]),
+         SENTINEL_TOKEN, UPDATED_TOKEN),
+        ('disabled', ('disable', '', []), ORIGINAL_TOKEN, SENTINEL_TOKEN),
+        ('enabled', ('enable', 'data LIKE %0', ["'%" + SENTINEL_TOKEN + "%'"]),
+         ORIGINAL_TOKEN, SENTINEL_TOKEN),
+        ('restored', ('restore_disabled', '', []), ORIGINAL_TOKEN, SENTINEL_TOKEN),
+    ]
+    for index, (phase, update, first, sentinel) in enumerate(phases):
+        if update is not None:
+            aid, expression, parameters = update
+            append(aid, 'update_filter', 'r0', {'expression': expression, 'parameters': parameters})
+        for offset, payload in enumerate((first, sentinel)):
+            aid = phase + ('_sample' if offset == 0 else '_sentinel')
+            params = {'count': 1, 'start_sequence': index * 2 + offset, 'payload': payload}
+            if phase == 'restored' and offset == 0:
+                params.pop('payload')
+                params['repeat_data_from'] = 'initial_sample'
+            append(aid, 'publish_batch', 'w0', params)
+        append(phase + '_observed', 'barrier', params={'condition': 'delivery_sentinel',
+               'timeout_sec': 5.0, 'endpoint_ids': ['w0', 'r0', 'r1'],
+               'publish_action_ids': [phase + '_sentinel']})
+        append(phase + '_snapshot', 'snapshot', params={'label': phase})
+    program['actions'] = actions
+    if topology_model.validate_program(program)['status'] != 'valid':
+        raise ValueError('CFT lifecycle seed violated the topology contract')
+    return program

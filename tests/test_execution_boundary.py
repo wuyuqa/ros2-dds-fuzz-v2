@@ -212,27 +212,31 @@ class OfflineContracts(unittest.TestCase):
             boundary._recv(left, 1)
 
     def test_namespace_fd_type_cannot_be_substituted(self):
-        host = boundary._identity()
+        # Isolate the later FD/namespace gate from the runner's UID.
+        host = dict(boundary._identity(), uid=1000, cap_eff=0)
         fds = [os.pidfd_open(os.getpid())] + [os.open('/proc/self/ns/' + name, os.O_RDONLY)
                                             for name in boundary.NAMESPACES]
         for fd in fds:
             self.addCleanup(os.close, fd)
         fds[1], fds[2] = fds[2], fds[1]
-        with self.assertRaisesRegex(boundary.BoundaryError, 'namespace_fd_type_mismatch:user'):
+        with patch.object(boundary, '_identity', return_value=host), \
+             self.assertRaisesRegex(boundary.BoundaryError, 'namespace_fd_type_mismatch:user'):
             boundary._authenticate({'reported_inner': host},
-                                   (os.getpid(), os.getuid(), os.getgid()), fds, host)
+                                   (os.getpid(), host['uid'], os.getgid()), fds, host)
 
     def test_host_namespaces_cannot_be_reported_as_isolated(self):
-        host = boundary._identity()
+        # Isolate the later FD/namespace gate from the runner's UID.
+        host = dict(boundary._identity(), uid=1000, cap_eff=0)
         fds = [os.pidfd_open(os.getpid())] + [os.open('/proc/self/ns/' + name, os.O_RDONLY) for name in boundary.NAMESPACES]
         for fd in fds:
             self.addCleanup(os.close, fd)
-        with self.assertRaisesRegex(boundary.BoundaryError, 'namespace_not_independent'):
-            boundary._authenticate({'reported_inner': host}, (os.getpid(), os.getuid(), os.getgid()), fds, host)
+        with patch.object(boundary, '_identity', return_value=host), \
+             self.assertRaisesRegex(boundary.BoundaryError, 'namespace_not_independent'):
+            boundary._authenticate({'reported_inner': host}, (os.getpid(), host['uid'], os.getgid()), fds, host)
         with self.assertRaisesRegex(boundary.BoundaryError, 'pidfd_mismatch'):
-            boundary._authenticate({'reported_inner': host}, (1, os.getuid(), os.getgid()), fds, host)
+            boundary._authenticate({'reported_inner': host}, (1, host['uid'], os.getgid()), fds, host)
         with self.assertRaisesRegex(boundary.BoundaryError, 'fd_count'):
-            boundary._authenticate({}, (os.getpid(), os.getuid(), os.getgid()), fds[:1], host)
+            boundary._authenticate({}, (os.getpid(), host['uid'], os.getgid()), fds[:1], host)
 
     def test_host_owner_start_ticks_and_three_inode_receipts(self):
         host = boundary._identity()
@@ -331,9 +335,11 @@ class OfflineContracts(unittest.TestCase):
 
     def test_full_boundary_refuses_privileged_host_and_existing_output(self):
         source = {'source_frozen': False}
-        with patch.object(boundary, '_identity', return_value={'uid': 0, 'cap_eff': 0}):
-            with self.assertRaisesRegex(boundary.BoundaryError, 'uid1000_cap0'):
-                boundary._supervise({}, self.out, boundary._options({}), source, probe={})
+        for uid, cap_eff in ((0, 0), (1001, 0), (1000, 1)):
+            with self.subTest(uid=uid, cap_eff=cap_eff), \
+                 patch.object(boundary, '_identity', return_value={'uid': uid, 'cap_eff': cap_eff}):
+                with self.assertRaisesRegex(boundary.BoundaryError, 'uid1000_cap0'):
+                    boundary._supervise({}, self.out, boundary._options({}), source, probe={})
         (self.out / 'runtime_result.json').write_text('{}')
         with self.assertRaisesRegex(boundary.BoundaryError, 'already_contains'):
             boundary._supervise({}, self.out, boundary._options({}), source, probe={})
@@ -344,8 +350,10 @@ class OfflineContracts(unittest.TestCase):
         fake = unittest.mock.Mock(pid=99999999)
         fake.poll.return_value = 0
         before = len(boundary._QUARANTINED_LEASES)
+        # Only the disconnected guardian is under test; retain real lock FDs.
+        host = dict(boundary._identity(), uid=1000, cap_eff=0)
         try:
-            with patch.object(boundary.subprocess, 'Popen', return_value=fake), patch.object(boundary, '_send'), patch.object(boundary, '_recv', side_effect=EOFError('intentional_test_disconnect')):
+            with patch.object(boundary, '_identity', return_value=host), patch.object(boundary.subprocess, 'Popen', return_value=fake), patch.object(boundary, '_send'), patch.object(boundary, '_recv', side_effect=EOFError('intentional_test_disconnect')):
                 result = boundary._supervise(config, self.out, boundary._options({}), {}, probe={'mode': 'success'})
             self.assertEqual(result['runtime_status'], 'blocked')
             self.assertFalse(result['real_execution'])
@@ -530,11 +538,16 @@ class KernelNonDDSLifecycle(unittest.TestCase):
 
     def wait_cleanup(self, audit):
         deadline = time.monotonic() + 15
-        while not (audit / 'manifest.json').exists():
-            if time.monotonic() > deadline:
-                self.fail('guardian did not record cleanup after caller termination')
-            time.sleep(.02)
-        manifest = json.loads((audit / 'manifest.json').read_text())
+        # The guardian creates the file before its JSON write completes.
+        # Completion is a readable manifest, not merely a directory entry.
+        while True:
+            try:
+                manifest = json.loads((audit / 'manifest.json').read_text())
+                break
+            except (FileNotFoundError, json.JSONDecodeError):
+                if time.monotonic() > deadline:
+                    self.fail('guardian did not record complete cleanup manifest after caller termination')
+                time.sleep(.02)
         # Guardian writes manifest before closing its inherited copies.
         while time.monotonic() < deadline:
             try:

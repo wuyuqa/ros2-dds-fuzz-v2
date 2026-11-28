@@ -10,7 +10,40 @@ import subprocess
 import time
 
 
+def _identity(pid):
+    try:
+        fields = Path(f'/proc/{pid}/stat').read_text().rsplit(')', 1)[1].split()
+    except FileNotFoundError:
+        return None
+    return {'pid': pid, 'state': fields[0], 'pgid': int(fields[2]),
+            'sid': int(fields[3]), 'start_ticks': int(fields[19])}
+
+
+# linux/uapi/linux/pidfd.h: PIDFD_SIGNAL_PROCESS_GROUP, available since 6.9.
+_PIDFD_SIGNAL_PROCESS_GROUP = 1 << 2
+
+
+def _require_group_pidfd():
+    if not callable(getattr(os, 'pidfd_open', None)) or not callable(getattr(signal, 'pidfd_send_signal', None)):
+        raise RuntimeError('worker_group_pidfd_capability_unavailable:python_api')
+    try:
+        fd = os.pidfd_open(os.getpid())
+        try:
+            try:
+                signal.pidfd_send_signal(fd, 0, None, _PIDFD_SIGNAL_PROCESS_GROUP)
+            except ProcessLookupError:
+                # Our task need not be its process-group leader. The kernel
+                # accepted the flag but this pid has no group attached.
+                pass
+        finally:
+            os.close(fd)
+    except OSError as exc:
+        raise RuntimeError('worker_group_pidfd_capability_unavailable:' + str(exc)) from exc
+
+
 class WorkerPool:
+    worker_module = 'r2f.runtime.worker'
+
     def __init__(self, config, environment, output_dir, emit, *, role_environments=None):
         self.config, self.environment, self.output_dir, self.emit = config, environment, Path(output_dir), emit
         self.selector = selectors.DefaultSelector()
@@ -25,8 +58,12 @@ class WorkerPool:
         # Current-role view only; instances below retain the stop state of
         # every generation so a restart cannot erase its predecessor's health.
         self.stopped_roles = set()
+        self.closed = False
 
     def start(self, role):
+        if self.closed:
+            raise RuntimeError('worker_pool_closed')
+        _require_group_pidfd()
         if role in self.workers and self.workers[role].poll() is None:
             raise RuntimeError('worker_role_still_live:' + role)
         for instance in self.instances:
@@ -49,26 +86,41 @@ class WorkerPool:
                 attempt += 1
                 stderr_path = self.output_dir / f'{role}.{attempt}.stderr.log'
         self.stderr_handles.append(stderr)
-        process = subprocess.Popen(['/usr/bin/python3', '-B', '-m', 'r2f.runtime.worker',
+        process = subprocess.Popen(['/usr/bin/python3', '-B', '-m', self.worker_module,
                                     json.dumps(self.config, sort_keys=True), role],
                                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=stderr,
                                    env=env, start_new_session=True, cwd=self.config['source_repo'])
+        # Keep the kernel group identity even after Popen reaps the leader.
+        # A numeric PGID plus a late /proc scan cannot rule out group reuse.
+        group_pidfd = None
+        identity_error = None
+        try:
+            group_pidfd = os.pidfd_open(process.pid)
+        except OSError as exc:
+            identity_error = str(exc)
         self.workers[role] = process
         self.buffers[role] = b''
         self.stopped_roles.discard(role)
-        os.set_blocking(process.stdout.fileno(), False)
         generation = self.role_generations.get(role, 0) + 1
         self.role_generations[role] = generation
         metadata = {'role': role, 'pid': process.pid, 'pgid': process.pid,
                     'worker_generation': generation, 'fresh_process': True,
-                    'separate_context': True, 'stderr_path': str(stderr_path)}
+                    'separate_context': True, 'stderr_path': str(stderr_path), 'start_ticks': None}
         instance = {'process': process, 'metadata': metadata, 'buffer': b'',
                     'stop_command_id': None, 'stop_requested_monotonic_ns': None,
-                    'endpoint_generation': None}
+                    'endpoint_generation': None, 'group_pidfd': group_pidfd,
+                    'identity_error': identity_error}
         self.instances.append(instance)
-        self.selector.register(process.stdout, selectors.EVENT_READ, instance)
         self.metadata.append(metadata)
+        identity = _identity(process.pid)
+        metadata['start_ticks'] = identity['start_ticks'] if identity else None
+        os.set_blocking(process.stdout.fileno(), False)
+        self.selector.register(process.stdout, selectors.EVENT_READ, instance)
         self.emit('process_started', **metadata)
+        if group_pidfd is None:
+            # Keep the instance for close/lease quarantine; never let a late
+            # resource/permission failure erase a child that already exists.
+            raise RuntimeError('worker_group_pidfd_bind_failed:' + str(identity_error))
 
     def command(self, role, command, **fields):
         self.command_serial += 1
@@ -167,7 +219,38 @@ class WorkerPool:
                 raise TimeoutError(label)
             self.pump(min(0.05, max(0, deadline - time.monotonic())))
 
+    def _group_members(self, metadata):
+        pgid = metadata['pgid']
+        leader = _identity(pgid)
+        if leader is not None and leader['start_ticks'] != metadata['start_ticks']:
+            raise RuntimeError('worker_group_identity_changed:' + str(pgid))
+        members = []
+        for entry in Path('/proc').glob('[0-9]*'):
+            member = _identity(int(entry.name))
+            if member is None or member['pgid'] != pgid or member['state'] in ('Z', 'X'):
+                continue
+            if (metadata['start_ticks'] is None or member['sid'] != pgid
+                    or member['start_ticks'] < metadata['start_ticks']):
+                raise RuntimeError('worker_group_identity_unconfirmed:' + str(pgid))
+            members.append(member)
+        return members
+
+    def _signal_group(self, instance, sig):
+        fd = instance['group_pidfd']
+        if fd is None:
+            raise RuntimeError('worker_group_pidfd_unavailable:' + str(instance['identity_error']))
+        # Linux PIDFD_SIGNAL_PROCESS_GROUP (6.9+). ESRCH refers to the original
+        # kernel group, never a newly allocated group with the same number.
+        # EINVAL/EPERM and other uncertainty propagate: no numeric fallback.
+        try:
+            signal.pidfd_send_signal(fd, sig, None, _PIDFD_SIGNAL_PROCESS_GROUP)
+        except ProcessLookupError:
+            return False
+        return True
+
     def close(self):
+        if self.closed:
+            return
         for role, process in self.workers.items():
             if process.poll() is None and not self.is_stopped(role):
                 with contextlib.suppress(OSError):
@@ -175,27 +258,80 @@ class WorkerPool:
         deadline = time.monotonic() + 3
         while any(p.poll() is None for p in self.workers.values()) and time.monotonic() < deadline:
             self.pump(0.05)
+        errors = []
         for instance in self.instances:
             process, metadata = instance['process'], instance['metadata']
             role = metadata['role']
-            if process.poll() is None:
-                # Only the process group allocated by this Popen is eligible.
-                with contextlib.suppress(ProcessLookupError):
-                    os.killpg(process.pid, signal.SIGTERM)
+            metadata['group_cleanup_confirmed'] = False
+            metadata['stdio_cleanup_confirmed'] = True
+            try:
+                # A reaped rc0 leader says nothing about its surviving group.
+                # Poll the whole original session/group through both stages.
+                group_exists = self._signal_group(instance, 0)
+                members = self._group_members(metadata) if group_exists else []
+                for sig in (signal.SIGTERM, signal.SIGKILL):
+                    deadline = time.monotonic() + 2
+                    while members:
+                        group_exists = self._signal_group(instance, sig)
+                        self.pump(0.02)
+                        members = self._group_members(metadata) if group_exists else []
+                        if time.monotonic() >= deadline:
+                            break
+                    if not members:
+                        break
+                if members:
+                    raise TimeoutError('worker_group_still_live:' + str(metadata['pgid']))
+                process.wait(timeout=2)
+                self.pump(0)
+                metadata['returncode'] = process.returncode
+                os.close(instance['group_pidfd'])
+                instance['group_pidfd'] = None
+                metadata['group_cleanup_confirmed'] = True
+                metadata['cleanup_confirmed'] = True
+            except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as exc:
+                metadata['cleanup_confirmed'] = False
+                errors.append(str(exc))
+                self.emit('process_cleanup_failed', role=role, pid=process.pid,
+                          pgid=metadata['pgid'], reason=str(exc))
+            finally:
+                # Pipe flush/close can fail after a successful group shutdown.
+                # Keep that failure separate, and still visit every generation.
                 try:
-                    process.wait(timeout=2)
-                except subprocess.TimeoutExpired:
-                    with contextlib.suppress(ProcessLookupError):
-                        os.killpg(process.pid, signal.SIGKILL)
-                    process.wait(timeout=2)
-            self.pump(0)
-            metadata['returncode'] = process.returncode
-            self.emit('process_exit', role=role, pid=process.pid, pgid=process.pid,
-                      worker_generation=metadata['worker_generation'], returncode=process.returncode)
-            with contextlib.suppress(KeyError, ValueError):
-                self.selector.unregister(process.stdout)
-            process.stdout.close()
-            process.stdin.close()
-        self.selector.close()
-        for handle in self.stderr_handles:
-            handle.close()
+                    self.selector.unregister(process.stdout)
+                except (KeyError, ValueError):
+                    pass  # Already unregistered/closed is harmless.
+                except OSError as exc:
+                    metadata['stdio_cleanup_confirmed'] = False
+                    errors.append(f'worker_selector_unregister_failed:{role}:'
+                                  f"{metadata['worker_generation']}:{exc}")
+                for name, stream in (('stdout', process.stdout), ('stdin', process.stdin)):
+                    try:
+                        stream.close()
+                    except (OSError, RuntimeError, ValueError) as exc:
+                        metadata['stdio_cleanup_confirmed'] = False
+                        reason = (f'worker_stdio_close_failed:{role}:'
+                                  f"{metadata['worker_generation']}:{name}:{type(exc).__name__}:{exc}")
+                        errors.append(reason)
+                        self.emit('process_cleanup_failed', role=role, pid=process.pid,
+                                  pgid=metadata['pgid'], worker_generation=metadata['worker_generation'],
+                                  resource=name, reason=reason)
+                metadata['cleanup_confirmed'] = (metadata['group_cleanup_confirmed']
+                                                 and metadata['stdio_cleanup_confirmed'])
+            if metadata['group_cleanup_confirmed']:
+                self.emit('process_exit', role=role, pid=process.pid, pgid=process.pid,
+                          worker_generation=metadata['worker_generation'], returncode=process.returncode,
+                          group_cleanup_confirmed=True,
+                          stdio_cleanup_confirmed=metadata['stdio_cleanup_confirmed'],
+                          cleanup_confirmed=metadata['cleanup_confirmed'])
+        for name, resource in [('selector', self.selector),
+                               *[(f'stderr:{index}', handle)
+                                 for index, handle in enumerate(self.stderr_handles)]]:
+            try:
+                resource.close()
+            except (OSError, RuntimeError, ValueError) as exc:
+                reason = f'worker_resource_close_failed:{name}:{type(exc).__name__}:{exc}'
+                errors.append(reason)
+                self.emit('process_cleanup_failed', resource=name, reason=reason)
+        if errors:
+            raise RuntimeError('worker_cleanup_unconfirmed:' + ';'.join(errors))
+        self.closed = True

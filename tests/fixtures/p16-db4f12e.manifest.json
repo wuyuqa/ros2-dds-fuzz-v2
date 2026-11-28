@@ -1,0 +1,251 @@
+{
+  "archive_sha256": "3aa367d886d81cd747cdcde08617dd8c68040e5adc5ecb8d0534e86d4eaf81f2",
+  "archive_size": 1031013,
+  "canonical_root": "/home/wuyuqa/ros2-dds-fuzz-v2/results/main-review/s1-final-breadth-prep-20261120/continuation-db4f12e/live-remaining-fifteen/partition-16",
+  "capsule": "p16",
+  "capture_head": "db4f12e383a6e99f64839a2a22684b93ac0305e9",
+  "members": {
+    "candidate_ledger.json": {
+      "sha256": "19a547e8426742e88370edc06a4aafb2dcbc655863dec884e84b0cd186ab39c7",
+      "size": 1539
+    },
+    "cases/s1-continued-partition-16-db4f12e-d178-20261120.0000.rejected/row.json": {
+      "sha256": "93fe73699a7d222094fab5d302c82719487facca36c5af28efb9ea0b618f1cde",
+      "size": 1999
+    },
+    "cases/s1-continued-partition-16-db4f12e-d178-20261120.0001.S1.topology.program/capsule.json": {
+      "sha256": "a7975383170320aea618d72920996b6202a28cca036a113e69d429423a739ccd",
+      "size": 854400
+    },
+    "cases/s1-continued-partition-16-db4f12e-d178-20261120.0001.S1.topology.program/mutation_plan.json": {
+      "sha256": "86820d9e40d72c85ba05991f5b18fa685ac3473ff4966953211cda57deb82043",
+      "size": 46060
+    },
+    "cases/s1-continued-partition-16-db4f12e-d178-20261120.0001.S1.topology.program/row.json": {
+      "sha256": "b2adb9f96def680b17d1e0b106934bf91c2a26040e6222bb1c6c2eb160c59aff",
+      "size": 463384
+    },
+    "cases/s1-continued-partition-16-db4f12e-d178-20261120.0001.S1.topology.program/runtime/execution-boundary-12828021ab5a4dc9a09c65a6a4c83657/guardian-events.jsonl": {
+      "sha256": "6449ba8ab040adf2290cfe760bbf04afa31a442a574cff86968d27d137863355",
+      "size": 4420
+    },
+    "cases/s1-continued-partition-16-db4f12e-d178-20261120.0001.S1.topology.program/runtime/execution-boundary-12828021ab5a4dc9a09c65a6a4c83657/guardian.stderr": {
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "size": 0
+    },
+    "cases/s1-continued-partition-16-db4f12e-d178-20261120.0001.S1.topology.program/runtime/execution-boundary-12828021ab5a4dc9a09c65a6a4c83657/guardian.stdout": {
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "size": 0
+    },
+    "cases/s1-continued-partition-16-db4f12e-d178-20261120.0001.S1.topology.program/runtime/execution-boundary-12828021ab5a4dc9a09c65a6a4c83657/inner-leases.json": {
+      "sha256": "f613bbbbf39c92843efa5f286673e0dcaa44f4b7f90311130497eb6fff50dfec",
+      "size": 3468
+    },
+    "cases/s1-continued-partition-16-db4f12e-d178-20261120.0001.S1.topology.program/runtime/execution-boundary-12828021ab5a4dc9a09c65a6a4c83657/inner-preflight.json": {
+      "sha256": "fc7a440c642a5b7faf4411a6477d3c678416de9df0057b68128ccc086d5f8611",
+      "size": 4840
+    },
+    "cases/s1-continued-partition-16-db4f12e-d178-20261120.0001.S1.topology.program/runtime/execution-boundary-12828021ab5a4dc9a09c65a6a4c83657/inner-runtime-result.json": {
+      "sha256": "b32a537fda2faf72dcf1ba592172896a8417615b8e067f3ed4a071a00776401c",
+      "size": 1766211
+    },
+    "cases/s1-continued-partition-16-db4f12e-d178-20261120.0001.S1.topology.program/runtime/execution-boundary-12828021ab5a4dc9a09c65a6a4c83657/launcher-cleanup.json": {
+      "sha256": "dc045a31046aebc14c285b1f5b96f55a49be821469a29568be3f080753b2cec9",
+      "size": 115
+    },
+    "cases/s1-continued-partition-16-db4f12e-d178-20261120.0001.S1.topology.program/runtime/execution-boundary-12828021ab5a4dc9a09c65a6a4c83657/launcher.stderr": {
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "size": 0
+    },
+    "cases/s1-continued-partition-16-db4f12e-d178-20261120.0001.S1.topology.program/runtime/execution-boundary-12828021ab5a4dc9a09c65a6a4c83657/launcher.stdout": {
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "size": 0
+    },
+    "cases/s1-continued-partition-16-db4f12e-d178-20261120.0001.S1.topology.program/runtime/execution-boundary-12828021ab5a4dc9a09c65a6a4c83657/manifest.json": {
+      "sha256": "6b5b0d85a0337726e489d3641e1a93e8f3f1b17f67f2f69aca4c051299f0a2e6",
+      "size": 33357
+    },
+    "cases/s1-continued-partition-16-db4f12e-d178-20261120.0001.S1.topology.program/runtime/execution-boundary-12828021ab5a4dc9a09c65a6a4c83657/raw-identity.json": {
+      "sha256": "a0a3fd20bd3e5a8959c7ac5eca50bb7315d557fe77f38924118eb0ef5af7c632",
+      "size": 40023
+    },
+    "cases/s1-continued-partition-16-db4f12e-d178-20261120.0001.S1.topology.program/runtime/execution-boundary-12828021ab5a4dc9a09c65a6a4c83657/request.json": {
+      "sha256": "4bf81d52664a25a6d26be958d5d506ca79c53bdc5f5522418259ce62b1302f15",
+      "size": 385632
+    },
+    "cases/s1-continued-partition-16-db4f12e-d178-20261120.0001.S1.topology.program/runtime/execution-boundary-12828021ab5a4dc9a09c65a6a4c83657/submitted-config.json": {
+      "sha256": "0cb0f0199ae752e6eac6f216e92ea1ce33b78c97d362b69aafd6306be787f6ea",
+      "size": 359398
+    },
+    "cases/s1-continued-partition-16-db4f12e-d178-20261120.0001.S1.topology.program/runtime/execution-boundary-12828021ab5a4dc9a09c65a6a4c83657/supervisor-final.json": {
+      "sha256": "6b01da356aa1a0a77f7911c24a1088c209506c7683bc9cb666c8143a06f884ca",
+      "size": 520
+    },
+    "cases/s1-continued-partition-16-db4f12e-d178-20261120.0001.S1.topology.program/runtime/inner-runtime/endpoints/r0/g1/reader.stderr.log": {
+      "sha256": "8897ba84d153247a8e2c50b0055f01169cc52108509ee1a129fb72e7b6a651f4",
+      "size": 300
+    },
+    "cases/s1-continued-partition-16-db4f12e-d178-20261120.0001.S1.topology.program/runtime/inner-runtime/endpoints/r0/g1/ros_logs/python3_74_1795187959382.log": {
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "size": 0
+    },
+    "cases/s1-continued-partition-16-db4f12e-d178-20261120.0001.S1.topology.program/runtime/inner-runtime/endpoints/r1/g1/reader2.stderr.log": {
+      "sha256": "d39c23afeb6f595eaaa65660164595d5fbad2bcf37ecdb9152e263ebad9bbb51",
+      "size": 513
+    },
+    "cases/s1-continued-partition-16-db4f12e-d178-20261120.0001.S1.topology.program/runtime/inner-runtime/endpoints/r1/g1/ros_logs/python3_90_1795187959827.log": {
+      "sha256": "11f788b253fb68b55801d3024e87f5aabf392d0d63ab2310472104c5a2f20927",
+      "size": 213
+    },
+    "cases/s1-continued-partition-16-db4f12e-d178-20261120.0001.S1.topology.program/runtime/inner-runtime/endpoints/r2/g1/reader3.stderr.log": {
+      "sha256": "e1ea3d7a63d63dc1278a019f2a8a367addd6a2ff3c237a4518939b62fcf5cc38",
+      "size": 300
+    },
+    "cases/s1-continued-partition-16-db4f12e-d178-20261120.0001.S1.topology.program/runtime/inner-runtime/endpoints/r2/g1/ros_logs/python3_106_1795187960272.log": {
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "size": 0
+    },
+    "cases/s1-continued-partition-16-db4f12e-d178-20261120.0001.S1.topology.program/runtime/inner-runtime/endpoints/r3/g1/reader4.stderr.log": {
+      "sha256": "04c47b854db85bc5c082888a23096f36db1d24d4f135717c142029879533be9d",
+      "size": 513
+    },
+    "cases/s1-continued-partition-16-db4f12e-d178-20261120.0001.S1.topology.program/runtime/inner-runtime/endpoints/r3/g1/ros_logs/python3_138_1795187961148.log": {
+      "sha256": "bacf85849dfb8276731d06cecf760118a500b7f0fa5383cd76eab953dcaf4aea",
+      "size": 213
+    },
+    "cases/s1-continued-partition-16-db4f12e-d178-20261120.0001.S1.topology.program/runtime/inner-runtime/endpoints/w0/g1/ros_logs/python3_122_1795187960726.log": {
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "size": 0
+    },
+    "cases/s1-continued-partition-16-db4f12e-d178-20261120.0001.S1.topology.program/runtime/inner-runtime/endpoints/w0/g1/writer.stderr.log": {
+      "sha256": "037ea74c947d778a8e7e77e34786a9f9a4dc53338d6a64d802fefde4f3cf697b",
+      "size": 300
+    },
+    "cases/s1-continued-partition-16-db4f12e-d178-20261120.0001.S1.topology.program/runtime/inner-runtime/endpoints/w2/g1/ros_logs/python3_154_1795187961608.log": {
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "size": 0
+    },
+    "cases/s1-continued-partition-16-db4f12e-d178-20261120.0001.S1.topology.program/runtime/inner-runtime/endpoints/w2/g1/writer3.stderr.log": {
+      "sha256": "987b496393796cf44f5cf22455318eb4ac83231454a6c0bd53a4d7a4650648b5",
+      "size": 300
+    },
+    "cases/s1-continued-partition-16-db4f12e-d178-20261120.0001.S1.topology.program/runtime/inner-runtime/endpoints/w3/g1/ros_logs/python3_58_1795187958935.log": {
+      "sha256": "34a38e4b758f74826ed1d8f467ba8146b889de808b00fbd00ad65331fae0eef7",
+      "size": 424
+    },
+    "cases/s1-continued-partition-16-db4f12e-d178-20261120.0001.S1.topology.program/runtime/inner-runtime/endpoints/w3/g1/writer4.stderr.log": {
+      "sha256": "7bdaabea6399a711f228f16fe0335204aab328c786efe5debda5eeeda7ff61b1",
+      "size": 724
+    },
+    "cases/s1-continued-partition-16-db4f12e-d178-20261120.0001.S1.topology.program/runtime/inner-runtime/environment.json": {
+      "sha256": "26bb748572f69ff21e1a5da90e8c727450ab0eff491ff7c2cf1e4a0f4aa506d6",
+      "size": 4572
+    },
+    "cases/s1-continued-partition-16-db4f12e-d178-20261120.0001.S1.topology.program/runtime/inner-runtime/execution_metadata.json": {
+      "sha256": "3ac5fb526b0add943f3afac032c8de2e0be1b55233ab4eb8f1cabc8ebcd3769c",
+      "size": 22093
+    },
+    "cases/s1-continued-partition-16-db4f12e-d178-20261120.0001.S1.topology.program/runtime/inner-runtime/raw.jsonl": {
+      "sha256": "fb2c2c5e4c5dbafeb0d5cbc23cf9afbc35b27aa70f3848cba41eb91cbf40c965",
+      "size": 962970
+    },
+    "cases/s1-continued-partition-16-db4f12e-d178-20261120.0001.S1.topology.program/runtime/inner-runtime/runtime_result.json": {
+      "sha256": "7432036038f8d24e5e45f451ad1aaf0a93b9ba019918e2489f01282c3704aaf2",
+      "size": 1753387
+    },
+    "cases/s1-continued-partition-16-db4f12e-d178-20261120.0001.S1.topology.program/runtime/inner-runtime/topology-namespace/child-envelope.json": {
+      "sha256": "0b05c1d8976dfebe927d0a48514e87ee3c244de32d94d70bdc670a7df842db17",
+      "size": 8402
+    },
+    "cases/s1-continued-partition-16-db4f12e-d178-20261120.0001.S1.topology.program/runtime/inner-runtime/topology-namespace/child-runtime-result.json": {
+      "sha256": "7432036038f8d24e5e45f451ad1aaf0a93b9ba019918e2489f01282c3704aaf2",
+      "size": 1753387
+    },
+    "cases/s1-continued-partition-16-db4f12e-d178-20261120.0001.S1.topology.program/runtime/inner-runtime/topology-namespace/manifest.json": {
+      "sha256": "7bb8fceeaff2d8e5f597afd6d55020667ea1165f6462596d2f378851672c5e59",
+      "size": 27651
+    },
+    "cases/s1-continued-partition-16-db4f12e-d178-20261120.0001.S1.topology.program/runtime/inner-runtime/topology-namespace/request.json": {
+      "sha256": "cbad1ba529490d396cb48f4ac991de9f1c60fc739366a8b639c3842bb9e6bc15",
+      "size": 382207
+    },
+    "cases/s1-continued-partition-16-db4f12e-d178-20261120.0001.S1.topology.program/runtime/inner-runtime/topology-namespace/source-after.json": {
+      "sha256": "4e9991b19670b71dcb8816c1c91e0f7c144ded9ae95b8af84f36f8499d044d5a",
+      "size": 256
+    },
+    "cases/s1-continued-partition-16-db4f12e-d178-20261120.0001.S1.topology.program/runtime/inner-runtime/topology-namespace/source-before.json": {
+      "sha256": "4e9991b19670b71dcb8816c1c91e0f7c144ded9ae95b8af84f36f8499d044d5a",
+      "size": 256
+    },
+    "cases/s1-continued-partition-16-db4f12e-d178-20261120.0001.S1.topology.program/runtime/inner-runtime/topology-namespace/stderr.log": {
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "size": 0
+    },
+    "cases/s1-continued-partition-16-db4f12e-d178-20261120.0001.S1.topology.program/runtime/inner-runtime/topology-namespace/stdout.log": {
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "size": 0
+    },
+    "cases/s1-continued-partition-16-db4f12e-d178-20261120.0001.S1.topology.program/runtime/runtime_result.json": {
+      "sha256": "2edf9ddd306ce20f6fe5d755136691fc91ed56d7299f36d62e4a9601ab8c494b",
+      "size": 1789504
+    },
+    "cases/s1-continued-partition-16-db4f12e-d178-20261120.0001.S1.topology.program/runtime_config.json": {
+      "sha256": "0cb0f0199ae752e6eac6f216e92ea1ce33b78c97d362b69aafd6306be787f6ea",
+      "size": 359398
+    },
+    "cases/s1-continued-partition-16-db4f12e-d178-20261120.0001.S1.topology.program/submission_intent.json": {
+      "sha256": "3d47cc3486bc369ade26bce3fb9bd187bfb5f1e4c81885fcbd68599501829bdc",
+      "size": 2673
+    },
+    "checkpoint.json": {
+      "sha256": "8e280d98efbc6d2f8c5481d08188b173e238244434729046dd17a6f7bd72bf09",
+      "size": 541605
+    },
+    "checkpoints/00000000-recorded.json": {
+      "sha256": "17b4e1e39a1a90388b73df436acdd960b0c78b94cd724953a838f29363d5e7a8",
+      "size": 128261
+    },
+    "checkpoints/00000001-planned.json": {
+      "sha256": "be26e6982f08161f95e195f7adc602045bbf4cf7201ebed2f7c9cbdb5ffacfdf",
+      "size": 556022
+    },
+    "checkpoints/00000002-planned.json": {
+      "sha256": "fc35e6524b1dc497eca302c3ad2e08281654c699429878b5c1c78332c450c4cc",
+      "size": 556201
+    },
+    "checkpoints/00000003-recorded.json": {
+      "sha256": "53b5c77fed2051f64a853362c47c664ac932a3bd1ef0ee1826872a146af16aeb",
+      "size": 541571
+    },
+    "checkpoints/00000004-final.json": {
+      "sha256": "8e280d98efbc6d2f8c5481d08188b173e238244434729046dd17a6f7bd72bf09",
+      "size": 541605
+    },
+    "corpus.json": {
+      "sha256": "0b3d75b5453070e5e3022e1ff99bbde3f012eec0ef70f4051bf0ef5314c6e6d8",
+      "size": 19919
+    },
+    "cycle.json": {
+      "sha256": "2a1a4be9fded2d0e960edafb27e734f8702b9dc763d84d7870f29e0fa72214c6",
+      "size": 1035947
+    },
+    "feedback.json": {
+      "sha256": "df3a58bb21fc43fc6f472ce2a5cd8d24fe1bf2e4338236aaf550f66739ae3664",
+      "size": 620
+    },
+    "manifest.json": {
+      "sha256": "d23c52faef12588d960c03e4bde82793d0670d8fc69f9de9746f31346b50ff09",
+      "size": 25462
+    },
+    "report.json": {
+      "sha256": "1f88fd6925cb1ce33fae46a1285ccceed71e2d73503d8938d3074a5bdc1cbf09",
+      "size": 543196
+    },
+    "selection_log.json": {
+      "sha256": "cb7dd50e0603efb0fe81d3dc19495bcb6e5035baf1944a35bd00822f22f7aab4",
+      "size": 447240
+    }
+  },
+  "schema": "r2f.offline-historical-capsule/v1",
+  "source_repo": "/home/wuyuqa/ros2-dds-fuzz-v2"
+}

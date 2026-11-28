@@ -76,22 +76,24 @@ def receive_callback():
     wrapper = ast.parse('def wrapper():\n receive_sequence = 0\n pass\n return receive\n').body[0]
     wrapper.body[1] = original
     emitted = []
-    env = {'__name__': 'r2f.runtime.topology_worker', '__package__': 'r2f.runtime',
+    from topology_ros_message_fixture import bound_message_codec
+    codec = bound_message_codec()
+    env = {'codec': codec, '__name__': 'r2f.runtime.topology_worker', '__package__': 'r2f.runtime',
            'json': json, 'local_gid': 'reader-gid',
            'gid_bytes': lambda x: bytes(x).hex() if x is not None else None,
            'emit': lambda name, **fields: emitted.append(dict(event=name, **fields))}
     exec(compile(ast.fix_missing_locations(ast.Module(body=[wrapper], type_ignores=[])), str(path), 'exec'), env)
-    return env['wrapper'](), emitted
+    return env['wrapper'](), emitted, codec.make_message
 
 
 def test_real_callback_wiring_captures_only_supplied_public_fields():
-    receive, rows = receive_callback()
+    receive, rows, make_message = receive_callback()
     data = json.dumps({'run_id': 'fixture', 'writer_id': 'w0', 'writer_generation': 1,
                        'send_sequence': 15, 'phase': 'pre'})
     info = dict(publication_sequence_number=17, reception_sequence_number=21,
                 source_timestamp=3000, received_timestamp=4000)
-    receive(SimpleNamespace(data=data), info)
-    receive(SimpleNamespace(data=data), dict(info, publication_sequence_number=18, reception_sequence_number=22))
+    receive(make_message(data), info)
+    receive(make_message(data), dict(info, publication_sequence_number=18, reception_sequence_number=22))
     assert [r['receive_sequence'] for r in rows] == [1, 2]
     assert [r['send_sequence'] for r in rows] == [15, 15]  # same complete bytes, distinct captured transport numbers
     assert [r['message_info_receipt']['fields']['publication_sequence_number']['value'] for r in rows] == [17, 18]

@@ -7,7 +7,7 @@ from copy import deepcopy
 import json
 from pathlib import Path
 
-from r2f.core.evidence import canonical_hash
+from r2f.core.evidence import canonical_hash, raw_sha256, verify_raw
 from r2f.core.replay import ReplayCapsule
 from r2f.core.scenario import Scenario
 from r2f.campaign.runtime_adapter import ingest_execution
@@ -121,6 +121,51 @@ def _qualify_g01_rejection(root, row, cycle):
     return {str(p.relative_to(root)): canonical_hash(_read(p)) for p in refs}
 
 
+def _verify_cycle_input(root, row, report):
+    """Verify the optional frozen builder input through the existing auditor.
+
+    Historical reports without a persisted cycle reference remain historical;
+    their old transient cycle hash is not upgraded into a verified file hash.
+    """
+    provenance = report.get('proof_provenance')
+    if provenance is None:
+        return
+    if not isinstance(provenance, dict):
+        raise ValueError('f1_cycle_input_invalid:provenance_not_an_object')
+    if not any(key in provenance for key in ('cycle_path', 'cycle_file_sha256')):
+        return
+    from r2f.reports.run_report import _path
+    try:
+        path = _path(root, provenance.get('cycle_path'))
+        verify_raw(path, provenance.get('cycle_file_sha256'))
+        saved = _read(path)
+        if canonical_hash(saved) != provenance.get('cycle_sha256'):
+            raise ValueError('hash_mismatch')
+        if any(key in saved for key in ('report_path', 'feedback_aggregate')):
+            raise ValueError('references_terminal_output')
+        for key in ('run_id', 'profile', 'source_manifest', 'budget', 'last_state', 'abort',
+                    'runtime_boundary', 'runtime_formal', 'cycle_budget', 'resume_origin',
+                    'row_sequences'):
+            _same(saved.get(key), report.get(key), 'identity_mismatch:' + key)
+        source = saved.get('source_manifest')
+        if not isinstance(source, dict):
+            raise ValueError('source_manifest_not_an_object')
+        _same(provenance.get('source_head'), source.get('head'),
+              'identity_mismatch:source_head')
+        rows = saved.get('rows')
+        if not isinstance(rows, list) or any(not isinstance(item, dict) for item in rows):
+            raise ValueError('rows_not_objects')
+        original = [item for item in rows if item.get('cell_id') == row['cell_id']]
+        if len(original) != 1:
+            raise ValueError('cell_missing_or_duplicated')
+        producer = deepcopy(row)
+        if 'generation_binding' in producer:
+            producer['binding'] = producer.pop('generation_binding')
+        _same(original[0], producer, 'row_identity_mismatch')
+    except (OSError, ValueError, TypeError, KeyError) as exc:
+        raise ValueError('f1_cycle_input_invalid:' + str(exc)) from exc
+
+
 def qualify_f1_artifacts(root, row, cycle):
     """Reopen sealed input, project persisted config, reingest raw and qualify.
 
@@ -131,6 +176,7 @@ def qualify_f1_artifacts(root, row, cycle):
     from r2f.reports.run_report import _path
     from r2f.campaign.runner import _F1_CYCLE_TARGETS
     root = Path(root).resolve()
+    _verify_cycle_input(root, row, cycle)
     cell = row.get('cell_id')
     if not isinstance(cell, str) or cell in {'', '.', '..'} or Path(cell).name != cell or '\\' in cell:
         raise ValueError('f1_invalid_cell_id')
@@ -256,14 +302,24 @@ def persist_f1_exploratory_report(output_dir, cycle, registry, *, artifact_root=
     An explicit historical read root does not relax the existing auditor's
     containment gate. Save any resulting audit errors verbatim.
     """
-    from r2f.campaign.runner import _atomic_json
     from r2f.campaign.scheduler import required_catalog_hash
     from r2f.core.mutators import ALL_MUTATOR_SPECS
     from r2f.modules.s1.fuzz_catalog import catalog_digest
-    from r2f.reports.candidate_report import exploratory_candidate_ledger
+    from r2f.reports.candidate_report import exploratory_candidate_ledger, _write_immutable_json
     from r2f.reports.run_report import EXPLORATORY_SCHEMA, exploratory_report_digest, audit_exploratory_report
     output_dir = Path(output_dir).resolve()
     root = Path(artifact_root).resolve() if artifact_root is not None else output_dir
+    for name in ('cycle-input.json', 'candidate_ledger.json', 'report.json'):
+        existing = output_dir / name
+        if existing.exists() or existing.is_symlink():
+            raise FileExistsError('immutable report artifact already exists: ' + str(existing))
+    # Freeze the builder's input before the runner attaches terminal outputs.
+    # The final cycle is an index pointing to this report, so the report must
+    # never bind that future index as its own evidence.
+    cycle_input = deepcopy(cycle)
+    for key in ('report_path', 'feedback_aggregate'):
+        cycle_input.pop(key, None)
+    _write_immutable_json(output_dir / 'cycle-input.json', cycle_input)
     targets = {key: registry.get_target(key) for key in cycle['profile']['target_ids']}
     target_model = {key: target.to_dict() for key, target in targets.items()}
     rules = {key: target.rule_contract for key, target in targets.items()}
@@ -310,7 +366,9 @@ def persist_f1_exploratory_report(output_dir, cycle, registry, *, artifact_root=
                   if key in cycle}),
               'runtime_boundary': cycle['runtime_boundary'], 'runtime_formal': cycle['runtime_formal'],
               'control_references': [], 'review_records': [],
-              'proof_provenance': {'artifact_root': str(root), 'cycle_sha256': canonical_hash(cycle),
+              'proof_provenance': {'artifact_root': str(root), 'cycle_path': 'cycle-input.json',
+                                   'cycle_sha256': canonical_hash(cycle_input),
+                                   'cycle_file_sha256': raw_sha256(output_dir / 'cycle-input.json'),
                                    'kind': 'offline_reopened_case_consistency',
                                    'source_head': cycle['source_manifest'].get('head'),
                                    'new_execution': False, 'controls_run_by_report_builder': False},
@@ -321,11 +379,10 @@ def persist_f1_exploratory_report(output_dir, cycle, registry, *, artifact_root=
                               'No controls run or required 72-cell seal borrowed.',
                               'Historical external-root references are rejected by the standalone auditor.']}
     ledger = exploratory_candidate_ledger(eligible)
-    _atomic_json(output_dir / 'candidate_ledger.json', ledger)
+    _write_immutable_json(output_dir / 'candidate_ledger.json', ledger)
     report.update(candidate_ledger_path='candidate_ledger.json', candidate_ledger_sha256=canonical_hash(ledger))
     report['report_sha256'] = exploratory_report_digest(report)
     path = output_dir / 'report.json'
-    _atomic_json(path, report)
-    report['audit'] = audit_exploratory_report(path)
-    _atomic_json(path, report)
+    report['audit'] = audit_exploratory_report(path, report=report)
+    _write_immutable_json(path, report)
     return path

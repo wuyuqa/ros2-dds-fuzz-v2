@@ -55,7 +55,7 @@ F2_SURFACE_MUTATORS = {'E02': 'M07', 'E03': 'M06'}
 F2_TIMING_FIELDS = frozenset({'runtime_capability', 'anchor_timing_policy',
                               'anchor_lateness_tolerance_sec'})
 
-PROJECTION_FIELDS = frozenset({'projection_roles', 'projection_role_qos'})
+PROJECTION_FIELDS = frozenset({'projection_roles', 'projection_role_qos', 'projection_discovery_layers', 'projection_discovery_tools', 'projection_sut_environment'})
 CONTROL_FIELDS = RECOVERY_FIELDS | PROJECTION_FIELDS | F2_TIMING_FIELDS | {'rmws'}
 PROFILE_CONTROL_FIELDS = (CONTROL_FIELDS - {'rmws'}) | {'role_rmws'}
 # These are declarations/provenance, never a blanket runtime passthrough.
@@ -259,6 +259,15 @@ def _controls(config, backend):
         if not isinstance(config['rmws'], dict) or not config['rmws']:
             raise ValueError('rmws must be a nonempty role mapping')
         _validate_rmws(config['rmws'])
+    if 'projection_discovery_layers' in present:
+        from r2f.runtime.discovery_profiles import validate_discovery_layers
+        validate_discovery_layers(config['projection_discovery_layers'], config.get('rmw', 'rmw_cyclonedds_cpp'))
+    if 'projection_discovery_tools' in present:
+        from r2f.runtime.discovery_tools import validate_tools_reference
+        validate_tools_reference(config)
+    if 'projection_sut_environment' in present:
+        from r2f.runtime.projection_sut import validate_sut_reference
+        validate_sut_reference(config)
     if present & PROJECTION_FIELDS:
         from r2f.runtime.projection_pair import projection_roles, validate_qos
         roles = projection_roles(config)
@@ -326,7 +335,8 @@ def validate_topology_profile(profile):
         TOPOLOGY_CAPABILITY, TOPOLOGY_TARGET, TOPOLOGY_SURFACE, TOPOLOGY_MUTATOR)
     from r2f.modules.s1 import fuzz_mutators_v2
     allowed = PROFILE_METADATA_FIELDS | {'source_schema', 'operator_whitelist', 'runtime_capability',
-                                         'observation_mode', 'fastdds_peer_instrumentation'}
+                                         'observation_mode', 'fastdds_peer_instrumentation',
+                                         'observe_native_peers', 'native_matching_qos'}
     unknown = set(profile) - allowed
     if unknown:
         raise ValueError('unsupported topology profile field:' + ','.join(sorted(unknown)))
@@ -356,14 +366,22 @@ def validate_topology_profile(profile):
             rmw not in ('rmw_cyclonedds_cpp', 'rmw_fastrtps_cpp') for rmw in rmws) or \
             len(set(rmws)) != len(rmws):
         raise ValueError('topology_rmws_invalid')
-    if 'observation_mode' in profile or 'fastdds_peer_instrumentation' in profile:
+    if 'native_matching_qos' in profile:
+        from r2f.runtime.matching_qos import reference as matching_reference
+        if rmws != ['rmw_fastrtps_cpp']:
+            raise ValueError('native_matching_qos_requires_single_fastdds_rmw')
+        matching_reference(dict(profile, rmw=rmws[0]))
+    if any(key in profile for key in ('observation_mode', 'fastdds_peer_instrumentation',
+                                      'observe_native_peers')):
         from r2f.instrumentation.fastdds_peer.activation import reference_from_config
         mode = profile.get('observation_mode', 'blackbox')
         if mode == 'instrumentation' and rmws != ['rmw_fastrtps_cpp']:
             raise ValueError('native_peer_profile_requires_single_fastdds_rmw')
         reference_from_config({'rmw': rmws[0], 'observation_mode': mode,
             **({'fastdds_peer_instrumentation': profile['fastdds_peer_instrumentation']}
-               if 'fastdds_peer_instrumentation' in profile else {})})
+               if 'fastdds_peer_instrumentation' in profile else {}),
+            **({'observe_native_peers': profile['observe_native_peers']}
+               if 'observe_native_peers' in profile else {})})
     budget = profile.get('budget')
     if not isinstance(budget, dict) or set(budget) != {'max_inputs', 'max_seconds'} or \
             type(budget['max_inputs']) is not int or not 1 <= budget['max_inputs'] <= 256:

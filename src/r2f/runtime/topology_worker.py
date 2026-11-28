@@ -33,6 +33,9 @@ import traceback
 import uuid
 
 from .environment import REPO, RMW_NAMES, activated_environment, check_environment
+from .topology_message_types import (
+    SUPPORTED_MESSAGE_TYPES, MessageTypeBindingError, RosMessageCodec, message_type_contract,
+)
 
 def _monotonic_clock_identity():
     try:
@@ -133,16 +136,25 @@ class TopologyBackendError(RuntimeError):
     """A backend/tool error, never a SUT verdict."""
 
 
-def _graph_local_gid(snapshot, node_name, kind):
+def _graph_local_gid(snapshot, node_name, kind, *, group_gids=None):
     rows = snapshot["publishers" if kind == "writer" else "subscriptions"]
     own = [row for row in rows if row.get("node_name") == node_name]
+    for row in own:
+        gid = row.get("endpoint_gid")
+        if (not isinstance(gid, str) or not re.fullmatch(r"[0-9a-f]{32}", gid)
+                or not any(c != "0" for c in gid)):
+            raise TopologyBackendError("local_graph_endpoint_gid_invalid")
+    if group_gids is not None:
+        # One serialized create per endpoint in the same node/context. Previously
+        # bound siblings remain visible; only the unique unbound graph identity
+        # can be this endpoint. Never select a first row or infer a GUID prefix.
+        gids = [row.get("endpoint_gid") for row in own]
+        if len(set(gids)) != len(gids) or not set(group_gids) <= set(gids):
+            raise TopologyBackendError("local_group_graph_identity_invalid")
+        own = [row for row in own if row.get("endpoint_gid") not in group_gids]
     if len(own) != 1:
         raise TopologyBackendError("local_graph_endpoint_not_unique")
-    gid = own[0].get("endpoint_gid")
-    if (not isinstance(gid, str) or not re.fullmatch(r"[0-9a-f]{32}", gid)
-            or not any(c != "0" for c in gid)):
-        raise TopologyBackendError("local_graph_endpoint_gid_invalid")
-    return gid
+    return own[0]["endpoint_gid"]
 
 
 def _observe_filter_state(endpoint, emit, *, command, command_id, reader_gid, phase):
@@ -270,6 +282,37 @@ def worker_role_for(role, index):
 def worker_role_kind(role):
     match = ROLE_RE.fullmatch(role) if isinstance(role, str) else None
     return match.group(1) if match else None
+
+
+def canonical_worker_roles(endpoints):
+    """Use the runner's declaration-order aliases, globally rather than per group."""
+    ordinals = {'writer': 0, 'reader': 0}
+    result = {}
+    for spec in endpoints:
+        eid, kind = spec['logical_id'], spec['role']
+        if eid in result:
+            raise ValueError('duplicate logical endpoint')
+        result[eid] = worker_role_for(kind, ordinals[kind])
+        ordinals[kind] += 1
+    return result
+
+
+def _group_worker_roles(config):
+    """Authenticate global aliases; legacy 1W1R configs may omit the binding."""
+    members = config['group_members']
+    program = config.get('group_program')
+    if program is None:
+        if any(sum(e['role'] == kind for e in members) > 1 for kind in ('writer', 'reader')):
+            raise ValueError('group canonical program required')
+        expected = canonical_worker_roles(members)
+        if config.get('group_worker_roles', expected) != expected:
+            raise ValueError('group worker role binding mismatch')
+        return expected
+    expected = canonical_worker_roles(program['endpoints'])
+    if (config.get('group_worker_roles') != expected
+            or members != [e for e in program['endpoints'] if e['participant_id'] == config['group_id']]):
+        raise ValueError('group worker role binding mismatch')
+    return expected
 
 
 def _finite_ns(seconds, field):
@@ -487,11 +530,14 @@ def _audit_worker_cleanup(executor, node, context, emit, *, endpoint_creation_re
         except BaseException as exc:
             audit_errors.append(exc)
 
-    actions = [("executor", executor.shutdown)]
+    actions = [("executor", executor.shutdown)] if executor is not None else []
     take_bridge = getattr(executor, "take_bridge", None)
     if take_bridge is not None:
         actions.append(("message_info_bridge", take_bridge.close))
-    actions.extend((("node", node.destroy_node), ("context", context.shutdown)))
+    if node is not None:
+        actions.append(("node", node.destroy_node))
+    if context is not None:
+        actions.append(("context", context.shutdown))
     for name, action in actions:
         try:
             result = action()
@@ -606,6 +652,19 @@ def _create_reader_with_initial_filter(node, message_type, topic, callback, qos,
     return endpoint, observed
 
 
+def _require_instrumented_message_type(type_name, config):
+    if config.get("observation_mode") != "instrumentation" or type_name == SUPPORTED_MESSAGE_TYPE:
+        return
+    try:
+        if config.get("rmw") != "rmw_fastrtps_cpp":
+            raise ValueError("instrumented_array_requires_fastdds")
+        from r2f.instrumentation.fastdds_peer.activation import reference_from_config
+        from .rcl_take_bridge import _bridge_options
+        _bridge_options(type_name, reference_from_config(config))
+    except (ValueError, RuntimeError, OSError, TypeError) as exc:
+        raise TopologyUnsupported("instrumented_message_type_not_expressible", str(exc)) from exc
+
+
 def endpoint_expressibility(spec, config):
     """Translate model endpoint fields into the exact public-rclpy input.
 
@@ -621,19 +680,36 @@ def endpoint_expressibility(spec, config):
     if not isinstance(topic, str) or not topic or len(topic) > 256:
         raise TopologyUnsupported("invalid_topic", "nonempty bounded topic required")
     type_name = spec.get("type_name")
-    if type_name != SUPPORTED_MESSAGE_TYPE:
+    if type_name not in SUPPORTED_MESSAGE_TYPES:
         raise TopologyUnsupported(
             "message_type_not_expressible",
-            "this worker constructs only std_msgs/msg/String",
-            details={"type_name": type_name, "supported": SUPPORTED_MESSAGE_TYPE})
+            "message type is outside the explicit topology type set",
+            details={"type_name": type_name, "supported": list(SUPPORTED_MESSAGE_TYPES)})
+    if "filter" in spec and type_name != SUPPORTED_MESSAGE_TYPE:
+        raise TopologyUnsupported("content_filter_message_type_not_expressible",
+                                  "content filters require std_msgs/msg/String.data")
+    _require_instrumented_message_type(type_name, config)
     initial_filter = (_initial_content_filter(spec["filter"], role)
                       if "filter" in spec else None)
     qos = spec.get("qos")
     if not isinstance(qos, dict):
         raise TopologyUnsupported("invalid_qos", "qos object required")
+    from .matching_qos import reference as matching_reference, partitions as partition_names
+    try:
+        matching = matching_reference(config)
+        if matching is not None and (config.get("participant_control") is not None
+                or (config.get("topology_program") or {}).get("participant_control") is not None):
+            raise TopologyUnsupported("native_matching_qos_endpoint_process_only")
+    except ValueError as exc:
+        raise TopologyUnsupported("native_matching_qos_invalid", str(exc)) from exc
+    actions = (config.get("topology_program") or {}).get("actions", [])
+    if config.get("rmw") == "rmw_fastrtps_cpp" and any(
+            action.get("op") == "native_matching_control" and action.get("endpoint_id") == spec.get("logical_id")
+            for action in actions) and spec.get("type_name") != "std_msgs/msg/String":
+        raise TopologyUnsupported("native_matching_control_requires_String_harness")
     reliability = _required_qos(qos, "reliability", ("best_effort", "reliable"))
     durability = _required_qos(qos, "durability", ("volatile", "transient_local"))
-    history = _required_qos(qos, "history", ("keep_last",))
+    history = _required_qos(qos, "history", ("keep_last", "keep_all"))
     depth = _required_qos(qos, "depth")
     if isinstance(depth, bool) or not isinstance(depth, int) or not 1 <= depth <= 65536:
         raise TopologyUnsupported("qos_not_expressible", "depth must be 1..65536")
@@ -641,9 +717,13 @@ def endpoint_expressibility(spec, config):
                                ("automatic", "manual_by_topic"))
     deadline_ns = _finite_ns(_required_qos(qos, "deadline_sec"), "deadline_sec")
     lease_ns = _finite_ns(_required_qos(qos, "lease_duration_sec"), "lease_duration_sec")
-    ownership = _required_qos(qos, "ownership", ("shared",))
+    ownership = _required_qos(qos, "ownership", ("shared", "exclusive") if matching else ("shared",))
     partitions = _required_qos(qos, "partitions")
-    if partitions != []:
+    try:
+        partition_names(partitions)
+    except ValueError as exc:
+        raise TopologyUnsupported("native_matching_qos_invalid", str(exc)) from exc
+    if partitions != [] and matching is None:
         raise TopologyUnsupported(
             "partitions_not_expressible",
             "rclpy QoSProfile has no public partition selector",
@@ -667,6 +747,7 @@ def endpoint_expressibility(spec, config):
         "role": role,
         "topic": topic,
         "type_name": type_name,
+        "message_type_support": message_type_contract(type_name),
         "requested_qos": deepcopy(qos),
         "public_api_qos": dict(public_qos),
         "api_fields": sorted(public_qos),
@@ -685,6 +766,12 @@ def endpoint_expressibility(spec, config):
         "execution_evidence": False,
         "candidate_eligible": False,
     }
+    if matching is not None:
+        binding["native_matching_qos"] = {
+            "partitions": deepcopy(partitions), "ownership": ownership, "build_reference": matching,
+            "scope": "native_publisher_or_subscriber", "adoption_status": "not_observed"}
+        binding["default_equivalent_fields"] = [row for row in binding["default_equivalent_fields"]
+                                                if row["field"] not in {"partitions", "ownership"}]
     if initial_filter is not None:
         binding["initial_content_filter"] = {
             **deepcopy(initial_filter), "scope": "initial_only",
@@ -694,6 +781,22 @@ def endpoint_expressibility(spec, config):
             "initial_content_filter": initial_filter}
 
 
+def observed_endpoint_expressibility(spec, created):
+    """Map the public request using an independently bound native selector.
+
+    This only reconstructs input mapping for raw application audits. Native
+    adoption and semantic matching remain separately audited observations.
+    """
+    from .matching_qos import KEY, validate_readback
+    config = {"rmw": created.get("rmw_identifier")}
+    native = created.get("native_partition_qos")
+    if native is not None:
+        qos = spec.get("qos") or {}
+        validate_readback(created, qos.get("partitions"), ownership=qos.get("ownership"))
+        config[KEY] = native["build_reference"]
+    return endpoint_expressibility(spec, config)
+
+
 def _public_qos_kwargs(qos):
     from rclpy.qos import (
         DurabilityPolicy, HistoryPolicy, LivelinessPolicy, ReliabilityPolicy,
@@ -701,7 +804,7 @@ def _public_qos_kwargs(qos):
     from rclpy.duration import Duration
     kwargs = {
         "depth": qos["depth"],
-        "history": HistoryPolicy.KEEP_LAST,
+        "history": getattr(HistoryPolicy, qos["history"].upper()),
         "reliability": {
             "best_effort": ReliabilityPolicy.BEST_EFFORT,
             "reliable": ReliabilityPolicy.RELIABLE,
@@ -724,7 +827,7 @@ def _public_qos_kwargs(qos):
 class CycloneMatchedPeerObserver:
     """Read existing process-local DDS entities; never create or instrument one.
 
-    Public CycloneDDS 0.10.5 ABI only. The library MUST already be mapped by the
+    Pinned public CycloneDDS ABI only. The library MUST already be mapped by the
     RMW in this worker. RCL pointers are never cast to vendor-private objects.
     Handles have process-local scope; only the copied GUIDs cross the worker
     boundary. Failure/incomplete/racing enumerations deliberately have no peer
@@ -738,7 +841,7 @@ class CycloneMatchedPeerObserver:
     MAX_ENTITIES = 512
     MAX_PEERS = 256
 
-    def __init__(self):
+    def __init__(self, *, sut_reference=None):
         import ctypes as c
         import hashlib
         self.c = c
@@ -757,6 +860,28 @@ class CycloneMatchedPeerObserver:
         # gap, not an excuse to dereference undocumented RMW internals.
         library = Path("/opt/ros/jazzy/lib/x86_64-linux-gnu/libddsc.so.0.10.5").resolve()
         header = Path("/opt/ros/jazzy/include/CycloneDDS/dds/dds.h")
+        verified_headers = self.VERIFIED_C_HEADERS
+        verified_abis = self.VERIFIED_C_ABIS
+        abi = "CycloneDDS-0.10.5-lp64-endpoint64"
+        probe, probe_source = self.C_ABI_PROBE_SHA256, self.C_ABI_PROBE_SOURCE_SHA256
+        if sut_reference is not None:
+            from .projection_sut import load_sut_environment
+            sut = load_sut_environment(sut_reference)
+            library = Path(sut['core']['library']).resolve()
+            header = Path(sut['core']['prefix']) / 'include/dds/dds.h'
+            # Independently compiled public-header probe, no DDS initialization.
+            # The source is scripts/probe_projection_sut_abi.c. Never infer a
+            # struct ABI from a version string or configuration alone.
+            verified_abis = ((
+                '34ef07e510d2743ed75c86861297267c78271b6f30abccabf41e139862e90257',
+                'b3fb18e23527fb7b4b09c7c5034792541a8468ef16d5590ceb7573a5ad8e21ea',
+                (64, 0, 16, 32, 40, 48, 56)),)
+            include = Path(sut['core']['prefix']) / 'include'
+            verified_headers = {path: digest for path, digest in sut['files'].items()
+                                if Path(path).is_relative_to(include)}
+            abi = "CycloneDDS-11.0.1-lp64-endpoint64"
+            probe = '9f272bb7ab3d50ec68bad1ffaa9e7cf513ae085c6579914ae8be8a961be4a07b'
+            probe_source = '3364e3ebc96c36c9723f73403a9009bcd5f78984bd571666d06cdbc4ce427e09'
         mapped = set()
         mapping_identity = []
         for row in Path("/proc/self/maps").read_text().splitlines():
@@ -777,13 +902,13 @@ class CycloneMatchedPeerObserver:
         if platform.machine() != "x86_64" or sys.byteorder != "little" or c.sizeof(c.c_ulong) != 8:
             raise ValueError("native_endpoint_c_abi_platform_unsupported")
         if any(hashlib.sha256(Path(path).read_bytes()).hexdigest() != digest
-               for path, digest in self.VERIFIED_C_HEADERS.items()):
+               for path, digest in verified_headers.items()):
             raise ValueError("native_endpoint_c_header_fingerprint_changed")
         actual_layout = (c.sizeof(Endpoint), *(getattr(Endpoint, name).offset for name in
                           ("key", "participant_key", "participant_instance_handle", "topic_name", "type_name", "qos")))
         abi_key = (hashlib.sha256(header.read_bytes()).hexdigest(),
                    hashlib.sha256(library.read_bytes()).hexdigest(), actual_layout)
-        if abi_key not in self.VERIFIED_C_ABIS:
+        if abi_key not in verified_abis:
             raise ValueError("native_endpoint_c_abi_probe_unverified")
         self.lib = c.CDLL(str(library), mode=os.RTLD_NOLOAD | os.RTLD_LOCAL)
         entity, handle = c.c_int32, c.c_uint64
@@ -809,11 +934,11 @@ class CycloneMatchedPeerObserver:
                            "library_sha256": hashlib.sha256(library.read_bytes()).hexdigest(),
                            "header": str(header),
                            "header_sha256": hashlib.sha256(header.read_bytes()).hexdigest(),
-                           "abi": "CycloneDDS-0.10.5-lp64-endpoint64",
-                           "c_probe_sha256": self.C_ABI_PROBE_SHA256,
-                           "c_probe_source_sha256": self.C_ABI_PROBE_SOURCE_SHA256,
+                           "abi": abi,
+                           "c_probe_sha256": probe,
+                           "c_probe_source_sha256": probe_source,
                            "c_probe_layout": actual_layout,
-                           "header_fingerprints": dict(self.VERIFIED_C_HEADERS),
+                           "header_fingerprints": dict(verified_headers),
                            "loaded_mapping_identity": mapping_identity,
                            "attachment": "existing_process_local_entities_no_instrumentation",
                            "creates_entities": False}
@@ -854,6 +979,318 @@ class CycloneMatchedPeerObserver:
                 or observed.value != domain):
             raise ValueError("local_entity_domain_mismatch")
         return matches[0], sorted(edges)
+
+    def _topic_kind_diagnostic(self, handle):
+        """Independent typed readbacks; never a wire GUID or ownership relation.
+
+        Cyclone 0.10.5 dds_topic.c pins DDS_KIND_TOPIC for these public APIs;
+        dds.h defines a nonnegative return as full byte length (excluding NUL).
+        One fixed buffer/call per symbol bounds copying, including error output.
+        """
+        capacity = 256
+        evidence = {"handle": handle, "kind": "unknown", "probes": {}}
+        for name in ("dds_get_name", "dds_get_type_name"):
+            probe = {"return_code": None, "status": "unavailable",
+                     "capacity_bytes": capacity, "buffer_hex": None, "value": None}
+            evidence["probes"][name] = probe
+            buffer = None
+            try:
+                function = getattr(self.lib, name, None)
+                if function is None:
+                    probe["error"] = "optional_symbol_absent"
+                    continue
+                # Lazy binding keeps optional symbols out of matched/count setup.
+                function.argtypes = [self.c.c_int32, self.c.POINTER(self.c.c_char),
+                                     self.c.c_size_t]
+                function.restype = self.c.c_int32
+                buffer = self.c.create_string_buffer(b"\xff" * capacity, capacity)
+                rc = function(handle, buffer, capacity)
+                probe["return_code"] = rc
+                raw = bytes(buffer)
+                probe["buffer_hex"] = raw.hex()
+                if type(rc) is not int:
+                    probe.update(status="malformed", error="return_code_not_integer")
+                elif rc == -12:
+                    probe.update(status="unsupported", error="illegal_operation")
+                elif rc < 0:
+                    probe.update(status="error", error="api_error")
+                elif rc >= capacity:
+                    probe.update(status="truncated", error="reported_length_exceeds_buffer")
+                elif raw[rc] != 0 or b"\x00" in raw[:rc]:
+                    probe.update(status="malformed", error="length_or_terminator_mismatch")
+                elif rc == 0:
+                    probe.update(status="malformed", error="empty_name")
+                else:
+                    try:
+                        probe["value"] = raw[:rc].decode("utf-8", errors="strict")
+                        probe["status"] = "observed"
+                    except UnicodeDecodeError:
+                        probe.update(status="malformed", error="invalid_utf8")
+            except Exception as exc:
+                # Optional observation must not replace a primary inventory error.
+                try:
+                    detail = str(exc)[:256]
+                except BaseException:
+                    # Exception formatting is untrusted diagnostic work, even
+                    # if __str__ raises outside the usual Exception hierarchy.
+                    detail = "<exception_text_unavailable>"
+                probe.update(status="error", error="optional_probe_exception",
+                             exception_type=type(exc).__name__, detail=detail)
+                if buffer is not None:
+                    probe["buffer_hex"] = bytes(buffer).hex()
+        if all(p["status"] == "observed" for p in evidence["probes"].values()):
+            evidence["kind"] = "topic"
+        return evidence
+
+    def sample_roots(self, domain):
+        """Enumerate all roots, including auxiliaries; no configured-count fill."""
+        result = {'domain_id': domain, 'complete': False, 'roots': [],
+                  'count': None, 'provenance': self.provenance}
+        try:
+            handles = self._enumerate(self.lib.dds_lookup_participant, domain)
+            for name in ('dds_get_parent', 'dds_get_participant'):
+                fn = getattr(self.lib, name)
+                fn.argtypes = [self.c.c_int32]
+                fn.restype = self.c.c_int32
+            for h in handles:
+                row = {'participant_handle': h, 'participant_gid': self._guid(h)}
+                result['roots'].append(row)
+                observed = self.c.c_uint32()
+                rc = self.lib.dds_get_domainid(h, self.c.byref(observed))
+                parent = self.lib.dds_get_parent(h)
+                row.update(domain_return_code=rc, domain_id=observed.value if rc == 0 else None,
+                           participant_self_return=self.lib.dds_get_participant(h), parent=parent)
+                valid_parent = type(parent) is int and parent == 0
+                if type(parent) is int and parent > 0 and parent not in handles:
+                    pd = self.c.c_uint32()
+                    prc = self.lib.dds_get_domainid(parent, self.c.byref(pd))
+                    row.update(parent_domain_return_code=prc,
+                               parent_domain_id=pd.value if prc == 0 else None,
+                               parent_participant_return=self.lib.dds_get_participant(parent),
+                               parent_children=self._enumerate(self.lib.dds_get_children, parent))
+                    valid_parent = (prc == 0 and pd.value == domain
+                                    and row['parent_participant_return'] == 0 and h in row['parent_children'])
+                gid = row['participant_gid']
+                row['valid'] = (rc == 0 and observed.value == domain and row['participant_self_return'] == h
+                                and isinstance(gid, str) and re.fullmatch(r'[0-9a-f]{32}', gid) is not None
+                                and gid != '0' * 32 and valid_parent)
+            result['count'] = len(result['roots'])
+            result['complete'] = (bool(handles) and all(r['valid'] for r in result['roots'])
+                and len({r['participant_gid'] for r in result['roots']}) == len(handles)
+                and handles == self._enumerate(self.lib.dds_lookup_participant, domain))
+        except (ValueError, TypeError, OSError, AttributeError, RuntimeError) as exc:
+            result['reason'] = str(exc)
+        return result
+
+    def sample_ownership(self, domain, gid, kind):
+        """Supporting local ownership observation; never a sharing/control claim.
+
+        Handles are process-local diagnostics. The worker raw envelope binds the
+        copied GUIDs to logical/generation/process/run identity. Two equal bounded
+        samples cannot establish atomicity or participant lifecycle generation.
+        """
+        result = {"schema": "r2f.cyclone-participant-ownership/v2",
+                  "complete": False, "status": "unknown", "candidate_eligible": False,
+                  "domain_id": domain, "local_gid": gid, "role_kind": kind,
+                  "provenance": self.provenance,
+                  "started_monotonic_ns": time.monotonic_ns(),
+                  "ownership_api": "dds_get_participant+dds_get_parent",
+                  "lookup_api": "dds_lookup_participant+dds_get_children+dds_get_guid",
+                  "limitations": ["bounded_stable_samples_not_atomic_or_continuous",
+                                  "process_local_handles_not_lifecycle_generation",
+                                  "configured_participant_sharing_not_controlled"]}
+        try:
+            if (type(domain) is not int or not 0 <= domain < 2**32
+                    or not isinstance(gid, str) or re.fullmatch(r"[0-9a-f]{32}", gid) is None
+                    or gid == "0" * 32 or kind not in ("writer", "reader")):
+                raise ValueError("participant_ownership_input_identity_invalid")
+            # Optional symbols are bound here so their absence cannot disable
+            # the existing matched-peer/count observer.
+            for name in ("dds_get_parent", "dds_get_participant"):
+                function = getattr(self.lib, name, None)
+                if function is None:
+                    result["status"] = "unavailable"
+                    raise ValueError("participant_ownership_api_unavailable:" + name)
+                function.argtypes = [self.c.c_int32]
+                function.restype = self.c.c_int32
+
+            def capture():
+                local, inventory = self._locate(domain, gid)
+                edges = dict(inventory)
+                participant = self.lib.dds_get_participant(local)
+                if type(participant) is not int or participant <= 0:
+                    raise ValueError("participant_lookup_failed")
+                chain = [local]
+                while chain[-1] != participant:
+                    parent = self.lib.dds_get_parent(chain[-1])
+                    if (parent not in edges or chain[-1] not in edges[parent]
+                            or parent in chain or len(chain) >= self.MAX_ENTITIES):
+                        raise ValueError("participant_parent_chain_invalid")
+                    chain.append(parent)
+                # Keep each attempt, including failed API values, in the raw
+                # supporting receipt. Never promote these diagnostics to proof.
+                root = {"participant_handle": participant}
+                result.setdefault("root_diagnostics", []).append(root)
+                root["participant_parent_return"] = self.lib.dds_get_parent(participant)
+                root["participant_self_return"] = self.lib.dds_get_participant(participant)
+                root["lookup_participants"] = self._enumerate(self.lib.dds_lookup_participant, domain)
+                parent = root["participant_parent_return"]
+                if (local == participant or root["participant_self_return"] != participant
+                        or participant not in root["lookup_participants"]
+                        or type(parent) is not int or parent < 0):
+                    raise ValueError("participant_root_invalid")
+                # dds.h documents NIL; pinned Cyclone 0.10.5 attaches the
+                # participant to its domain entity instead (dds_participant.c).
+                # Corroborate a positive parent using public relations, without
+                # treating the domain handle as a participant or wire identity.
+                if parent > 0:
+                    if parent in edges:
+                        raise ValueError("participant_root_invalid")
+                    parent_domain = self.c.c_uint32()
+                    rc = self.lib.dds_get_domainid(parent, self.c.byref(parent_domain))
+                    root["parent_domain_return_code"] = rc
+                    root["parent_domain_id"] = parent_domain.value if rc == 0 else None
+                    root["parent_participant_return"] = self.lib.dds_get_participant(parent)
+                    root["parent_children_queries"] = []
+                    def read_children(handle, array, capacity):
+                        value = self.lib.dds_get_children(handle, array, capacity)
+                        root["parent_children_queries"].append(
+                            {"capacity": capacity, "return_code": value})
+                        return value
+                    root["parent_children"] = self._enumerate(read_children, parent)
+                    if (rc != 0 or parent_domain.value != domain
+                            or root["parent_participant_return"] != 0
+                            or participant not in root["parent_children"]):
+                        raise ValueError("participant_root_invalid")
+                    # A domain may itself have a library parent. Bound and
+                    # retain the ancestry, rejecting loops and endpoint aliases.
+                    ancestors = [parent]
+                    root["parent_ancestry"] = []
+                    while ancestors[-1] != 0:
+                        ancestor = self.lib.dds_get_parent(ancestors[-1])
+                        root["parent_ancestry"].append([ancestors[-1], ancestor])
+                        if (type(ancestor) is not int or ancestor < 0
+                                or ancestor in edges or ancestor in ancestors
+                                or len(ancestors) >= self.MAX_ENTITIES):
+                            raise ValueError("participant_root_invalid")
+                        ancestors.append(ancestor)
+                # Retain attempted reads before validation can fail. These are
+                # supporting diagnostics, not successful ownership fields.
+                diagnostics = {"entity_inventory": inventory, "entity_identities": [],
+                               "topic_kind_diagnostics": []}
+                result.setdefault("inventory_diagnostics", []).append(diagnostics)
+                identities = []
+                for handle, _ in inventory:
+                    diagnostic = {"handle": handle, "known_labels": [],
+                                  "domain_return_code": None, "observed_domain_id": None,
+                                  "guid_return_code": None, "guid": None}
+                    if handle == local:
+                        diagnostic["known_labels"].append("local_endpoint")
+                    if handle in root["lookup_participants"]:
+                        diagnostic["known_labels"].append("participant")
+                    diagnostics["entity_identities"].append(diagnostic)
+                    topic = self._topic_kind_diagnostic(handle)
+                    diagnostics["topic_kind_diagnostics"].append(topic)
+                    if topic["kind"] == "topic":
+                        diagnostic["known_labels"].append("topic")
+                    observed_domain = self.c.c_uint32()
+                    domain_rc = self.lib.dds_get_domainid(handle, self.c.byref(observed_domain))
+                    diagnostic["domain_return_code"] = domain_rc
+                    diagnostic["observed_domain_id"] = observed_domain.value if domain_rc == 0 else None
+                    if domain_rc != 0 or observed_domain.value != domain:
+                        raise ValueError("participant_inventory_domain_mismatch")
+                    guid = self.Guid()
+                    rc = self.lib.dds_get_guid(handle, self.c.byref(guid))
+                    diagnostic["guid_return_code"] = rc
+                    # Cyclone 0.10.5 dds_get_guid returns OK + zero m_guid
+                    # for topics. Only two complete typed public readbacks can
+                    # establish non-wire applicability, never a wire identity.
+                    value = bytes(guid.v).hex() if rc == 0 else None
+                    diagnostic["guid"] = value
+                    topic_applicable = (topic["kind"] == "topic" and handle != local
+                                        and handle not in root["lookup_participants"])
+                    if (rc not in (0, -12)
+                            or (rc == -12 and (handle == local or handle in root["lookup_participants"]))
+                            or (value == "0" * 32 and not topic_applicable)):
+                        raise ValueError("participant_inventory_guid_invalid_or_aliased")
+                    identity = {"handle": handle, "gid": value,
+                                "guid_return_code": rc, "domain_id": observed_domain.value,
+                                "guid_applicability": ("not_applicable_topic" if topic_applicable
+                                                       else "unavailable_illegal_operation" if rc == -12
+                                                       else "wire_guid")}
+                    if topic["kind"] == "topic":
+                        # Includes raw return codes/bounded buffers, so name,
+                        # type, kind and applicability must survive both captures.
+                        identity["topic_identity"] = topic
+                    identities.append(identity)
+                if next(row["gid"] for row in identities if row["handle"] == local) != gid:
+                    raise ValueError("participant_endpoint_guid_changed")
+                gids = [row["gid"] for row in identities if row["gid"] not in (None, "0" * 32)]
+                if len(gids) != len(set(gids)):
+                    raise ValueError("participant_inventory_guid_invalid_or_aliased")
+                participant_gid = next(row["gid"] for row in identities
+                                       if row["handle"] == participant)
+                if not participant_gid or participant_gid == "0" * 32 or participant_gid == gid:
+                    raise ValueError("participant_guid_invalid")
+                if any("topic_identity" in row and row["guid_applicability"] != "not_applicable_topic"
+                       for row in identities):
+                    raise ValueError("participant_inventory_kind_conflict")
+                return {"local_handle": local, "participant_handle": participant,
+                        "participant_gid": participant_gid, "parent_chain": chain,
+                        "entity_inventory": inventory, "entity_identities": identities,
+                        "participant_root_observation": root}
+
+            first, second = capture(), capture()
+            if first != second:
+                raise ValueError("participant_ownership_inventory_changed")
+            result.update(first, complete=True, status="observed", stable_sample_count=2)
+        except (ValueError, TypeError, OSError, AttributeError, RuntimeError) as exc:
+            if result.get("inventory_diagnostics"):
+                result["inventory_diagnostics"][-1]["failure_category"] = str(exc)
+            result.update(complete=False, reason=str(exc))
+        if result.get("complete") is True:
+            result["instance_identity"] = self.sample_instance_identity(
+                [result["participant_handle"], result["local_handle"]])
+        result["ended_monotonic_ns"] = time.monotonic_ns()
+        return result
+
+    def sample_instance_identity(self, handles):
+        """Copy entity IIDs separately from process-local DDS entity handles.
+
+        This is a Cyclone public-API observation, not a portable wire IID or
+        participant generation. Missing symbols never invalidate GUID ownership.
+        """
+        result = {"schema": "r2f.cyclone-entity-instance-identity/v1",
+                  "api": "dds_get_instance_handle+dds_get_guid",
+                  "scope": "cyclonedds_entity_instance_id", "samples": [],
+                  "status": "unknown", "started_monotonic_ns": time.monotonic_ns()}
+        try:
+            function = getattr(self.lib, "dds_get_instance_handle", None)
+            if function is None:
+                result["status"] = "unavailable"
+                raise ValueError("dds_get_instance_handle_unavailable")
+            function.argtypes = [self.c.c_int32, self.c.POINTER(self.c.c_uint64)]
+            function.restype = self.c.c_int32
+            for _ in range(2):
+                rows = []
+                result["samples"].append(rows)
+                for handle in handles:
+                    value, guid = self.c.c_uint64(), self.Guid()
+                    rc = function(handle, self.c.byref(value))
+                    grc = self.lib.dds_get_guid(handle, self.c.byref(guid))
+                    row = {"entity_handle": handle, "instance_id": value.value,
+                           "return_code": rc, "guid_return_code": grc,
+                           "guid": bytes(guid.v).hex() if grc == 0 else None}
+                    rows.append(row)
+                    if rc != 0 or grc != 0 or value.value == 0 or row["guid"] == "0" * 32:
+                        raise ValueError("entity_instance_identity_readback_failed")
+            if result["samples"][0] != result["samples"][1]:
+                raise ValueError("entity_instance_identity_changed")
+            result["status"] = "observed"
+        except (ValueError, TypeError, OSError, AttributeError, RuntimeError) as exc:
+            result["reason"] = str(exc)
+        result["ended_monotonic_ns"] = time.monotonic_ns()
+        return result
 
     def sample(self, domain, gid, kind):
         began = time.monotonic_ns()
@@ -933,9 +1370,10 @@ class _LivelinessPeerSampler:
     observer only reads matched endpoints through the already pinned public
     ABI. Even a complete sample cannot establish an uninterrupted peer set.
     """
-    def __init__(self, endpoint, rmw, domain, gid, *, instrumentation=None):
+    def __init__(self, endpoint, rmw, domain, gid, *, instrumentation=None, enabled=True):
         self.endpoint, self.rmw, self.domain, self.gid = endpoint, rmw, domain, gid
         self.instrumentation = instrumentation
+        self.enabled = enabled
         self.observer = None
 
     def __call__(self):
@@ -949,7 +1387,9 @@ class _LivelinessPeerSampler:
                  'continuous_coverage': False, 'external_peers_known': None,
                  'effect_observed': None, 'candidate_eligible': False,
                  's1_mutation_hit': False, 'execution_evidence': False}
-        observation = {'complete': False, 'reason': 'rmw_has_no_public_peer_observer'}
+        observation = {'complete': False, 'reason': (
+            'rmw_has_no_public_peer_observer' if self.enabled
+            else 'native_peer_sampling_disabled_control')}
         try:
             value['public_count_before'] = self.endpoint.get_publisher_count()
             if self.rmw == 'rmw_cyclonedds_cpp':
@@ -960,7 +1400,7 @@ class _LivelinessPeerSampler:
                 except Exception as exc:
                     observation = {'complete': False,
                                    'reason': 'native_peer_observation_failed:' + type(exc).__name__}
-            elif self.rmw == 'rmw_fastrtps_cpp' and self.instrumentation is not None:
+            elif self.rmw == 'rmw_fastrtps_cpp' and self.instrumentation is not None and self.enabled:
                 try:
                     from .fastdds_peer_observer import FastddsMatchedPeerObserver
                     if self.observer is None:
@@ -1009,7 +1449,40 @@ def _drain_filter_decisions(observer, emit, *, final=False):
     return stats
 
 
-def _worker_main(argv):
+def _drain_pdp_lifecycle(observer, emit, *, final=False):
+    records, stats = observer.drain()
+    for receipt in records:
+        emit("native_pdp_lifecycle", receipt=receipt, candidate_eligible=False)
+    if records or final:
+        emit("native_pdp_trace_health", manifest_reference=observer.reference,
+             stats=stats, final=final, capture_complete=stats["dropped"] == 0,
+             candidate_eligible=False)
+    if final and stats["pending"]:
+        raise TopologyBackendError("native_pdp_trace_final_pending")
+
+
+def _drive_endpoint_session(session_factory):
+    """Preserve the legacy blocking entry; expose sessions only to the group owner."""
+    from functools import wraps
+    @wraps(session_factory)
+    def run(argv, group_owner=None):
+        if group_owner is not None:
+            return session_factory(argv, group_owner)
+        if len(argv) == 3 and 'participant_control' in json.loads(argv[1]):
+            return _group_worker_main(argv)
+        session = session_factory(argv)
+        try:
+            next(session)
+        except StopIteration as done:
+            return done.value
+        finally:
+            session.close()
+        raise TopologyBackendError('legacy_session_unexpected_yield')
+    return run
+
+
+@_drive_endpoint_session
+def _worker_main(argv, group_owner=None):
     """Child entry point: one endpoint generation, strict JSONL on stdout."""
     if len(argv) != 3:
         print(json.dumps({"event": "worker_error", "error": "usage: config_json role"}))
@@ -1024,6 +1497,17 @@ def _worker_main(argv):
         reference_from_config, manifest_for_reference, verify_vendor_mapping,
     )
     instrumentation = reference_from_config(config)
+    observe_native_peers = config.get("observe_native_peers", True)
+    if (group_owner is not None and instrumentation is not None
+            and manifest_for_reference(instrumentation).get("pdp_trace") is not None):
+        raise TopologyUnsupported("pdp_trace_requires_one_context_and_consumer_per_worker_process")
+    _require_instrumented_message_type(config["type_name"], config)
+    from .participant_identity import emit_identity_probe
+    if group_owner is None:
+        emit_identity_probe(config, _monotonic_clock_identity())
+    if config.get("native_matching_qos") is not None:
+        from .matching_qos import verify_profile
+        verify_profile(config)
     import rclpy
     from rclpy.context import Context
     from rclpy.executors import SingleThreadedExecutor
@@ -1033,47 +1517,62 @@ def _worker_main(argv):
         PublisherEventCallbacks = SubscriptionEventCallbacks = UnsupportedEventTypeError = None
     from rclpy.node import Node
     from rclpy.qos import QoSProfile
-    from std_msgs.msg import String
 
-    context = Context()
-    rclpy.init(context=context)
-    rmw_identifier = rclpy.get_rmw_implementation_identifier()
-    if instrumentation is not None and rmw_identifier != "rmw_fastrtps_cpp":
-        raise TopologyBackendError("instrumented_worker_rmw_mismatch")
-    vendor_identity = (verify_vendor_mapping(instrumentation)
-                       if rmw_identifier == "rmw_fastrtps_cpp" else None)
-    try:
-        observed_domain_id = context.get_domain_id()
-    except (AttributeError, RuntimeError, TypeError):
-        observed_domain_id = None
-    start_ticks = int(Path("/proc/self/stat").read_text().rsplit(")", 1)[1].split()[19])
-    node_token = uuid.uuid4().hex
-    node_name = f"r2f_topo_{config['logical_id']}_g{config['generation']}_{node_token[:8]}"
-    node = Node(node_name, context=context, enable_rosout=False, start_parameter_services=False)
-    take_capability = {"status": "unavailable", "reason": "unsupported_rmw_identifier",
-                       "original_rclpy_dict_provided_gid": False}
-    if kind == "reader" and rmw_identifier == "rmw_fastrtps_cpp":
-        from .rcl_take_bridge import make_full_info_executor, BridgeUnavailable
+    if group_owner is None:
+        context = Context()
+        rclpy.init(context=context)
+        rmw_identifier = rclpy.get_rmw_implementation_identifier()
+        if instrumentation is not None and rmw_identifier != "rmw_fastrtps_cpp":
+            raise TopologyBackendError("instrumented_worker_rmw_mismatch")
+        vendor_identity = (verify_vendor_mapping(instrumentation)
+                           if rmw_identifier == "rmw_fastrtps_cpp" else None)
         try:
-            executor = make_full_info_executor(context=context, rmw_identifier=rmw_identifier,
-                **({"instrumentation": instrumentation} if instrumentation is not None else {}))
-            take_capability = {"status": "observed", "reason": None,
-                               "observation_basis": "single_take_owner_public_rcl_api",
-                               "original_rclpy_dict_provided_gid": False,
-                               "abi": executor.take_bridge.abi_receipt}
-        except BridgeUnavailable as exc:
-            if instrumentation is not None:
-                raise TopologyBackendError("instrumented_take_bridge_unavailable:" + str(exc)) from exc
-            # Explicitly keep the stock path if this pinned public ABI is absent.
-            # Its callback still has unavailable GID; no second consumer is added.
+            observed_domain_id = context.get_domain_id()
+        except (AttributeError, RuntimeError, TypeError):
+            observed_domain_id = None
+        start_ticks = int(Path("/proc/self/stat").read_text().rsplit(")", 1)[1].split()[19])
+        node_token = uuid.uuid4().hex
+        node_name = f"r2f_topo_{config['logical_id']}_g{config['generation']}_{node_token[:8]}"
+        node = Node(node_name, context=context, enable_rosout=False, start_parameter_services=False)
+        take_capability = {"status": "unavailable", "reason": "unsupported_rmw_identifier",
+                           "original_rclpy_dict_provided_gid": False}
+        if kind == "reader" and config["type_name"] not in SUPPORTED_MESSAGE_TYPES:
+            take_capability = {"status": "unavailable", "reason": "native_take_message_type_not_supported",
+                               "original_rclpy_dict_provided_gid": False}
+        if (kind == "reader" and rmw_identifier == "rmw_fastrtps_cpp"
+                and config["type_name"] in SUPPORTED_MESSAGE_TYPES):
+            from .rcl_take_bridge import make_full_info_executor, BridgeUnavailable
+            try:
+                executor = make_full_info_executor(context=context, rmw_identifier=rmw_identifier,
+                    **({"message_type": config["type_name"]} if config["type_name"] != SUPPORTED_MESSAGE_TYPE else {}),
+                    **({"instrumentation": instrumentation} if instrumentation is not None else {}))
+                take_capability = {"status": "observed", "reason": None,
+                                   "observation_basis": "single_take_owner_public_rcl_api",
+                                   "original_rclpy_dict_provided_gid": False,
+                                   "abi": executor.take_bridge.abi_receipt}
+            except BridgeUnavailable as exc:
+                if instrumentation is not None:
+                    raise TopologyBackendError("instrumented_take_bridge_unavailable:" + str(exc)) from exc
+                # Explicitly keep the stock path if this pinned public ABI is absent.
+                # Its callback still has unavailable GID; no second consumer is added.
+                executor = SingleThreadedExecutor(context=context)
+                take_capability = dict(exc.capability_receipt)
+        else:
             executor = SingleThreadedExecutor(context=context)
-            take_capability = dict(exc.capability_receipt)
+        executor.add_node(node)
     else:
-        executor = SingleThreadedExecutor(context=context)
-    executor.add_node(node)
+        context, node, executor = (group_owner[k] for k in ('context', 'node', 'executor'))
+        rmw_identifier = group_owner['rmw_identifier']
+        observed_domain_id = group_owner['observed_domain_id']
+        start_ticks = group_owner['process_start_ticks']
+        node_name = group_owner['node_name']
+        node_token = uuid.uuid4().hex
+        take_capability = group_owner['take_capability']
+        vendor_identity = group_owner['vendor_identity']
     local_gid = None
     native_peer_observer = None
     filter_decision_observer = None
+    pdp_lifecycle_observer = None
     incarnation_ordinal = 0
     receive_sequence = 0
     endpoint_generation = node_token
@@ -1081,6 +1580,8 @@ def _worker_main(argv):
     def emit(event, **fields):
         if event == "command_done" and filter_decision_observer is not None:
             _drain_filter_decisions(filter_decision_observer, emit)
+        if event == "command_done" and pdp_lifecycle_observer is not None:
+            _drain_pdp_lifecycle(pdp_lifecycle_observer, emit)
         value = {
             "event": event, "time_ns": time.time_ns(), "monotonic_ns": time.monotonic_ns(),
             "monotonic_clock_identity": _monotonic_clock_identity(),
@@ -1094,6 +1595,11 @@ def _worker_main(argv):
             "observation_mode": config.get("observation_mode", "blackbox"),
             "topic": config["topic"], "message_type": config["type_name"],
         }
+        if "observe_native_peers" in config:
+            value["observe_native_peers"] = observe_native_peers
+        if group_owner is not None:
+            value.update({k: config[k] for k in ('group_id', 'worker_instance_id', 'context_instance_id')})
+            value['worker_role'] = role
         value.update(fields)
         print(json.dumps(value, sort_keys=True), flush=True)
         return value
@@ -1118,6 +1624,7 @@ def _worker_main(argv):
                  abi=filter_decision_observer.manifest["abi"],
                  capture_scope="actual_evaluate_calls_only", candidate_eligible=False)
 
+
     def gid_bytes(value):
         return bytes(value).hex() if value is not None else None
 
@@ -1125,8 +1632,9 @@ def _worker_main(argv):
         nonlocal receive_sequence
         receive_sequence += 1
         body = None
+        sample = codec.sample_fields(message, capture_stage="callback_reserialization")
         try:
-            body = json.loads(message.data)
+            body = json.loads(sample["payload_text"])
         except (ValueError, TypeError):
             body = None
         get = info.get if isinstance(info, dict) else lambda key: getattr(info, key, None)
@@ -1145,8 +1653,7 @@ def _worker_main(argv):
             publisher_gid_status=(get("publisher_gid_status") or
                                   ("available" if publisher_gid is not None else "unavailable_api")),
             identity_basis="message_info_gid" if publisher_gid is not None else "endpoint_correlated",
-            payload_sha256=__import__("hashlib").sha256(message.data.encode()).hexdigest(),
-            string_data=message.data,
+            **sample,
             payload_run_id=body.get("run_id") if isinstance(body, dict) else None,
             payload_writer_id=body.get("writer_id") if isinstance(body, dict) else None,
             payload_writer_generation=body.get("writer_generation") if isinstance(body, dict) else None,
@@ -1170,15 +1677,34 @@ def _worker_main(argv):
         publish_observer = PublishOccurrenceObserver(emit, rmw_identifier)
     endpoint_creation_returned = False
     try:
+        if instrumentation is not None and selected.get("pdp_trace") is not None:
+            from r2f.instrumentation.fastdds_pdp_trace.observer import PdpLifecycleObserver
+            pdp_lifecycle_observer = PdpLifecycleObserver(selected)
+            emit("native_pdp_provider_selected", manifest_reference=pdp_lifecycle_observer.reference,
+                 peer_manifest_reference=instrumentation,
+                 binary=pdp_lifecycle_observer.manifest["binary"],
+                 capture_enabled=pdp_lifecycle_observer.manifest["capture_enabled"],
+                 provider_mapping=pdp_lifecycle_observer.mapping,
+                 vendor_binary=selected["binaries"]["vendor"], abi=pdp_lifecycle_observer.manifest["abi"],
+                 candidate_eligible=False)
+        try:
+            codec = RosMessageCodec(config["type_name"])
+        except MessageTypeBindingError as exc:
+            emit("topology_message_type_support",
+                 status="unsupported" if exc.code == "message_type_support_unavailable" else "binding_error",
+                 reason=exc.code,
+                 detail=str(exc), attribution="binding_adapter", candidate_eligible=False)
+            raise TopologyUnsupported(exc.code, str(exc)) from exc
+        emit("topology_message_type_support", **codec.support_receipt)
         create_begin = emit("endpoint_create_begin", topic=config["topic"],
                             qos=config["qos"], message_type=config["type_name"])
         filter_configuration = None
         def create_endpoint():
             if kind == "writer":
-                return node.create_publisher(String, config["topic"], qos, **(
+                return node.create_publisher(codec.message_class, config["topic"], qos, **(
                     {"event_callbacks": callbacks} if callbacks is not None else {})), None
             return _create_reader_with_initial_filter(
-                node, String, config["topic"], receive, qos,
+                node, codec.message_class, config["topic"], receive, qos,
                 config.get("initial_content_filter"), emit=emit, event_callbacks=callbacks)
         liveliness.create_begin_ns = time.monotonic_ns()
         endpoint, filter_configuration = _create_with_liveliness_audit(
@@ -1187,6 +1713,8 @@ def _worker_main(argv):
         liveliness.create_return_ns = time.monotonic_ns()
         created_ns = (filter_configuration["creation_returned_monotonic_ns"]
                       if filter_configuration is not None else time.monotonic_ns())
+
+        native_partitions = None
 
         def graph(*, authenticate=True):
             def entry(info):
@@ -1210,23 +1738,81 @@ def _worker_main(argv):
             snapshot = {"publishers": publishers, "subscriptions": subscriptions}
             if authenticate:
                 rows = publishers if kind == "writer" else subscriptions
-                if local_gid is None and not any(x["node_name"] == node_name for x in rows):
+                siblings = None
+                if group_owner is not None:
+                    siblings = {item['token']['endpoint_gid']
+                                for eid, item in group_owner['sessions'].items()
+                                if eid != config['logical_id'] and 'token' in item
+                                and item['token']['kind'] == kind}
+                bootstrapping = local_gid is None
+                try:
+                    observed = _graph_local_gid(snapshot, node_name, kind, group_gids=siblings)
+                except TopologyBackendError as exc:
+                    if not bootstrapping:
+                        raise
+                    reason = str(exc)
+                    retry = reason == "local_graph_endpoint_not_unique"
+                    # A wholly absent local graph is also an unbound attempt.
+                    if not any(row["node_name"] == node_name for row in rows):
+                        retry = True
+                        reason = "local_graph_endpoint_not_unique"
+                    bootstrap_diagnostic(snapshot, siblings, phase="attempt",
+                                         status="unknown" if retry else "error", reason=reason)
+                    if not retry:
+                        bootstrap_diagnostic(snapshot, siblings, phase="final_failure",
+                                             status="error", reason=reason)
+                        raise
                     return snapshot
-                observed = _graph_local_gid(snapshot, node_name, kind)
-                if local_gid is None:
+                if bootstrapping:
+                    if group_owner is not None and observed in group_owner['retired_gids']:
+                        bootstrap_diagnostic(snapshot, siblings, phase="attempt", status="unknown",
+                                             reason="local_graph_endpoint_gid_retired")
+                        return snapshot
                     local_gid = observed
+                    bootstrap_diagnostic(snapshot, siblings, phase="attempt", status="bound", reason=None)
                 elif local_gid != observed:
                     raise TopologyBackendError("unreceipted_endpoint_identity_change")
+            if native_partitions is not None:
+                from .matching_qos import observe as observe_partitions
+                snapshot["native_partition_qos"] = observe_partitions(
+                    endpoint, kind, config["native_partitions"], config["native_matching_qos"],
+                    apply=False, profile=config["native_qos_profile"])
             return snapshot
 
-        initial_graph = graph()
+        def bootstrap_diagnostic(snapshot, siblings, *, phase, status, reason):
+            rows = snapshot["publishers" if kind == "writer" else "subscriptions"]
+            own = [row for row in rows if row.get("node_name") == node_name]
+            candidates = [row.get("endpoint_gid") for row in own
+                          if row.get("endpoint_gid") not in (siblings or set())]
+            emit("endpoint_identity_bootstrap", phase=phase, status=status, reason=reason,
+                 graph=snapshot, graph_count=len(rows), local_graph_count=len(own),
+                 candidate_count=len(candidates), candidate_gids=candidates,
+                 sibling_gids=sorted(siblings or ()),
+                 retired_gids=sorted(group_owner['retired_gids']) if group_owner else [],
+                 endpoint_gid=local_gid,
+                 candidate_eligible=False)
+
         deadline = time.monotonic() + float(config.get("startup_timeout_sec", 10.0))
+        initial_graph = graph()
         while local_gid is None and time.monotonic() < deadline:
-            executor.spin_once(timeout_sec=0.02)
+            executor.spin_once(timeout_sec=min(0.02, max(0.0, deadline - time.monotonic())))
             initial_graph = graph()
         if local_gid is None:
+            siblings = {item['token']['endpoint_gid']
+                        for item in group_owner['sessions'].values()
+                        if 'token' in item and item['token']['kind'] == kind} if group_owner else set()
+            bootstrap_diagnostic(initial_graph, siblings, phase="final_failure", status="unknown",
+                                 reason="endpoint_gid_not_observed_within_startup_timeout")
             emit("worker_error", error="endpoint_gid_not_observed_within_startup_timeout")
             return 1
+        if config.get("native_matching_qos") is not None:
+            from .matching_qos import observe as observe_partitions
+            native_partitions = observe_partitions(endpoint, kind, config["native_partitions"],
+                                                   config["native_matching_qos"], apply=True, profile=config["native_qos_profile"])
+            if (native_partitions["endpoint_gid"] != local_gid
+                    or native_partitions["ownership"] != config["native_ownership"]):
+                raise TopologyBackendError("native_matching_endpoint_gid_or_ownership_mismatch")
+            emit("native_partition_configuration", **native_partitions)
         # Graph retains the independent remote contract and GID/type. Local
         # history/depth and resolved defaults come only from the actual public
         # endpoint API; endpoint.qos_profile is merely the supplied Python object.
@@ -1246,6 +1832,7 @@ def _worker_main(argv):
              graph_qos=own.get("qos"),
              identity_source="get_publishers_info_by_topic" if kind == "writer"
              else "get_subscriptions_info_by_topic",
+             **({"native_partition_qos": native_partitions} if native_partitions is not None else {}),
              initial_content_filter=filter_configuration,
              initial_content_filter_request=config.get("initial_content_filter"))
         if kind == "reader":
@@ -1255,8 +1842,18 @@ def _worker_main(argv):
         if kind == "reader":
             liveliness.peer_sampler = _LivelinessPeerSampler(
                 endpoint, rmw_identifier, config["domain_id"], local_gid,
-                instrumentation=instrumentation)
+                instrumentation=instrumentation, enabled=observe_native_peers)
         emit("graph_snapshot", **initial_graph)
+        if group_owner is not None:
+            group_owner['emit']('endpoint_group_bound', endpoint={
+                'logical_id': config['logical_id'], 'generation': config['generation'],
+                'endpoint_generation': endpoint_generation, 'endpoint_gid': local_gid,
+                'worker_role': role})
+            group_owner['sessions'][config['logical_id']]['endpoint'] = endpoint
+            group_owner['sessions'][config['logical_id']]['token'] = {
+                'logical_id': config['logical_id'], 'generation': config['generation'],
+                'endpoint_generation': endpoint_generation, 'endpoint_gid': local_gid,
+                'worker_role': role, 'kind': kind}
 
         pending_publish = None
         stdin_buffer = b""
@@ -1277,7 +1874,12 @@ def _worker_main(argv):
             if now - last_graph_ns > 500_000_000:
                 emit("graph_snapshot", **graph())
                 last_graph_ns = now
-            if sys.stdin is not None and selectors_for_stdin():
+            if group_owner is not None:
+                command = yield
+                if command is None:
+                    continue
+                queue.append(json.dumps(command).encode())
+            elif sys.stdin is not None and selectors_for_stdin():
                 chunk = os.read(sys.stdin.fileno(), 65536)
                 if not chunk:
                     break
@@ -1321,19 +1923,85 @@ def _worker_main(argv):
             if command["command"] in ("stop", "destroy"):
                 emit("worker_stopping", command_id=command_id)
                 break
+            if command["command"] == "native_matching_control":
+                from .native_matching import execute_control
+                value = execute_control(command["control"], domain=config["domain_id"],
+                    rmw=rmw_identifier, endpoint=endpoint, kind=kind,
+                    output_dir=config.get("native_control_output_dir"))
+                emit("native_matching_result", command_id=command_id, endpoint_gid=local_gid,
+                     control_receipt=value, supporting_diagnostic=True, candidate_eligible=False)
+                if value.get("cleanup_confirmed") is not True:
+                    raise TopologyBackendError("native_matching_control_cleanup_unconfirmed")
+                emit("command_done", command_id=command_id, endpoint_gid=local_gid)
+                continue
+            if command["command"] == "lookup_topic":
+                from .scoped_topic_lookup import lookup_receipt, observe_topic_lookup
+                scope, name = command.get("scope"), command.get("name")
+                if (rmw_identifier == "rmw_fastrtps_cpp" and instrumentation is not None
+                        and "native_type_support" not in command):
+                    from .fastdds_peer_observer import FastddsMatchedPeerObserver
+                    if native_peer_observer is None:
+                        native_peer_observer = FastddsMatchedPeerObserver(endpoint, instrumentation=instrumentation)
+                    lookup = native_peer_observer.lookup_topic(config["domain_id"], local_gid, kind, scope, name)
+                elif rmw_identifier != "rmw_cyclonedds_cpp":
+                    lookup = lookup_receipt(scope, name,
+                        reason="rmw_native_typed_topic_lookup_unsupported", execution_evidence=True)
+                    lookup["binding"] = rmw_identifier
+                    if "native_type_support" in command:
+                        lookup["native_type_support"] = {"reference": command["native_type_support"]}
+                else:
+                    try:
+                        lookup = observe_topic_lookup(CycloneMatchedPeerObserver(),
+                            config["domain_id"], local_gid, kind, scope, name,
+                            **({"native_type_support": command["native_type_support"],
+                                "ros_type_name": config["type_name"]}
+                               if "native_type_support" in command else {}))
+                    except (ValueError, TypeError, OSError, AttributeError, RuntimeError) as exc:
+                        lookup = lookup_receipt(scope, name,
+                            reason="native_topic_lookup_adapter_unavailable:" + str(exc),
+                            execution_evidence=True)
+                        known_capability = isinstance(exc, ValueError) and str(exc) in {
+                            "native_endpoint_c_abi_platform_unsupported",
+                            "native_endpoint_c_abi_probe_unverified",
+                            "native_endpoint_c_header_fingerprint_changed",
+                        }
+                        lookup["exception_type"] = type(exc).__name__
+                        if not known_capability:
+                            lookup.update(status="unknown",
+                                attribution="binding_adaptation_or_observation_error")
+                emit("topic_lookup_result", command_id=command_id, endpoint_gid=local_gid,
+                     supporting_diagnostic=True, candidate_eligible=False, lookup_receipt=lookup)
+                if lookup.get("cleanup_confirmed") is False:
+                    raise TopologyBackendError("topic_lookup_cleanup_unconfirmed")
+                emit("command_done", command_id=command_id, endpoint_gid=local_gid)
+                continue
+            if command["command"] == "refresh_participant" and kind == "writer":
+                from r2f.instrumentation.fastdds_pdp_trace.refresh import refresh_participant
+                if rmw_identifier == "rmw_fastrtps_cpp" and instrumentation is not None:
+                    from .fastdds_peer_observer import FastddsMatchedPeerObserver
+                    if native_peer_observer is None:
+                        native_peer_observer = FastddsMatchedPeerObserver(endpoint, instrumentation=instrumentation)
+                receipt = refresh_participant(native_peer_observer, config["domain_id"], local_gid, command.get("data"))
+                emit("participant_refresh_result", command_id=command_id, endpoint_gid=local_gid,
+                     candidate_eligible=False, refresh_receipt=receipt)
+                emit("command_done", command_id=command_id, endpoint_gid=local_gid)
+                continue
             if command["command"] == "snapshot":
                 count_api = (endpoint.get_subscription_count if kind == "writer"
                              else endpoint.get_publisher_count)
                 count_before = count_api()
                 observer = None
-                observation = {"complete": False, "reason": "rmw_has_no_public_peer_observer"}
+                observation = {"complete": False, "reason": (
+                    "rmw_has_no_public_peer_observer" if observe_native_peers
+                    else "native_peer_sampling_disabled_control")}
                 if rmw_identifier == "rmw_cyclonedds_cpp":
                     try:
                         observer = CycloneMatchedPeerObserver()
                         observation = observer.sample(config["domain_id"], local_gid, kind)
                     except (ValueError, OSError, AttributeError) as exc:
                         observation = {"complete": False, "reason": str(exc)}
-                elif rmw_identifier == "rmw_fastrtps_cpp" and instrumentation is not None:
+                elif (rmw_identifier == "rmw_fastrtps_cpp" and instrumentation is not None
+                      and observe_native_peers):
                     try:
                         from .fastdds_peer_observer import FastddsMatchedPeerObserver
                         if native_peer_observer is None:
@@ -1345,12 +2013,45 @@ def _worker_main(argv):
                         observation = {"complete": False, "reason": str(exc),
                             "schema": "r2f.fastdds-native-matched-peer-observation/v1",
                             "manifest_reference": instrumentation}
+                ownership = {"schema": "r2f.participant-ownership-unavailable/v1",
+                             "complete": False, "status": "unavailable",
+                             "candidate_eligible": False,
+                             "domain_id": config["domain_id"], "local_gid": local_gid,
+                             "role_kind": kind,
+                             "reason": "rmw_participant_ownership_observer_unavailable"}
+                if observer is not None and hasattr(observer, "sample_ownership"):
+                    try:
+                        if observer is None:
+                            raise ValueError("cyclone_ownership_observer_unavailable:"
+                                             + str(observation.get("reason")))
+                        ownership = observer.sample_ownership(config["domain_id"], local_gid, kind)
+                    except (ValueError, TypeError, OSError, AttributeError, RuntimeError) as exc:
+                        ownership.update(status="unknown", reason=str(exc))
+                # Ownership is supporting diagnostic evidence, independent of
+                # matched-peer proof and the two canonical public count samples.
                 count_after = count_api()
-                peer_fields = _matched_peer_fields(
-                    observer, config["domain_id"], local_gid, kind,
-                    count_before, count_after, observation)
+                emit("participant_ownership_snapshot", command_id=command_id,
+                     endpoint_gid=local_gid, supporting_diagnostic=True,
+                     candidate_eligible=False, participant_ownership_observation=ownership)
+                peer_observer_selected = (
+                    rmw_identifier == "rmw_cyclonedds_cpp"
+                    or (rmw_identifier == "rmw_fastrtps_cpp" and instrumentation is not None
+                        and observe_native_peers))
+                if peer_observer_selected:
+                    # Selection can fail before constructing an observer. Keep
+                    # those attempted captures incomplete, even if observer=None.
+                    peer_fields = _matched_peer_fields(
+                        observer, config["domain_id"], local_gid, kind,
+                        count_before, count_after, observation)
+                else:
+                    # A named API absence is diagnostic, not an incomplete
+                    # peer-list claim. Preserve it without declaring peer proof.
+                    peer_fields = {"peer_observation_limitation": observation["reason"]}
+                # A changing interval cannot qualify a stable public count.
+                # Keep both actual samples even when no peer observer exists.
                 emit("match_snapshot", command_id=command_id,
-                     matched_count=count_after, public_count_before=count_before,
+                     matched_count=count_after if count_before == count_after else None,
+                     public_count_before=count_before, public_count_after=count_after,
                      **peer_fields,
                      endpoint_gid=local_gid, sampled_monotonic_ns=time.monotonic_ns(),
                      count_api="get_subscription_count" if kind == "writer"
@@ -1358,6 +2059,10 @@ def _worker_main(argv):
                 emit("graph_snapshot", command_id=command_id, **graph())
                 emit("command_done", command_id=command_id)
             elif command["command"] == "update_filter" and kind == "reader":
+                if config["type_name"] != SUPPORTED_MESSAGE_TYPE:
+                    emit("worker_command_error", command_id=command_id,
+                         error="content_filter_message_type_not_expressible")
+                    continue
                 local_gid, incarnation_ordinal = _update_filter_identity(
                     endpoint, lambda: graph(authenticate=False), node_name, local_gid,
                     incarnation_ordinal, command, emit, state_observer=_observe_filter_state)
@@ -1390,6 +2095,10 @@ def _worker_main(argv):
                 if repeat_data is not None and (not isinstance(repeat_data, str) or len(sequences) != 1):
                     emit("worker_command_error", command_id=command_id, error="invalid_repeat_data")
                     continue
+                if repeat_data is not None and config["type_name"] != SUPPORTED_MESSAGE_TYPE:
+                    emit("worker_command_error", command_id=command_id,
+                         error="repeat_string_data_message_type_not_expressible")
+                    continue
                 for index, sequence in enumerate(sequences):
                     body = {
                         "run_id": config["run_id"], "send_sequence": sequence,
@@ -1400,8 +2109,9 @@ def _worker_main(argv):
                     if payload is not None:
                         body["declared_payload"] = payload
                         body["declared_payload_sha256"] = _sha256_text(payload)
-                    message = String()
-                    message.data = repeat_data if repeat_data is not None else json.dumps(body, sort_keys=True)
+                    message = codec.make_message(
+                        repeat_data if repeat_data is not None else json.dumps(body, sort_keys=True))
+                    sample = codec.sample_fields(message, capture_stage="pre_publish")
                     publish_begin_ns = time.monotonic_ns()
                     occurrence = publish_observer.publish(
                         endpoint, message, command_id=command_id,
@@ -1412,7 +2122,7 @@ def _worker_main(argv):
                     emit("send", **native_receipt,
                          publish_begin_ns=publish_begin_ns, publish_return_ns=publish_return_ns, send_sequence=sequence, phase=phase,
                          writer_gid=local_gid, publish_returned=True,
-                         payload_sha256=_sha256_text(message.data), string_data=message.data,
+                         **sample,
                          declared_payload_sha256=body.get("declared_payload_sha256"),
                          command_id=command_id, burst=True)
                     if interval and index + 1 < len(sequences):
@@ -1451,15 +2161,252 @@ def _worker_main(argv):
         # The same cleanup auditor owns executor -> take bridge -> node ->
         # context teardown, so secondary close/telemetry errors cannot mask
         # an original worker failure or skip remaining resource cleanup.
-        _audit_worker_cleanup(executor, node, context, emit,
-                              endpoint_creation_returned=endpoint_creation_returned,
-                              primary_error=primary_error, close_error=close_error)
+        if group_owner is None:
+            try:
+                _audit_worker_cleanup(executor, node, context, emit,
+                                      endpoint_creation_returned=endpoint_creation_returned,
+                                      primary_error=primary_error, close_error=close_error)
+            except BaseException:
+                if pdp_lifecycle_observer is not None:
+                    try:
+                        _drain_pdp_lifecycle(pdp_lifecycle_observer, emit, final=True)
+                    except BaseException as exc:
+                        emit("native_pdp_trace_close_error", error=str(exc), candidate_eligible=False)
+                raise
+            else:
+                if pdp_lifecycle_observer is not None:
+                    _drain_pdp_lifecycle(pdp_lifecycle_observer, emit, final=True)
+        else:
+            cleanup_error = None
+            if endpoint_creation_returned:
+                try:
+                    ok = (node.destroy_publisher(endpoint) if kind == 'writer'
+                          else node.destroy_subscription(endpoint))
+                    if ok is False:
+                        raise TopologyBackendError('group_endpoint_cleanup_returned_false')
+                    emit('endpoint_destroyed', endpoint_gid=local_gid, cleanup_status='closed')
+                except BaseException as exc:
+                    cleanup_error = exc
+                    emit('endpoint_destroyed', endpoint_gid=local_gid, cleanup_status='unknown', error=str(exc))
+            if (primary_error is None or isinstance(primary_error, GeneratorExit)) and (close_error is not None or cleanup_error is not None):
+                raise close_error or cleanup_error
+
     return 0
 
 
 def selectors_for_stdin():
     import select
     return select.select([sys.stdin], [], [], 0)[0]
+
+
+def _group_worker_main(argv):
+    """The existing endpoint implementation, cooperatively addressed by one owner."""
+    from .participant_groups import CONTROL, LINK_KEYS, runtime_supported
+    config = json.loads(argv[1])
+    if (config.get('participant_control') != CONTROL
+            or not runtime_supported(config)):
+        raise TopologyBackendError('group_worker_admission_invalid')
+    members = {e['logical_id']: e for e in config['group_members']}
+    if (not 1 <= len(members) <= 8 or len(members) != len(config['group_members'])
+            or any(e.get('participant_id') != config['group_id']
+                   or e.get('role') not in {'writer', 'reader'}
+                   or e.get('type_name') != 'std_msgs/msg/String'
+                   or e.get('filter') is not None for e in members.values())
+            or any(sum(e['role'] == role for e in members.values()) > 4 for role in ('writer', 'reader'))
+            or len({e.get('topic') for e in members.values()}) != 1):
+        raise TopologyBackendError('group_worker_members_invalid')
+    aliases = _group_worker_roles(config)
+    from .participant_identity import emit_identity_probe
+    emit_identity_probe(config, _monotonic_clock_identity())
+    import rclpy
+    from rclpy.context import Context
+    from rclpy.node import Node
+    from rclpy.executors import SingleThreadedExecutor
+    context = node = executor = None
+    sessions, errors = {}, []
+    generations = {}
+    ticks = int(Path('/proc/self/stat').read_text().rsplit(')', 1)[1].split()[19])
+    rmw = observed_domain = vendor_identity = None
+    def emit(event, **fields):
+        row = {'event': event, 'pid': os.getpid(), 'pgid': os.getpgrp(),
+               'process_start_ticks': ticks, 'run_id': config['run_id'],
+               'domain_id': config['domain_id'], 'observed_domain_id': observed_domain,
+               'rmw_identifier': rmw, 'time_ns': time.time_ns(),
+               'monotonic_ns': time.monotonic_ns(),
+               'monotonic_clock_identity': _monotonic_clock_identity(),
+               **{k: config[k] for k in LINK_KEYS}, **fields}
+        print(json.dumps(row, sort_keys=True), flush=True)
+        return row
+    try:
+        context = Context()
+        rclpy.init(context=context)
+        rmw = rclpy.get_rmw_implementation_identifier()
+        observed_domain = context.get_domain_id()
+        if rmw != config['rmw'] or observed_domain != config['domain_id']:
+            raise TopologyBackendError('group_context_observed_rmw_domain_mismatch')
+        if rmw == 'rmw_fastrtps_cpp':
+            from r2f.instrumentation.fastdds_peer.activation import reference_from_config, verify_vendor_mapping
+            vendor_identity = verify_vendor_mapping(reference_from_config(config))
+        emit('group_context_created', api='rclpy.context.Context+rclpy.init', ros_context_created=True)
+        node_name = 'r2f_group_' + uuid.uuid4().hex[:16]
+        node = Node(node_name, context=context, enable_rosout=False, start_parameter_services=False)
+        take_capability = {'status': 'unavailable', 'reason': 'cyclone_public_message_info',
+                           'original_rclpy_dict_provided_gid': False}
+        if rmw == 'rmw_fastrtps_cpp':
+            from .rcl_take_bridge import make_full_info_executor, BridgeUnavailable
+            try:
+                executor = make_full_info_executor(context=context, rmw_identifier=rmw,
+                    instrumentation=reference_from_config(config))
+            except BridgeUnavailable as exc:
+                raise TopologyBackendError('instrumented_take_bridge_unavailable:' + str(exc)) from exc
+            take_capability = {'status': 'observed', 'reason': None,
+                               'observation_basis': 'single_take_owner_public_rcl_api',
+                               'original_rclpy_dict_provided_gid': False,
+                               'abi': executor.take_bridge.abi_receipt}
+        else:
+            executor = SingleThreadedExecutor(context=context)
+        executor.add_node(node)
+        owner = dict(context=context, node=node, executor=executor, rmw_identifier=rmw,
+                     observed_domain_id=observed_domain, process_start_ticks=ticks,
+                     node_name=node_name, emit=emit, sessions=sessions, retired_gids=set(),
+                     vendor_identity=vendor_identity, take_capability=take_capability)
+        emit('group_worker_ready', node_name=node_name)
+        buffer = b''
+        serial = 0
+        while True:
+            executor.spin_once(timeout_sec=0.01)
+            if not selectors_for_stdin():
+                continue
+            chunk = os.read(sys.stdin.fileno(), 65536)
+            if not chunk:
+                break
+            buffer += chunk
+            while b'\n' in buffer:
+                line, buffer = buffer.split(b'\n', 1)
+                command = json.loads(line)
+                cid = command.get('command_id')
+                if type(cid) is not int or cid != serial + 1:
+                    raise TopologyBackendError('group_command_serial_invalid')
+                serial = cid
+                op = command.get('command')
+                if op == 'stop':
+                    emit('command_done', command='stop', command_id=cid)
+                    return 0
+                eid = command.get('logical_id')
+                if op == 'group_snapshot' and eid is None:
+                    # An empty group still has a live process/context owner. Do
+                    # not borrow an already retired endpoint's address or token.
+                    if sessions or any(k in command for k in ('generation', 'endpoint_generation', 'endpoint_gid', 'worker_role')):
+                        raise TopologyBackendError('group_empty_snapshot_address_invalid')
+                    capture = _capture_group_ownership(config, sessions)
+                    emit('participant_group_snapshot', command_id=cid,
+                         supporting_diagnostic=True, candidate_eligible=False,
+                         endpoint_absence_observed=True, active_endpoint_count=0,
+                         **capture)
+                    emit('command_done', command=op, command_id=cid,
+                         endpoint_absence_observed=True, active_endpoint_count=0)
+                    continue
+                if eid not in members or type(command.get('generation')) is not int:
+                    raise TopologyBackendError('group_command_address_invalid')
+                if op == 'create_endpoint':
+                    if (eid in sessions or command.get('worker_role') != aliases[eid]
+                            or command['generation'] != generations.get(eid, 0) + 1):
+                        raise TopologyBackendError('group_create_reused_or_wrong_role')
+                    spec = members[eid]
+                    prepared = endpoint_expressibility(spec, config)
+                    cfg = {**config, **spec, 'generation': command['generation'], 'qos': prepared['public_qos']}
+                    session = _worker_main([argv[0], json.dumps(cfg), command['worker_role']], owner)
+                    sessions[eid] = {'session': session}
+                    next(session)  # exactly this endpoint, never another declaration
+                    token = sessions[eid]['token']
+                    generations[eid] = command['generation']
+                    emit('command_done', command=op, command_id=cid, **token)
+                elif op == 'destroy_endpoint':
+                    item = sessions.get(eid)
+                    token = item.get('token') if item else None
+                    if (token is None or command['generation'] != token['generation']
+                            or command.get('endpoint_generation') != token['endpoint_generation']):
+                        raise TopologyBackendError('group_destroy_address_invalid')
+                    item['session'].close()  # ROS endpoint destroy; owner context stays alive
+                    owner['retired_gids'].add(token['endpoint_gid'])
+                    del sessions[eid]
+                    emit('command_done', command=op, command_id=cid, cleanup_status='closed', **token)
+                elif op == 'group_snapshot':
+                    token = sessions.get(eid, {}).get('token')
+                    if (token is None or command['generation'] != token['generation']
+                            or command.get('endpoint_generation') != token['endpoint_generation']):
+                        raise TopologyBackendError('group_snapshot_address_invalid')
+                    capture = _capture_group_ownership(config, sessions)
+                    emit('participant_group_snapshot', command_id=cid,
+                         supporting_diagnostic=True, candidate_eligible=False, **capture, **token)
+                    emit('command_done', command=op, command_id=cid, **token)
+                else:
+                    token = sessions.get(eid, {}).get('token')
+                    if (op not in {'snapshot', 'publish_batch', 'lookup_topic', 'native_matching_control'} or token is None
+                            or command['generation'] != token['generation']
+                            or command.get('endpoint_generation') != token['endpoint_generation']):
+                        raise TopologyBackendError('group_command_target_or_operation_invalid')
+                    sessions[eid]['session'].send(command)
+    finally:
+        # Close every acquired session even if another close fails. The owner
+        # tears down executor/node/context once, including partial create errors.
+        for item in sessions.values():
+            try:
+                item['session'].close()
+            except BaseException as exc:
+                errors.append(type(exc).__name__ + ':' + str(exc))
+        primary = sys.exc_info()[1]
+        def audit_emit(event, **fields):
+            return emit(event, **fields)
+        try:
+            outcomes = _audit_worker_cleanup(executor, node, context, audit_emit,
+                                  endpoint_creation_returned=bool(sessions), primary_error=primary)
+            if any(v['status'] != 'returned' for v in outcomes.values()):
+                errors.append('group_owner_cleanup_unverified')
+        except BaseException as exc:
+            errors.append(type(exc).__name__ + ':' + str(exc))
+        emit('group_context_shutdown', closed=not errors, errors=errors)
+        if primary is None and errors:
+            raise TopologyBackendError('group_cleanup_failed:' + repr(errors))
+
+
+def _capture_group_ownership(config, sessions):
+    """Serial stable local roots plus double-sampled unchanged ownership v2."""
+    from .participant_groups import OBSERVATION_SCHEMA
+    result = {'schema': OBSERVATION_SCHEMA, 'requested_grouping': config['group_id'],
+              'qualification_scope': 'owned_Cyclone_process_local_roots_serial_not_atomic',
+              'ros_context_application_observed': True, 'endpoint_ownership_observed': False,
+              'local_root_inventory_complete': False, 'group_relation_observed': False,
+              'roots_before': None, 'roots_after': None, 'endpoints': [],
+              'actual_local_root_count': None, 'unknown_reasons': []}
+    try:
+        if config.get('rmw') == 'rmw_fastrtps_cpp':
+            from .fastdds_local_api import sample_roots
+            from .fastdds_peer_observer import FastddsMatchedPeerObserver
+            from r2f.instrumentation.fastdds_peer.activation import reference_from_config
+            reference = reference_from_config(config)
+            result['qualification_scope'] = 'owned_FastDDS_process_public_parent_and_factory_roots_serial_not_atomic'
+            roots = lambda: sample_roots(reference, config['domain_id'])
+            observer_for = lambda item: FastddsMatchedPeerObserver(item['endpoint'], instrumentation=reference)
+        else:
+            observer = CycloneMatchedPeerObserver()
+            roots = lambda: observer.sample_roots(config['domain_id'])
+            observer_for = lambda item: observer
+        result['roots_before'] = roots()
+        for item in sessions.values():
+            token = item['token']
+            observer = observer_for(item)
+            samples = [observer.sample_ownership(config['domain_id'], token['endpoint_gid'], token['kind'])
+                       for _ in range(2)]
+            result['endpoints'].append({**token, 'samples': samples})
+        result['roots_after'] = roots()
+        from .participant_groups import qualify_observation
+        result.update(qualify_observation(result, [v['token'] for v in sessions.values()]))
+    except (ValueError, TypeError, OSError, AttributeError, RuntimeError) as exc:
+        result['capture_error'] = str(exc)
+    from .participant_groups import qualify_observation
+    result.update(qualify_observation(result, [v['token'] for v in sessions.values() if 'token' in v]))
+    return result
 
 
 def worker_main():  # console/module entry used by RosTopologyBackend
@@ -1505,6 +2452,14 @@ class _EndpointProcess:
             "PYTHONDONTWRITEBYTECODE": "1",
             "PYTHONUNBUFFERED": "1",
         })
+        if self.config.get("native_matching_qos") is not None:
+            from .matching_qos import ownership_profile, digest
+            profile = self.output_dir / "native-qos-profile.xml"
+            with profile.open("xb") as stream:
+                stream.write(ownership_profile(self.config["topic"], self.config["native_ownership"]))
+            self.config["native_qos_profile"] = {"path": str(profile), "sha256": digest(profile)}
+            env["FASTRTPS_DEFAULT_PROFILES_FILE"] = str(profile)
+            env["FASTDDS_DEFAULT_PROFILES_FILE"] = str(profile)
         attempt = 1
         stderr_path = self.output_dir / f"{self.role}.stderr.log"
         while True:
@@ -1529,6 +2484,11 @@ class _EndpointProcess:
             "worker_role": self.role, "worker_generation": self.config["generation"],
             "stderr_path": str(stderr_path),
         }
+        if 'participant_control' in self.config:
+            self.metadata = {k: self.metadata[k] for k in ('pid', 'pgid', 'fresh_process', 'stderr_path')}
+            self.metadata.update({k: self.config[k] for k in ('group_id', 'worker_instance_id', 'context_instance_id')})
+            self.metadata['process_start_ticks'] = int(Path(f'/proc/{self.process.pid}/stat').read_text().rsplit(')', 1)[1].split()[19])
+            self.metadata['separate_context'] = False
         self.emit("process_started", **self.metadata)
         return self.metadata
 
@@ -1542,11 +2502,27 @@ class _EndpointProcess:
                 raise ValueError("concurrent pgid mismatch")
             if event.get("pid") not in (None, self.process.pid):
                 raise ValueError("pid mismatch")
+            grouped = 'participant_control' in self.config
+            if grouped and (event.get('pid') != self.process.pid
+                            or event.get('pgid') != self.process.pid
+                            or event.get('process_start_ticks') != self.metadata.get('process_start_ticks')):
+                raise ValueError('group process identity mismatch')
             event["pid"] = self.process.pid
             event["pgid"] = self.process.pid
-            event["worker_role"] = self.role
-            event["worker_generation"] = self.config["generation"]
-            if kind == "endpoint_created":
+            if grouped:
+                if any(event.get(k) != self.config[k] for k in ('group_id', 'worker_instance_id', 'context_instance_id')):
+                    raise ValueError('group process/context identity mismatch')
+                eid = event.get('logical_id')
+                if eid is not None:
+                    specs = [e for e in self.config['group_members'] if e['logical_id'] == eid]
+                    aliases = _group_worker_roles(self.config)
+                    if (len(specs) != 1 or event.get('worker_role') != aliases[eid]
+                            or ('role' in event and event['role'] != aliases[eid])):
+                        raise ValueError('group endpoint role mismatch')
+            else:
+                event["worker_role"] = self.role
+                event["worker_generation"] = self.config["generation"]
+            if kind == "endpoint_created" and not grouped:
                 self.metadata.update({k: deepcopy(event.get(k)) for k in
                     ("logical_id", "generation", "endpoint_gid", "endpoint_generation", "process_start_ticks",
                      "rmw_identifier", "domain_id", "observed_domain_id", "domain_observation_source")})
@@ -1578,26 +2554,46 @@ class _EndpointProcess:
         self.command_serial += 1
         command_id = self.command_serial
         payload = {"command": command, "command_id": command_id, **fields}
+        if 'participant_control' in self.config:
+            self.emit('group_command_requested', command=command, command_id=command_id,
+                      **{k: self.metadata[k] for k in ('pid', 'pgid', 'process_start_ticks', 'group_id', 'worker_instance_id', 'context_instance_id')},
+                      **fields)
         if command in {"prepare_concurrent_publish", "release_concurrent_publish"}:
-            created = next((e for e in reversed(self.events) if e.get("event") == "endpoint_created"), {})
+            created = next((e for e in reversed(self.events) if e.get("event") == "endpoint_created"
+                            and all(e.get(k) == fields[k] for k in ('logical_id', 'generation', 'endpoint_generation') if k in fields)), {})
             self.emit("concurrent_publish_requested" if command == "prepare_concurrent_publish" else "concurrent_publish_release",
                       concurrency_group=fields["concurrency_group"],
                       command_id=command_id if command == "prepare_concurrent_publish" else fields["prepared_command_id"],
                       **{k: created.get(k) for k in ("logical_id", "generation", "endpoint_gid", "pid", "pgid", "process_start_ticks", "endpoint_generation")})
+        if command == "native_matching_control":
+            created = next((e for e in reversed(self.events) if e.get("event") == "endpoint_created"
+                            and all(e.get(k) == fields[k] for k in ("logical_id", "generation", "endpoint_generation") if k in fields)), {})
+            self.emit("native_matching_requested", command_id=command_id, control=fields["control"],
+                      **{k: created.get(k) for k in ("logical_id", "generation", "endpoint_gid", "endpoint_generation",
+                                                    "pid", "pgid", "process_start_ticks")})
         if command == "snapshot":
-            created = next((e for e in reversed(self.events) if e.get("event") == "endpoint_created"), {})
+            created = next((e for e in reversed(self.events) if e.get("event") == "endpoint_created"
+                            and all(e.get(k) == fields[k] for k in ('logical_id', 'generation', 'endpoint_generation') if k in fields)), {})
+            identity = {k: (self.metadata or {}).get(k, created.get(k)) for k in
+                        ("logical_id", "generation", "endpoint_gid", "pid", "process_start_ticks", "endpoint_generation")}
+            if 'participant_control' in self.config:
+                identity.update({k: self.metadata[k] for k in
+                                 ('pgid', 'group_id', 'worker_instance_id', 'context_instance_id')})
             self.emit("topology_snapshot_requested", command="snapshot", command_id=command_id,
-                      **{k: (self.metadata or {}).get(k, created.get(k)) for k in ("logical_id", "generation", "endpoint_gid", "pid", "process_start_ticks", "endpoint_generation")})
+                      **identity)
         data = (json.dumps(payload) + "\n").encode()
-        audit = command == "assert_liveliness"
+        audit = command in {"assert_liveliness", "refresh_participant"}
+        audit_prefix = "topology_participant_refresh" if command == "refresh_participant" else "topology_assert_liveliness"
         if audit:
-            created = next((e for e in reversed(self.events) if e.get("event") == "endpoint_created"), {})
+            created = next((e for e in reversed(self.events) if e.get("event") == "endpoint_created"
+                            and all(e.get(k) == fields[k] for k in ('logical_id', 'generation', 'endpoint_generation') if k in fields)), {})
             identity = {k: created.get(k) for k in ("logical_id", "generation", "endpoint_gid", "pid", "process_start_ticks", "endpoint_generation", "run_id")}
             identity["worker_role"] = self.role
             identity["worker_generation"] = self.config.get("generation")
-            self.emit("topology_assert_liveliness_requested", command=command, command_id=command_id,
+            self.emit(audit_prefix + "_requested", command=command, command_id=command_id,
                       request_monotonic_ns=time.monotonic_ns(),
-                      request_clock_identity=_monotonic_clock_identity(), **identity)
+                      request_clock_identity=_monotonic_clock_identity(),
+                      **({"requested_data": fields.get("data")} if command == "refresh_participant" else {}), **identity)
         written = None
         try:
             written = self.process.stdin.write(data)
@@ -1606,13 +2602,13 @@ class _EndpointProcess:
             self.process.stdin.flush()
         except (BrokenPipeError, OSError, ValueError) as exc:
             if audit:
-                self.emit("topology_assert_liveliness_write_result", command=command, command_id=command_id,
+                self.emit(audit_prefix + "_write_result", command=command, command_id=command_id,
                           status="failed", bytes_written=written, bytes_expected=len(data),
                           error_type=type(exc).__name__, result_monotonic_ns=time.monotonic_ns(),
                           result_clock_identity=_monotonic_clock_identity(), **identity)
             raise TopologyBackendError("worker_pipe_closed:" + self.role) from exc
         if audit:
-            self.emit("topology_assert_liveliness_write_result", command=command, command_id=command_id,
+            self.emit(audit_prefix + "_write_result", command=command, command_id=command_id,
                       status="flushed", bytes_written=written, bytes_expected=len(data), error_type=None,
                       result_monotonic_ns=time.monotonic_ns(),
                       result_clock_identity=_monotonic_clock_identity(), **identity)
@@ -1935,6 +2931,10 @@ class OfflineTopologyBackend:
             if repeat_string_data is not None:
                 body = json.loads(string_data)
             payload_sha256 = _sha256_text(string_data)
+            sample = {"payload_sha256": payload_sha256, "string_data": string_data}
+            if handle["type_name"] == "std_msgs/msg/UInt8MultiArray":
+                sample.update(string_data=None, payload_text=string_data,
+                              message_type=handle["type_name"])
             publish_begin_ns = time.monotonic_ns()
             publish_return_ns = time.monotonic_ns()  # simulated, not DDS
             self._emit("send", publish_begin_ns=publish_begin_ns, publish_return_ns=publish_return_ns, logical_id=handle["logical_id"],
@@ -1942,7 +2942,7 @@ class OfflineTopologyBackend:
                        worker_role=handle["worker_role"], endpoint_gid=handle["endpoint_gid"],
                        writer_gid=handle["endpoint_gid"], send_sequence=sequence,
                        phase=phase, publish_returned=True, command_id=command_id,
-                       burst=True, payload_sha256=payload_sha256, string_data=string_data,
+                       burst=True, **sample,
                        pid=handle["pid"], pgid=handle["pgid"],
                        process_start_ticks=handle["process_start_ticks"],
                        endpoint_generation=handle["endpoint_generation"],
@@ -1965,7 +2965,7 @@ class OfflineTopologyBackend:
                             pid=reader["pid"], pgid=reader["pgid"],
                             process_start_ticks=reader["process_start_ticks"],
                             endpoint_generation=reader["endpoint_generation"],
-                            payload_sha256=payload_sha256, string_data=string_data,
+                            **sample,
                             payload_writer_id=body["writer_id"],
                             payload_writer_generation=body["writer_generation"],
                             payload_endpoint_gid=body["endpoint_gid"],
@@ -2006,12 +3006,15 @@ class OfflineTopologyBackend:
                 matched_count = sum(self.reader_sees.get((eid, handle["logical_id"]), False)
                                     for eid in rows["writer"])
             matched_count = self.count_overrides.get(handle["logical_id"], matched_count)
+            # Discovery rows describe the endpoint owning each GID, not the
+            # observer. Mixed-type peers remain visible without claiming match.
+            gid_types = {h["endpoint_gid"]: h["type_name"] for h in self.handles.values()}
             graph = {
                 "publishers": [{"endpoint_gid": gid, "node_name": "offline_fake",
-                                "node_namespace": "/", "topic_type": handle["type_name"],
+                                "node_namespace": "/", "topic_type": gid_types[gid],
                                 "qos": {}} for gid in publishers],
                 "subscriptions": [{"endpoint_gid": gid, "node_name": "offline_fake",
-                                   "node_namespace": "/", "topic_type": handle["type_name"],
+                                   "node_namespace": "/", "topic_type": gid_types[gid],
                                    "qos": {}} for gid in subscriptions],
             }
             match = {"command_id": command_id, "matched_count": matched_count,
@@ -2029,6 +3032,23 @@ class OfflineTopologyBackend:
             self._emit("command_done", command_id=command_id, **identity)
         return {"snapshots": snapshots, "command_id": command_id,
                 "complete": all(v["complete"] for v in snapshots.values())}
+
+    def native_matching_control(self, handle, control):
+        return {"status": "unsupported", "reason": "offline_fixture_no_native_matching_control",
+                "cleanup_confirmed": True, "request": deepcopy(control), "candidate_eligible": False}
+
+    def lookup_topic(self, handle, scope, name, *, native_type_support=None):
+        from .scoped_topic_lookup import lookup_receipt
+        receipt = lookup_receipt(scope, name, reason="offline_fixture_no_native_topic_lookup")
+        if native_type_support is not None:
+            receipt["native_type_support_request"] = deepcopy(native_type_support)
+        return receipt
+
+    def refresh_participant(self, handle, data):
+        return {"schema": "r2f.fastdds-participant-refresh/v1", "status": "unsupported",
+                "complete": False, "requested_data": data,
+                "reason": "offline_fixture_no_native_participant_refresh",
+                "candidate_eligible": False, "execution_evidence": False}
 
     def assert_liveliness(self, handle):
         if self.closed:
@@ -2098,6 +3118,8 @@ class RosTopologyBackend:
         self.closed = False
         self.netem_isolation = None
         self.instrumentation_reference = None
+        self.group_program = None
+        self.groups = {}
 
     def set_event_sink(self, sink):
         self.event_sink = sink
@@ -2118,6 +3140,21 @@ class RosTopologyBackend:
         cfg = dict(self.config)
         cfg.update(config or {})
         cfg.setdefault("source_repo", str(REPO))
+        from .participant_groups import enabled, validate_control
+        try:
+            validate_control(program, cfg)
+        except (ValueError, KeyError, TypeError) as exc:
+            raise TopologyUnsupported('participant_control_scope', str(exc)) from exc
+        from .matching_qos import reference as matching_reference, load_build
+        try:
+            native_reference = matching_reference(cfg)
+            if native_reference is not None:
+                load_build(native_reference)
+                if enabled(program):
+                    raise ValueError("native_matching_qos_endpoint_process_only")
+        except (ValueError, KeyError, OSError, TypeError) as exc:
+            raise TopologyUnsupported("native_matching_qos_qualification", str(exc)) from exc
+        self.group_program = deepcopy(program) if enabled(program) else None
         # Hard gate: this backend must refuse to touch a live domain unless an
         # explicit owner GO was supplied.  Direct API use cannot bypass it.
         if cfg.get("live_execution_go") is not True:
@@ -2204,6 +3241,15 @@ class RosTopologyBackend:
             raise TopologyBackendError("backend_closed")
         if self.environment is None:
             raise TopologyBackendError("backend_not_prepared")
+        if self.group_program is not None:
+            order = [(a['endpoint_id'], a['generation']) for a in self.group_program['actions']
+                     if a['op'] in {'create', 'recreate'}]
+            created_count = sum(e.get('event') == 'endpoint_created' for p in self.processes for e in p.events)
+            if created_count >= len(order) or (spec.get('logical_id'), generation) != order[created_count]:
+                raise TopologyBackendError('group_endpoint_create_order')
+        if (self.group_program is not None
+                and worker_role != canonical_worker_roles(self.group_program['endpoints']).get(spec.get('logical_id'))):
+            raise TopologyBackendError('group_endpoint_worker_role_mismatch')
         prepared = endpoint_expressibility(spec, self.config)
         endpoint_dir = (self.output_dir / "endpoints"
                         / re.sub(r"[^A-Za-z0-9_.-]", "_", spec["logical_id"])
@@ -2215,38 +3261,82 @@ class RosTopologyBackend:
             "logical_id": spec["logical_id"], "generation": generation,
             "topic": spec["topic"], "type_name": spec["type_name"],
             "qos": prepared["public_qos"],
+            "native_control_output_dir": str(endpoint_dir / "native-controls"),
             "startup_timeout_sec": float(self.config.get("startup_timeout_sec", 10.0)),
         }
 
+        if self.config.get("native_matching_qos") is not None:
+            worker_config["native_matching_qos"] = deepcopy(self.config["native_matching_qos"])
+            worker_config["native_partitions"] = deepcopy(spec["qos"]["partitions"])
+            worker_config["native_ownership"] = spec["qos"]["ownership"]
+        identity_checks = self.config.get("topology_program", {}).get("identity_checks")
+        if identity_checks is not None:
+            worker_config["identity_checks"] = deepcopy(identity_checks)
+        if self.group_program is not None:
+            declared = [e for e in self.group_program['endpoints'] if e == spec]
+            previous = self.handles.get(spec['logical_id'])
+            expected = previous['generation'] + 1 if previous is not None else 1
+            if (len(declared) != 1 or type(generation) is not int or generation != expected
+                    or (previous is not None and previous.get('alive'))):
+                raise TopologyBackendError('group_endpoint_not_exact_admitted_spec')
+            label = spec['participant_id']
+            worker_config.update(participant_control=self.group_program['participant_control'],
+                group_id=label, group_program=deepcopy(self.group_program),
+                group_worker_roles=canonical_worker_roles(self.group_program['endpoints']),
+                group_members=[e for e in self.group_program['endpoints'] if e['participant_id'] == label],
+                worker_instance_id=uuid.uuid4().hex, context_instance_id=uuid.uuid4().hex)
         if self.instrumentation_reference is not None:
             worker_config["observation_mode"] = "instrumentation"
             worker_config["fastdds_peer_instrumentation"] = {
                 key: self.instrumentation_reference[key]
                 for key in ("manifest_path", "manifest_sha256")}
+            if "observe_native_peers" in self.config:
+                worker_config["observe_native_peers"] = self.config["observe_native_peers"]
         if prepared["initial_content_filter"] is not None:
             worker_config["initial_content_filter"] = deepcopy(prepared["initial_content_filter"])
 
         def sink(event, **fields):
             value = dict(fields)
-            value.setdefault("topology_logical_id", spec["logical_id"])
-            value.setdefault("topology_generation", generation)
-            value.setdefault("topology_worker_role", worker_role)
+            if self.group_program is None:
+                value.setdefault("topology_logical_id", spec["logical_id"])
+                value.setdefault("topology_generation", generation)
+                value.setdefault("topology_worker_role", worker_role)
+            elif value.get('logical_id') is not None:
+                value.setdefault('topology_logical_id', value['logical_id'])
+                value.setdefault('topology_generation', value['generation'])
+                value.setdefault('topology_worker_role', value.get('worker_role', value.get('role')))
             value.setdefault("backend", self.backend_name)
             value.setdefault("real_ros", True)
             if self.event_sink is not None:
                 self.event_sink(event, **value)
 
-        process = _EndpointProcess(worker_config, self.environment, endpoint_dir,
-                                   worker_role, sink)
-        self.processes.append(process)
+        grouped = self.group_program is not None
+        process = self.groups.get(spec['participant_id']) if grouped else None
+        fresh = process is None
+        if fresh:
+            process = _EndpointProcess(worker_config, self.environment, endpoint_dir,
+                                       worker_role, sink)
+            self.processes.append(process)
+            if grouped:
+                self.groups[spec['participant_id']] = process
         try:
-            process.start()
+            if fresh:
+                process.start()
             pid = process.process.pid
-            process.wait(lambda: process.has("endpoint_created", pid=pid),
+            if grouped:
+                process.wait(lambda: process.has('group_worker_ready', pid=pid),
+                             worker_config['startup_timeout_sec'], 'group_ready')
+                cid = process.command('create_endpoint', logical_id=spec['logical_id'],
+                                      generation=generation, worker_role=worker_role)
+                process.wait(lambda: process.has('command_done', command_id=cid,
+                              logical_id=spec['logical_id'], generation=generation),
+                             worker_config['startup_timeout_sec'], 'group_endpoint_create_ack')
+            process.wait(lambda: process.has("endpoint_created", pid=pid, logical_id=spec['logical_id'], generation=generation),
                          worker_config["startup_timeout_sec"],
                          "topology_endpoint_created:" + spec["logical_id"])
             row = [e for e in process.events
-                   if e.get("event") == "endpoint_created" and e.get("pid") == pid][-1]
+                   if e.get("event") == "endpoint_created" and e.get("pid") == pid
+                   and e.get('logical_id') == spec['logical_id'] and e.get('generation') == generation][-1]
             gid = row.get("endpoint_gid")
             if not isinstance(gid, str) or not re.fullmatch(r"[0-9a-fA-F]{2,}", gid):
                 raise TopologyBackendError("endpoint_created_without_real_guid")
@@ -2278,6 +3368,19 @@ class RosTopologyBackend:
                 "process": process, "alive": True, "real_ros": True,
                 "created_monotonic_ns": row.get("created_monotonic_ns"),
             }
+            if grouped:
+                from .participant_groups import LINK_KEYS
+                handle.update({k: row.get(k) for k in LINK_KEYS})
+                if any(handle[k] != process.config[k] for k in LINK_KEYS):
+                    raise TopologyBackendError('group_endpoint_binding_mismatch')
+                ack = [e for e in process.events if e.get('event') == 'command_done' and e.get('command_id') == cid]
+                if len(ack) != 1 or any(ack[0].get(k) != handle[k] for k in ('logical_id','generation','endpoint_generation','endpoint_gid')):
+                    raise TopologyBackendError('group_create_ack_identity_mismatch')
+            if grouped:
+                prior = [e for e in process.events if e.get('event') == 'endpoint_created' and e is not row]
+                if any(e.get('endpoint_gid') == gid or e.get('endpoint_generation') == handle['endpoint_generation']
+                       for e in prior):
+                    raise TopologyBackendError('group_endpoint_identity_reused')
             if prepared["initial_content_filter"] is not None:
                 # Only child API results can populate this observation.
                 handle["initial_content_filter"] = deepcopy(row.get("initial_content_filter"))
@@ -2291,9 +3394,37 @@ class RosTopologyBackend:
             return handle
         except Exception:
             process.close()
+            for handle in self.handles.values():
+                if handle.get('process') is process:
+                    handle['alive'] = False
             raise
 
     def destroy_endpoint(self, handle):
+        if self.group_program is not None:
+            if self.handles.get(handle.get('logical_id')) is not handle or not handle.get('alive'):
+                raise TopologyBackendError('group_destroy_stale_handle')
+            process = handle['process']
+            begin = len(process.events)
+            cid = self._batch(handle, 'destroy_endpoint')
+            from .participant_groups import ENDPOINT_KEYS, PROCESS_KEYS, LINK_KEYS
+            keys = ENDPOINT_KEYS + PROCESS_KEYS + LINK_KEYS
+            rows = process.events[begin:]
+            cleanups = [e for e in rows if e.get('event') == 'endpoint_destroyed'
+                        and all(e.get(k) == handle.get(k) for k in keys)]
+            acks = [e for e in rows if e.get('event') == 'command_done' and e.get('command_id') == cid]
+            if (len(cleanups) != 1 or len(acks) != 1
+                    or cleanups[0].get('cleanup_status') != 'closed'
+                    or acks[0].get('command') != 'destroy_endpoint' or acks[0].get('cleanup_status') != 'closed'
+                    or any(acks[0].get(k) != handle.get(k) for k in keys)
+                    or rows.index(cleanups[0]) >= rows.index(acks[0])
+                    or process.process.poll() is not None):
+                raise TopologyBackendError('group_destroy_cleanup_ack_invalid')
+            handle['alive'] = False
+            identity = {k: handle[k] for k in keys}
+            self._emit('topology_endpoint_destroyed', **identity, role=handle['worker_role'],
+                       cleanup_status='closed', command_id=cid, process_retained=True)
+            return {**identity, 'cleanup_status': 'closed', 'command_id': cid,
+                    'process_retained': True, 'returncode': None}
         process = handle.get("process")
         receipt = process.close() if process is not None else {"closed": False}
         handle["alive"] = False
@@ -2310,18 +3441,24 @@ class RosTopologyBackend:
         return {"cleanup_status": "closed" if receipt.get("closed") else "unknown",
                 "returncode": receipt.get("returncode"), **identity}
 
-    def _batch(self, handle, command, **fields):
+    def _batch(self, handle, command, *, _timeout_sec=None, **fields):
         process = handle["process"]
-        command_id = process.command(command, **fields)
+        address = ({k: handle[k] for k in ('logical_id', 'generation', 'endpoint_generation')}
+                   if self.group_program is not None else {})
+        command_id = process.command(command, **address, **fields)
         try:
             process.wait(lambda: process.has("command_done", command_id=command_id),
-                         float(self.config.get("publish_timeout_sec", 10.0)),
+                         float(self.config.get("publish_timeout_sec", 10.0) if _timeout_sec is None else _timeout_sec),
                          "topology_" + command + ":" + handle["logical_id"])
         except TopologyBackendError as exc:
             if isinstance(exc, TopologyBackendTimeout):
                 raise TopologyBackendTimeout(
                     str(exc), command_id=command_id, endpoint_id=handle["logical_id"]) from exc
             raise
+        if self.group_program is not None:
+            acks = [e for e in process.events if e.get('event') == 'command_done' and e.get('command_id') == command_id]
+            if len(acks) != 1 or any(acks[0].get(k) != handle[k] for k in ('logical_id', 'generation', 'endpoint_generation')):
+                raise TopologyBackendError('group_command_ack_target_mismatch')
         errors = [e for e in process.events
                   if e.get("event") == "worker_command_error" and e.get("command_id") == command_id]
         if errors:
@@ -2432,6 +3569,13 @@ class RosTopologyBackend:
         if interval_sec < 0 or interval_sec > MAX_INTERVAL_SEC:
             raise TopologyUnsupported("burst_interval_not_expressible",
                                       "interval outside bounded worker input")
+        if self.group_program is not None:
+            expected = {e['logical_id'] for e in self.group_program['endpoints']}
+            if set(self.handles) != expected or any(not h.get('alive') for h in self.handles.values()):
+                raise TopologyBackendError('group_publish_requires_both_created_endpoints')
+            for process in self.groups.values():
+                member = next(h for h in self.handles.values() if h['process'] is process)
+                self._batch(member, 'group_snapshot')
         command_id = self._batch(handle, "publish_batch", sequences=list(sequences),
                                  interval_sec=float(interval_sec), phase=phase,
                                  payload=payload, repeat_string_data=repeat_string_data)
@@ -2450,13 +3594,41 @@ class RosTopologyBackend:
             "backend": self.backend_name,
         }
 
+    def _snapshot_group(self, process):
+        member = next((h for h in self.handles.values()
+                       if h['process'] is process and h.get('alive')), None)
+        begin = len(process.events)
+        if member is not None:
+            cid = self._batch(member, 'group_snapshot')
+        else:
+            cid = process.command('group_snapshot')
+            process.wait(lambda: process.has('command_done', command_id=cid),
+                         float(self.config.get('snapshot_timeout_sec', 5.0)),
+                         'topology_empty_group_snapshot')
+        rows = process.events[begin:]
+        captures = [e for e in rows if e.get('event') == 'participant_group_snapshot' and e.get('command_id') == cid]
+        acks = [e for e in rows if e.get('event') == 'command_done' and e.get('command_id') == cid]
+        if (len(captures) != 1 or len(acks) != 1 or acks[0].get('command') != 'group_snapshot'
+                or rows.index(captures[0]) >= rows.index(acks[0]) or process.process.poll() is not None):
+            raise TopologyBackendError('group_capture_ack_invalid')
+        if member is None:
+            from .participant_groups import ENDPOINT_KEYS
+            if (any(k in e for e in (captures[0], acks[0]) for k in ENDPOINT_KEYS + ('worker_role',))
+                    or any(e.get('endpoint_absence_observed') is not True or type(e.get('active_endpoint_count')) is not int
+                           or e['active_endpoint_count'] != 0 for e in (captures[0], acks[0]))
+                    or captures[0].get('endpoints') != []):
+                raise TopologyBackendError('group_empty_capture_invalid')
+        return deepcopy(captures[0])
+
     def snapshot(self, handles):
         if self.closed:
             raise TopologyBackendError("backend_closed")
         snapshots = {}
         for logical_id, handle in (handles.items() if isinstance(handles, dict) else handles):
             process = handle["process"]
-            command_id = process.command("snapshot")
+            address = ({k: handle[k] for k in ('logical_id', 'generation', 'endpoint_generation')}
+                       if self.group_program is not None else {})
+            command_id = process.command("snapshot", **address)
             try:
                 process.wait(lambda: process.has("command_done", command_id=command_id),
                              float(self.config.get("snapshot_timeout_sec", 5.0)),
@@ -2466,6 +3638,10 @@ class RosTopologyBackend:
                     raise TopologyBackendTimeout(str(exc), command_id=command_id,
                                                  endpoint_id=logical_id) from exc
                 raise
+            if self.group_program is not None:
+                acks = [e for e in process.events if e.get('event') == 'command_done' and e.get('command_id') == command_id]
+                if len(acks) != 1 or any(acks[0].get(k) != handle[k] for k in ('logical_id','generation','endpoint_generation')):
+                    raise TopologyBackendError('group_snapshot_ack_target_mismatch')
             matches = [e for e in process.events if e.get("event") == "match_snapshot"
                        and e.get("command_id") == command_id]
             graphs = [e for e in process.events if e.get("event") == "graph_snapshot"
@@ -2476,8 +3652,72 @@ class RosTopologyBackend:
                 "command_id": command_id,
                 "complete": bool(matches and graphs),
             }
+        group_observations = []
+        if (self.group_program is not None
+                and len(self.handles) == len(self.group_program['endpoints'])):
+            for process in self.groups.values():
+                group_observations.append(self._snapshot_group(process))
         return {"snapshots": snapshots, "command_id": None,
+                "group_observations": group_observations,
                 "complete": all(v["complete"] for v in snapshots.values())}
+
+    def native_matching_control(self, handle, control):
+        command_id = self._batch(handle, "native_matching_control", control=control,
+                                  _timeout_sec=2 * control["timeout_sec"] + 30)
+        events = handle["process"].events
+        rows = [row for row in events if row.get("event") == "native_matching_result"
+                and row.get("command_id") == command_id]
+        acks = [row for row in events if row.get("event") == "command_done"
+                and row.get("command_id") == command_id]
+        keys = ("logical_id", "generation", "endpoint_generation", "endpoint_gid", "pid",
+                "pgid", "process_start_ticks")
+        if (len(rows) != 1 or len(acks) != 1
+                or any(rows[0].get(key) != handle.get(key) or acks[0].get(key) != handle.get(key) for key in keys)
+                or events.index(rows[0]) >= events.index(acks[0])
+                or rows[0].get("control_receipt", {}).get("request") != control):
+            raise TopologyBackendError("native_matching_control_worker_binding_invalid")
+        return deepcopy(rows[0]["control_receipt"])
+
+    def lookup_topic(self, handle, scope, name, *, native_type_support=None):
+        command_id = self._batch(handle, "lookup_topic", scope=scope, name=name,
+            **({"native_type_support": native_type_support} if native_type_support is not None else {}))
+        rows = [row for row in handle["process"].events
+                if row.get("event") == "topic_lookup_result" and row.get("command_id") == command_id]
+        if len(rows) != 1:
+            raise TopologyBackendError("topic_lookup_result_missing_or_ambiguous")
+        row = rows[0]
+        keys = ("logical_id", "generation", "endpoint_generation", "endpoint_gid", "pid",
+                "pgid", "process_start_ticks")
+        if any(row.get(key) != handle.get(key) for key in keys):
+            raise TopologyBackendError("topic_lookup_worker_identity_mismatch")
+        events = handle["process"].events
+        acks = [event for event in events if event.get("event") == "command_done"
+                and event.get("command_id") == command_id]
+        if (len(acks) != 1 or any(acks[0].get(key) != handle.get(key) for key in keys)
+                or events.index(acks[0]) <= events.index(row)):
+            raise TopologyBackendError("topic_lookup_ack_identity_or_order_mismatch")
+        value = deepcopy(row["lookup_receipt"])
+        if (value.get("scope") != scope or value.get("requested_name") != name
+                or value.get("native_type_support", {}).get("reference") != native_type_support
+                or row.get("run_id") != self.config["run_id"]):
+            raise TopologyBackendError("topic_lookup_request_binding_mismatch")
+        value.update(command_id=command_id, worker_identity={key: row[key] for key in keys})
+        return value
+
+    def refresh_participant(self, handle, data):
+        command_id = self._batch(handle, "refresh_participant", data=data, _timeout_sec=30.0)
+        events = handle["process"].events
+        rows = [row for row in events if row.get("event") == "participant_refresh_result" and row.get("command_id") == command_id]
+        acks = [row for row in events if row.get("event") == "command_done" and row.get("command_id") == command_id]
+        keys = ("logical_id", "generation", "endpoint_generation", "endpoint_gid", "pid", "pgid", "process_start_ticks")
+        if (len(rows) != 1 or len(acks) != 1 or any(row.get(key) != handle.get(key) for row in rows+acks for key in keys)
+                or events.index(rows[0]) >= events.index(acks[0])):
+            raise TopologyBackendError("participant_refresh_identity_or_ack_mismatch")
+        value = deepcopy(rows[0]["refresh_receipt"])
+        if value.get("requested_data") != data or rows[0].get("run_id") != self.config["run_id"]:
+            raise TopologyBackendError("participant_refresh_request_binding_mismatch")
+        value.update(command_id=command_id, worker_identity={key: rows[0][key] for key in keys})
+        return value
 
     def assert_liveliness(self, handle):
         command_id = self._batch(handle, "assert_liveliness")
@@ -2496,8 +3736,22 @@ class RosTopologyBackend:
         workers, errors = [], []
         for process in self.processes:
             try:
+                if (self.group_program is not None
+                and len(self.handles) == len(self.group_program['endpoints'])
+                        and process.process is not None and process.process.poll() is None):
+                    member = next((h for h in self.handles.values() if h.get('process') is process and h.get('alive')), None)
+                    if member is not None:
+                        try:
+                            self._batch(member, 'group_snapshot')
+                        except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+                            errors.append({'error': type(exc).__name__, 'detail': 'final_group_capture:' + str(exc)})
                 receipt = process.close()
                 workers.append(receipt)
+                if self.group_program is not None:
+                    for h in self.handles.values():
+                        if h.get('process') is process and receipt.get('closed'):
+                            h['alive'] = False
+                    continue
                 handle = next((h for h in self.handles.values() if h.get("process") is process and h.get("alive")), None)
                 if handle is not None and receipt.get("closed"):
                     handle["alive"] = False

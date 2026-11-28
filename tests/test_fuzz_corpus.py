@@ -35,7 +35,9 @@ class FuzzCorpusContracts(unittest.TestCase):
         expected = {"parameter", "environment", "composed", "f2-windows",
                     "endpoint-chains", "topology-chains", "common-baseline-routes", "model-bfs-routes",
                     "model-bfs-topology", "model-bfs-topology-operators",
-                    "model-bfs-topology-runtime-smoke", "model-bfs-topology-combinations"}
+                    "model-bfs-topology-runtime-smoke", "model-bfs-topology-combinations",
+                    "model-bfs-topology-cft-matrix", "model-bfs-topology-concurrent-writers",
+                    "model-bfs-topology-continuous-episode"}
         f2_target = "discovery.interruption_recovery.fuzz_windows_v1"
         f2_mutators = {"E02": ["M07"], "E03": ["M06"]}
         seen = set()
@@ -85,6 +87,31 @@ class FuzzCorpusContracts(unittest.TestCase):
                 self.assertEqual(data["seed_specs"], data["declared_seed_specs_union"])
                 self.assertEqual([spec for cycle in data["cycles"] for spec in cycle["seed_specs"]],
                                  data["declared_seed_specs_union"])
+                validate_profile_fields(data)
+            elif path.stem in {
+                "model-bfs-topology-cft-matrix", "model-bfs-topology-concurrent-writers",
+                "model-bfs-topology-continuous-episode",
+            }:
+                # These three committed authored opt-ins remain bounded and off.
+                # Unknown future profiles must still fail the exact inventory.
+                seeds = {
+                    "model-bfs-topology-cft-matrix": "topology.cft_matrix",
+                    "model-bfs-topology-concurrent-writers": "topology.concurrent_writers",
+                    "model-bfs-topology-continuous-episode": "topology.continuous_episode",
+                }
+                self.assertEqual(data["profile_id"], path.stem)
+                self.assertEqual(data["runtime_capability"], "topology_v1")
+                self.assertEqual(data["target_ids"], ["discovery.endpoint_topology.fuzz_v1"])
+                self.assertEqual(data["surfaces"], ["S1.topology.program"])
+                self.assertEqual(data["mutator_whitelist"], ["I2.topology_program.v1"])
+                self.assertEqual(data["operator_whitelist"], ["action.insert"])
+                self.assertEqual(data["rmws"], ["rmw_cyclonedds_cpp"])
+                self.assertEqual(data["chain_length"], 1)
+                self.assertEqual(data["budget"], {"max_inputs": 1, "max_seconds": 180})
+                self.assertEqual([spec["seed_id"] for spec in data["seed_specs"]], [seeds[path.stem]])
+                self.assertEqual(data["seed_specs"], data["declared_seed_specs_union"])
+                self.assertEqual([spec for cycle in data["cycles"] for spec in cycle["seed_specs"]],
+                                 data["seed_specs"])
                 validate_profile_fields(data)
             elif path.stem in {"model-bfs-topology", "model-bfs-topology-operators",
                                "model-bfs-topology-runtime-smoke", "model-bfs-topology-combinations"}:

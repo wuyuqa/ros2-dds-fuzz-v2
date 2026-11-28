@@ -9,11 +9,11 @@ import os
 from copy import deepcopy
 
 from r2f.core import Registry, compile_scenario
-from r2f.core.evidence import canonical_hash
+from r2f.core.evidence import canonical_hash, raw_sha256
 from r2f.core.replay import ReplayCapsule
 from r2f.modules.s1.module import register
 from r2f.modules.s1.targets import EXECUTION_ORDER
-from r2f.reports.candidate_report import candidate_ledger
+from r2f.reports.candidate_report import candidate_ledger, _write_immutable_json
 from r2f.reports.run_report import (
     audit_report, identity_hashes, report_digest, write_json,
     boundary_qualification_for_row, execution_boundary_qualification,
@@ -22,6 +22,8 @@ from .identity import runtime_config, semantic_input, source_manifest
 from .runtime_adapter import ingest_execution
 from .scheduler import first_slice_cells, control_references
 from .triage import attribute
+from .anomalies import (prepare_identity, finish_evidence, runtime_exception,
+                        persist_runtime_result, wrapper_failure, record_packaging_failure)
 
 # The normal host path stays the historical default.  `isolated_netns` is an
 # explicit host-side supervisor; it never turns an injected fixture into live
@@ -31,10 +33,67 @@ HOST_RUNTIME = 'host'
 ISOLATED_RUNTIME = 'isolated_netns'
 RUNTIME_BOUNDARIES = (HOST_RUNTIME, ISOLATED_RUNTIME)
 
+_OBSERVATION_UNSET = object()
+_OBSERVATION_CELL = "rmw_cyclonedds_cpp.baseline.0"
+
+
+def _observation_selection(observation, target_id):
+    """Validate an execution-only observation selection, never an evidence claim."""
+    if observation is _OBSERVATION_UNSET:
+        return None
+    keys = {"observation_mode", "observe_adopted_config"}
+    recovery = target_id == EXECUTION_ORDER[2]
+    if recovery:
+        keys.add("cell_id")
+    if not isinstance(observation, dict) or set(observation) != keys:
+        if recovery:
+            raise ValueError("observation CP1 recovery extension requires cell_id")
+        raise ValueError("observation must contain exactly observation_mode and observe_adopted_config")
+    mode, adopted = observation["observation_mode"], observation["observe_adopted_config"]
+    if type(mode) is not str or mode not in ("blackbox", "instrumentation"):
+        raise ValueError("observation_mode must be blackbox or instrumentation")
+    if type(adopted) is not bool:
+        raise ValueError("observe_adopted_config must be boolean")
+    if adopted and mode != "instrumentation":
+        raise ValueError("observe_adopted_config requires instrumentation mode")
+    if recovery:
+        selected = observation['cell_id']
+        allowed = {c['cell_id'] for c in first_slice_cells(target_id)
+                   if c['rmw'] == 'rmw_cyclonedds_cpp'}
+        if type(selected) is not str or selected not in allowed or adopted:
+            raise ValueError('participant lease observation requires a Cyclone cell and no adoption claim')
+        return {"observation_mode": mode, "observe_adopted_config": False, "cell_id": selected}
+    if target_id != EXECUTION_ORDER[0]:
+        raise ValueError("observation CP1 supports only discovery.late_endpoint")
+    return {"observation_mode": mode, "observe_adopted_config": adopted}
+
+
+def _validate_expected_source_manifest(source, expected_source_manifest):
+    """Bind a caller's optional pin to the measured, complete intake source."""
+    if expected_source_manifest is not None and source != expected_source_manifest:
+        raise ValueError("expected_source_manifest_mismatch")
+
 
 def plan_campaign(output_dir, *, repo=None, run_id=None, domain_id=173, seed=0,
-                  target_id=EXECUTION_ORDER[0], parameters=None):
-    """Build input capsules offline; planning never implies reached or executed."""
+                  target_id=EXECUTION_ORDER[0], parameters=None, rmws=None,
+                  expected_source_manifest=None, observation=_OBSERVATION_UNSET):
+    """Build input capsules offline; planning never implies reached or executed.
+
+    An optional expected_source_manifest must equal the entire measured intake
+    source; a mismatch raises before any plan artifacts are written.
+    observation is an execution-only mode/bool pair for first-target baseline0,
+    or includes an explicit Cyclone cell_id for opt-in participant lease recovery.
+    Its declaration is execution metadata only;
+    omission preserves legacy artifacts, and explicit null is invalid.
+    rmws optionally selects a nonempty, unique subset of target-applicable RMWs.
+    Partial plans list uncovered cells; the frozen required scope and its audit
+    are unchanged. None preserves the complete plan and legacy artifact shape.
+    """
+    selection = _observation_selection(observation, target_id)
+    if selection is not None and "cell_id" in selection and (parameters or {}).get("observe_participant_leases") is not True:
+        raise ValueError("participant lease observation requires observe_participant_leases=true")
+    if isinstance(parameters, dict) and {"observation_mode", "observe_adopted_config"}.intersection(parameters):
+        semantic_input("baseline", parameters, target_id=target_id)
     repo = Path(repo or Path(__file__).resolve().parents[3]).resolve()
     output_dir = Path(output_dir).resolve()
     if output_dir.exists() and any(output_dir.iterdir()):
@@ -49,16 +108,38 @@ def plan_campaign(output_dir, *, repo=None, run_id=None, domain_id=173, seed=0,
     module = register(registry)
     target = registry.get_target(target_id)
     services = registry.get_services(target_id)
+    rmw_selection = None
+    if rmws is not None:
+        if (not isinstance(rmws, (list, tuple)) or not rmws
+                or any(not isinstance(rmw, str) for rmw in rmws)
+                or len(set(rmws)) != len(rmws)
+                or any(rmw not in target.rmw_applicability for rmw in rmws)):
+            raise ValueError("rmws must be a nonempty unique list of target-applicable RMWs")
+        uncovered = [cell["cell_id"] for cell in first_slice_cells(target_id)
+                     if cell["rmw"] not in rmws]
+        if selection is not None and selection.get("cell_id", _OBSERVATION_CELL) in uncovered:
+            raise ValueError("rmws selection excludes observation cell: " + _OBSERVATION_CELL)
+        rmw_selection = {"plan_kind": "partial_rmw_plan" if uncovered else "full_rmw_plan",
+                         "selected_rmws": [rmw for rmw in target.rmw_applicability if rmw in rmws],
+                         "partial": bool(uncovered), "uncovered_cell_ids": uncovered}
     scope = json.loads((repo / "config/s1_scope.json").read_text())
+    source = source_manifest(repo)
+    _validate_expected_source_manifest(source, expected_source_manifest)
     manifest = {"schema_version": 1, "run_id": run_id, "target": target.to_dict(),
                 "catalog": module.to_dict(), "scope": scope, "rule": target.rule_contract,
-                "source_manifest": source_manifest(repo), "environment_mode": "ros_overlay",
+                "source_manifest": source, "environment_mode": "ros_overlay",
                 "execution_order": list(EXECUTION_ORDER), "requested_domain": domain_id,
                 "maturity_denominator_changed": False, "applicable_rmws_requested": list(target.rmw_applicability)}
+    if selection is not None:
+        manifest["observation"] = dict(selection, cell_id=selection.get("cell_id", _OBSERVATION_CELL))
+    if rmw_selection is not None:
+        manifest["rmw_selection"] = rmw_selection
     identity = identity_hashes(manifest)
     write_json(output_dir / "manifest.json", manifest)
     rows = []
     for cell in first_slice_cells(target_id):
+        if rmw_selection is not None and cell["rmw"] not in rmw_selection["selected_rmws"]:
+            continue
         cell = dict(cell, target_id=target_id)
         submitted = semantic_input(cell["arm"], parameters, target_id=target_id)
         recovery = target_id == EXECUTION_ORDER[2]
@@ -90,6 +171,8 @@ def plan_campaign(output_dir, *, repo=None, run_id=None, domain_id=173, seed=0,
                                 final_input=submitted, effective_input_sha256=capsule.input["effective_input_sha256"],
                                 input_layer_receipts=capsule.input["effective_input"]["input_layer_receipts"],
                                 control_kind=cell.get("control_kind"))
+        if selection is not None and cell["cell_id"] == selection.get("cell_id", _OBSERVATION_CELL):
+            config.update(selection)
         directory = output_dir / "cells" / cell["cell_id"]
         replay_path = directory / "capsule.json"
         config_path = directory / "runtime_config.json"
@@ -103,6 +186,8 @@ def plan_campaign(output_dir, *, repo=None, run_id=None, domain_id=173, seed=0,
                          mutation_receipt=dict.fromkeys(("planned", "submitted", "carrier_admitted", "configured", "applied", "hit", "effect_observed"), False),
                          oracle_verdict="unknown", replay_status="not_run", candidate_status="none", actual_run=False))
     return {"schema_version": 1, "run_id": run_id, "manifest_path": str(output_dir / "manifest.json"),
+            **({"observation": deepcopy(manifest["observation"])} if selection is not None else {}),
+            **({"rmw_selection": deepcopy(rmw_selection)} if rmw_selection is not None else {}),
             "identity": identity, "rows": rows, "control_references": control_references(rows),
             "required_cells": 18, "independent_fault_controls": 6, "full_scope_required_cells": 72,
             "scope_dispositions": module.dispositions, "maturity_denominator_changed": False,
@@ -137,13 +222,14 @@ def _persist(output_dir, report):
         ledger["boundary_exclusions"] = boundary_exclusions
 
     ledger_path = output_dir / "candidate_ledger.json"
-    write_json(ledger_path, ledger)
+    _write_immutable_json(ledger_path, ledger)
     report.update(candidate_ledger_path=str(ledger_path), candidate_ledger_sha256=canonical_hash(ledger))
     report["report_sha256"] = report_digest(report)
     report_path = output_dir / "report.json"
-    write_json(report_path, report)
-    report["seal"] = audit_report(report_path)
-    write_json(report_path, report)
+    audit_input = output_dir / "report-audit-input.json"
+    _write_immutable_json(audit_input, report)
+    report["seal"] = audit_report(audit_input)
+    _write_immutable_json(report_path, report)
     lines = [f"# Campaign {report['run_id']}", "", f"Target: {report['target_id']} revision {report['target_revision']}",
              f"Per-target seal: {report['seal']['sealed']}", "Full S1 required denominator: 72; this report does not establish full S1 maturity.",
              f"Natural candidates: {ledger['natural_candidate_count']}; confirmed: {ledger['confirmed_candidates']}", "",
@@ -152,7 +238,8 @@ def _persist(output_dir, report):
     for row in report["rows"]:
         lines.append(f"| {row['cell_id']} | {row['execution_stage']} | {row['oracle_verdict']} | {row.get('abort_reason') or row.get('reason_code', '')} |")
     lines += ["", "Seal errors:"] + [f"- {error}" for error in report["seal"]["errors"]]
-    (output_dir / "report.md").write_text("\n".join(lines) + "\n")
+    with (output_dir / "report.md").open("x") as stream:
+        stream.write("\n".join(lines) + "\n")
     return report
 
 
@@ -262,12 +349,48 @@ def _resolve_execution_runtime(runtime=None, runtime_boundary=HOST_RUNTIME):
 
 
 def run_campaign(output_dir, *, runtime=None, execute=False,
-                 runtime_boundary=HOST_RUNTIME, **options):
+                 runtime_boundary=HOST_RUNTIME, auto_replay=None, replay_runtime=None,
+                 max_executions=None, stop_on_unexpected_result=False, **options):
     """Sequential cells, never parallel campaigns. Default is offline plan only.
 
     The owner coordinates actual execution; execute=True is an explicit action.
     An injected runner is for contract testing and is not proof of ROS execution.
+    auto_replay declares output_dir, domain_ids and max_attempts; attempts run
+    after original evidence sealing. replay_runtime injection is offline-only.
+    max_executions optionally bounds original carrier dispatch attempts, including
+    failed/blocked attempts, in canonical order; the full plan remains intact.
+    It does not bound replay: an explicit budget conflicts with auto_replay,
+    whose separate policy may dispatch additional executions. None preserves
+    historical behavior. Planning never dispatches, even with a budget.
+    Explicit observation execution requires max_executions=1. The legacy
+    declaration dispatches Cyclone baseline0; the lease extension dispatches its
+    named cell, leaving all other cells planned. A declaration is not evidence.
+    stop_on_unexpected_result optionally stops after the first non-judged,
+    non-actual or unexpected primary verdict (pass normally, fail for negative).
+    It preserves the full planned denominator and failing artifacts; it is an
+    execution policy, not semantic input, and cannot enable automatic replay.
+    query_runner_evidence exposes associations without revising this report.
     """
+    if type(stop_on_unexpected_result) is not bool:
+        raise ValueError("stop_on_unexpected_result must be a boolean")
+    if stop_on_unexpected_result and auto_replay is not None:
+        raise ValueError("stop_on_unexpected_result requires auto_replay=None")
+    selection = _observation_selection(
+        options.get("observation", _OBSERVATION_UNSET), options.get("target_id", EXECUTION_ORDER[0]))
+    if selection is not None and "cell_id" in selection and (options.get("parameters") or {}).get("observe_participant_leases") is not True:
+        raise ValueError("participant lease observation requires observe_participant_leases=true")
+    if selection is not None and execute and (type(max_executions) is not int or max_executions != 1):
+        raise ValueError("observation CP1 execution requires max_executions=1")
+    if max_executions is not None:
+        cell_count = len(first_slice_cells(options.get("target_id", EXECUTION_ORDER[0])))
+        if type(max_executions) is not int or not 1 <= max_executions <= cell_count:
+            raise ValueError(f"max_executions must be a positive int <= {cell_count}")
+        if auto_replay is not None:
+            raise ValueError("max_executions bounds originals only; auto_replay must be None")
+    # Reject malformed or target-inapplicable flags before planning writes files.
+    if "observe_participant_leases" in (options.get("parameters") or {}):
+        semantic_input("baseline", options["parameters"],
+                       target_id=options.get("target_id", EXECUTION_ORDER[0]))
     output_dir = Path(output_dir).resolve()
     if runtime_boundary not in RUNTIME_BOUNDARIES:
         raise ValueError('unsupported runtime_boundary: ' + repr(runtime_boundary))
@@ -276,6 +399,38 @@ def run_campaign(output_dir, *, runtime=None, execute=False,
         runtime, formal = _resolve_execution_runtime(runtime, runtime_boundary)
     report = plan_campaign(output_dir, **options)
     report.update(runtime_boundary=runtime_boundary, formal_runtime=formal)
+    if stop_on_unexpected_result:
+        report["execution_stop_policy"] = {
+            "schema": "r2f.campaign-cell-stop/v1", "enabled": True,
+            "expected_verdict_by_arm": {arm: "fail" if arm == "negative" else "pass"
+                                        for arm in ("baseline", "transparent", "mutated", "negative")},
+            "stopped_cell_id": None,
+        }
+    if max_executions is not None:
+        report["execution_budget"] = {
+            "max_executions": max_executions,
+            "scope": "original_carrier_dispatch_attempts",
+            "attempts": 0, "stop_reason": "planning_only" if not execute else None}
+    intake_manifest = json.loads(Path(report["manifest_path"]).read_text())
+    intake_source = intake_manifest["source_manifest"]
+    intake_rule = intake_manifest["rule"]["primary_rule"]
+    for row in report["rows"]:
+        prepare_identity(output_dir, row, intake_source, identity=report["identity"], rule=intake_rule)
+
+    def finish():
+        if max_executions is not None and execute:
+            budget = report["execution_budget"]
+            budget["stop_reason"] = (report.get("abort_reason") or budget["stop_reason"]
+                                     or ("max_executions_reached" if budget["attempts"] >= max_executions
+                                         else "canonical_cells_exhausted"))
+        def persist_report():
+            _persist(output_dir, report)
+            return output_dir / "report.json"
+        return finish_evidence(output_dir, report, persist_report, source=intake_source,
+                               automatic_replay={"policy": auto_replay, "runtime": replay_runtime,
+                                                 "execute": execute, "runtime_boundary": runtime_boundary,
+                                                 "fixture_original": not formal})
+
     # Execution switches are persisted separately from capsule/input identity.
     # Planned qualification is pending; it is NOT an execution admission veto.
     for planned in report["rows"]:
@@ -288,7 +443,7 @@ def run_campaign(output_dir, *, runtime=None, execute=False,
         if runtime_boundary == ISOLATED_RUNTIME:
             planned["boundary_qualification"] = execution_boundary_qualification(runtime_boundary)
     if not execute:
-        return _persist(output_dir, report)
+        return finish()
     manifest = json.loads(Path(report["manifest_path"]).read_text())
     repo = Path(manifest["source_manifest"]["source_repo"])
     source = manifest["source_manifest"]
@@ -298,11 +453,16 @@ def run_campaign(output_dir, *, runtime=None, execute=False,
                        or not source.get("behavior_tree_sha256"))):
         report["abort_reason"] = "source_behavior_not_tracked_and_clean_at_HEAD"
         report["runtime_boundary"] = runtime_boundary
-        return _persist(output_dir, report)
+        return finish()
     registry = Registry()
     register(registry)
     services = registry.get_services(report["target_id"])
     for index, planned in enumerate(report["rows"]):
+        if selection is not None and "cell_id" in selection and planned["cell_id"] != selection["cell_id"]:
+            continue
+        if max_executions is not None and report["execution_budget"]["attempts"] >= max_executions:
+            report["execution_budget"]["stop_reason"] = "max_executions_reached"
+            break
         if source_manifest(repo) != manifest["source_manifest"]:
             report["abort_reason"] = "source_repo_HEAD_or_behavior_tree_changed"
             break
@@ -318,15 +478,23 @@ def run_campaign(output_dir, *, runtime=None, execute=False,
         try:
             if not services.carrier.accepts(scenario):
                 raise ValueError("registered carrier does not accept execution scenario")
+            if max_executions is not None:
+                report["execution_budget"]["attempts"] += 1
             result = services.carrier.apply(scenario, capsule.input["effective_input"],
                                             execution={"config": config, "output_dir": runtime_dir, "runtime": runtime})
         except Exception as exc:
-            result = {"real_execution": False, "runtime_status": "tool_error", "reason": f"{type(exc).__name__}:{exc}"}
+            result = runtime_exception(exc)
         # Preserve the result, including failures. run_pair already writes it; this
         # also gives injected contract runners the same artifact boundary.
-        write_json(planned["runtime_result_path"], result)
-        execution = ingest_execution(scenario, config, result, capsule, services=services)
-        row = dict(planned, **execution)
+        try:
+            persist_runtime_result(planned["runtime_result_path"], result)
+            execution = ingest_execution(scenario, config, result, capsule, services=services)
+            row = dict(planned, **execution)
+            if result.get("runner_exception"):
+                row["runner_exception"] = result["runner_exception"]
+        except Exception as exc:
+            row = wrapper_failure(planned, exc)
+            result = runtime_exception(exc)
         row["actual_submitted_payload_sha256"] = canonical_hash(capsule.input["effective_input"]["final_input"])
         row["replay_status"] = "not_run"
         row["provenance"] = {"source_manifest": manifest["source_manifest"], "runtime_execution": row.get("runtime_execution_metadata"), "raw_sha256": row.get("raw_sha256"), "observation_path": "isolated_discovery_activity_and_public_pair" if report["target_id"] == EXECUTION_ORDER[2] else "independent_passive_sedp_and_public_graph" if report["target_id"] == EXECUTION_ORDER[3] else "public_rclpy_graph_and_message_info"}
@@ -336,8 +504,13 @@ def run_campaign(output_dir, *, runtime=None, execute=False,
                 capsule.record_execution(row)
             except ValueError as exc:
                 row["capsule_execution_error"] = str(exc)
-        write_json(planned["replay_path"], capsule.to_dict())
         report["rows"][index] = row
+        try:
+            write_json(planned["replay_path"], capsule.to_dict())
+        except Exception as exc:
+            record_packaging_failure(row, exc, planned["replay_path"])
+            report["abort_reason"] = "packaging_failure"
+            break
         qualification = execution_boundary_qualification(runtime_boundary, config=config,
                                                       result=result, row=row, formal_runtime=formal,
                                                       output_root=runtime_dir)
@@ -351,6 +524,15 @@ def run_campaign(output_dir, *, runtime=None, execute=False,
         if source_manifest(repo) != manifest["source_manifest"]:
             report["abort_reason"] = "source_repo_HEAD_or_behavior_tree_changed"
             break
+        if stop_on_unexpected_result:
+            expected = "fail" if row["arm"] == "negative" else "pass"
+            if (row.get("execution_stage") != "judged" or row.get("actual_run") is not True
+                    or row.get("oracle_verdict") != expected):
+                report["execution_stop_policy"].update(
+                    stopped_cell_id=row["cell_id"], execution_stage=row.get("execution_stage"),
+                    oracle_verdict=row.get("oracle_verdict"), expected_verdict=expected)
+                report["abort_reason"] = "unexpected_cell_result"
+                break
     # Attribute only after all independent control evidence exists; no early
     # candidate attribution from a promised future control.
     from r2f.core.oracle import validate_control
@@ -366,7 +548,7 @@ def run_campaign(output_dir, *, runtime=None, execute=False,
         row.update(controls_support_sut=passed and equal_payload, provenance_supports_sut=passed and equal_payload)
         if "oracle" in row:
             row.update(attribute(row, row.get("typed_facts", {}), row["oracle"]))
-    return _persist(output_dir, report)
+    return finish()
 
 
 
@@ -1320,13 +1502,12 @@ def _persist_topology_exploratory_report(output_dir, cycle, registry):
     ledger = exploratory_candidate_ledger(eligible)
     if exclusions:
         ledger["execution_exclusions"] = exclusions
-    _atomic_json(output_dir / "candidate_ledger.json", ledger)
+    _write_immutable_json(output_dir / "candidate_ledger.json", ledger)
     report.update(candidate_ledger_path="candidate_ledger.json", candidate_ledger_sha256=canonical_hash(ledger))
     report["report_sha256"] = exploratory_report_digest(report)
     path = output_dir / "report.json"
-    _atomic_json(path, report)
-    report["audit"] = audit_exploratory_report(path)
-    _atomic_json(path, report)
+    report["audit"] = audit_exploratory_report(path, report=report)
+    _write_immutable_json(path, report)
     return path
 
 
@@ -1441,13 +1622,19 @@ def _terminal_feedback_aggregate(path, cycle, registry, *, output_dir, repo):
 def run_exploratory_cycle(output_dir, *, corpus, feedback, scheduler, profile, runtime=None,
                           execute=False, repo=None, run_id=None, max_inputs=None,
                           domain_id=173, continuation=None, checkpoint_hook=None,
-                          runtime_boundary=HOST_RUNTIME, feedback_aggregate=None):
+                          runtime_boundary=HOST_RUNTIME, feedback_aggregate=None,
+                          auto_replay=None, replay_runtime=None, recipe_releases=None,
+                          expected_source_manifest=None):
     """Run one bounded feedback-driven exploratory cycle.
 
     ``execute=False`` performs no runtime call: rows stay ``planned`` and no
     feedback is recorded.  ``execute=True`` requires a runtime callable; the
     carrier dispatches the plan-bearing v2 identity, so the runner passes the
     same single digest it wrote to the capsule and runtime config.
+    An optional expected_source_manifest pins the entire measured intake source;
+    it does not replace the existing frozen-source or later drift checks.
+    auto_replay/replay_runtime use the same bounded policy as run_campaign,
+    after both original report and terminal cycle have been sealed.
     """
     if not isinstance(corpus, Corpus):
         raise ExploratoryCycleError("exploratory cycle requires a Corpus")
@@ -1521,6 +1708,7 @@ def run_exploratory_cycle(output_dir, *, corpus, feedback, scheduler, profile, r
         raise ExploratoryCycleError("invalid run_id")
 
     source = source_manifest(repo)
+    _validate_expected_source_manifest(source, expected_source_manifest)
     registry = Registry()
     register_exploratory(registry, include_required=False,
                          runtime_capability=profile.get("runtime_capability"))
@@ -1635,6 +1823,17 @@ def run_exploratory_cycle(output_dir, *, corpus, feedback, scheduler, profile, r
         _atomic_json(output_dir / "resume-origin-checkpoint.json", origin)
         resume_origin = {"path": "resume-origin-checkpoint.json",
                          "checkpoint_sha256": origin["checkpoint_sha256"]}
+
+    # Apply owner decisions only after validating the untouched resume origin.
+    # They are append-only feedback events, not an origin/identity exemption.
+    if recipe_releases is not None:
+        if not isinstance(recipe_releases, list):
+            raise ExploratoryCycleError("recipe releases must be a list of named owner decisions")
+        for release in recipe_releases:
+            if not isinstance(release, dict) or set(release) != {"recipe", "owner", "reason", "revalidation_basis"}:
+                raise ExploratoryCycleError("incomplete recipe owner release")
+            feedback.release_recipe(**release)
+        scheduler.advance_feedback(feedback)
 
     def update_elapsed():
         budget["elapsed_sec"] = elapsed_before + max(0.0, time.monotonic() - started)
@@ -1953,6 +2152,16 @@ def run_exploratory_cycle(output_dir, *, corpus, feedback, scheduler, profile, r
         last_state = {"planned": budget["planned"], "executed": budget["executed"],
                       "cell_id": row["cell_id"], "sequence": sequence,
                       "execution_stage": row["execution_stage"]}
+        attempt = row.get("recipe_attempt") or {}
+        if attempt.get("outcome") == "global_invalid":
+            reason = attempt["diagnostic"]["reason"]
+            abort = {"reason_code": (reason if reason == "source_repo_HEAD_or_behavior_tree_changed"
+                                     else "global_execution_invalidity"),
+                     "detail": reason, "after_row_index": len(rows) - 1}
+            stop_reason = abort["reason_code"]
+            manifest["abort"] = abort
+            _atomic_json(output_dir / "manifest.json", manifest)
+            break
         qualification = row.get("boundary_qualification", {})
         if execute and qualification.get("status") in {"unknown", "invalid"}:
             abort = {"reason_code": "execution_boundary_qualification_failed",
@@ -2050,17 +2259,30 @@ def run_exploratory_cycle(output_dir, *, corpus, feedback, scheduler, profile, r
         result["boundary_qualifications"] = {
             row["cell_id"]: row.get("boundary_qualification", execution_boundary_qualification(runtime_boundary))
             for row in rows}
-    _atomic_json(output_dir / "selection_log.json", scheduler.to_dict())
-    _atomic_json(output_dir / "feedback.json", feedback.to_dict())
-    _atomic_json(output_dir / "corpus.json", corpus.to_dict())
-    if (profile.get("runtime_capability") == TOPOLOGY_CAPABILITY
-            or set(profile["target_ids"]).issubset(_F1_CYCLE_TARGETS)):
-        result["report_path"] = str(_persist_exploratory_report(output_dir, result, registry))
-    if feedback_aggregate is not None:
-        result["feedback_aggregate"] = _terminal_feedback_aggregate(
-            feedback_aggregate, result, registry, output_dir=output_dir, repo=repo)
-    _atomic_json(output_dir / "cycle.json", result)
-    return result
+    for name, value in (("selection_log.json", scheduler.to_dict()),
+                        ("feedback.json", feedback.to_dict()), ("corpus.json", corpus.to_dict())):
+        try:
+            _atomic_json(output_dir / name, value)
+        except Exception as exc:
+            record_packaging_failure(result, exc, output_dir / name)
+    def persist_report():
+        if (profile.get("runtime_capability") == TOPOLOGY_CAPABILITY
+                or set(profile["target_ids"]).issubset(_F1_CYCLE_TARGETS)):
+            path = _persist_exploratory_report(output_dir, result, registry)
+            result["report_path"] = str(path)
+            return path
+
+    def persist_terminal():
+        if feedback_aggregate is not None:
+            result["feedback_aggregate"] = _terminal_feedback_aggregate(
+                feedback_aggregate, result, registry, output_dir=output_dir, repo=repo)
+        _write_immutable_json(output_dir / "cycle.json", result)
+
+    return finish_evidence(output_dir, result, persist_report, source=source,
+                           terminal=persist_terminal,
+                           automatic_replay={"policy": auto_replay, "runtime": replay_runtime,
+                                             "execute": execute, "runtime_boundary": runtime_boundary,
+                                             "fixture_original": not formal_runtime})
 
 
 def _build_case_plan(entry, target, contract, surface, parent, mutator_id,
@@ -2369,7 +2591,7 @@ def _generate_case(sequence, entry, target, contract, surface, parent, mutator_i
                       topology_generation=topology_generation)
         # Observation/build selection is explicit execution metadata, never a
         # post-hash mutation of the submitted topology program or input capsule.
-        for key in ("observation_mode", "fastdds_peer_instrumentation"):
+        for key in ("observation_mode", "fastdds_peer_instrumentation", "observe_native_peers", "native_matching_qos"):
             if key in profile:
                 config[key] = deepcopy(profile[key])
     if runtime_windows and "environment_windows" not in plan.final_config:
@@ -2480,7 +2702,22 @@ def _generate_case(sequence, entry, target, contract, surface, parent, mutator_i
             row["observation_mode"] = config["observation_mode"]
         if "fastdds_peer_instrumentation" in config:
             row["fastdds_peer_instrumentation"] = deepcopy(config["fastdds_peer_instrumentation"])
+        if "observe_native_peers" in config:
+            row["observe_native_peers"] = config["observe_native_peers"]
+        if "native_matching_qos" in config:
+            row["native_matching_qos"] = deepcopy(config["native_matching_qos"])
 
+    if execute:
+        from .tool_failures import generation_recipe
+        row["generation_recipe"] = generation_recipe(
+            entry, target, plan, source=source, carrier=carrier, mutation_kind=mutation_kind,
+            runtime_boundary=runtime_boundary, profile=profile, sampling_kind=sampling_kind,
+            selection=selection, observation_mode=config.get("observation_mode", "black_box"))
+        row["recipe_tool_failure_policy"] = scheduler.recipe_submission_policy(row["generation_recipe"])
+    if runtime_boundary == ISOLATED_RUNTIME and "execution_boundary" in profile:
+        # Execution budgets are profile metadata, outside the deterministic
+        # submitted-input binding. The boundary helper validates their shape.
+        config["execution_boundary"] = deepcopy(profile["execution_boundary"])
     config = _runtime_execution_config(
         config, execute=execute, runtime=runtime, runtime_boundary=runtime_boundary)
     qualification = execution_boundary_qualification(runtime_boundary, config=config)
@@ -2489,6 +2726,11 @@ def _generate_case(sequence, entry, target, contract, surface, parent, mutator_i
         if not execute:
             row.update(candidate_eligible=False, feedback_eligible=False, seal_eligible=False)
 
+    prepare_identity(output_dir, row, source,
+                     identity={"source_sha256": canonical_hash(source),
+                               "target_sha256": canonical_hash(target.to_dict()),
+                               "rule_sha256": canonical_hash(target.rule_contract)},
+                     rule=target.rule_contract.get("primary_rule"))
     _atomic_json(plan_path, plan.to_dict())
     _atomic_json(capsule_path, capsule.to_dict())
     _atomic_json(config_path, config)
@@ -2546,6 +2788,13 @@ def _generate_case(sequence, entry, target, contract, surface, parent, mutator_i
         budget["aborted"] += 1
         _atomic_json(row_path, row)
         return row
+    policy = row["recipe_tool_failure_policy"]
+    if not policy["submission_allowed"]:
+        reason = "recipe_tool_failure_isolated"
+        row.update(reason_code=reason, blocked_reason=reason, candidate_eligible=False,
+                   feedback_eligible=False, seal_eligible=False)
+        _atomic_json(row_path, row)
+        return row
     if submission_hook is not None:
         submission_hook(row, selection)
     # Snapshot persistence may itself take time or overlap a source edit.  The
@@ -2570,14 +2819,28 @@ def _generate_case(sequence, entry, target, contract, surface, parent, mutator_i
                        "output_dir": result_path.parent,
                        "runtime": runtime})
     except Exception as exc:
-        import traceback as _traceback
-        runtime_result = {"real_execution": False, "runtime_status": "tool_error",
-                          "reason": f"{type(exc).__name__}:{exc}",
-                          "evidence_origin": "injected_runtime",
-                          "tool_error_traceback": _traceback.format_exc()}
-    _atomic_json(result_path, runtime_result)
-    execution = ingest_execution(scenario, config, runtime_result, capsule, services=services)
-    row.update(execution)
+        runtime_result = runtime_exception(exc)
+    # Runtime-supplied validity flags cannot attest to the actual checkout.
+    # Latch this fence before any healthy receipt, coverage or admission; still
+    # persist and ingest the original result to retain its stage and raw facts.
+    post_runtime_source = source_manifest(repo)
+    try:
+        persist_runtime_result(result_path, runtime_result)
+        execution = ingest_execution(scenario, config, runtime_result, capsule, services=services)
+        row.update(execution)
+        if runtime_result.get("runner_exception"):
+            row["runner_exception"] = runtime_result["runner_exception"]
+    except Exception as exc:
+        row.update(wrapper_failure(row, exc))
+        if not isinstance(runtime_result, dict):
+            runtime_result = runtime_exception(exc)
+        elif runtime_result.get("runner_exception"):
+            row["runner_exception"] = runtime_result["runner_exception"]
+    if post_runtime_source != source:
+        # Apply the latched failure after ingest/wrapper annotations: neither a
+        # successful result nor a persistence failure can hide source drift.
+        row.update(abort_reason="source_repo_HEAD_or_behavior_tree_changed",
+                   post_runtime_source_manifest=post_runtime_source)
     # Deterministic/input fields keep the plan identity; ingest cannot change them.
     row.update({
         "surface_id": surface.surface_id, "surface_ids": [surface.surface_id],
@@ -2594,6 +2857,23 @@ def _generate_case(sequence, entry, target, contract, surface, parent, mutator_i
         "evidence_origin": _evidence_origin(runtime_result, runtime=runtime,
                                             runtime_boundary=runtime_boundary),
     })
+    from .tool_failures import attempt_receipt
+    try:
+        result_reference = {"path": str(result_path), "sha256": raw_sha256(result_path),
+                            "basis": "persisted_file", "status": "available"}
+    except OSError as exc:
+        result_reference = {"path": str(result_path), "sha256": canonical_hash(runtime_result),
+                            "basis": "returned_value", "status": "unavailable", "error": str(exc)}
+    row["recipe_attempt"] = attempt_receipt(
+        row["generation_recipe"], row, runtime_result, result_reference)
+    global_invalid = row["recipe_attempt"]["outcome"] == "global_invalid"
+    if global_invalid:
+        # Preserve actual stage/raw facts, but never qualify globally invalid
+        # source/lock/observer evidence as coverage, novelty or a SUT candidate.
+        row.update(tool_error=True, reason_code="global_execution_invalidity",
+                   candidate_eligible=False, feedback_eligible=False, seal_eligible=False,
+                   evidence_errors=list(row.get("evidence_errors") or []) +
+                       [row["recipe_attempt"]["diagnostic"]["reason"]])
     if wide:
         row.update({"sampling_kind": sampling_kind,
                     "chain_depth": len(plan.operations),
@@ -2606,9 +2886,26 @@ def _generate_case(sequence, entry, target, contract, surface, parent, mutator_i
             capsule.record_execution(row)
         except ValueError as exc:
             row["capsule_execution_error"] = str(exc)
-    _atomic_json(capsule_path, capsule.to_dict())
+    try:
+        _atomic_json(capsule_path, capsule.to_dict())
+    except Exception as exc:
+        record_packaging_failure(row, exc, capsule_path)
+        row.update(candidate_eligible=False, feedback_eligible=False, seal_eligible=False,
+                   corpus_offer={"accepted": False, "reason": "packaging_failure"})
+        if not global_invalid:
+            row["recipe_attempt"]["outcome"] = "tool_failure"
+        row["tool_error"] = True
+        feedback.record(row)
+        scheduler.advance_feedback(feedback)
+        return row
     if row.get("execution_stage") == "judged" and row.get("actual_run") is True:
         budget["executed"] += 1
+    if global_invalid:
+        row["corpus_offer"] = {"accepted": False, "reason": "global_execution_invalidity"}
+        feedback.record(row)
+        scheduler.advance_feedback(feedback)
+        _atomic_json(row_path, row)
+        return row
 
     def persist_topology_candidate_assessment(boundary, formal):
         if not topology:
@@ -2723,3 +3020,34 @@ def _generate_case(sequence, entry, target, contract, surface, parent, mutator_i
     scheduler.advance_feedback(feedback)
     _atomic_json(row_path, row)
     return row
+
+
+def reevaluate_capability(output_dir, *, review_log, validation_record_id, original_row, saved_cases,
+                          human_log=None, human_authority=None):
+    """Publish immutable canonical saved-case oracle reevaluation attachments.
+
+    No runtime is acquired and no capture row is rerun or admitted as a new
+    candidate. Current registered code is measured; proposal version labels do
+    not choose code. Optional host authority derives implementation qualification;
+    fixture evidence never qualifies as real feedback.
+    """
+    from r2f.reports.capability_reconnect import evaluate_review_reconnect
+    from r2f.reports.candidate_report import _write_immutable_json, capability_reconnect_report
+
+    evaluation = evaluate_review_reconnect(review_log=review_log,
+        validation_record_id=validation_record_id, original_row=original_row, saved_cases=saved_cases,
+        human_log=human_log, human_authority=human_authority)
+    root = Path(output_dir)
+    def publish(name, value):
+        path = _write_immutable_json(root / name, value)
+        return {'path': name, 'sha256': raw_sha256(path)}
+    evaluation_ref = publish('capability-reevaluation.json', evaluation)
+    report = capability_reconnect_report(evaluation, evaluation_ref)
+    report_ref = publish('candidate-report.json', report)
+    manifest_ref = publish('manifest.json', dict(run_id=report['run_id'],
+        source_manifest=evaluation['evaluation_source'], new_execution=False,
+        interpretation='offline_reinterpretation'))
+    publish('evidence-index.json', dict(schema_version='r2f.runner-evidence-index/v1',
+        run_id=report['run_id'], source_manifest=evaluation['evaluation_source'],
+        manifest=manifest_ref, reports=[report_ref], packets=[], identities=[], tool_problems=[]))
+    return report

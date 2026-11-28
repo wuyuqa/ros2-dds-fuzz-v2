@@ -31,12 +31,18 @@ def manifest_for_reference(reference):
     if manifest.get('filter_trace') is not None:
         from r2f.instrumentation.fastdds_filter_trace.activation import selected_manifest
         selected_manifest(manifest)
+    if manifest.get('pdp_trace') is not None:
+        from r2f.instrumentation.fastdds_pdp_trace.activation import selected_manifest
+        selected_manifest(manifest)
     return manifest
 
 
 def reference_from_config(config):
     mode = config.get('observation_mode', 'blackbox')
     raw = config.get('fastdds_peer_instrumentation')
+    if 'observe_native_peers' in config and (
+            type(config['observe_native_peers']) is not bool or mode != 'instrumentation'):
+        raise ProbeError('native_peer_sampling_control_requires_explicit_instrumentation_boolean')
     if mode == 'blackbox':
         if raw is not None:
             raise ProbeError('fastdds_peer_requires_instrumentation_mode')
@@ -68,6 +74,11 @@ def environment_for_reference(base_env, reference):
     if manifest.get('filter_trace') is not None:
         from r2f.instrumentation.fastdds_filter_trace.activation import selected_manifest
         env['LD_PRELOAD'] = selected_manifest(manifest)['binary']['path']
+    if manifest.get('pdp_trace') is not None:
+        from r2f.instrumentation.fastdds_pdp_trace.activation import selected_manifest
+        trace = selected_manifest(manifest)
+        env['LD_PRELOAD'] = trace['binary']['path']
+        env['R2F_FASTDDS_PDP_TRACE_ENABLED'] = '1' if trace['capture_enabled'] else '0'
     return env
 
 

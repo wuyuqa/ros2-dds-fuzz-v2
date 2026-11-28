@@ -314,6 +314,8 @@ def test_worker_prepare_release_real_publish_segment_ast_offline():
     from pathlib import Path
     import hashlib
     import math
+    from contextlib import nullcontext
+    from r2f.runtime.rmw_publish_observer import PublishOccurrenceObserver
     import r2f.runtime.topology_worker as module
     tree = ast.parse(Path(module.__file__).read_text())
     condition = lambda n: isinstance(n, ast.If) and ast.unparse(n.test)
@@ -325,15 +327,26 @@ def test_worker_prepare_release_real_publish_segment_ast_offline():
     code = compile(ast.fix_missing_locations(wrapper), '<offline-worker-branches>', 'exec')
     emitted, calls = [], []
     class Endpoint:
+        handle = nullcontext()  # Public publisher handle protocol; no ROS entity.
         def publish(self, message):
             calls.append((time.monotonic_ns(), message.data))
-    class String:
-        pass
+    from topology_ros_message_fixture import bound_message_codec
+    codec = bound_message_codec()
     def emit(kind, **fields):
         emitted.append(dict(event=kind, monotonic_ns=time.monotonic_ns(), **fields))
-    env = dict(commands=[], pending_publish=None, kind='writer', emit=emit, endpoint=Endpoint(), String=String,
+    # Cyclone uses the public publish path without loading a native observer.
+    def unexpected_native_factory(callback):
+        pytest.fail('offline public publish must not load native instrumentation')
+    observer = PublishOccurrenceObserver(emit, 'rmw_cyclonedds_cpp',
+                                         native_factory=unexpected_native_factory)
+    assert observer.native is None and observer.unavailable == 'unsupported_rmw'
+    emitted.clear()
+    env = dict(publish_observer=observer, rmw_identifier='rmw_cyclonedds_cpp',
+               commands=[], pending_publish=None, kind='writer', emit=emit, endpoint=Endpoint(), codec=codec,
+               SUPPORTED_MESSAGE_TYPE='std_msgs/msg/String',
                math=math, json=json, time=time, MAX_INTERVAL_SEC=30, local_gid='aabb',
-               config={'run_id':'offline', 'logical_id':'w0', 'generation':1},
+               config={'run_id':'offline', 'logical_id':'w0', 'generation':1,
+                       'type_name':'std_msgs/msg/String'},
                _sha256_text=lambda s: hashlib.sha256(s.encode()).hexdigest())
     prepare_command = dict(command='prepare_concurrent_publish', command_id=1, concurrency_group='g',
                            sequences=[0,1,2], interval_sec=0, phase='publish_w0', payload=None)

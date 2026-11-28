@@ -1,3 +1,5 @@
+> **当前导航（2026-11-23）**：先读 [S1 接续入口](s1-current.md)。本页保留原规格/工程决定/历史截面；下文“当前”、旧 source、owner、GO 和待批准边界均按其记录日期解释。用户确认的 #6 完整 S1 规格覆盖旧 MAIN-only／公共 API 正常互操作执行限制，不能据此缩小范围；历史通过不迁移到新 source。修改前全文及 dirty 内容见 [逐字节归档](history/issue26-before-2026-11-23/INDEX.md)。
+
 # First / second 正式证据快照与source边界
 
 记录时间：2026-11-15T00:30:42+08:00（Asia/Shanghai）。来源：主agent独立验收消息及文档子agent只读核对的report、manifest、verify execution/stdout、raw hash。文档子agent未重新执行verify、ROS或campaign，不修改results，不暂存/commit。

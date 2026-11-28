@@ -14,6 +14,7 @@ from r2f.runtime.discovery_network import DiscoveryNetworkError
 from r2f.core.state_machine import StepReceipt
 from r2f.modules.s1.facts import integer
 from .runtime_adapter import _one, _iso, fresh_match_proof
+from .participant_lease import attach_participant_lease
 
 from r2f.runtime.ros2_pair import role_rmw, F2_WINDOWS_TARGET, f2_windows_operations
 
@@ -932,7 +933,8 @@ def _multi_window_recovery_facts(events, runtime, config):
 
 def recovery_facts(events, runtime, config):
     if _multi_window_chain(events, config):
-        return _multi_window_recovery_facts(events, runtime, config)
+        return attach_participant_lease(_multi_window_recovery_facts(events, runtime, config),
+                                        events, runtime, config)
     facts = {'schema_version': 1, 'environment_healthy': runtime.get('environment', {}).get('ok') is True,
              'process_healthy': False, 'preconditions_reached': False, 'endpoint_identity_complete': False,
              'observed_effects': [], 'sent': [], 'received': []}
@@ -1352,4 +1354,5 @@ def recovery_facts(events, runtime, config):
         facts['endpoint_identity_complete'] = False
         facts['window'] = {'complete': False}
     from .state_projection import attach_state_observations
+    facts = attach_participant_lease(facts, events, runtime, config)
     return attach_state_observations(facts, events, runtime, config)

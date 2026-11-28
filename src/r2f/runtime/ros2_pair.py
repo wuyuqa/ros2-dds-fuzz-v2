@@ -1393,12 +1393,11 @@ def run_pair(config: dict, output_dir: Path, *, topology_backend=None) -> dict:
                      observation_api='get_publishers_info_by_topic/get_subscriptions_info_by_topic',
                      binding_event_ref=binding_event_index)
             if active_mutation:
-                # A submitted mutation is not automatically a hit.  P01's zero
-                # delay is a legitimate boundary input but has no observable timing
-                # effect; record it as no_effect instead of fabricating hit=True.
+                # Required and exploratory late joiners use the same timing
+                # evidence.  Zero configured delay has no mutation effect even
+                # when worker startup produces a positive observed interval.
                 timing_hit = (c.get('mutation_kind') != 'late_joiner'
-                              or bool(c.get('fuzz_surfaces'))
-                              and (delay > 0.0 and actual_delay > 0))
+                              or (delay > 0.0 and actual_delay > 0))
                 receipt.update(applied=True, hit=timing_hit, effect_observed=timing_hit)
                 emit('mutation_effect' if timing_hit else 'mutation_no_effect',
                      effect_id='reader_created_after_writer', mutation_receipt=dict(receipt),
@@ -1490,15 +1489,29 @@ def run_pair(config: dict, output_dir: Path, *, topology_backend=None) -> dict:
                       status='failed' if result['real_execution'] else 'blocked', reason=reason)
         emit('runtime_abort', reason=reason)
     finally:
+        cleanup_confirmed = pool is None
         if pool is not None:
+            # Use the canonical quarantine: a local reference or a receipt is
+            # insufficient once this function returns and GC closes the FDs.
+            from .execution_boundary import _QUARANTINED_LEASES
+            if lease is not None:
+                _QUARANTINED_LEASES.append(lease)
             try:
                 pool.close()
-            except (OSError, RuntimeError, TimeoutError) as exc:
+            except Exception as exc:
                 result.update(runtime_status='failed', status='failed', reason='worker_cleanup_error:' + str(exc))
                 emit('runtime_abort', reason=result['reason'])
+            else:
+                cleanup_confirmed = True
+                if lease is not None:
+                    _QUARANTINED_LEASES.remove(lease)
             # A failed shutdown invalidates process health even if messages arrived.
             if any(m.get('returncode') != 0 for m in pool.metadata) and result['runtime_status'] == 'completed':
                 result.update(runtime_status='failed', status='failed', reason='worker_shutdown_failed')
+        result['cleanup'] = {'confirmed': cleanup_confirmed,
+                             'lease_retained': lease is not None and not cleanup_confirmed}
+        if lease is not None and not cleanup_confirmed:
+            emit('isolation_locks_retained', reason='worker_cleanup_unconfirmed', locks=lease.receipts)
         final_source = execution_chain_identity()
         if not same_source(before_source, final_source):
             result.update(runtime_status='failed' if result['real_execution'] else 'blocked',
@@ -1552,6 +1565,6 @@ def run_pair(config: dict, output_dir: Path, *, topology_backend=None) -> dict:
                 (output_dir / 'execution.json').write_text(json.dumps(result['execution'], sort_keys=True, indent=2) + '\n')
             (output_dir / 'runtime_result.json').write_text(json.dumps(result, sort_keys=True, indent=2) + '\n')
         finally:
-            if lease is not None:
+            if lease is not None and cleanup_confirmed:
                 lease.__exit__(None, None, None)
     return result

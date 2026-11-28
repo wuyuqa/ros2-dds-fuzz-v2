@@ -92,6 +92,10 @@ def validated_feedback(events):
             raise ValueError("invalid feedback surface class")
         if event.get("edge_id") is not None and (not isinstance(event["edge_id"], str) or not event["edge_id"]):
             raise ValueError("invalid feedback edge")
+    from .tool_failures import validate_policy_event, validate_release_history
+    for event in events:
+        validate_policy_event(event)
+    validate_release_history(events)
     return FeedbackLog.from_events(events)
 
 
@@ -226,6 +230,17 @@ class ExploratoryScheduler:
         self.feedback_event_count = len(self.feedback.events)
         self.feedback_identity_at_start = self.feedback.identity()
         return deepcopy(self.feedback_epochs[-1])
+
+    def recipe_submission_policy(self, recipe):
+        """Scheduling admission derived only from the accepted feedback epoch.
+
+        Selection/planning remains auditable, even when submission is isolated.
+        No additional mutable or persisted counter is maintained.
+        """
+        from .tool_failures import submission_policy
+        if self._epoch() != self.feedback_epochs[-1]:
+            raise ValueError("accepted feedback epoch was modified")
+        return submission_policy(self.feedback.events, recipe)
 
     def configure_sampling(self, sampling_kinds, sampling_weight=None):
         """Validate and install the opt-in sampling namespace.

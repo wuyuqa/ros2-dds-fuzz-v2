@@ -126,3 +126,12 @@ def test_non_object_or_incomplete_json_normalized_to_probe_error(tmp_path, value
     path.write_text(json.dumps(value))
     with pytest.raises(p.ProbeError):
         p.validate_manifest(path, p.file_hash(path))
+
+
+@pytest.mark.parametrize('extension', [{}, {'schema': 'unrecognized'}, None])
+def test_declared_local_api_extension_requires_its_own_source_and_build_receipts(build_manifest, extension):
+    path, value = build_manifest
+    value['local_api'] = extension
+    path.write_text(json.dumps(value))
+    with pytest.raises(p.ProbeError, match='local_api'):
+        p.validate_manifest(path, p.file_hash(path))

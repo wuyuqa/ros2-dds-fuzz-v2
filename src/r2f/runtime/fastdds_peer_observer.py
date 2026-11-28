@@ -130,7 +130,10 @@ class _Bindings:
     def __init__(self, reference):
         self.reference = _reference(reference)
         self.manifest = manifest_for_reference(self.reference)
-        from r2f.instrumentation.fastdds_filter_trace.activation import verify_loader_selection
+        if self.manifest.get('pdp_trace') is not None:
+            from r2f.instrumentation.fastdds_pdp_trace.activation import verify_loader_selection
+        else:
+            from r2f.instrumentation.fastdds_filter_trace.activation import verify_loader_selection
         verify_loader_selection(self.manifest)
         self.abi = verify_abi()
         self._check_manifest_abi(self.manifest)
@@ -180,6 +183,12 @@ class _Bindings:
                 or any(type(abi['statuses'][name]) is not int for name in STATUS_NAMES.values())):
             raise PeerObservationUnavailable('unsupported_provider_abi_manifest')
 
+    def local_api(self):
+        from r2f.instrumentation.fastdds_peer.local_api import validate_extension
+        manifest = manifest_for_reference(self.reference)
+        validate_extension(manifest)
+        return self.libs['provider'].r2f_fastdds_local_v1
+
     def revalidate(self):
         manifest = manifest_for_reference(self.reference)
         self._check_manifest_abi(manifest)
@@ -194,7 +203,8 @@ class _Bindings:
                                        'vendor_binary': copy.deepcopy(manifest['binaries']['vendor']),
                                        'provider_source_sha256': manifest['provider_source_sha256'],
                                        'provider_abi': copy.deepcopy(manifest['patch']['abi']),
-                                       'public_api_abi': abi, 'public_api_mapped_libraries': api_maps}}
+                                       'public_api_abi': abi, 'public_api_mapped_libraries': api_maps,
+                                       **({'local_api': copy.deepcopy(manifest['local_api'])} if 'local_api' in manifest else {})}}
 
 
 def _pointer(value, reason):
@@ -231,6 +241,14 @@ class FastddsMatchedPeerObserver:
         self._native = _Bindings(self._reference)
         self._lock = threading.Lock()
         self._last_ordinal = 0  # only serial freshness; NEVER endpoint generation
+
+    def lookup_topic(self, domain, gid, kind, scope, name):
+        from .fastdds_local_api import lookup_topic
+        return lookup_topic(self, domain, gid, kind, scope, name)
+
+    def sample_ownership(self, domain, gid, kind):
+        from .fastdds_local_api import sample_ownership
+        return sample_ownership(self, domain, gid, kind)
 
     @staticmethod
     def _check_handle(handle, kind):

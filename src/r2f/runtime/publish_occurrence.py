@@ -58,11 +58,22 @@ def _stamp(value):
 
 
 def _body(row):
-    data = row.get('string_data')
+    message_type = row.get('message_type')
+    if message_type == 'std_msgs/msg/String':
+        data = row.get('string_data')
+    elif message_type == 'std_msgs/msg/UInt8MultiArray':
+        # RosMessageCodec captures the complete UTF-8 data sequence, with an
+        # empty canonical layout. It is not String.data or a body sequence ID.
+        _need(row.get('payload_encoding') == 'utf8_json_uint8_sequence'
+              and row.get('string_data') is None, 'array_payload_encoding_invalid')
+        data = row.get('payload_text')
+    else:
+        raise _Unknown('publish_occurrence_message_type_unsupported')
     digest = row.get('payload_sha256')
     _need(isinstance(data, str) and isinstance(digest, str)
           and hashlib.sha256(data.encode()).hexdigest() == digest,
-          'complete_string_data_hash_invalid')
+          ('complete_string_data_hash_invalid' if message_type == 'std_msgs/msg/String'
+           else 'complete_array_data_hash_invalid'))
     return data, digest
 
 
@@ -131,7 +142,8 @@ def _direct(row, gid):
           and take.get('pointer_scope') == 'borrowed_fresh_inside_current_subscription_handle'
           and take.get('rmw_identifier') == RMW
           and type(take.get('return_code')) is int and take['return_code'] == 0
-          and take.get('message_type') == 'std_msgs/msg/String' and take.get('raw') is False
+          and row.get('message_type') in ('std_msgs/msg/String', 'std_msgs/msg/UInt8MultiArray')
+          and take.get('message_type') == row['message_type'] and take.get('raw') is False
           and isinstance(take.get('bridge_id'), str) and bool(take['bridge_id'])
           and _positive(take.get('take_index'))
           and isinstance(take.get('rcl_subscription_pointer'), str)
@@ -299,7 +311,7 @@ def publish_occurrence_witness(pair, receive, events):
     """Return (raw occurrence witness, None), or (None, specific unknown reason).
 
     r0 is joined to an explicitly named control reader on authenticated writer
-    GID + exact source timestamp + complete String.data hash; pubseq must agree.
+    GID + exact source timestamp + complete typed data hash; pubseq must agree.
     This is independently scoped occurrence evidence, never filtering proof.
     No receipt failure falls back to the ambiguous payload-only consumer.
     """

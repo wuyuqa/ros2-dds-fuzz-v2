@@ -24,7 +24,7 @@ def setup_case(tmp_path, monkeypatch):
         (case / name).write_text('{"a":1}\n')
     source = dict(source_repo=str(tmp_path / 'source'), head='a' * 40,
                   behavior_tree_sha256='b' * 64, source_frozen=True, dirty_behavior_paths=[])
-    row = dict(cell_id='one', target_id=TOPOLOGY_TARGET, actual_run=True,
+    row = dict(cell_id='one', target_id=TOPOLOGY_TARGET, target_revision=0, actual_run=True,
                execution_stage='judged', oracle_verdict='pass', observer_complete=True)
     report = dict(schema_version=audit.EXPLORATORY_SCHEMA, campaign_kind='exploratory',
                   run_id='offline-only', source_manifest=source, rows=[row])
@@ -173,7 +173,7 @@ def wire_offline_audit(monkeypatch):
     def verifier(root, row, report, errors, *, qualification_reuse=None):
         qualification_reuse.qualify(root, row, report)
         return True
-    def ledger(root, report, rows, errors, details, *, qualification_reuse=None):
+    def ledger(root, report, rows, errors, details, *, qualification_reuse=None, human_authority=None):
         for row in rows:
             qualification_reuse.qualify(root, row, report)
     monkeypatch.setattr(audit, '_verify_exploratory_row', verifier)

@@ -120,7 +120,7 @@ def _registered_target(capsule):
     return registry.get_target(identifier), registry.get_services(identifier), exploratory
 
 
-_OBSERVATION_KEYS = ('observation_mode', 'fastdds_peer_instrumentation')
+_OBSERVATION_KEYS = ('observation_mode', 'fastdds_peer_instrumentation', 'observe_native_peers', 'native_matching_qos')
 _TOPOLOGY_TARGET = 'discovery.endpoint_topology.fuzz_v1'
 
 
@@ -139,8 +139,14 @@ def _replay_observation_config(capsule):
         if not isinstance(metadata, dict):
             raise ValueError('observation_runtime_metadata_invalid')
         declared = any(key in execution for key in _OBSERVATION_KEYS)
-        hints = (declared or metadata.get('observation_mode') not in (None, 'blackbox')
-                 or metadata.get('fastdds_peer_instrumentation') is not None)
+        refresh_declared = any(a.get('op') == 'update_participant_userdata'
+                               for a in final.get('topology_program', {}).get('actions', []))
+        hints = (declared or refresh_declared or metadata.get('observation_mode') not in (None, 'blackbox')
+                 or metadata.get('fastdds_peer_instrumentation') is not None
+                 or 'observe_native_peers' in metadata or 'native_matching_qos' in metadata)
+        if capsule.input['target_id'] == 'discovery.interruption_recovery' and final.get('observe_participant_leases') is True:
+            from .participant_lease import replay_lease_selection
+            return replay_lease_selection(capsule)
         if capsule.input['target_id'] != _TOPOLOGY_TARGET:
             if hints:
                 raise ValueError('observation_selection_unsupported_target')
@@ -154,7 +160,13 @@ def _replay_observation_config(capsule):
                 raise ValueError('observation_original_raw_hash_mismatch')
             events = [json.loads(line) for line in raw.splitlines() if line.strip()]
             records = [event for event in events if event.get('event') == 'topology_execution_metadata']
-            native = any(event.get('event') == 'native_peer_provider_selected' for event in events)
+            native_carrier = any(event.get('event') == 'native_partition_configuration'
+                                 or 'native_partition_qos' in event for event in events)
+            if native_carrier and 'native_matching_qos' not in execution:
+                raise ValueError('observation_native_matching_selection_missing')
+            native = native_carrier or any(event.get('event') == 'native_peer_provider_selected'
+                         or str(event.get('event', '')).startswith(('native_pdp_', 'participant_refresh_', 'topology_participant_refresh_'))
+                         for event in events)
             if len(records) > 1 or ((hints or native) and len(records) != 1):
                 raise ValueError('observation_raw_metadata_not_unique')
             if records:
@@ -163,7 +175,8 @@ def _replay_observation_config(capsule):
                     raise ValueError('observation_raw_metadata_invalid')
                 hints = (hints or native
                          or raw_metadata.get('observation_mode') not in (None, 'blackbox')
-                         or raw_metadata.get('fastdds_peer_instrumentation') is not None)
+                         or raw_metadata.get('fastdds_peer_instrumentation') is not None
+                         or 'observe_native_peers' in raw_metadata or 'native_matching_qos' in raw_metadata)
         mode = execution.get('observation_mode', 'blackbox')
         reference = execution.get('fastdds_peer_instrumentation')
         if mode not in ('blackbox', 'instrumentation'):
@@ -178,10 +191,19 @@ def _replay_observation_config(capsule):
         # selection, sealed input and source identity are NEVER normalized away.
         for record in (metadata, raw_metadata):
             if (record.get('observation_mode', 'blackbox') != mode
-                    or record.get('fastdds_peer_instrumentation') != reference):
+                    or record.get('fastdds_peer_instrumentation') != reference
+                    or canonical_hash(record.get('observe_native_peers', True))
+                       != canonical_hash(execution.get('observe_native_peers', True))
+                    or ('observe_native_peers' in record) != ('observe_native_peers' in execution)
+                    or record.get('native_matching_qos') != execution.get('native_matching_qos')
+                    or ('native_matching_qos' in record) != ('native_matching_qos' in execution)):
                 raise ValueError('observation_execution_selection_mismatch')
-        if mode == 'instrumentation' and not all(key in execution for key in _OBSERVATION_KEYS):
+        if mode == 'instrumentation' and not all(key in execution for key in ('observation_mode', 'fastdds_peer_instrumentation')):
             raise ValueError('observation_original_execution_selection_missing')
+        if 'native_matching_qos' in execution:
+            from r2f.runtime.matching_qos import reference as matching_reference, load_build
+            selected = matching_reference(dict(execution, rmw=capsule.input['rmw']))
+            load_build(selected)
         from r2f.core.replay import validate_replay_input, _v2_execution_input
         validate_replay_input(capsule.input)
         _v2_execution_input(execution, capsule.input)
@@ -198,8 +220,11 @@ def _replay_observation_config(capsule):
         for key in ('target_id', 'target_revision', 'rmw', 'arm', 'repeat', 'seed', 'mutation_kind', 'carrier'):
             if canonical_hash(execution.get(key)) != canonical_hash(capsule.input[key]):
                 raise ValueError('observation_original_input_identity_mismatch:' + key)
+        from r2f.runtime.participant_groups import enabled
+        metadata_schema = ('r2f.topology-execution-metadata/v2' if enabled(final['topology_program'])
+                           else 'r2f.topology-execution-metadata/v1')
         for record in (metadata, raw_metadata):
-            if (record.get('schema') != 'r2f.topology-execution-metadata/v1'
+            if (record.get('schema') != metadata_schema
                     or record.get('context_basis') != 'sealed_input_declaration_not_sut_observation'
                     or canonical_hash(record.get('sealed_execution_context')) != canonical_hash(context)
                     or record.get('raw_refs_hash_binding') != 'enclosing_result.raw_sha256'
@@ -211,9 +236,20 @@ def _replay_observation_config(capsule):
                 if canonical_hash(record.get(key)) != canonical_hash(context[key]):
                     raise ValueError('observation_original_runtime_identity_mismatch:' + key)
         selection = {key: _copy_json(execution[key]) for key in _OBSERVATION_KEYS if key in execution}
-        if mode == 'instrumentation':
-            from r2f.instrumentation.fastdds_peer.activation import reference_from_config
-            reference_from_config(dict(selection, rmw=scenario.rmw))  # file-only validation
+        from r2f.instrumentation.fastdds_peer.activation import reference_from_config
+        reference_from_config(dict(selection, rmw=scenario.rmw))  # file-only validation
+        from r2f.instrumentation.fastdds_peer.receipt import validate_sampling_control
+        validate_sampling_control(events, selection)
+        from r2f.instrumentation.fastdds_peer.activation import manifest_for_reference
+        from r2f.instrumentation.fastdds_pdp_trace.receipt import validate_raw
+        selected_reference = reference_from_config(dict(selection, rmw=scenario.rmw))
+        raw_reference = dict(selected_reference) if selected_reference else None
+        if raw_reference is not None:
+            raw_reference['manifest_path'] = str(Path(execution['raw_path']).resolve().parent / 'native-peer-build-manifest.json')
+        validate_raw(events, manifest_for_reference(selected_reference) if selected_reference else None,
+                     peer_reference=raw_reference)
+        from r2f.instrumentation.fastdds_pdp_trace.refresh import validate_replay
+        validate_replay(events, final['topology_program'], selected_reference, raw_path=execution['raw_path'])
         return selection
     except (ValueError, KeyError, TypeError, OSError, AttributeError) as exc:
         raise _Failure('fail_artifact', 'observation_execution_metadata_invalid',
@@ -231,7 +267,23 @@ def _observation_replay_declaration(capsule, config):
             'input_identity_unchanged': True}
 
 
-def _replay_config(capsule, replay_id, domain, source):
+def _validated_boundary_options(value, runtime_boundary):
+    """Validate fresh execution metadata identically at entry and artifact audit."""
+    if value is None:
+        return None
+    if runtime_boundary != 'isolated_netns' or not isinstance(value, dict):
+        raise ValueError('boundary_options requires isolated_netns and an options object')
+    from .runner import _boundary_execution_config
+    from r2f.runtime.execution_boundary import BoundaryError, _options
+    checked = _boundary_execution_config({'execution_boundary': value}, runtime_boundary)
+    try:
+        _options(checked['execution_boundary'])  # pure; no runtime or namespace entry
+    except BoundaryError as exc:
+        raise ValueError(str(exc)) from exc
+    return _copy_json(value)
+
+
+def _replay_config(capsule, replay_id, domain, source, *, boundary_options=None):
     """Project sealed input/plan plus verified original observation execution mode.
 
     The default run_pair is already the exact-id dispatcher for endpoint,
@@ -257,11 +309,13 @@ def _replay_config(capsule, replay_id, domain, source):
         evidence_purpose='normal_conformance_replay',
         control_kind='fault' if scenario.arm == 'negative' else None)
     execution.update(observation)  # execution-only; never part of effective input
-    reject_execution_identity(final)
+    if boundary_options is not None:
+        execution["execution_boundary"] = _copy_json(boundary_options)
     if set(final) & set(execution):
         raise ValueError('submitted input shadows replay execution metadata: '
                          + ','.join(sorted(set(final) & set(execution))))
     if not exploratory:
+        reject_execution_identity(final)
         return runtime_config(final, **execution)
 
     from r2f.core.evidence import INPUT_SCHEMA_V2
@@ -308,8 +362,21 @@ def _replay_config(capsule, replay_id, domain, source):
     # affected window must bind to the saved operation's requested offset.
     from .runner import _plan_surface_bindings
     surfaces, submitted = _plan_surface_bindings(plan, target.exploration_contract)
-    config = dict(execution, **runtime_input(final, backend=spec['backend'],
-                                                runtime_capability=TOPOLOGY_CAPABILITY if topology else None))
+    submitted_input = runtime_input(final, backend=spec['backend'],
+                                    runtime_capability=TOPOLOGY_CAPABILITY if topology else None)
+    metadata_check = _copy_json(submitted_input)
+    if topology:
+        # runtime_input validated the complete program and exact hash-bound
+        # reference shape. This locator identifies a pre-execution build INPUT,
+        # not an output execution manifest. Exempt only this validated location
+        # from the transient-key check; never change the sealed input or hash.
+        for action in metadata_check['topology_program']['actions']:
+            if action['op'] == 'lookup_topic':
+                reference = action['params'].get('native_type_support')
+                if reference is not None:
+                    reference.pop('manifest_path')
+    reject_execution_identity(metadata_check)
+    config = dict(execution, **submitted_input)
     config.update(input_identity_schema=INPUT_SCHEMA_V2, effective_input=_copy_json(effective),
                   mutation_parameters=_copy_json(scenario.mutation_parameters),
                   mutation_plan=plan.to_dict(), mutation_plan_sha256=canonical_hash(plan.to_dict()),
@@ -470,7 +537,10 @@ def _worker_counts(config):
         backend = 'discovery_namespace'
     if backend == 'projection_pair':
         from r2f.runtime.projection_pair import projection_roles
-        return Counter(projection_roles(config))
+        counts = Counter(projection_roles(config))
+        if 'projection_discovery_tools' in config:
+            counts['discovery_tools'] = 1
+        return counts
     counts = Counter({'writer': 1, 'reader': 1})
     if backend == 'discovery_namespace' and config.get('arm') == 'mutated':
         from r2f.runtime.namespace_pair import window_churn_schedule
@@ -517,7 +587,8 @@ def _worker_qualification(config, metadata, events):
                 or worker.get('separate_context') is not True):
             errors.append('worker_health_receipt_missing:' + str(role))
         links = []
-        for kind in ('process_started', 'endpoint_created', 'process_exit'):
+        helper = role == 'discovery_tools' and counts.get(role) == 1
+        for kind in ('process_started', 'discovery_tools_ready' if helper else 'endpoint_created', 'process_exit'):
             found = [(index, event) for index, event in enumerate(events)
                      if event.get('event') == kind and event.get('role') == role
                      and event.get('pid') == pid
@@ -528,7 +599,22 @@ def _worker_qualification(config, metadata, events):
                 index, event = found[0]
                 links.append(index)
                 linked.add(index)
-                if kind == 'endpoint_created':
+                if kind == 'discovery_tools_ready':
+                    starts = [item for item in events if item.get('event') == 'process_started'
+                              and item.get('role') == role and item.get('pid') == pid
+                              and item.get('worker_generation') == generation]
+                    if (event.get('manifest') != config.get('projection_discovery_tools')
+                            or event.get('run_id') != config.get('run_id')
+                            or event.get('domain_id') != config.get('domain_id')
+                            or not event.get('observer_generation')
+                            or not event.get('participant_guid')
+                            or type(event.get('process_start_ticks')) is not int
+                            or event.get('process_start_ticks') != worker.get('start_ticks')
+                            or len(starts) != 1
+                            or starts[0].get('start_ticks') != event.get('process_start_ticks')
+                            or worker.get('cleanup_confirmed') is not True):
+                        errors.append('discovery_tools_identity_mismatch')
+                elif kind == 'endpoint_created':
                     endpoint = (event.get('endpoint_gid'), event.get('endpoint_generation'))
                     if (not all(isinstance(value, str) and value for value in endpoint)
                             or endpoint in endpoints):
@@ -541,7 +627,7 @@ def _worker_qualification(config, metadata, events):
         if len(links) == 3 and links != sorted(links):
             errors.append('worker_raw_chronology_mismatch:' + str(role))
     expected_links = {index for index, event in enumerate(events)
-                      if event.get('event') in {'process_started', 'endpoint_created', 'process_exit'}}
+                      if event.get('event') in {'process_started', 'endpoint_created', 'process_exit', 'discovery_tools_ready'}}
     if linked != expected_links:
         errors.append('worker_raw_identity_unaccounted')
     return errors
@@ -592,6 +678,24 @@ def _topology_worker_errors(config, result):
     PID/PGID values are compared only inside their recorded runtime scope. The
     isolated helper binds that scope; no inner identifier is treated as a host PID.
     """
+    from r2f.runtime.participant_groups import enabled, project_lineage
+    if enabled(config.get('topology_program')):
+        try:
+            expected = project_lineage(config['topology_program'], result.get('events') or [],
+                                       result.get('raw_path'), config=config)
+            metadata = result.get('execution_metadata') or {}
+            if (metadata.get('schema') != 'r2f.topology-execution-metadata/v2'
+                    or metadata.get('participant_groups') != expected
+                    or metadata.get('workers') != expected['workers']):
+                raise ValueError('group_metadata_raw_projection_mismatch')
+            if any(w['unknowns'] or not w['real_ros'] for w in expected['workers']):
+                raise ValueError('group_fixture_not_actual_worker')
+            return []
+        except (ValueError, KeyError, TypeError, IndexError) as exc:
+            return ['topology_group_lineage_invalid:' + str(exc)]
+    if ((result.get('execution_metadata') or {}).get('schema') == 'r2f.topology-execution-metadata/v2'
+            or 'participant_groups' in (result.get('execution_metadata') or {})):
+        return ['topology_group_metadata_without_sealed_opt_in']
     from r2f.runtime.endpoint_incarnation import endpoint_identity_at
 
     errors, seen, identities, gids = [], set(), set(), set()
@@ -981,7 +1085,7 @@ def _qualification(origin, config, result, row, *, output_root=None):
 
 
 def replay_cell(capsule_path, *, output_dir, domain_id, runtime=None,
-                runtime_boundary='host', episode_checkpoint=None) -> dict:
+                runtime_boundary='host', episode_checkpoint=None, boundary_options=None) -> dict:
     """Replay an unchanged capsule into a fresh evidence directory and domain.
 
     output_dir must be empty and outside the original run. Source must match the
@@ -992,6 +1096,7 @@ def replay_cell(capsule_path, *, output_dir, domain_id, runtime=None,
     if runtime_boundary not in ('host', 'isolated_netns'):
         raise ValueError('unsupported runtime_boundary: ' + repr(runtime_boundary))
     from .runner import _resolve_execution_runtime, _runtime_execution_config
+    boundary_options = _validated_boundary_options(boundary_options, runtime_boundary)
     runtime, formal = _resolve_execution_runtime(runtime, runtime_boundary)
     origin = (ISOLATED_RUNTIME if runtime_boundary == 'isolated_netns' else DEFAULT_RUNTIME) \
         if formal else 'injected_runtime'
@@ -1000,6 +1105,8 @@ def replay_cell(capsule_path, *, output_dir, domain_id, runtime=None,
     request = {'schema': SCHEMA, 'replay_id': replay_id, 'capsule_path': str(capsule_path),
                'domain_id': domain_id, 'execution_origin': origin,
                'runtime_boundary': runtime_boundary, 'timestamp': utc_now()}
+    if boundary_options is not None:
+        request['boundary_options'] = boundary_options
     if episode_checkpoint is not None:
         if not isinstance(episode_checkpoint, str) or not episode_checkpoint.strip():
             raise ValueError('episode_checkpoint must be a nonempty action id')
@@ -1057,7 +1164,7 @@ def replay_cell(capsule_path, *, output_dir, domain_id, runtime=None,
         def runner(scenario, domain):
             try:
                 config = _runtime_execution_config(
-                    _replay_config(capsule, replay_id, domain, before), execute=True,
+                    _replay_config(capsule, replay_id, domain, before, boundary_options=boundary_options), execute=True,
                     runtime=runtime, runtime_boundary=runtime_boundary)
                 if episode_checkpoint is not None:
                     if capsule.input['target_id'] != _TOPOLOGY_TARGET:
@@ -1075,7 +1182,8 @@ def replay_cell(capsule_path, *, output_dir, domain_id, runtime=None,
                         if not any(ref['path'] == str(path) for ref in report['original_artifacts']):
                             report['original_artifacts'].append(_reference(path))
                 context['config'] = config
-                if capsule.input['target_id'] == _TOPOLOGY_TARGET:
+                if (capsule.input['target_id'] == _TOPOLOGY_TARGET
+                        or config.get('observe_participant_leases') is True):
                     report['observation_replay'] = _observation_replay_declaration(capsule, config)
                 _write(output / 'runtime_config.json', config)
                 runtime_dir = output / 'runtime'
@@ -1238,8 +1346,8 @@ def audit_replay(report_path) -> dict:
         request = _json(root / 'request.json')
         if report.get('episode_checkpoint') != request.get('episode_checkpoint'):
             errors.append('request/report identity mismatch:episode_checkpoint')
-        for key in ('replay_id', 'domain_id', 'execution_origin'):
-            if report.get(key) != request.get(key):
+        for key in ('replay_id', 'domain_id', 'execution_origin', 'boundary_options'):
+            if canonical_hash(report.get(key)) != canonical_hash(request.get(key)):
                 errors.append('request/report identity mismatch:' + key)
         # Missing boundary fields in historical host reports mean host only.
         boundary = report.get('runtime_boundary', 'host')
@@ -1388,8 +1496,10 @@ def _check_audit_config(root, original, report, errors):
     # invocation. Intent is reconstructed from report/request canonical origin,
     # not a user-supplied config bool; audit_replay separately binds request,
     # attempt, source snapshots and runtime artifacts/qualification.
+    boundary_options = _validated_boundary_options(report.get('boundary_options'), boundary)
     expected = _runtime_execution_config(
-        _replay_config(original, report['replay_id'], report['domain_id'], original.input['source_manifest']),
+        _replay_config(original, report['replay_id'], report['domain_id'], original.input['source_manifest'],
+                       boundary_options=boundary_options),
         execute=True, runtime=runtime_for_boundary(boundary) if formal else None,
         runtime_boundary=boundary)
     if report.get('episode_checkpoint') is not None:

@@ -182,6 +182,25 @@ class TopologyProjectionTests(unittest.TestCase):
             self.assertFalse(result["eligible"])
             self.assertEqual(self.pair(result, "w0", "r1")["delivery_closure"], "closed")
 
+    def test_node_annotations_do_not_contradict_actual_endpoint_matching_contract(self):
+        f = RawFixture()
+        writer_view = f.event("graph_snapshot", logical_id="w0")["publishers"][0]
+        reader_view = f.event("graph_snapshot", logical_id="r0")["publishers"][0]
+        writer_view.update(node_name="writer_node", node_namespace="/")
+        reader_view.update(node_name="_NODE_NAME_UNKNOWN_", node_namespace="_NODE_NAMESPACE_UNKNOWN_")
+        result = self.project(f)
+        self.assertEqual(self.pair(result)["compatibility"], "compatible")
+        proof = result["receipt"]["after"]["component_refs"]["/pairs/w0/r0/compatibility"]
+        self.assertIn("graph_annotation_differences", proof["detail"]["policy_scope"])
+        self.assertFalse(result["eligible"])
+        for field in ("topic_type", "qos", "unrecognized_contract_field"):
+            with self.subTest(field=field):
+                damaged = deepcopy(f)
+                damaged.event("graph_snapshot", logical_id="r0")["publishers"][0][field] = "different"
+                checked = self.project(damaged)
+                self.assertEqual(self.pair(checked)["compatibility"], "unknown")
+                self.assertFalse(checked["eligible"])
+
     def test_predicted_graph_cannot_replace_raw_matching_or_contracts(self):
         f = RawFixture(direct=False)
         f.program["predicted_graph"] = {"w0->r0": "matched"}

@@ -516,9 +516,13 @@ class PreflightFailClosedTests(unittest.TestCase):
         with patch('r2f.runtime.namespace_pair.LeaseSet', self.GoodLease), \
              patch('r2f.runtime.namespace_pair.check_environment',
                    return_value={'ok': True, 'reason': None}), \
+             patch('r2f.runtime.namespace_pair.activated_environment',
+                   return_value=({}, {'R2F_OFFLINE_FIXTURE': '1'})), \
              patch('r2f.runtime.namespace_pair._supervise',
-                   side_effect=IsolationError('namespace_lease_not_held')):
+                   side_effect=IsolationError('namespace_lease_not_held')) as supervise:
             result = run_pair(recovery_config(), state_dir())
+        supervise.assert_called_once()
+        self.assertEqual(supervise.call_args.args[2], {'R2F_OFFLINE_FIXTURE': '1'})
         self.assertEqual(result['reason'], 'namespace_lease_not_held')
         self.assertFalse(result['real_execution'])
         self.assertIsNone(result['execution'])
@@ -527,9 +531,13 @@ class PreflightFailClosedTests(unittest.TestCase):
         with patch('r2f.runtime.namespace_pair.LeaseSet', self.GoodLease), \
              patch('r2f.runtime.namespace_pair.check_environment',
                    return_value={'ok': True, 'reason': None}), \
+             patch('r2f.runtime.namespace_pair.activated_environment',
+                   return_value=({}, {'R2F_OFFLINE_FIXTURE': '1'})), \
              patch('r2f.runtime.namespace_pair._supervise',
-                   side_effect=RuntimeError('projection_observer_not_ready')):
+                   side_effect=RuntimeError('projection_observer_not_ready')) as supervise:
             result = run_pair(projection_config(), state_dir())
+        supervise.assert_called_once()
+        self.assertEqual(supervise.call_args.args[2], {'R2F_OFFLINE_FIXTURE': '1'})
         self.assertEqual(result['reason'], 'projection_observer_not_ready')
         self.assertFalse(result['real_execution'])
 
@@ -542,10 +550,14 @@ class PreflightFailClosedTests(unittest.TestCase):
         with patch('r2f.runtime.namespace_pair.LeaseSet', self.GoodLease), \
              patch('r2f.runtime.namespace_pair.check_environment',
                    return_value={'ok': True, 'reason': None}), \
-             patch('r2f.runtime.namespace_pair._supervise', return_value=inner), \
+             patch('r2f.runtime.namespace_pair.activated_environment',
+                   return_value=({}, {'R2F_OFFLINE_FIXTURE': '1'})), \
+             patch('r2f.runtime.namespace_pair._supervise', return_value=inner) as supervise, \
              patch('r2f.runtime.namespace_pair.execution_chain_identity',
                    side_effect=[before, after]):
             result = run_pair(recovery_config(), state_dir())
+        supervise.assert_called_once()
+        self.assertEqual(supervise.call_args.args[2], {'R2F_OFFLINE_FIXTURE': '1'})
         self.assertEqual(result['reason'], 'source_identity_changed_during_execution')
         self.assertEqual(result['runtime_status'], 'blocked')
         self.assertFalse(result['real_execution'])

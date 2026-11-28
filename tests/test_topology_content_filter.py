@@ -158,6 +158,7 @@ class InitialFilterBinding(unittest.TestCase):
                 configs.append(config)
                 self.process = SimpleNamespace(pid=424242)
                 self.events = [{'event': 'endpoint_created', 'pid': 424242, 'pgid': 424242,
+                                'logical_id': config['logical_id'], 'generation': config['generation'],
                                 'endpoint_gid': 'aa11', 'endpoint_generation': 'fake-generation',
                                 'process_start_ticks': 17, 'fixture': True, 'real_ros': False,
                                 'candidate_eligible': False}]
@@ -329,7 +330,8 @@ class InitialFilterCreation(unittest.TestCase):
         modules['rclpy.node'].Node = FixtureNode
         modules['rclpy.qos'].QoSProfile = lambda **kwargs: kwargs
         modules['rclpy.subscription_content_filter_options'].ContentFilterOptions = FakeOptions
-        modules['std_msgs.msg'].String = type('FixtureString', (), {})
+        from topology_ros_message_fixture import add_generated_message_fixtures
+        add_generated_message_fixtures(modules)
         fixture_qos = {'history': 'keep_last', 'depth': 16, 'reliability': 'reliable',
                        'durability': 'volatile', 'deadline_ns': tw.INFINITE_NS,
                        'liveliness': 'automatic', 'liveliness_lease_duration_ns': tw.INFINITE_NS}

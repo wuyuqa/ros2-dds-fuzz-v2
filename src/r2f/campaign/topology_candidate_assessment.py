@@ -6,9 +6,12 @@ Pending requirements are None, never false denials to be silently ignored later.
 """
 from r2f.core._json import snapshot
 from r2f.core.candidate import _validate_observation_identity, topology_observation_identity
-from r2f.core.evidence import canonical_hash
+from r2f.core.evidence import canonical_hash, verify_raw
+import json
+from pathlib import Path
 from r2f.core.execution import validate_execution
 from r2f.core.oracle import attribute_responsibility
+from r2f.core.observation_status import observation_complete
 from r2f.core.replay import (_v2_execution_input, conformance_signature,
                              validate_replay_input)
 
@@ -29,8 +32,11 @@ def _stage(scope, checks, pending=(), binding=None):
 
 
 def _oracle_semantics(oracle):
-    return {k: oracle.get(k) for k in ('rule_id', 'rule_role', 'evaluator_id', 'verdict',
+    result = {k: oracle.get(k) for k in ('rule_id', 'rule_role', 'evaluator_id', 'verdict',
             'reason_codes', 'forbidden_residuals', 'closure', 'diagnostic_only')}
+    for key in ('cft_rule_contract','lookup_rule_contract','lookup_checks'):
+        if key in oracle:result[key]=oracle[key]
+    return result
 
 
 def provider_assessment(scenario, facts, oracle):
@@ -43,6 +49,19 @@ def provider_assessment(scenario, facts, oracle):
     facts = facts if isinstance(facts, dict) else {}
     target = getattr(scenario, 'target', None)
     target_binding = target.to_dict() if target is not None else {'target_id': scenario.target_id}
+    query_qualified=False
+    lookup_raw_matches=False
+    if (facts.get('topic_lookup_observations') or {}).get('declared') is True:
+        from r2f.core.candidate import _topology_topic_lookup
+        try:
+            raw=facts['raw'];verify_raw(raw['path'],raw['sha256'])
+            events=[json.loads(line) for line in Path(raw['path']).read_text().splitlines() if line.strip()]
+            verified=_topology_topic_lookup({'raw_path':raw['path'],'raw_sha256':raw['sha256'],
+                'typed_facts':facts,'oracle':oracle,'final_input':scenario.mutation_plan.final_config},events)
+            lookup_raw_matches=verified is not None and verified.get('declared') is True
+            query_qualified=lookup_raw_matches and not verified.get('unknown_reasons') and bool(verified.get('checks'))
+        except (ValueError,KeyError,TypeError,OSError,IndexError,AttributeError):
+            pass
     checks = {
         'exact_target': scenario.target_id == TARGET and facts.get('target_id') == TARGET,
         'typed_facts_schema': facts.get('schema') == 'r2f.s1-topology-facts/v1',
@@ -57,15 +76,34 @@ def provider_assessment(scenario, facts, oracle):
         'typed_execution_health': all(facts.get(k) is True for k in
             ('diagnostic_valid', 'execution_evidence', 'environment_healthy', 'process_healthy',
              'source_provenance_qualified', 'preconditions_reached', 'candidate_eligible')),
-        'typed_pair_objects': isinstance(facts.get('pairs'), list) and bool(facts['pairs'])
+        'typed_observation_objects': isinstance(facts.get('pairs'), list)
+            and (bool(facts['pairs']) or query_qualified and oracle.get('forbidden_residuals')==['topology.topic_lookup_mismatch'])
             and isinstance(facts.get('endpoint_lineage'), list) and bool(facts['endpoint_lineage']),
         'typed_residuals': isinstance(oracle.get('forbidden_residuals'), list)
             and bool(oracle['forbidden_residuals'])
             and all(isinstance(v, str) for v in oracle['forbidden_residuals'])
-            and set(oracle['forbidden_residuals']) <= {'topology.closed_delivery_gap', 'topology.pair_graph_mismatch'},
+            and set(oracle['forbidden_residuals']) <= {
+                'topology.closed_delivery_gap', 'topology.pair_graph_mismatch',
+                'topology.identity_mismatch', 'topology.cft_predicate_mismatch',
+                'topology.topic_lookup_mismatch'},
         'sample_identity_resolved': not facts.get('unknown_reasons_sample_identity')
             and not facts.get('unresolved_historical_obligations'),
     }
+    if (facts.get('content_filter_observations') or {}).get('declared') is True:
+        from r2f.modules.s1.topology_cft_contract import predicate_contract
+        cft = facts['content_filter_observations']
+        contract_sha256 = canonical_hash(predicate_contract())
+        checks['cft_evidence_consistent'] = (not cft.get('evidence_conflicts')
+            and canonical_hash(cft.get('predicate_contract')) == contract_sha256
+            and canonical_hash(oracle.get('cft_rule_contract')) == contract_sha256)
+    if (facts.get('topic_lookup_observations') or {}).get('declared') is True:
+        from r2f.modules.s1.topology_lookup_contract import predicate_contract
+        from .topology_lookup_observation import semantic_checks
+        lookup = facts['topic_lookup_observations']
+        checks['lookup_raw_matches'] = lookup_raw_matches
+        checks['lookup_contract_matches'] = (canonical_hash(lookup.get('predicate_contract')) == canonical_hash(predicate_contract())
+            and canonical_hash(oracle.get('lookup_rule_contract')) == canonical_hash(predicate_contract())
+            and canonical_hash(oracle.get('lookup_checks')) == canonical_hash(semantic_checks(lookup)))
     stage = _stage('provider_typed_evidence', checks,
                    ('canonical_ingest', 'formal_boundary', 'formal_topology_execution'),
                    {'facts_sha256': canonical_hash(facts), 'oracle_semantics_sha256': canonical_hash(_oracle_semantics(oracle)),
@@ -177,11 +215,27 @@ def finalize_assessment(scenario, config, capsule, row, *, boundary, qualificati
         checks['concrete_anomaly_signature'] = conformance_signature(row) is not None
         assessment['final'] = _stage('runner_formal_qualification', checks, pending, binding)
         row['candidate_eligible'] = assessment['final']['qualified'] is True
+    # A healthy primary pass has no anomaly to admit. Retain every observation,
+    # input/raw/source and formal gate, excluding only candidate-specific checks.
+    facts, oracle = row.get('typed_facts') or {}, row.get('oracle') or {}
+    healthy_pass_evaluable = (
+        row.get('execution_stage') == 'judged' and row.get('oracle_verdict') == 'pass'
+        and oracle.get('verdict') == 'pass' and oracle.get('rule_id') == RULE
+        and oracle.get('rule_role') == 'primary' and oracle.get('forbidden_residuals') == []
+        and not facts.get('unknown_reasons') and observation_complete(row)
+        and not pending
+        and all(passed is True for name, passed in assessment['provider']['checks'].items()
+                if name not in ('primary_fail', 'typed_residuals'))
+        and all(passed is True for name, passed in upstream['checks'].items()
+                if name not in ('provider_known_checks', 'canonical_judged_fail',
+                                'provider_scoped_eligibility_declaration'))
+        and all(passed is True for name, passed in checks.items() if name != 'ingest_known_checks'))
     attribution = dict(row, environment_healthy=facts_value(row, 'environment_healthy'),
         preconditions_reached=facts_value(row, 'preconditions_reached'),
         identity_complete=upstream['checks'].get('raw_lineage_pair_proofs_valid') is True,
         window_complete=facts_value(row, 'observation_complete'),
-        expected_effect_evaluable=row['candidate_eligible'], expected_effect_set=scenario.target.expected_effect_set,
+        expected_effect_evaluable=row['candidate_eligible'] or healthy_pass_evaluable,
+        expected_effect_set=scenario.target.expected_effect_set,
         primary_rule_violated=row.get('oracle_verdict') == 'fail' and row['candidate_eligible'],
         controls_support_sut=False, provenance_supports_sut=False)
     original_reason = (capsule.execution or {}).get('reason_code')

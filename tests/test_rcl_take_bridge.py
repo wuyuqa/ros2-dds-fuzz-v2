@@ -696,3 +696,72 @@ print(json.dumps({'status':'native_load_verified', 'identifier':f().decode(),
     assert result['identifier'] == b.RMW_IDENTIFIER
     assert result['library'] == str(b.PREFIX/'lib/librmw_fastrtps_cpp.so')
     assert not result['ros_init'] and not result['dds_entities_created']
+
+
+class UInt8MultiArray:
+    def __init__(self):
+        self.data = []
+        self.layout = SimpleNamespace(dim=[], data_offset=0)
+
+
+class ArrayNative(Native):
+    """Generated array allocation/conversion boundary; no native DDS runtime."""
+    def array_create(self):
+        assert self.handle.entered
+        self.calls.append('array_create')
+        return 0x2000
+
+    def take(self, pointer, message, info, allocation):
+        assert message == 0x2000
+        # Reuse only the native MessageInfo output fixture, never String bytes
+        # as an array buffer. The real generated converter owns that layout.
+        scratch = b._String()
+        return super().take(pointer, C.byref(scratch), info, allocation)
+
+    def array_convert(self, pointer):
+        assert pointer == 0x2000 and self.handle.entered
+        self.calls.append('array_convert')
+        result = UInt8MultiArray()
+        result.data = list(b'\x00\xffarray payload')
+        result.layout.data_offset = 2
+        result.layout.dim = [SimpleNamespace(label='维度', size=2, stride=4)]
+        return result
+
+    def array_destroy(self, pointer):
+        assert pointer == 0x2000 and self.handle.entered
+        self.calls.append('array_destroy')
+
+
+def test_array_take_preserves_generated_body_and_full_identity_before_destroy():
+    handle = Handle()
+    native = ArrayNative(handle)
+    bridge = b.RclTakeBridge(message_type='std_msgs/msg/UInt8MultiArray',
+                             _bindings=native, _array_type=UInt8MultiArray)
+    subscription = SimpleNamespace(handle=handle, msg_type=UInt8MultiArray, raw=False)
+    message, info = bridge.take(subscription)
+    assert message.data == [0, 255, 97, 114, 114, 97, 121, 32, 112, 97, 121, 108, 111, 97, 100]
+    assert message.layout.data_offset == 2
+    assert [(d.label, d.size, d.stride) for d in message.layout.dim] == [('维度', 2, 4)]
+    assert info['publisher_gid'] == bytes.fromhex('010f7f014c00961e0000000000000603')
+    assert info['publication_sequence_number'] == 3
+    assert info['rcl_take_receipt']['message_type'] == 'std_msgs/msg/UInt8MultiArray'
+    assert native.calls == ['array_create', ('take', 0x1000), 'array_convert', 'array_destroy']
+    assert handle.enters == handle.exits == 1 and handle.stock_takes == 0
+
+
+@pytest.mark.parametrize('code', [401, 11])
+def test_array_no_sample_or_error_destroys_once_without_second_take(code):
+    handle = Handle()
+    native = ArrayNative(handle)
+    native.code = code
+    bridge = b.RclTakeBridge(message_type='std_msgs/msg/UInt8MultiArray',
+                             _bindings=native, _array_type=UInt8MultiArray)
+    subscription = SimpleNamespace(handle=handle, msg_type=UInt8MultiArray, raw=False)
+    if code == 401:
+        assert bridge.take(subscription) is None
+    else:
+        with pytest.raises(b.BridgeError, match='rcl_take_failed:11'):
+            bridge.take(subscription)
+    assert 'array_convert' not in native.calls
+    assert native.calls.count('array_destroy') == 1
+    assert len(take_calls(native)) == 1 and handle.stock_takes == 0

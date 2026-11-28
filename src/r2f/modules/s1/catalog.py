@@ -91,3 +91,9 @@ def resolve_rule_lineage(target_id, rule_id):
     from .rule_lineage import resolve
     return resolve(target, rule_id, scope={key: entry[key] for key in
         ("usage", "family_id", "conformance_baseline_id", "runtime_capability")})
+
+
+def coverage_lineage():
+    """Read the complete source/model/evidence sidecar, never a target manifest."""
+    from .coverage import catalog_lineage
+    return catalog_lineage()

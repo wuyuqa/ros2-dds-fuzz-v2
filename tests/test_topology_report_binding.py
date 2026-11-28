@@ -19,7 +19,6 @@ from r2f.campaign.scheduler import ExploratoryScheduler
 from r2f.campaign.topology_search import descriptor
 from r2f.core.evidence import canonical_hash, raw_sha256
 from r2f.reports import run_report as audit
-from r2f.reports.candidate_report import exploratory_candidate_ledger
 
 
 def repo_root():
@@ -38,8 +37,7 @@ def write(path, value):
 
 
 @pytest.fixture(scope='module')
-def model_report(tmp_path_factory):
-    root = tmp_path_factory.mktemp('topology-report-model')
+def model_profile():
     doc = read(repo_root() / 'config/s1_fuzz/profiles/model-bfs-topology.json')
     doc['rmws'] = doc['rmws'][:1]
     doc['operator_whitelist'] = ['endpoint.count', 'queue.depth', 'relation.pair']
@@ -50,6 +48,15 @@ def model_report(tmp_path_factory):
     doc['declared_seed_specs_union'] = deepcopy(doc['seed_specs'])
     doc['cycles'][0]['seed_specs'] = deepcopy(doc['seed_specs'])
     doc['budget'].update(max_inputs=4, max_seconds=300)
+    return doc
+
+
+@pytest.fixture
+def four_rows(model_profile, tmp_path, monkeypatch, request):
+    root = tmp_path / 'report'
+    doc = deepcopy(model_profile)
+    if hasattr(request, "param"):
+        doc["execution_boundary"] = deepcopy(request.param)
     source = dict(source_repo=str(repo_root()), head='a' * 40, behavior_tree_sha256='b' * 64,
                   source_frozen=True, dirty_behavior_paths=[])
     corpus = corpus_from_profile(doc, cycle_id='topology-authored')
@@ -59,47 +66,6 @@ def model_report(tmp_path_factory):
                                     sampling_weight=doc.get('sampling_weight'))
     scheduler.configure_search(doc['search'], descriptor(doc['topology_search'], doc['operator_whitelist']))
     hook = make_checkpoint_hook(root, profile=doc, cycle_id='topology-authored', source_manifest=source)
-    with patch.object(runner, 'source_manifest', return_value=source):
-        runner.run_exploratory_cycle(root, corpus=corpus, feedback=feedback, scheduler=scheduler,
-                                    continuation=None, profile=doc, max_inputs=4, execute=False,
-                                    runtime=None, run_id='four-row-mock', checkpoint_hook=hook)
-    return root
-
-
-@pytest.fixture
-def four_rows(model_report, tmp_path, monkeypatch):
-    root = tmp_path / 'report'
-    shutil.copytree(model_report, root)
-    for file in root.rglob('*.json'):
-        file.write_text(file.read_text().replace(str(model_report), str(root)))
-    checkpoint = read(root / 'checkpoint.json')
-    checkpoint['checkpoint_sha256'] = canonical_hash({k: v for k, v in checkpoint.items()
-                                                      if k != 'checkpoint_sha256'})
-    write(root / 'checkpoint.json', checkpoint)
-    report = read(root / 'report.json')
-    report.update(runtime_boundary='isolated_netns', runtime_formal=True)
-    source = deepcopy(report['source_manifest'])
-    # Only the execution/reingest/qualification boundary is mocked. The saved
-    # inputs, plans, capsules and rejection model are the real offline producer.
-    for row in report['rows']:
-        if row.get('generation_status') == 'rejected':
-            continue
-        cfgpath = Path(row['runtime_config_path'])
-        cfg = read(cfgpath)
-        cfg.update(execution_boundary={'enabled': True}, live_execution_go=True)
-        write(cfgpath, cfg)
-        runtime = Path(row['runtime_result_path']).parent
-        runtime.mkdir()
-        raw = runtime / 'raw.jsonl'
-        raw.write_text('{"event":"explicit_mock_execution_not_real_DDS"}\n')
-        row.update(actual_run=True, execution_stage='judged', oracle_verdict='unknown',
-                   raw_path=str(raw), raw_sha256=raw_sha256(raw), runtime_status='completed',
-                   runtime_reason=None, observer_complete=True,
-                   typed_facts={'mock_only': True}, oracle={'verdict': 'unknown'},
-                   state_projection={'status': 'observed'})
-        # A separate saved result is the mocked reingest authority, not the
-        # mutable row under test. Tampering row/raw must disagree with it.
-        write(row['runtime_result_path'], {'mock_ingest': deepcopy(row)})
     monkeypatch.setattr(audit, 'source_manifest', lambda path: deepcopy(source))
     monkeypatch.setattr(audit, 'ingest_execution', lambda scenario, config, result, capsule, **kw:
                         deepcopy(result['mock_ingest']))
@@ -111,17 +77,50 @@ def four_rows(model_report, tmp_path, monkeypatch):
             return dict(status='qualified', reason_code='mock_only', errors=[], eligible=True)
         return dict(status='unknown', reason_code=audit.BOUNDARY_AUDIT_PENDING, errors=[], eligible=False)
     monkeypatch.setattr(audit, 'boundary_qualification_for_row', boundary)
-    ledger = exploratory_candidate_ledger([r for r in report['rows'] if r.get('actual_run')])
-    ledger_path = root / 'candidate_ledger.json'
-    write(ledger_path, ledger)
-    report['candidate_ledger_path'] = str(ledger_path)
-    report['candidate_ledger_sha256'] = canonical_hash(ledger)
-    report['budget'].update(attempted=2, executed=2, actual=2, unique_actual=2)
-    # Fresh synthetic segment: its local counters must match its cumulative budget.
-    report['cycle_budget'].update(attempted=2, executed=2, actual=2)
-    report['last_state']['executed'] = 2
-    report['report_sha256'] = audit.exploratory_report_digest(report)
-    write(root / 'report.json', report)
+    finish_evidence = runner.finish_evidence
+    def finish_mock_execution(directory, record, persist, **kwargs):
+        # Author fresh fixture execution BEFORE the normal immutable report,
+        # ledger, packet and replay-index writers bind it at its final path.
+        # No published tree is copied, relocated or repaired by re-signing.
+        report = record
+        report.update(runtime_boundary='isolated_netns', runtime_formal=True)
+        for row in report['rows']:
+            if row.get('generation_status') == 'rejected':
+                continue
+            cfgpath = Path(row['runtime_config_path'])
+            cfg = read(cfgpath)
+            options = doc.get('execution_boundary')
+            cfg.update(execution_boundary=dict(options if isinstance(options, dict) else {}, enabled=True),
+                       live_execution_go=True)
+            write(cfgpath, cfg)
+            runtime = Path(row['runtime_result_path']).parent
+            runtime.mkdir()
+            raw = runtime / 'raw.jsonl'
+            raw.write_text('{"event":"explicit_mock_execution_not_real_DDS"}\n')
+            row.update(actual_run=True, execution_stage='judged', oracle_verdict='unknown',
+                       domain_id=cfg['domain_id'], raw_path=str(raw), raw_sha256=raw_sha256(raw), runtime_status='completed',
+                       runtime_reason=None, observer_complete=True,
+                       typed_facts={'mock_only': True}, oracle={'verdict': 'unknown'},
+                       state_projection={'status': 'observed'})
+            # A separate saved result is the mocked reingest authority, not the
+            # mutable row under test. Tampering row/raw must disagree with it.
+            write(row['runtime_result_path'], {'mock_ingest': deepcopy(row),
+                'raw_path': str(raw), 'raw_sha256': row['raw_sha256'], 'evidence_origin': 'fixture'})
+            write(cfgpath.parent / 'row.json', row)
+        report['budget'].update(attempted=2, executed=2, actual=2, unique_actual=2)
+        # Fresh synthetic segment: its local counters match its cumulative budget.
+        report['cycle_budget'].update(attempted=2, executed=2, actual=2)
+        report['last_state']['executed'] = 2
+        return finish_evidence(directory, record, persist, **kwargs)
+
+    monkeypatch.setattr(runner, 'finish_evidence', finish_mock_execution)
+    with patch.object(runner, 'source_manifest', return_value=deepcopy(source)):
+        runner.run_exploratory_cycle(root, corpus=corpus, feedback=feedback, scheduler=scheduler,
+                                    continuation=None, profile=doc, max_inputs=4, execute=False,
+                                    runtime=None, run_id='four-row-mock', checkpoint_hook=hook)
+    report = read(root / 'report.json')
+    pristine = audit.audit_exploratory_report(root / 'report.json')
+    assert pristine['evidence_valid'], pristine['errors']
     return root, report
 
 
@@ -395,3 +394,17 @@ def test_malformed_resigned_checkpoint_is_invalid_not_exception(four_rows, damag
     row = report['rows'][3] if damage == 'cyclic_parent' else report['rows'][0]
     assert not audit._verify_exploratory_row(root, row, report, errors)
     assert errors
+
+
+@pytest.mark.parametrize('four_rows', [
+    {'enabled': True, 'timeout_sec': 600, 'startup_timeout_sec': 40},
+], indirect=True)
+def test_declared_profile_boundary_budget_is_audited(four_rows):
+    result = run_audit(four_rows)
+    assert result['evidence_valid'], result['errors']
+    root, report = four_rows
+    row = report['rows'][1]
+    config = read(row['runtime_config_path'])
+    config['execution_boundary']['timeout_sec'] = 999
+    write(row['runtime_config_path'], config)
+    assert not run_audit(four_rows)['evidence_valid']

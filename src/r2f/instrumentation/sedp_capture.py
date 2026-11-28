@@ -171,6 +171,14 @@ def _filtered_submessage_entities(payload, submessages):
                         entry['reason'] = 'unknown_other_builtin_counterpart'
                     else:
                         entry.update(classification='other_builtin', reason=pair[1] + '_entity_pair')
+                elif writer == '000002c2' or reader == '000002c7':
+                    # RTPS 2.5 Table 9.2 topic announcer/detector pair. Reader-
+                    # originated controls must identify the actual topic reader.
+                    if writer == '000002c2' and (reader == '000002c7' or
+                            (reader == '00000000' and kind not in (0x06, 0x12))):
+                        entry.update(classification='discovery', reason='builtin_entity')
+                    else:
+                        entry['reason'] = 'unknown_topic_builtin_counterpart'
                 elif writer in BUILTIN_WRITERS or reader in ('000100c7', '000003c7', '000004c7'):
                     entry.update(classification='discovery', reason='builtin_entity')
                 elif writer[-2:] in ('02', '03') and (reader == '00000000' or reader[-2:] in ('04', '07')):
@@ -666,6 +674,44 @@ class PassiveSedpObserver:
                                    'file_identity': copy.deepcopy(self._raw_identity)},
                     'ready': copy.deepcopy(self._ready),
                     'assurance': 'wire transmit/control activity; not proof remote vendor installed endpoint'}
+
+    def snapshot_participant_leases(self, *, since_ns, participant_prefixes, field_policy=None):
+        """Supporting SPDP advertisements from the existing flushed capture prefix.
+
+        Prefixes select observations, never prove endpoint ownership. Lifecycle
+        generation and remote expiry require separate evidence. This opt-in read
+        leaves the activity/SEDP capture path and its health limits unchanged.
+        """
+        from .spdp_wire import parse_spdp_capture, parse_spdp_capture_prefix
+
+        snapshot = self.snapshot_activity(since_ns=since_ns, participant_prefixes=participant_prefixes)
+        raw = snapshot['raw_prefix']
+        if raw['final']:
+            result = parse_spdp_capture({'raw': raw, 'health': snapshot['health']}, field_policy=field_policy)
+        else:
+            result = parse_spdp_capture_prefix(raw, capture_health=snapshot['health'], field_policy=field_policy)
+        wanted = {p.lower() for p in snapshot['participant_prefixes']}
+        result['observations'] = [e for e in result['observations']
+            if since_ns <= e['unix_ns'] <= snapshot['until_ns'] and e['source_guid_prefix'] in wanted]
+        # Re-evaluate the selected window, preserving file/framing/health failures.
+        reasons = [r for r in result['reasons'] if r not in
+                   ('no_participant_lease_observation_in_finite_capture', 'unknown_participant_lease_observation')]
+        if not result['observations']:
+            reasons.append('no_participant_lease_observation_in_finite_window')
+        elif any(e['status'] != 'observed' for e in result['observations']):
+            reasons.append('unknown_participant_lease_observation')
+        missing = sorted(wanted - {e['source_guid_prefix'] for e in result['observations'] if e['status'] == 'observed'})
+        if missing:
+            reasons.append('missing_requested_participant_lease_observation')
+        if not snapshot['window_buffer_retained']:
+            reasons.append('activity_window_not_retained')
+        result.update(status='unknown' if reasons else 'observed', reasons=reasons,
+                      since_ns=since_ns, until_ns=snapshot['until_ns'], clock='unix_ns_realtime',
+                      snapshot_monotonic_ns=snapshot['monotonic_ns'],
+                      participant_prefixes=sorted(wanted), missing_participant_prefixes=missing,
+                      ownership_status='unknown_separate_ownership_evidence_required',
+                      window_buffer_retained=snapshot['window_buffer_retained'])
+        return result
 
     def stop(self):
         if self._stopped is not None:

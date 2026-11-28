@@ -584,6 +584,26 @@ class WorkerIdentityContracts(_ReplayFixtures):
         self.assertIn('offline_fixture_cannot_establish_real_ros', qualification['qualification_errors'])
         self.assertNotIn('independent_worker_metadata_missing', qualification['qualification_errors'])
 
+    def test_projection_tools_helper_uses_its_real_ready_receipt_not_endpoint_identity(self):
+        capsule, _ = self.case(PROJECTION)
+        config = self.config(capsule)
+        metadata, events = self.worker_fixture(config)
+        ref = {'path': '/offline/manifest.json', 'sha256': 'a'*64}
+        config.update(projection_discovery_layers='participant_topic_v1', projection_discovery_tools=ref)
+        identity = {'role': 'discovery_tools', 'pid': 13000, 'worker_generation': 1}
+        metadata['workers'].append(dict(identity, returncode=0, fresh_process=True,
+            separate_context=True, start_ticks=42, cleanup_confirmed=True))
+        for kind in ('process_started', 'discovery_tools_ready', 'process_exit'):
+            events.append(dict(identity, event=kind, event_index=len(events),
+                run_id=config['run_id'], domain_id=config['domain_id'], returncode=0,
+                manifest=ref, process_start_ticks=42, start_ticks=42,
+                observer_generation='observer-generation', participant_guid='01'*12+'000001c1',
+                cleanup_confirmed=True))
+        self.assertEqual(_worker_qualification(config, metadata, events), [])
+        ready = next(event for event in events if event['event'] == 'discovery_tools_ready')
+        ready['manifest'] = dict(ref, sha256='b'*64)
+        self.assertIn('discovery_tools_identity_mismatch', _worker_qualification(config, metadata, events))
+
     def test_multiwindow_same_role_generations_are_not_mistaken_for_duplicates(self):
         capsule, _ = self.case(RECOVERY, {'reader_recreate_in_window': True,
                                         'reader_recreate_count': 2, 'writer_churn_in_window': True}, windows=2)

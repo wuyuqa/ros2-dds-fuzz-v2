@@ -189,7 +189,7 @@ def _binding_times(binding, guid, graph_raw_path):
         if begin.get('event') != 'endpoint_create_begin' or returned.get('event') != 'endpoint_created':
             return None
         generation = binding.get('generation')
-        if not isinstance(generation, str) or not generation or binding.get('role') not in ('writer', 'reader'):
+        if not isinstance(generation, str) or not generation or re.fullmatch(r'(?:writer|reader)(?:[2-4])?', str(binding.get('role'))) is None:
             return None
         if not all(_positive_int(binding.get(k)) for k in ('pid', 'process_start_ticks')):
             return None

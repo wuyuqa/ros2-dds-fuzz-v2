@@ -15,6 +15,15 @@ from r2f.campaign.checkpoint import load_checkpoint, make_checkpoint_hook
 from r2f.modules.s1.catalog import target_catalog
 
 
+def _observation_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate observation field: " + key)
+        result[key] = value
+    return result
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--list-targets", action="store_true",
@@ -28,6 +37,10 @@ def main(argv=None):
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--target", dest="target_id", choices=("discovery.late_endpoint", "discovery.late_join_delivery", "discovery.interruption_recovery", "builtin.discovery_projection_reconciliation"), default="discovery.late_endpoint")
     parser.add_argument("--parameters-json", type=Path)
+    parser.add_argument("--observation-json", type=Path,
+                        help="execution-only observer selection: legacy Cyclone baseline0, or explicit recovery cell_id with participant lease opt-in")
+    parser.add_argument("--max-executions", type=int, default=None,
+                        help="required original carrier dispatch cap; observation execution requires 1")
     parser.add_argument("--exploratory-profile", type=Path,
                         help="explicit exploratory profile (including topology_v1 opt-in); uses the unified exploratory cycle")
     parser.add_argument("--cycle-id", help="cycle inside the exploratory profile")
@@ -50,7 +63,17 @@ def main(argv=None):
     parameters_path = args.pop("parameters_json")
     if parameters_path:
         args["parameters"] = json.loads(parameters_path.read_text())
+    observation_path = args.pop("observation_json")
     profile_path = args.pop("exploratory_profile")
+    if profile_path and (observation_path is not None or args["max_executions"] is not None):
+        parser.error("--observation-json and --max-executions are required-campaign options")
+    if args["max_executions"] is None:
+        args.pop("max_executions")
+    if observation_path is not None:
+        try:
+            args["observation"] = json.loads(observation_path.read_text(), object_pairs_hook=_observation_object)
+        except (OSError, ValueError) as error:
+            parser.error("invalid --observation-json: " + str(error))
     cycle_id = args.pop("cycle_id")
     resume_path = args.pop("resume_from")
     scheduler_policy = args.pop("scheduler_policy")
@@ -132,7 +155,10 @@ def main(argv=None):
     args.pop("max_inputs")
     args["seed"] = args["seed"] if args["seed"] is not None else 0
     args["runtime_boundary"] = runtime_boundary
-    result = run_campaign(**args)
+    try:
+        result = run_campaign(**args)
+    except ValueError as error:
+        parser.error(str(error))
     print(json.dumps({"run_id": result["run_id"], "report_path": str(Path(args["output_dir"]).resolve() / "report.json"),
                       "seal": result["seal"], "runtime_boundary": result.get("runtime_boundary", runtime_boundary),
                       "formal_runtime": result.get("formal_runtime", False)}, indent=2))

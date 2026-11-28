@@ -1,3 +1,5 @@
+> **当前导航（2026-11-23）**：先读 [S1 接续入口](s1-current.md)。本页保留原规格/工程决定/历史截面；下文“当前”、旧 source、owner、GO 和待批准边界均按其记录日期解释。用户确认的 #6 完整 S1 规格覆盖旧 MAIN-only／公共 API 正常互操作执行限制，不能据此缩小范围；历史通过不迁移到新 source。修改前全文及 dirty 内容见 [逐字节归档](history/issue26-before-2026-11-23/INDEX.md)。
+
 # S1 验收要求与证据矩阵
 
 最新快照指引（2026-11-15）：下文旧 source 的 seal、开发状态及待办均按各节历史身份解读；当前以[末尾 cf507 正式矩阵与 projection 修复快照](#current-capture-snapshot)为准：cf507前三target各自seal=true、projection seal=false且已完整清理；九文件修复的整合full已由Hooke执行并经main读盘审核通过，本次审计时尚待提交冻结及新运行GO，candidate0/required72不变。

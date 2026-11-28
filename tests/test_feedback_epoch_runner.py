@@ -135,8 +135,28 @@ class FeedbackEpochRunner(unittest.TestCase):
         rows = first["rows"] + second["rows"]
         self.assertEqual([r["selection_sequence"] for r in first["row_sequences"] + second["row_sequences"]], [0, 1, 2, 3])
         self.assertEqual([r["content_sha256"] for r in rows], [r["content_sha256"] for r in full["rows"]])
-        self.assertEqual([r["effective_input_sha256"] for r in rows],
-                         [r["effective_input_sha256"] for r in full["rows"]])
+        # Classification participates in feedback RNG identity. A valid M03
+        # sample can now hit no-op: compare its explicit refusal as well as
+        # generated execution identities, without inventing a replay input.
+        for resumed_row, whole_row in zip(rows, full["rows"]):
+            if whole_row.get("generation_status") == "rejected":
+                for row in (resumed_row, whole_row):
+                    self.assertEqual(row["generation_status"], "rejected")
+                    self.assertEqual(row["reason_code"], "no_effective_input")
+                    self.assertEqual(row["execution_stage"], "planned")
+                    self.assertFalse(row["actual_run"])
+                    self.assertFalse(row["candidate_eligible"])
+                    self.assertFalse(row["feedback_eligible"])
+                    self.assertNotIn("effective_input_sha256", row)
+                    self.assertIn("active no_op layer", row["no_effective_input_reason"])
+                self.assertEqual(resumed_row["no_effective_input_reason"],
+                                 whole_row["no_effective_input_reason"])
+            else:
+                self.assertEqual(resumed_row["execution_stage"], "judged")
+                self.assertTrue(resumed_row["actual_run"])
+                self.assertEqual(resumed_row["effective_input_sha256"],
+                                 whole_row["effective_input_sha256"])
+        self.assertTrue(any(row["actual_run"] for row in rows))
         self.assertEqual([e["selection_sha256"] for e in restored.selection_log],
                          [e["selection_sha256"] for e in full_s.selection_log])
         self.assertEqual(second["cycle_budget"]["selected"], 2)

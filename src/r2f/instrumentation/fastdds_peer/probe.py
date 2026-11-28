@@ -80,6 +80,12 @@ def validate_manifest(path, expected_sha256):
             raise ProbeError('binary_hash_mismatch:' + role)
         if not binary_path.is_relative_to(Path(manifest['install']).resolve()):
             raise ProbeError('binary_outside_isolated_install:' + role)
+    if 'local_api' in manifest:
+        from .local_api import validate_extension
+        try:
+            validate_extension(manifest)
+        except (ValueError, OSError, TypeError, KeyError) as exc:
+            raise ProbeError('local_api_extension_invalid:' + str(exc)) from exc
     return manifest
 
 

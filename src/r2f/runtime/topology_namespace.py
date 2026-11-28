@@ -163,6 +163,17 @@ class _ChildContext:
             binding = {**{k: handle[k] for k in _WORKER_KEYS}, 'namespaces': actual['namespaces'],
                        'outer_pid': None, 'host_pid': None,
                        'mapping_status': 'nested_kernel_bound; ancestor mapping unobserved unless independently sampled'}
+            if 'group_id' in handle:
+                from .participant_groups import LINK_KEYS
+                process_config = handle['process'].config
+                if any(handle.get(k) != process_config.get(k) for k in LINK_KEYS):
+                    raise boundary.BoundaryError('topology_namespace_group_identity_mismatch')
+                observed = [e for e in handle['process'].events if e.get('event') == 'group_context_created'
+                            and all(e.get(k) == handle[k] for k in LINK_KEYS)]
+                if len(observed) != 1 or observed[0].get('process_start_ticks') != actual['start_ticks']:
+                    raise boundary.BoundaryError('topology_namespace_group_context_not_observed')
+                binding.update({k: handle[k] for k in LINK_KEYS})
+                binding['lineage_schema'] = 'r2f.ros-participant-group-lineage/v1'
             row = emit('topology_namespace_worker_bound', binding=binding, execution_evidence=True)
             binding['raw_event_ref'] = row['event_index']
             self.worker_bindings.append(binding)

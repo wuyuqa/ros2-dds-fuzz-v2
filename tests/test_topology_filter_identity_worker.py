@@ -172,6 +172,7 @@ def test_snapshot_request_uses_authenticated_metadata_not_creation():
     from io import BytesIO
     from r2f.runtime.topology_worker import _EndpointProcess
     process = object.__new__(_EndpointProcess)
+    process.config = {}
     process.process = SimpleNamespace(poll=lambda: None, stdin=BytesIO())
     process.command_serial, process.role = 0, "reader"
     process.events = [{"event": "endpoint_created", "endpoint_gid": A}]

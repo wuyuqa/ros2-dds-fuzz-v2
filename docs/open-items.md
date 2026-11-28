@@ -1,3 +1,5 @@
+> **当前导航（2026-11-23）**：先读 [S1 接续入口](s1-current.md)。本页保留原规格/工程决定/历史截面；下文“当前”、旧 source、owner、GO 和待批准边界均按其记录日期解释。用户确认的 #6 完整 S1 规格覆盖旧 MAIN-only／公共 API 正常互操作执行限制，不能据此缩小范围；历史通过不迁移到新 source。修改前全文及 dirty 内容见 [逐字节归档](history/issue26-before-2026-11-23/INDEX.md)。
+
 # 待核实事项与证据更新
 
 当前逐项验收入口（2026-11-15）：见[c884437完整验收表](s1-final-acceptance-2026-11-15.md)。HEAD `c884437be86c2082d449bafade8185c132138955` / behavior `ceaee506bc189a6de9764bbcdd64c6c6753ed782a92c550e40d86b98b6e39205`：统一provider/carrier/fact/oracle已真实接线；新formal四seal、72required pass+24negative预期fail、unknown0/192worker rc0；新F07健康与受控失败、Phase2→4真实zero分支已执行。QoS72原辅助rc1/71of72保留，main已按独立旁证接受72既有观察链。seconds-edge三配置另有分层72格/144不同worker实证：首24原rc1保留并获独立合同旁证，后48新执行及独审通过，不称原首attempt整体通过。自然/instrumentation/confirmed仍0，非空生命周期及2–3自然候选目标未达，不标完整S1/goalcomplete，不进入S2。147及更早source均为历史，seal不迁移；主agent公共API执行边界不是原任务书原话。

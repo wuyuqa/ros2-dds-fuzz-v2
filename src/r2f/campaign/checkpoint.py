@@ -302,7 +302,9 @@ def _validate_state(state, identity, seeds, registry):
     if (budget.get("unique_inputs", 0) > budget["generated"] or
             budget.get("unique_actual", 0) > actual):
         raise ValueError("checkpoint unique/generated/actual budget mismatch")
-    if len(feedback.events) != budget["attempted"] or sum(e["executed"] for e in feedback.events) != actual:
+    # Explicit owner releases share canonical feedback but are never attempts.
+    attempt_events = [e for e in feedback.events if "recipe_policy_release" not in e]
+    if len(attempt_events) != budget["attempted"] or sum(e["executed"] for e in attempt_events) != actual:
         raise ValueError("checkpoint feedback/attempt/actual counts mismatch")
     if not set(continuation.get("seen_actual_hashes", [])) <= set(continuation.get("seen_input_hashes", [])):
         raise ValueError("checkpoint actual hashes are not generated inputs")

@@ -27,6 +27,7 @@ import time
 from r2f.modules.s1 import topology_model as model
 
 from .domains import IsolationError
+from .topology_message_types import SUPPORTED_MESSAGE_TYPES
 from .endpoint_incarnation import endpoint_identity_at, validate_filter_identity_update
 from .topology_environment_observation import TopologyEnvironmentObservation
 
@@ -84,7 +85,7 @@ def build_input_receipts(program, config, *, mutation_receipts=None):
             "errors": [],
         }
         try:
-            prepared = endpoint_expressibility(spec, config)
+            prepared = endpoint_expressibility(spec, dict(config, topology_program=program))
             row["binding_status"] = "expressible"
             row["binding"] = prepared["binding"]
         except TopologyUnsupported as exc:
@@ -96,6 +97,8 @@ def build_input_receipts(program, config, *, mutation_receipts=None):
                    "publish_timeout_sec", "snapshot_timeout_sec")
     return {
         "schema": INPUT_SCHEMA,
+        **({"participant_control": deepcopy(program["participant_control"])}
+           if "participant_control" in program else {}),
         "program_sha256": sha256_json(program),
         "validation_status": validation.get("status"),
         "guard_disposition": validation.get("guard_disposition"),
@@ -202,20 +205,39 @@ def _direct_peer_membership(token, peer, snapshot, events, *, before_index=None)
                             before_index=request["event_index"]))
             except ValueError as exc:
                 return None, "per_peer_incarnation_invalid:" + str(exc)
-    for field in ("logical_id", "endpoint_gid", "endpoint_generation", "pid"):
+    for field in ("logical_id", "endpoint_gid", "endpoint_generation"):
         values = [row.get(field) for row in live]
         if None in values or len(set(values)) != len(values):
             return None, "per_peer_live_identity_alias:" + field
+    pids = [row.get("pid") for row in live]
+    shared_process = len(set(pids)) != len(pids)
+    if None in pids:
+        return None, "per_peer_live_identity_alias:pid"
+    if shared_process:
+        from .participant_groups import _validate_shared_process
+        for pid in set(pids):
+            shared = [row for row in live if row["pid"] == pid]
+            if len(shared) < 2:
+                continue
+            try:
+                _validate_shared_process(shared, events, request_index=request["event_index"],
+                                        before_index=chain[-1]["event_index"] + 1)
+            except (ValueError, TypeError, KeyError, IndexError) as exc:
+                return None, "per_peer_live_identity_alias:pid:" + str(exc)
     opposite = "reader" if worker_role_kind(token.get("role")) == "writer" else "writer"
     inventory = [e for e in live if worker_role_kind(e.get("role")) == opposite
                  and e.get("topic") == token.get("topic")]
     known = {e.get("endpoint_gid") for e in inventory}
     for queried, role in ((token, worker_role_kind(token.get("role"))), (peer, opposite)):
         bound = [e for e in live if e.get("logical_id") == queried.get("logical_id")]
+        identity_keys = ("generation", "endpoint_gid", "endpoint_generation", "pid",
+                         "process_start_ticks", "topic", "message_type")
+        if shared_process:
+            from .participant_groups import LINK_KEYS
+            identity_keys += ("pgid",) + LINK_KEYS
         if (len(bound) != 1 or worker_role_kind(bound[0].get("role")) != role
                 or any(queried.get(key) is None or bound[0].get(key) != queried[key]
-                       for key in ("generation", "endpoint_gid", "endpoint_generation", "pid",
-                                   "process_start_ticks", "topic", "message_type"))):
+                       for key in identity_keys)):
             return None, "per_peer_query_identity_not_current_raw_generation"
     if (not set(gids) <= known
             or (peer.get("topic") == token.get("topic") and peer.get("endpoint_gid") not in known)):
@@ -383,10 +405,25 @@ def _occurrence_pair_with_control(pair, receive, events):
     if len(writers) != 1:
         return pair
     writer = writers[0]
+    # Repeat-data callers have no receive boundary and retain their original
+    # whole-capture control contract.
+    receive_index = receive.get("event_index") if receive is not None else None
+    receive_ns = receive.get("monotonic_ns") if receive is not None else None
+    if receive is not None and (type(receive_index) is not int or type(receive_ns) is not int):
+        return pair
+
+    def strictly_after_sample(row, boundary):
+        return (boundary is not None
+                and type(row.get("event_index")) is int and row["event_index"] > boundary["event_index"]
+                and type(row.get("monotonic_ns")) is int and row["monotonic_ns"] > boundary["monotonic_ns"])
+
     controls = []
     for created in events:
         if (created.get("event") != "endpoint_created"
                 or worker_role_kind(created.get("role")) != "reader"
+                or receive is not None and (
+                    type(created.get("event_index")) is not int or created["event_index"] >= receive_index
+                    or type(created.get("monotonic_ns")) is not int or created["monotonic_ns"] > receive_ns)
                 or "initial_content_filter" not in created
                 or created["initial_content_filter"] is not None
                 or any(writer.get(k) is None or created.get(k) != writer[k]
@@ -394,17 +431,46 @@ def _occurrence_pair_with_control(pair, receive, events):
             continue
         same = lambda row: (row.get("logical_id") == created.get("logical_id")
                             and row.get("generation") == created.get("generation"))
+        # A later retirement/update cannot erase a historical unfiltered
+        # reader. Both raw order and clock must prove it happened later; an
+        # inconsistent or missing timestamp still prevents control selection.
         if any(same(row) and row.get("event") in {
                 "content_filter_dynamic_update", "endpoint_identity_transition",
                 "endpoint_destroyed", "topology_endpoint_destroyed"}
-               for row in events):
+               and not strictly_after_sample(row, receive) for row in events):
             continue
         controls.append(created)
+    if receive is not None:
+        # An explicitly unfiltered receiver can authenticate its own sample;
+        # this is one receive, not an independent filtering control. Other
+        # unfiltered readers do not make that identity ambiguous. Filtered
+        # targets and receive-free callers still need a unique external control.
+        self_controls = [created for created in controls
+                         if created.get("logical_id") == pair.get("reader") == receive.get("logical_id")
+                         and created.get("generation") == pair.get("reader_generation") == receive.get("generation")]
+        if len(self_controls) == 1:
+            controls = self_controls
     if len(controls) != 1:
         return pair
     control = controls[0]
-    return {**pair, "control": control["logical_id"],
-            "control_generation": control["generation"], "control_gid": control["endpoint_gid"]}
+    selected = {**pair, "control": control["logical_id"],
+                "control_generation": control["generation"], "control_gid": control["endpoint_gid"]}
+    changes = [row for row in events
+               if row.get("logical_id") == control.get("logical_id")
+               and row.get("generation") == control.get("generation")
+               and row.get("event") in {"content_filter_dynamic_update", "endpoint_identity_transition",
+                                        "endpoint_destroyed", "topology_endpoint_destroyed"}]
+    if receive is not None and changes:
+        # Only the full native verifier can identify the actual control sample.
+        # A change after the target but before that sample disqualifies control.
+        from .publish_occurrence import publish_occurrence_witness
+        witness, _ = publish_occurrence_witness(selected, receive, events)
+        if witness is not None and any(
+                not strictly_after_sample(row, events[witness["control_ref"]]) for row in changes):
+            return pair
+        # If authentication failed, let the caller retain the strict failure;
+        # never substitute a different sample or a weaker attribution path.
+    return selected
 
 
 def payload_delivery_witness(pair, receive, events):
@@ -513,7 +579,7 @@ def _single_writer_correlation(pair, events, active_writers_on_topic, sequence):
       one send of this writer generation.
     """
     if type(active_writers_on_topic) is not int or active_writers_on_topic != 1:
-        # A missing value must never be coerced to "only one writer".
+        # The caller's explicit inventory remains necessary, never sufficient.
         return False, "active_writer_inventory_not_exactly_one"
     writer_id = pair.get("writer")
     writer_generation = pair.get("writer_generation")
@@ -540,13 +606,52 @@ def _single_writer_correlation(pair, events, active_writers_on_topic, sequence):
     send_ns = sends[0]["monotonic_ns"]
     if send_ns < created:
         return False, "send_precedes_reader_creation"
-    raw_count, raw_reason = _raw_active_writer_inventory(events, writer_id, send_ns)
-    if raw_count is not None and raw_count != 1:
-        return False, "raw_writer_inventory_contradicts_single_writer"
-    return True, (raw_reason if raw_count is None else None)
+    # Reconstruct the send's prefix, never the final snapshot's writer count.
+    # Excluding the send itself also preserves source order for equal clocks.
+    prefix = events[:events.index(sends[0])]
+    raw_count, raw_reason = _raw_active_writer_inventory(prefix, writer_id, send_ns)
+    if any(e.get("event") == "endpoint_created" for e in prefix):
+        if raw_count is None:
+            return False, raw_reason
+        if raw_count != 1:
+            return False, "raw_writer_inventory_contradicts_single_writer"
+        return True, None
+    # Retain the diagnostic legacy format without raw lifecycle observations.
+    if type(active_writers_on_topic) is not int or active_writers_on_topic != 1:
+        return False, "active_writer_inventory_not_exactly_one"
+    return True, raw_reason
 
 
-def pair_delivery_fact(pair, events, *, active_writers_on_topic=None, real_ros=False):
+def _delivery_lifetimes(events):
+    """Index physical lifetimes once for a captured source prefix."""
+    lifetimes = {}
+    for index, event in enumerate(events):
+        key = (event.get("logical_id"), event.get("generation"))
+        if event.get("event") == "endpoint_created":
+            lifetimes[key] = {"start": index, "created": event, "end": None, "retired": None}
+        elif event.get("event") in {"endpoint_destroyed", "topology_endpoint_destroyed"} and key in lifetimes:
+            life = lifetimes[key]
+            if life["end"] is None:
+                life.update(end=index, retired=event)
+    return lifetimes
+
+
+def _in_delivery_lifetime(event, index, life):
+    if life is None:
+        return True  # Legacy diagnostic rows may lack a raw lifecycle inventory.
+    if index <= life["start"] or life["end"] is not None and index >= life["end"]:
+        return False
+    clock = event.get("monotonic_ns")
+    if type(clock) is int:
+        start = life["created"].get("monotonic_ns")
+        end = (life["retired"] or {}).get("monotonic_ns")
+        if type(start) is int and clock < start or type(end) is int and clock > end:
+            return False
+    return True
+
+
+def pair_delivery_fact(pair, events, *, active_writers_on_topic=None, real_ros=False,
+                       _lifetimes=None):
     """Attribute deliveries per writer generation; never fill from a total count."""
     writer_gid = pair.get("writer_gid")
     reader_gid = pair.get("reader_gid")
@@ -556,18 +661,28 @@ def pair_delivery_fact(pair, events, *, active_writers_on_topic=None, real_ros=F
     # Volatile history is not replayed to a later generation, so pre-creation
     # sequences must not be reported as "missing" for that pair.
     reader_created = pair.get("reader_created_monotonic_ns")
-    sends = [e for e in events if e.get("event") == "send"
+    lifetimes = _delivery_lifetimes(events) if _lifetimes is None else _lifetimes
+    writer_life = lifetimes.get((writer_id, pair.get("writer_generation")))
+    reader_life = lifetimes.get((reader_id, pair.get("reader_generation")))
+    sends = [e for index, e in enumerate(events) if e.get("event") == "send"
              and e.get("logical_id") == writer_id
              and e.get("generation") == pair.get("writer_generation")
-             and (reader_created is None
+             and e.get("writer_gid") in (None, writer_gid)
+             and _in_delivery_lifetime(e, index, writer_life)
+             and _in_delivery_lifetime(e, index, reader_life)
+             and (reader_life is not None or reader_created is None
                   or (isinstance(e.get("monotonic_ns"), int)
                       and e["monotonic_ns"] >= reader_created))]
     expected = [e.get("send_sequence") for e in sends]
     direct, correlated, single, unknown = [], [], [], []
     payload_witnesses, attribution_reasons, single_limitations = [], [], []
     effective_sequences = {}
-    for event in events:
+    for event_index, event in enumerate(events):
         if event.get("event") != "receive":
+            continue
+        # A valid receipt can arrive after writer retirement. Only the reader
+        # lifetime bounds receiving; the send obligation was fenced separately.
+        if not _in_delivery_lifetime(event, event_index, reader_life):
             continue
         if event.get("logical_id") != reader_id:
             continue
@@ -1961,11 +2076,12 @@ def _delivery_rows(pairs, events, handles, *, real_ros=False):
     for handle in handles.values():
         if handle.get("alive") and handle.get("role") == "writer":
             active_by_topic[handle.get("topic")] = active_by_topic.get(handle.get("topic"), 0) + 1
+    lifetimes = _delivery_lifetimes(events)
     for pair in pairs:
         rows.append(pair_delivery_fact(
             pair, events,
             active_writers_on_topic=active_by_topic.get(pair.get("topic"), 0),
-            real_ros=real_ros))
+            real_ros=real_ros, _lifetimes=lifetimes))
     return rows
 
 
@@ -1977,6 +2093,12 @@ def topology_capabilities(backend=None):
         "ros_execution": real,
         "max_writers": 4, "max_readers": 4, "max_endpoints": 8,
         "variable_cardinality": True, "empty_roles": True,
+        "participant_identity_checks": {
+            "initialization_modes": ["fresh_process", "fork_before_participant"],
+            "unsupported_initialization": ["fork_after_participant"],
+            "rmw": "rmw_cyclonedds_cpp", "observation_mode": "blackbox",
+            "library_scope": "installed_verified_CycloneDDS_0.10.5",
+            "execution_evidence": False},
         "create_destroy_recreate": True,
         "fresh_endpoint_identity_per_generation": True,
         "per_pair_graph_facts": True,
@@ -1984,14 +2106,31 @@ def topology_capabilities(backend=None):
         "publish_batch_without_per_sample_ack": True,
         "bounded_barrier": True,
         "assert_liveliness_public_api": bool(getattr(backend, "supports_assert_liveliness", False)),
-        "supported_message_types": ["std_msgs/msg/String"],
+        "supported_message_types": list(SUPPORTED_MESSAGE_TYPES),
+        "message_type_scopes": {
+            "endpoint_process_blackbox": list(SUPPORTED_MESSAGE_TYPES),
+            "participant_control": ["std_msgs/msg/String"],
+            "instrumentation": ["std_msgs/msg/String"],
+            "content_filter": ["std_msgs/msg/String"],
+            "native_full_message_info_take": ["std_msgs/msg/String"],
+        },
         "supported_bypass_fields": {"content_filter": initial_content_filter_capability(),
-                                    "ownership_non_shared": False,
-                                    "partitions_non_default": False,
+                                    "ownership_non_shared": {
+                                        "carrier": "native_matching_qos", "rmw": "rmw_fastrtps_cpp",
+                                        "scope": "endpoint_process", "activation": "explicit_build_reference",
+                                        "adoption": "requires_native_readback", "execution_evidence": False},
+                                    "partitions_non_default": {
+                                        "carrier": "native_matching_qos", "rmw": "rmw_fastrtps_cpp",
+                                        "scope": "endpoint_process", "activation": "explicit_build_reference", "adoption": "requires_native_readback",
+                                        "execution_evidence": False},
                                     "durability_transient_or_later": False,
-                                    "history_keep_all": False,
+                                    "history_keep_all": True,
                                     "assert_liveliness_public_writer_api": bool(
                                         getattr(backend, "supports_assert_liveliness", False))},
+        "native_matching_control": {
+            "carrier": "native_dds_public_api_inside_ROS_worker", "vendors": ["fastdds", "cyclonedds"],
+            "activation": "explicit_source_bound_support_reference", "same_or_separate_participant": True,
+            "ros_qos_adoption": False, "fastdds_type_scope": "String_harness", "execution_evidence": False},
         "max_batch_interval_sec": MAX_INTERVAL_SEC,
         "max_publish_batch": 1024,
         "execution_evidence": real,
@@ -1999,12 +2138,56 @@ def topology_capabilities(backend=None):
     }
 
 
-def _execution_workers(events, raw_path):
+def group_termination_rows(program, events, raw_path, tokens, boundary, *, config=None):
+    """Audit group shutdown once, preserving actual process and endpoint rows.
+
+    This consumes a closed capture, not a lifecycle transition. Group processes
+    have no endpoint identity; each endpoint keeps its own cleanup receipt.
+    """
+    from .participant_groups import project_lineage
+    lineage = project_lineage(program, events, raw_path, config=config)
+    selected = {}
+    fields = ("logical_id", "generation", "endpoint_generation", "endpoint_gid",
+              "group_id", "worker_instance_id", "context_instance_id", "pid", "pgid", "process_start_ticks")
+    group_ids = set()
+    for token in tokens:
+        workers = [w for w in lineage["workers"] if all(w.get(k) == token.get(k) for k in fields)]
+        if len(workers) != 1:
+            raise ValueError("group_termination_endpoint_identity")
+        group_ids.add(workers[0]["group_id"])
+        if any(ref['event_index'] <= boundary['event_index'] for ref in workers[0]['cleanup_raw_refs']):
+            raise ValueError('group_termination_selected_endpoint_retired')
+    # Audit the entire lineage above; final closure excludes already retired siblings.
+    for worker in lineage["workers"]:
+        if worker["group_id"] not in group_ids:
+            continue
+        for ref in worker["cleanup_raw_refs"] + worker["exit_raw_refs"]:
+            if ref['event_index'] <= boundary['event_index']:
+                continue  # Historical endpoint closure was authenticated by project_lineage.
+            selected[ref["event_index"]] = events[ref["event_index"]]
+    for context in lineage["contexts"]:
+        if context["group_id"] in group_ids:
+            ref = context["shutdown_raw_ref"]
+            selected[ref["event_index"]] = events[ref["event_index"]]
+    rows = [selected[i] for i in sorted(selected)]
+    previous = boundary
+    for row in rows:
+        if (row["event_index"] <= previous["event_index"]
+                or row["monotonic_ns"] < previous["monotonic_ns"]):
+            raise ValueError("group_termination_after_boundary_chronology")
+        previous = row
+    return rows
+
+
+def _execution_workers(events, raw_path, program=None, *, config=None):
     """Project all captured endpoint generations; never fill actuals from cfg.
 
     Raw refs are offsets into the enclosing result's SHA-bound raw file. No
     self-referential raw hash is embedded in that file's metadata event.
     """
+    from .participant_groups import enabled, lineage_metadata
+    if enabled(program):
+        return lineage_metadata(program, events, raw_path, config=config)['workers']
     def ref(event):
         return {"raw_path": str(raw_path), "event_index": event["event_index"]}
 
@@ -2291,7 +2474,19 @@ def run_topology(program, config, output_dir, *, backend=None):
     except (ValueError, TypeError) as exc:
         result["reason"] = "blocked:input_mutation_failed:" + type(exc).__name__ + ":" + str(exc)
         return result
+    from .participant_identity import validate_identity_checks
+    try:
+        validate_identity_checks(effective_program, cfg)
+    except (ValueError, TypeError) as exc:
+        result['reason'] = 'blocked:identity_checks_scope:' + str(exc)
+        return result
     validation = model.validate_program(effective_program)
+    from .participant_groups import validate_control
+    try:
+        validate_control(effective_program, cfg)
+    except (ValueError, TypeError, KeyError) as exc:
+        result['reason'] = 'blocked:participant_control_scope:' + str(exc)
+        return result
     try:
         result["input_receipts"] = build_input_receipts(
             effective_program, cfg, mutation_receipts=mutation_receipts)
@@ -2454,7 +2649,7 @@ def run_topology(program, config, output_dir, *, backend=None):
         handles = {eid: st["handle"] for eid, st in state.items()
                    if st["alive"] and st["handle"] is not None
                    and (endpoint_ids is None or eid in endpoint_ids)}
-        if not handles:
+        if not handles and "participant_control" not in effective_program:
             # Zero-endpoint programs are a supported boundary case; an empty
             # fresh snapshot is complete, not an observation failure.
             return {"snapshots": {}, "command_id": None, "complete": True}
@@ -2620,6 +2815,8 @@ def run_topology(program, config, output_dir, *, backend=None):
             "snapshot_command_id": snapshot.get("command_id"),
             "label": label,
             "snapshots": deepcopy(snapshot.get("snapshots", {})),
+            **({"group_observations": deepcopy(snapshot["group_observations"])}
+               if "group_observations" in snapshot else {}),
             "complete": snapshot.get("complete") is True,
             "real_ros": bool(backend.real_ros),
             "execution_evidence": bool(backend.real_ros),
@@ -2628,8 +2825,10 @@ def run_topology(program, config, output_dir, *, backend=None):
         result["observation_receipts"].append(receipt)
         live = {eid: st["handle"] for eid, st in state.items() if st["alive"]}
         pairs = _pair_rows(live, snapshot, events, real_ros=bool(backend.real_ros))
-        delivery = _delivery_rows(pairs, events, live, real_ros=bool(backend.real_ros))
         _upsert(result["pair_facts"], pairs, _PAIR_KEY)
+        # Refresh every retained generation, including previously complete rows.
+        # Each fact consumes this prefix and its own physical lifetime bounds.
+        delivery = _delivery_rows(result["pair_facts"], events, live, real_ros=bool(backend.real_ros))
         _upsert(result["delivery_facts"], delivery, _PAIR_KEY)
         netem_counter_snapshot(receipt["step_id"], "action_window")
         emit("topology_pair_observation", step_id=receipt["step_id"],
@@ -2653,7 +2852,13 @@ def run_topology(program, config, output_dir, *, backend=None):
             for token in tokens:
                 lifecycle_refs.append(token["event_index"])
                 if token.get("generation") < st["generation"] or not st["alive"]:
-                    retired = [e for e in events if e.get("event") in {"endpoint_destroyed", "topology_endpoint_destroyed"}
+                    # Group controller receipts acknowledge the worker's same
+                    # cleanup; inventory the physical destruction only. Full
+                    # request/cleanup/ACK/controller binding is audited from raw.
+                    from .participant_groups import enabled as groups_enabled
+                    kinds = ({"endpoint_destroyed"} if groups_enabled(effective_program)
+                             else {"endpoint_destroyed", "topology_endpoint_destroyed"})
+                    retired = [e for e in events if e.get("event") in kinds
                                and all(e.get(k) == token.get(k) for k in
                                        ("logical_id", "generation", "pid", "process_start_ticks", "endpoint_generation"))
                                and e.get("cleanup_status") == "closed" and e["event_index"] > token["event_index"]]
@@ -3301,6 +3506,53 @@ def run_topology(program, config, output_dir, *, backend=None):
                                       "cross_writer_order_required": False,
                               })
                     return
+                if op == "native_matching_control":
+                    st = state[eid]
+                    if not (st["alive"] and st["generation"] == gen):
+                        record_guard(action, "native_control_target_alive_guard", "native control requires live harness", before=before)
+                        return
+                    value = backend.native_matching_control(st["handle"], params["control"])
+                    emit("native_matching_observation", action_id=aid, logical_id=eid,
+                         generation=gen, endpoint_gid=st["handle"]["endpoint_gid"],
+                         control_receipt=deepcopy(value), fixture=not backend.real_ros, candidate_eligible=False)
+                    result["observation_receipts"].append({"action_id": aid, "kind": "native_matching_control", "receipt": deepcopy(value)})
+                    observed = value.get("status") in ("observed", "unsupported") and value.get("cleanup_confirmed") is True
+                    record_action(action, before, before, disposition="effect_observed" if observed else "unknown",
+                                  satisfied=observed, effect_scope="native_DDS_control_not_RCL_QoS_adoption",
+                                  requires=[{"id": "runtime_native_matching_control", "status": "satisfied" if observed else "unknown"}])
+                    if not observed:
+                        result["unknowns"].append({"action_id": aid, "reason": value.get("reason", "native_control_incomplete")})
+                    return
+                if op == "lookup_topic":
+                    st = state[eid]
+                    if not (st["alive"] and st["generation"] == gen):
+                        record_guard(action, "lookup_target_alive_guard",
+                                     "lookup requires a live current generation", before=before)
+                        return
+                    value = backend.lookup_topic(st["handle"], params["scope"], params["name"],
+                        **({"native_type_support": params["native_type_support"]}
+                           if "native_type_support" in params else {}))
+                    emit("topic_lookup_observation", action_id=aid, logical_id=eid,
+                         generation=gen, endpoint_gid=st["handle"]["endpoint_gid"],
+                         lookup_receipt=deepcopy(value), fixture=not backend.real_ros,
+                         candidate_eligible=False)
+                    result["observation_receipts"].append({
+                        "action_id": aid, "kind": "typed_topic_lookup", "receipt": deepcopy(value)})
+                    observed = (value.get("complete") is True
+                                and (value.get("status") in ("found", "not_found")
+                                     or backend.real_ros and value.get("execution_evidence") is True
+                                     and value.get("cleanup_confirmed") is True
+                                     and value.get("status") == "contract_mismatch"))
+                    record_action(action, before, {**before, "lookup": value},
+                                  disposition="effect_observed" if observed else "unknown",
+                                  satisfied=observed,
+                                  effect_scope="native_typed_topic_lookup_not_endpoint_matching",
+                                  requires=[{"id": "runtime_typed_topic_lookup",
+                                             "status": "satisfied" if observed else "unknown"}])
+                    if not observed:
+                        result["unknowns"].append({"action_id": aid,
+                                                   "reason": value.get("reason", "topic_lookup_incomplete")})
+                    return
                 if op == "snapshot":
                     if eid is not None and not (state[eid]["alive"] and state[eid]["generation"] == gen):
                         record_guard(action, "snapshot_target_alive_guard",
@@ -3421,6 +3673,27 @@ def run_topology(program, config, output_dir, *, backend=None):
                                                 if st["alive"]},
                                                real_ros=bool(backend.real_ros)),
                                 _PAIR_KEY)
+                    return
+                if op == "update_participant_userdata":
+                    st = state[eid]
+                    if not (st["alive"] and st["generation"] == gen and endpoint_specs[eid]["role"] == "writer"):
+                        record_guard(action, "writer_generation_alive_guard",
+                                     "participant refresh requires a live writer generation", before=before)
+                        return
+                    try:
+                        value = backend.refresh_participant(st["handle"], params["data"])
+                    except TopologyBackendError as exc:
+                        record_guard(action, "participant_refresh_error", str(exc), kind="tool", before=before)
+                        return
+                    emit("participant_refresh_observation", logical_id=eid, generation=gen,
+                         action_id=aid, refresh_receipt=value, candidate_eligible=False)
+                    complete = value.get("complete") is True and value.get("status") == "applied"
+                    record_action(action, before, {**before, "participant_refresh": value},
+                                  disposition="effect_observed" if complete else "unknown", satisfied=complete,
+                                  effect_scope="normal_public_participant_userdata_control_only",
+                                  requires=[{"id": "native_participant_refresh_receipt", "status": "satisfied" if complete else "unknown"}])
+                    if not complete:
+                        result["unknowns"].append({"action_id": aid, "reason": value.get("reason", "participant_refresh_incomplete")})
                     return
                 if op == "assert_liveliness":
                     st = state[eid]
@@ -3765,14 +4038,18 @@ def run_topology(program, config, output_dir, *, backend=None):
                 validator = _delivery_recreated_no_sends_basis if regenerated else _delivery_no_sends_basis
                 basis = validator(writer, reader, effective_program, events, chains)
                 valid = cleanup_complete and basis is not None and all(claim.get(k) == v for k, v in basis.items())
-                for token in (writer, reader):
-                    exits = [e for e in events if e.get("event") == "topology_worker_exit"
-                             and e.get("logical_id") == token["logical_id"]
-                             and (not regenerated or e.get("generation") == token["generation"])]
-                    valid = valid and len(exits) == 1 and exits[0].get("returncode") == 0 and all(
-                        exits[0].get(k) == token[k] for k in
-                        ("generation", "endpoint_gid", "pid", "process_start_ticks", "endpoint_generation"))
-                    valid = valid and exits[0]["event_index"] > claim["event_index"]
+                from .participant_groups import enabled as group_control_enabled
+                if group_control_enabled(effective_program):
+                    group_termination_rows(effective_program, events, raw_path, (writer, reader), claim, config=cfg)
+                else:
+                    for token in (writer, reader):
+                        exits = [e for e in events if e.get("event") == "topology_worker_exit"
+                                 and e.get("logical_id") == token["logical_id"]
+                                 and (not regenerated or e.get("generation") == token["generation"])]
+                        valid = valid and len(exits) == 1 and exits[0].get("returncode") == 0 and all(
+                            exits[0].get(k) == token[k] for k in
+                            ("generation", "endpoint_gid", "pid", "process_start_ticks", "endpoint_generation"))
+                        valid = valid and exits[0]["event_index"] > claim["event_index"]
             except (KeyError, IndexError, TypeError, ValueError):
                 valid = False
             if not valid:
@@ -3799,12 +4076,19 @@ def run_topology(program, config, output_dir, *, backend=None):
             "program_sha256": result["input_receipts"]["program_sha256"] if result["input_receipts"] else None,
             "processes_started": len(getattr(backend, "processes", []) or []),
         }
-        workers = _execution_workers(events, raw_path)
+        workers = _execution_workers(events, raw_path, effective_program, config=cfg)
+        from .participant_groups import enabled, lineage_metadata
+        group_lineage = (lineage_metadata(effective_program, events, raw_path, config=cfg)
+                         if enabled(effective_program) else None)
+        if group_lineage is not None:
+            result['observation_receipts'].extend(deepcopy(group_lineage['observations']))
         actual_workers = [w for w in workers if w["real_ros"]]
         actual_rmws = {w["rmw_identifier"] for w in actual_workers if w["rmw_identifier"] is not None}
         actual_domains = {w["domain_id"] for w in actual_workers if w["domain_id"] is not None}
         result["execution_metadata"] = {
-            "schema": "r2f.topology-execution-metadata/v1",
+            "schema": ("r2f.topology-execution-metadata/v2" if group_lineage is not None
+                       else "r2f.topology-execution-metadata/v1"),
+            **({'participant_groups': group_lineage} if group_lineage is not None else {}),
             "backend": backend.backend_name,
             "real_ros": bool(result["real_execution"]),
             "source_identity": deepcopy(result["environment"].get("source")) if backend.real_ros else None,
@@ -3816,6 +4100,10 @@ def run_topology(program, config, output_dir, *, backend=None):
             "actual_rmws": sorted(actual_rmws), "actual_domains": sorted(actual_domains),
             "observation_mode": cfg.get("observation_mode", "blackbox"),
             "fastdds_peer_instrumentation": deepcopy(cfg.get("fastdds_peer_instrumentation")),
+            **({"observe_native_peers": cfg["observe_native_peers"]}
+               if "observe_native_peers" in cfg else {}),
+            **({"native_matching_qos": deepcopy(cfg["native_matching_qos"])}
+               if "native_matching_qos" in cfg else {}),
             "workers": workers,
             "target_id": cfg.get("target_id"), "target_revision": cfg.get("target_revision"),
             "arm": cfg.get("arm"), "repeat": cfg.get("repeat"),
@@ -3842,7 +4130,7 @@ def run_topology(program, config, output_dir, *, backend=None):
             raw.flush()
             provisional = {"raw_path": str(raw_path),
                            "raw_sha256": hashlib.sha256(raw_path.read_bytes()).hexdigest()}
-            application = audit_topology_application(cfg["mutation_plan"], cfg["input_layer_receipts"], provisional)
+            application = audit_topology_application(cfg["mutation_plan"], cfg["input_layer_receipts"], provisional, config=cfg)
             result["mutation_receipt"] = application["mutation_receipt"]
             emit("topology_application_audited", status=application["status"],
                  layers=[{"op_id": r["op_id"], "status": r["status"], "reasons": r["reasons"]}

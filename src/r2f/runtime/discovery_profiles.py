@@ -23,12 +23,30 @@ FAST_XML = '''<?xml version="1.0" encoding="UTF-8"?>
 '''
 
 
-def write_profiles(output_dir, rmw):
+def validate_discovery_layers(value, rmw):
+    if value != 'participant_topic_v1':
+        raise ValueError('unsupported_projection_discovery_layers')
+    if rmw != 'rmw_cyclonedds_cpp':
+        raise ValueError('unsupported_projection_discovery_layers_rmw')
+
+
+def cyclone_profile(discovery_layers=None):
+    if discovery_layers is None:
+        return CYCLONE_XML
+    validate_discovery_layers(discovery_layers, 'rmw_cyclonedds_cpp')
+    return CYCLONE_XML.replace('<Discovery>',
+        '<Discovery><EnableTopicDiscoveryEndpoints>true</EnableTopicDiscoveryEndpoints>')
+
+
+def write_profiles(output_dir, rmw, *, discovery_layers=None):
+    if discovery_layers is not None:
+        validate_discovery_layers(discovery_layers, rmw)
     root = Path(output_dir) / 'profiles'
     root.mkdir()
     records, environments = {}, {}
-    for index, role in enumerate(('writer', 'reader')):
-        text = CYCLONE_XML if rmw == 'rmw_cyclonedds_cpp' else FAST_XML.format(role=role, index=index)
+    roles = ('writer', 'reader', 'builtin_observer') if discovery_layers else ('writer', 'reader')
+    for index, role in enumerate(roles):
+        text = cyclone_profile(discovery_layers) if rmw == 'rmw_cyclonedds_cpp' else FAST_XML.format(role=role, index=index)
         path = root / (role + '.xml')
         with path.open('x') as handle:
             handle.write(text)

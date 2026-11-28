@@ -7,7 +7,11 @@ from __future__ import annotations
 import hashlib
 import struct
 
-BUILTIN_WRITERS = {'000100c2': 'SPDP', '000003c2': 'SEDP', '000004c2': 'SEDP'}
+# OMG DDSI-RTPS 2.5, section 9.3.1.3, Table 9.2; also installed CycloneDDS
+# dds/ddsi/q_rtps.h NN_ENTITYID_SEDP_BUILTIN_TOPIC_{WRITER,READER} (0x2c2/0x2c7).
+# DCPSTopic discovery is distinct from publication/subscription endpoint SEDP.
+BUILTIN_WRITERS = {'000100c2': 'SPDP', '000002c2': 'DCPSTopic',
+                   '000003c2': 'SEDP', '000004c2': 'SEDP'}
 
 
 def udp_frame(frame):

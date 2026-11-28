@@ -132,6 +132,7 @@ class _Projection:
         self.program, self.path, self.digest = program, path, digest
         self.events, self.receipt = events, receipt
         self.roles = logical_endpoints(program)
+        self.group_destroy_prefixes = {}
         self.declared = {eid: set() for eid in self.roles}
         for a in program["actions"]:
             if isinstance(a, dict) and a.get("op") in ("create", "recreate"):
@@ -218,6 +219,16 @@ class _Projection:
     def endpoints(self, side, boundary, lifecycle):
         facts, tokens = {}, {}
         prefix = self.prefix(boundary)
+        from r2f.runtime.participant_groups import enabled, closed_destroy_receipts
+        def same_destroy(event):
+            if not enabled(self.program):
+                return False
+            index = boundary["event_index"]
+            if index not in self.group_destroy_prefixes:
+                self.group_destroy_prefixes[index] = closed_destroy_receipts(
+                    self.program, self.events, before_index=index + 1)
+            return any(r["controller_ref"] == event["event_index"]
+                       for r in self.group_destroy_prefixes[index])
         for eid in self.roles:
             path = "/endpoints/" + _pointer(eid)
             history = [e for e in prefix if e.get("logical_id") == eid
@@ -256,6 +267,9 @@ class _Projection:
                         # at the boundary; this pass independently fences lifecycle.
                         old_gids.add(_gid(event.get("after_gid")))
                     else:
+                        if (not alive and current is not None and event.get("generation") == generation
+                                and same_destroy(event)):
+                            continue  # Controller receipt for the already verified worker cleanup.
                         if current is None or not alive:
                             raise ValueError("retirement_without_current_generation")
                         current = endpoint_identity_at(self.events, current,
@@ -434,10 +448,30 @@ class _Projection:
                 active = {eid: endpoint_identity_at(self.events, origin,
                               before_index=chain[0]["event_index"])
                           for eid, origin in active.items()}
-                for key in ("endpoint_gid", "endpoint_generation", "pid"):
+                for key in ("endpoint_gid", "endpoint_generation"):
                     values = [event.get(key) for event in active.values()]
                     if None in values or len(set(values)) != len(values):
                         raise ValueError("direct_peer_scope_identity_alias_or_missing:" + key)
+                pids = [event.get("pid") for event in active.values()]
+                if None in pids:
+                    raise ValueError("direct_peer_scope_identity_alias_or_missing:pid")
+                shared_process = len(set(pids)) != len(pids)
+                if shared_process:
+                    from r2f.runtime.participant_groups import (
+                        LINK_KEYS, _validate_shared_process, validate_control,
+                    )
+                    # Native membership is already qualified above; sharing a
+                    # PID separately requires the same bounded group lineage.
+                    if validate_control(self.program) is None:
+                        raise ValueError("direct_peer_scope_identity_alias_or_missing:pid")
+                    # Authenticate only the raw prefix through this snapshot ACK.
+                    # A later group binding or clean shutdown cannot repair it.
+                    for pid in set(pids):
+                        members = [e for e in active.values() if e['pid'] == pid]
+                        if len(members) > 1:
+                            _validate_shared_process(members, self.events,
+                                request_index=chain[0]["event_index"],
+                                before_index=chain[-1]["event_index"] + 1)
                 for name, role in (("publishers", "writer"), ("subscriptions", "reader")):
                     raw = [event for eid, event in active.items()
                            if self.roles.get(eid) == role and event.get("topic") == token["topic"]]
@@ -455,12 +489,15 @@ class _Projection:
                 opposite = "reader" if self.roles.get(token["logical_id"]) == "writer" else "writer"
                 known = {_gid(event["endpoint_gid"]) for eid, event in active.items()
                          if self.roles.get(eid) == opposite and event.get("topic") == token["topic"]}
+                identity_keys = ("generation", "endpoint_gid", "endpoint_generation", "pid",
+                                 "process_start_ticks", "topic", "message_type")
+                if shared_process:
+                    identity_keys += ("pgid",) + LINK_KEYS
                 for queried, role in ((token, self.roles.get(token["logical_id"])), (peer, opposite)):
                     bound = active.get(queried["logical_id"])
                     if (bound is None or re.fullmatch(role + r"[1-9]?", str(bound.get("role"))) is None
                             or any(queried.get(key) is None or bound.get(key) != queried[key]
-                                   for key in ("generation", "endpoint_gid", "endpoint_generation", "pid",
-                                               "process_start_ticks", "topic", "message_type"))):
+                                   for key in identity_keys)):
                         raise ValueError("direct_peer_query_identity_not_current_raw_generation")
                 if (not set(gids) <= known or (peer["topic"] == token["topic"]
                         and _gid(peer["endpoint_gid"]) not in known)):
@@ -483,8 +520,29 @@ class _Projection:
         return value, [w, r, *wc, *rc, *native_sources] + ([proof] if proof else []), proof
 
     def compatibility(self, w, r, wc, rc):
+        from r2f.runtime.matching_qos import pair_contract
+        native = pair_contract(w, r, wc[2], rc[2], {e["logical_id"]: e for e in self.program["endpoints"]})
+        annotations = []
+
+        def conclude(check):
+            if annotations:
+                check["graph_annotation_differences"] = deepcopy(annotations)
+            if native is not None:
+                values = (check["compatible"], native["compatible"])
+                check.update({key: value for key, value in native.items()
+                              if key not in ("compatible", "responsibility_layer")})
+                check.setdefault("responsibility_layer", native["responsibility_layer"])
+                check["compatible"] = False if False in values else None if None in values else True
+                # Optional matching metadata must not rewrite canonical state
+                # receipts of ordinary captures that never selected this carrier.
+                check.setdefault("responsibility_layer", "qos_requested_offered")
+                check.setdefault("s1_coverage_rows", ["C10", "C13", "C15"])
+            return ("compatible" if check["compatible"] is True else "incompatible"
+                    if check["compatible"] is False else "unknown"), check
+
         if w["topic"] != r["topic"]:
-            return "incompatible", {"reason": "observed_topic_mismatch", "actual_match": "not_evaluated"}
+            return conclude({"compatible": False, "reason": "observed_topic_mismatch",
+                             "responsibility_layer": "topic_matching", "actual_match": "not_evaluated"})
         contracts = {}
         for token, list_key in ((w, "publishers"), (r, "subscriptions")):
             rows = []
@@ -494,29 +552,52 @@ class _Projection:
                 if len(members) != 1:
                     raise ValueError("observed_endpoint_contract_missing_from_graph")
                 rows.append(members[0])
-            if rows[0] != rows[1]:
+            # ROS node annotations can be unknown on a remote non-default
+            # partition. Preserve them, but compare every actual contract field.
+            annotation_fields = {"node_name", "node_namespace"}
+            contracts_only = [{k: v for k, v in row.items() if k not in annotation_fields} for row in rows]
+            if contracts_only[0] != contracts_only[1]:
                 raise ValueError("observed_contract_sources_contradict")
+            differences = {key: [row.get(key) for row in rows] for key in sorted(annotation_fields)
+                           if rows[0].get(key) != rows[1].get(key)}
+            if differences:
+                annotations.append({"logical_id": token["logical_id"], "fields": differences,
+                                    "scope": "node_metadata_not_matching_policy"})
             row = rows[0]
-            if not _text(row.get("topic_type")) or not isinstance(row.get("qos"), dict):
+            if not _text(row.get("topic_type")):
                 raise ValueError("observed_contract_fields_missing")
+            if row["topic_type"] != token.get("message_type"):
+                raise ValueError("observed_endpoint_type_binding_mismatch")
+            contracts[token["logical_id"]] = row
+        writer, reader = contracts[w["logical_id"]], contracts[r["logical_id"]]
+        if writer["topic_type"] != reader["topic_type"]:
+            # A known type difference is independent of missing QoS. Retain
+            # the observed types; this contract does not infer actual match.
+            return conclude({
+                "compatible": False, "reason": "observed_type_mismatch", "actual_match": "not_evaluated",
+                "responsibility_layer": "type_matching", "s1_coverage_rows": ["C10", "C13", "C15"],
+                "writer_type": writer["topic_type"], "reader_type": reader["topic_type"],
+                "type_scope": "observed_ros_type_names_not_xtypes_assignability",
+                "qos": "not_evaluated_type_mismatch",
+            })
+        fields_by_endpoint = {}
+        for eid, row in contracts.items():
             fields = {}
+            raw_qos = row.get("qos")
+            if raw_qos is not None and not isinstance(raw_qos, dict):
+                raise ValueError("observed_contract_qos_not_mapping")
             for policy, key in (("reliability", "reliability"), ("durability", "durability"),
                                 ("liveliness.kind", "liveliness"), ("deadline", "deadline_ns"),
                                 ("liveliness.lease_duration", "liveliness_lease_duration_ns")):
-                value = row["qos"].get(key)
+                value = (raw_qos or {}).get(key)
                 if key.endswith("_ns"):
                     value = ({"infinite": True} if value == 9223372036854775807 else
                              {"nanoseconds": value} if _integer(value) else None)
                 if value is not None:
                     fields[policy] = {"status": "observed", "value": value}
-            contracts[token["logical_id"]] = fields, row["topic_type"]
-        wf, wt = contracts[w["logical_id"]]
-        rf, rt = contracts[r["logical_id"]]
-        check = check_offered_requested(wf, rf)
-        if w["topic"] != r["topic"] or wt != rt:
-            return "incompatible", check
-        return ("compatible" if check["compatible"] is True else "incompatible"
-                if check["compatible"] is False else "unknown"), check
+            fields_by_endpoint[eid] = fields
+        check = check_offered_requested(fields_by_endpoint[w["logical_id"]], fields_by_endpoint[r["logical_id"]])
+        return conclude(check)
 
     def pair_bound(self, event, w, r):
         if any(event.get(role) != t["logical_id"] or not _integer(event.get(role + "_generation"), 1)
@@ -532,6 +613,31 @@ class _Projection:
             if field in event:
                 if _gid(event[field]) != _gid(current["endpoint_gid"]):
                     raise ValueError("delivery_window_incarnation_mismatch:" + field)
+
+    def _group_termination(self, token, boundary):
+        """Consume the same closed group lineage as runtime and saved captures."""
+        from r2f.runtime.topology_pair import group_termination_rows
+        try:
+            return group_termination_rows(self.program, self.events, self.path, (token,), boundary)
+        except (ValueError, TypeError, KeyError, IndexError):
+            return None
+
+    def _termination_rows(self, token, boundary):
+        from r2f.runtime.participant_groups import enabled
+        if enabled(self.program):
+            proof = self._group_termination(token, boundary)
+            if proof is None:
+                raise ValueError("group_process_exit_or_endpoint_cleanup_unbound")
+            return list(proof)
+        exits = [e for e in self.events if e.get("event") == "topology_worker_exit"
+                 and e.get("logical_id") == token.get("logical_id")
+                 and e.get("generation") == token.get("generation")]
+        fields = ("generation", "endpoint_gid", "pid", "process_start_ticks", "endpoint_generation")
+        if (len(exits) != 1 or exits[0].get("returncode") != 0
+                or any(exits[0].get(k) != token.get(k) for k in fields)
+                or exits[0]["event_index"] <= boundary["event_index"]):
+            raise ValueError("no_sends_generation_end_not_identity_bound")
+        return [exits[0]]
 
     def no_sends(self, w, r, boundary):
         """Independently reconstruct the committed inventory, never trust a label.
@@ -579,6 +685,7 @@ class _Projection:
             raise ValueError("no_sends_action_inventory_mismatch")
         fields = ("logical_id", "generation", "endpoint_gid", "pid", "process_start_ticks", "endpoint_generation")
         chains = {}
+        terminations = []
         for token in (w, r):
             history = [e for e in prefix if e.get("logical_id") == token["logical_id"]
                        and e["event"] in {"endpoint_created", "endpoint_destroyed", "topology_endpoint_destroyed", "topology_generation_retired"}]
@@ -589,16 +696,15 @@ class _Projection:
             if any(any(row.get(k) != token[k] for k in fields if k != "endpoint_gid") for row in chain):
                 raise ValueError("no_sends_snapshot_identity_incomplete")
             self.chain_order([token, seal, *chain, claim, boundary])
-            exits = [e for e in self.events if e["event"] == "topology_worker_exit"
-                     and e.get("logical_id") == token["logical_id"]]
-            if (len(exits) != 1 or exits[0].get("returncode") != 0
-                    or any(exits[0].get(k) != token[k] for k in fields)
-                    or exits[0]["event_index"] <= boundary["event_index"]):
-                raise ValueError("no_sends_generation_end_not_identity_bound")
+            terminations.extend(self._termination_rows(token, boundary))
         ends = [e for e in self.events if e["event"] == "runtime_end"]
         if (len(ends) != 1 or ends[0].get("cleanup_complete") is not True
                 or ends[0].get("status") != "executed" or ends[0]["event_index"] <= boundary["event_index"]):
             raise ValueError("no_sends_complete_runtime_end_missing")
+        if ends[0] != self.events[-1]:
+            raise ValueError("no_sends_runtime_end_not_final")
+        for termination in terminations:
+            self.chain_order([boundary, termination, ends[0]])
         for e in self.events:
             if e["event"] in {"runtime_abort", "worker_error", "worker_command_error", "topology_backend_blocked"}:
                 raise ValueError("no_sends_raw_worker_or_runtime_error")
@@ -628,7 +734,9 @@ class _Projection:
         return "no_obligation", [w, r, seal, claim, *chains[w["logical_id"]], *chains[r["logical_id"]]], {
             "expected": [], "received": [], "missing": [], "applicability_kind": "not_applicable_no_sends",
             "no_sends_ref": self.ref(claim), "inventory_end_ref": self.ref(seal),
-            "inventory_sha256": digest, "generation_scope": expected["scope"]}
+            "inventory_sha256": digest, "generation_scope": expected["scope"],
+            "termination_refs": [self.ref(e) for _, e in sorted({e["event_index"]: e for e in terminations}.items())],
+            "termination_runtime_end_ref": self.ref(ends[0])}
 
     def _native_send_evidence(self, send, boundary):
         """Declared scopes must verify even when no reader received this send."""
@@ -748,12 +856,8 @@ class _Projection:
             if any(any(e.get(k) != token[k] for k in fields if k != "endpoint_gid") for e in chain):
                 raise ValueError("recreated_no_sends_snapshot_identity")
             self.chain_order([token,seal,*chain,claim,boundary])
-            exits = [e for e in self.events if e["event"] == "topology_worker_exit"
-                     and e.get("logical_id") == token["logical_id"] and e.get("generation") == token["generation"]]
-            if (len(exits) != 1 or exits[0].get("returncode") != 0 or any(exits[0].get(k) != token[k] for k in fields)):
-                raise ValueError("recreated_no_sends_cleanup_identity")
-            self.chain_order([boundary,exits[0]])
-            current_exits.append(exits[0])
+            exits = self._termination_rows(token, boundary)
+            current_exits.extend(exits)
         ends = [e for e in self.events if e["event"] == "runtime_end"]
         if len(ends) != 1 or ends[0].get("cleanup_complete") is not True or ends[0].get("status") != "executed":
             raise ValueError("recreated_no_sends_runtime_end")

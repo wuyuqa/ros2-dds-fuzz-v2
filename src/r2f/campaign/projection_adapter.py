@@ -354,6 +354,10 @@ def projection_graph_proof(events, config, observation, tokens):
     graph = observation['graph_snapshot']
     content = _json(graph['raw'])
     expected = {'source': 'ros_graph', 'captured_at_unix_ns': snapshots[roles[0]]['time_ns'], 'endpoints': []}
+    # These snapshots already passed command, chronology and worker binding.
+    if all(snapshots[role].get('timestamp_clock') == 'unix_ns_realtime'
+           and type(snapshots[role]['time_ns']) is int for role in roles):
+        expected['timestamp_clock'] = 'unix_ns_realtime'
     for key in ('publishers', 'subscriptions'):
         for item in snapshots[roles[0]][key]:
             gid = item['endpoint_gid']
@@ -424,8 +428,53 @@ def projection_facts(events, runtime, config):
         for key in ('capture_receipt','graph_snapshot','observation_window','field_policy'):
             if raw_observation.get(key) != observation.get(key):
                 raise ValueError('projection raw observation differs:'+key)
+        layers_enabled = 'projection_discovery_layers' in config
+        if layers_enabled:
+            from r2f.runtime.discovery_profiles import validate_discovery_layers
+            validate_discovery_layers(config['projection_discovery_layers'], config['rmw'])
+            if (not observation.get('discovery_layers')
+                    or raw_observation.get('discovery_layers') != observation['discovery_layers']):
+                raise ValueError('projection discovery layers raw observation differs')
+            started = _one(events, 'discovery_builtin_observer_started')
+            native = _json(observation['discovery_layers']['raw'])
+            admission = _one(events, 'namespace_host_admission_verified')
+            if not isinstance(native, dict) or not isinstance(native.get('admission'), dict):
+                raise ValueError('projection discovery layers admission object required')
+            if (native.get('admission', {}).get('raw_event_ref') != admission.get('raw_event_ref')
+                    or native.get('admission', {}).get('isolation') != admission.get('isolation')
+                    or started.get('admission_ref') != admission.get('raw_event_ref')
+                    or native.get('profile') != started.get('profile')
+                    or native.get('environment') != started.get('environment')):
+                raise ValueError('projection discovery layers admission/profile differs')
+            stopped = _one(events, 'discovery_builtin_observer_stopped')
+            if stopped.get('receipt') != observation['discovery_layers']:
+                raise ValueError('projection discovery layers stop receipt differs')
+            if (native.get('domain_id') != config['domain_id']
+                    or native.get('pid') != raw_observation.get('pid')
+                    or any(event.get('domain_id') != config['domain_id']
+                           or event.get('run_id') != config['run_id']
+                           or event.get('pid') != raw_observation.get('pid')
+                           for event in (native['admission'], admission, started, stopped, raw_observation))):
+                raise ValueError('projection discovery layers canonical admission/domain differs')
+        elif 'discovery_layers' in observation or 'discovery_layers' in raw_observation:
+            raise ValueError('projection discovery layers require submitted opt-in')
         tokens = _lifecycle(events,runtime,config,observation)
         roles = tuple(tokens)
+        if 'projection_sut_environment' in config:
+            from r2f.runtime.projection_sut import load_sut_environment, verify_sut_libraries
+            ref = config['projection_sut_environment']
+            sut = load_sut_environment(ref)
+            if runtime.get('environment', {}).get('sut_environment', {}).get('manifest') != ref:
+                raise ValueError('projection_sut_environment_receipt_mismatch')
+            for role, token in tokens.items():
+                receipt = _one(events, 'projection_sut_libraries_verified', role=role)
+                mapped = _json(receipt['libraries'])
+                if (receipt.get('manifest') != ref or receipt.get('worker_pid') != token['pid']
+                        or mapped.get('pid') != token['pid']
+                        or receipt.get('process_start_ticks') != token['process_start_ticks']
+                        or mapped.get('process_start_ticks') != token['process_start_ticks']):
+                    raise ValueError('projection_sut_worker_identity_mismatch')
+                verify_sut_libraries(sut, mapped['loaded_libraries'])
         facts.update(tokens)
         # The canonical ProjectionFacts contract compares one independent
         # writer/reader pair. Select that pair from the observed facts after
@@ -448,6 +497,26 @@ def projection_facts(events, runtime, config):
         kwargs = {'endpoint_bindings': canonical,
                   'observation_window': observation['observation_window'],
                   'field_policy': observation.get('field_policy')}
+        if layers_enabled:
+            kwargs['discovery_layers'] = observation['discovery_layers']
+            kwargs['discovery_endpoint_bindings'] = observation['endpoint_bindings']
+        if 'projection_discovery_tools' in config:
+            if (not observation.get('discovery_tools')
+                    or raw_observation.get('discovery_tools') != observation['discovery_tools']):
+                raise ValueError('projection discovery tools raw observation differs')
+            tools = _json(observation['discovery_tools']['raw'])
+            if tools.get('manifest') != config['projection_discovery_tools']:
+                raise ValueError('projection discovery tools manifest differs')
+            for recorded in tools['events']:
+                matching = [event for event in events
+                            if event.get('namespace_event_index') == recorded.get('namespace_event_index')]
+                if len(matching) != 1 or any(matching[0].get(key) != value for key, value in recorded.items()):
+                    raise ValueError('projection discovery tools canonical event differs')
+            if _one(events, 'discovery_tools_observer_stopped').get('receipt') != observation['discovery_tools']:
+                raise ValueError('projection discovery tools stop receipt differs')
+            kwargs['discovery_tools'] = observation['discovery_tools']
+        elif 'discovery_tools' in observation or 'discovery_tools' in raw_observation:
+            raise ValueError('projection discovery tools require submitted opt-in')
         graph_for_reconcile = deepcopy(observation['graph_snapshot'])
         original = reconcile_discovery_projection(discovery,graph_for_reconcile,**kwargs)
         result = original
@@ -477,12 +546,14 @@ def projection_facts(events, runtime, config):
             result = dict(original)
             result.update(comparison_status='mismatch' if differences else 'consistent',
                           comparisons=comparisons, differences=differences,
+                          all_endpoint_comparisons=rows,
                           unknown_reasons=sorted(set(result.get('unknown_reasons', []))),
                           projection_graph_reasons=sorted(set(graph_reasons)),
                           primary_pair=pair,
                           endpoint_count=len(roles))
             original = dict(original)
-            original.update(projection_graph_reasons=sorted(set(graph_reasons)),
+            original.update(all_endpoint_comparisons=rows,
+                            projection_graph_reasons=sorted(set(graph_reasons)),
                             primary_pair=pair, endpoint_count=len(roles))
         if config['arm']=='negative':
             receipt = projection_fault_receipt(events,config,observation)
@@ -493,10 +564,25 @@ def projection_facts(events, runtime, config):
             result = reconcile_discovery_projection(discovery,controlled,**kwargs)
             if result['comparison_status'] != 'mismatch' or len(result['differences']) != 1 or result['differences'][0]['field'] != 'reliability':
                 raise ValueError('known projection fault did not isolate one primary mismatch')
+        if layers_enabled:
+            from r2f.instrumentation.discovery_layers import summarize_discovery_obligations
+            summarize_discovery_obligations(result, discovery, observation['endpoint_bindings'])
+            if original is not result:
+                summarize_discovery_obligations(original, discovery, observation['endpoint_bindings'])
         workers = (runtime.get('execution_metadata') or runtime.get('execution') or {}).get('workers',[])
         if isinstance(workers,dict): workers=list(workers.values())
-        healthy = (len(workers)==len(roles) and {w.get('role') for w in workers}==set(roles)
-                   and all(w.get('returncode')==0 and w.get('pid')==tokens[w['role']]['pid'] for w in workers)
+        expected_roles = set(roles) | ({'discovery_tools'} if 'projection_discovery_tools' in config else set())
+        endpoint_workers = [worker for worker in workers if worker.get('role') in roles]
+        tools_workers = [worker for worker in workers if worker.get('role') == 'discovery_tools']
+        tools_healthy = ('projection_discovery_tools' not in config or
+                         (len(tools_workers) == 1 and len(tools.get('workers', [])) == 1
+                          and all(tools_workers[0].get(key) == tools['workers'][0].get(key)
+                                  for key in ('pid', 'start_ticks', 'role', 'worker_generation', 'returncode'))
+                          and tools_workers[0].get('cleanup_confirmed') is True))
+        healthy = (len(workers)==len(expected_roles) and {w.get('role') for w in workers}==expected_roles
+                   and all(w.get('returncode')==0 for w in workers)
+                   and all(w.get('pid')==tokens[w['role']]['pid'] for w in endpoint_workers)
+                   and tools_healthy
                    and _one(events,'namespace_controller_exited').get('returncode')==0
                    and runtime.get('runtime_status')=='completed'
                    and runtime.get('carrier_implementation')=='isolated_netns_passive_sedp_public_qos'

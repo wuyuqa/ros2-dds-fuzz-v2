@@ -6,6 +6,7 @@ references explain instrumentation points, not the distro binary's source commit
 """
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import asdict, dataclass
 from decimal import Decimal
 import hashlib
@@ -68,16 +69,21 @@ class TraceConfig:
         return {'CYCLONEDDS_URI': self.xml}
 
     def to_dict(self):
-        return asdict(self)
+        return dict(asdict(self), categories=list(self.categories))
 
 
-def build_trace_config(output_file, *, domain_id, base_xml=None):
+def build_trace_config(output_file, *, domain_id, base_xml=None, observe_adopted_config=False,
+                       observe_participant_lifecycle=False):
     """Preserve transport config, replace only Tracing; use one file per process.
 
     Inline XML avoids changing an already referenced file. Fresh output is required
     by the collector/probe owner, and '$' is rejected because Cyclone expands env
     variables in config values. Multiple Domain sections are deliberately rejected.
     """
+    if type(observe_participant_lifecycle) is not bool:
+        raise ValueError('observe_participant_lifecycle must be boolean')
+    if type(observe_adopted_config) is not bool:
+        raise ValueError('observe_adopted_config must be boolean')
     if isinstance(domain_id, bool) or not isinstance(domain_id, int) or not 0 <= domain_id <= 231:
         raise ValueError('domain_id must be an integer in 0..231')
     output = Path(output_file)
@@ -101,11 +107,18 @@ def build_trace_config(output_file, *, domain_id, base_xml=None):
         if _tag(e) == 'Tracing':
             domain.remove(e)
     tracing = ET.SubElement(domain, ns + 'Tracing')
-    for name, value in (('Verbosity', 'none'), ('Category', 'discovery,plist'),
+    categories = (('discovery', 'plist') + (('config',) if observe_adopted_config else ())
+                  + (('trace',) if observe_participant_lifecycle else ()))
+    for name, value in (('Verbosity', 'none'), ('Category', ','.join(categories)),
                         ('OutputFile', str(output)), ('AppendToFile', 'false')):
         ET.SubElement(tracing, ns + name).text = value
+    if observe_participant_lifecycle:
+        # Cyclone 0.10.x's configuration reader accepts unqualified names, not
+        # ElementTree's generated ns0 prefixes. Preserve the actual settings.
+        for element in root.iter():
+            element.tag = _tag(element)
     xml = ET.tostring(root, encoding='unicode', short_empty_elements=True)
-    return TraceConfig(xml, hashlib.sha256(xml.encode()).hexdigest(), str(output), domain_id)
+    return TraceConfig(xml, hashlib.sha256(xml.encode()).hexdigest(), str(output), domain_id, categories)
 
 
 def environment_for_mode(base_env: Mapping[str, str], *, mode, trace_config=None,
@@ -271,6 +284,149 @@ def parse_trace(data: bytes | str):
             'events': events, 'diagnostics': diagnostics, 'source_reference': SOURCE_REFERENCE}
 
 
+# Explanatory upstream pins, distinct from loaded binary and observer hashes.
+_CONFIG_SOURCE = {
+    'repository': SOURCE_REFERENCE['repository'], 'tag': '0.10.5',
+    'files': {'src/core/ddsi/src/ddsi_config.c':
+              'a9f11aeb037a091f77fbdcd248d3c2895eed6360531d228f7872d483d2d3096e',
+              'src/core/ddsi/include/dds/ddsi/ddsi_cfgelems.h':
+              '6214072f854e0cdd23b82e3c747980af998b98388a115f785f5054e94cdb62b7'},
+    'binary_source_equivalence': 'unknown',
+}
+_CONFIG_PATHS = {'transport': 'Domain/General/Transport/#text',
+                 'spdp_interval': 'Domain/Discovery/SPDPInterval/#text'}
+_CONFIG_MAX_BYTES = 8 * 1024 * 1024
+_CONFIG_MAX_LINES = 32768
+_CONFIG_MAX_LINE = 4096
+_DURATION_UNITS = {'ns': 1, 'us': 1000, 'ms': 1000000, 's': 1000000000,
+                   'min': 60000000000, 'hr': 3600000000000, 'day': 86400000000000}
+
+
+def _selected_config(raw, domain_id):
+    """Pure bounded projection of source-derived normalized print syntax.
+
+    No XML/default fallbacks. This is not a full dump parser or live acceptance.
+    References use original bytes, including newlines; wall time is not ordering.
+    """
+    fields = {name: {'status': 'unknown', 'value': None, 'reason': 'missing',
+                     'unit': 'ns' if name == 'spdp_interval' else None, 'references': []}
+              for name in _CONFIG_PATHS}
+    result = {'schema': 'r2f.cyclonedds-adopted-domain-settings/v1', 'fields': fields,
+              'source_reference': deepcopy(_CONFIG_SOURCE), 'parser_acceptance': 'pending_real_trace',
+              'semantic_effect': 'unknown', 'unknown_fields': []}
+    issues, threads, offset = [], set(), 0
+    raw_hash = hashlib.sha256(raw).hexdigest()
+    if len(raw) > _CONFIG_MAX_BYTES:
+        issues.append('config_parse_byte_limit')
+    else:
+        for number, line in enumerate(raw.splitlines(keepends=True), 1):
+            if number > _CONFIG_MAX_LINES:
+                issues.append('config_parse_line_limit')
+                break
+            if len(line) > _CONFIG_MAX_LINE:
+                issues.append('config_parse_line_size_limit')
+                offset += len(line)
+                continue
+            header = _HEADER.fullmatch(line.decode('utf-8', errors='replace').rstrip('\r\n'))
+            if header and header['body'].startswith('config: '):
+                if len(line) > _CONFIG_MAX_LINE or not line.endswith(b'\n'):
+                    issues.append('config_line_truncated_or_oversize')
+                if header['domain'] != str(domain_id):
+                    issues.append('config_domain_mismatch')
+                for name, path in _CONFIG_PATHS.items():
+                    if not header['body'].startswith('config: ' + path + ':'):
+                        continue
+                    threads.add(header['thread'].strip())
+                    ref = {'line_number': number, 'byte_offset': offset, 'byte_length': len(line),
+                           'raw_line_sha256': hashlib.sha256(line).hexdigest(),
+                           'raw_sha256': raw_hash,
+                           'path': path, 'original_token': None, 'source_indices': None,
+                           'normalized_value': None}
+                    fields[name]['references'].append(ref)
+                    match = re.fullmatch(re.escape('config: ' + path) +
+                                         r': (.+) \{((?:(?:0|[1-9][0-9]*)(?:,(?:0|[1-9][0-9]*))*)?)\}', header['body'])
+                    if not match:
+                        continue
+                    token, indices = match.groups()
+                    ref['original_token'] = token
+                    # Source mask is uint32; indices are diagnostics, never identity.
+                    if len(indices) > 85:
+                        continue
+                    sources = [int(i) for i in indices.split(',')] if indices else []
+                    if sources != sorted(set(sources)) or any(i > 31 for i in sources):
+                        continue
+                    ref['source_indices'] = sources
+                    if name == 'transport':
+                        if token in ('default', 'udp', 'udp6', 'tcp', 'tcp6', 'raweth', 'none'):
+                            ref['normalized_value'] = token
+                    else:
+                        duration = re.fullmatch(r'(0|[1-9][0-9]{0,12}) (ns|us|ms|s|min|hr|day)', token)
+                        if duration:
+                            value = int(duration[1]) * _DURATION_UNITS[duration[2]]
+                            if value <= 3600000000000:
+                                ref['normalized_value'] = value
+            offset += len(line)
+    if len(threads) > 1:
+        issues.append('config_producer_thread_ambiguous')
+    if any(len(f['references']) > 1 for f in fields.values()):
+        issues.append('multiple_config_values_or_dumps')
+    for name, field in fields.items():
+        refs = field['references']
+        if issues:
+            field['reason'] = ','.join(sorted(set(issues)))
+        elif refs:
+            if refs[0]['normalized_value'] is None:
+                field['reason'] = 'malformed_or_unsupported_value'
+            else:
+                field.update(status='parsed', value=refs[0]['normalized_value'], reason=None)
+        if field['status'] == 'unknown':
+            result['unknown_fields'].append(name + ':' + field['reason'])
+    return result
+
+
+def _adopted_config(raw, config, processes, stat):
+    result = _selected_config(raw, config.domain_id)
+    # Use the real applied URI, FD device/inode, lifetime and mapped binaries.
+    # A filename, source tag, or probe alone cannot bind these domain-only lines.
+    owners = [p for p in processes if p.get('trace_fd_attached')]
+    bound = False
+    if len(processes) == len(owners) == 1:
+        proof = owners[0]
+        bound = (proof.get('scope') == 'observed_process'
+                 and all(proof.get(k) is True for k in ('vendor_loaded', 'process_identity_stable',
+                     'config_matches', 'domain_matches', 'rmw_matches', 'trace_fd_attached'))
+                 and not proof.get('unknown') and type(proof.get('pid')) is int
+                 and proof['pid'] > 0 and str(proof.get('process_start_ticks', '')).isdigit()
+                 and str(proof.get('trace_fd', '')).isdigit()
+                 and proof.get('trace_inode') == stat.st_ino and proof.get('trace_device') == stat.st_dev
+                 and proof.get('selected_environment') == {
+                     'CYCLONEDDS_URI': config.xml, 'ROS_DOMAIN_ID': str(config.domain_id),
+                     'RMW_IMPLEMENTATION': RMW}
+                 and all(any(isinstance(lib, dict) and lib.get('identity_verified') is True
+                         and re.fullmatch(r'[0-9a-f]{64}', str(lib.get('sha256', '')))
+                         and (Path(str(lib.get('mapped_path') or '')).name == name or
+                              Path(str(lib.get('mapped_path') or '')).name.startswith(name + '.'))
+                         for lib in (proof.get('loaded_libraries') or []))
+                     for name in ('libddsc.so', 'librmw_cyclonedds_cpp.so')))
+    result['binding'] = (deepcopy({k: owners[0][k] for k in ('pid', 'process_start_ticks',
+                          'trace_fd', 'trace_inode', 'trace_device', 'loaded_libraries')})
+                         if bound else None)
+    result['provenance_status'] = 'verified_vendor_process' if bound else 'unknown'
+    result['collection_identity'] = list(_stable_stat(stat))
+    result['raw_path'] = config.output_file
+    result['raw_sha256'] = hashlib.sha256(raw).hexdigest()
+    for name, field in result['fields'].items():
+        for ref in field['references']:
+            ref['raw_path'] = config.output_file
+        if not bound:
+            field.update(status='unknown', value=None, reason='process_binding_unverified')
+        elif field['status'] == 'parsed':
+            field['status'] = 'observed'
+    result['unknown_fields'] = [name + ':' + f['reason'] for name, f in result['fields'].items()
+                                if f['status'] == 'unknown']
+    return result
+
+
 def capture_process_provenance(pid, *, trace_config=None, proc_root=Path('/proc')):
     """Read a live process's maps/environ/fds; never call DDS or inspect secrets."""
     root = Path(proc_root) / str(int(pid))
@@ -317,7 +473,9 @@ def capture_process_provenance(pid, *, trace_config=None, proc_root=Path('/proc'
                     if fd.resolve(strict=True) == expected:
                         result['trace_fd_attached'] = True
                         result['trace_fd'] = fd.name
-                        result['trace_inode'] = expected.stat().st_ino
+                        identity = fd.stat()
+                        result['trace_inode'] = identity.st_ino
+                        result['trace_device'] = identity.st_dev
                 except OSError:
                     continue
         stat_after = (root / 'stat').read_text()
@@ -388,6 +546,8 @@ def collect_trace(config, *, processes, control_task):
     if _stable_stat(before) != _stable_stat(after):
         raise ValueError('trace changed during collection')
     result = parse_trace(raw)
+    if 'config' in config.categories:
+        result['adopted_domain_settings'] = _adopted_config(raw, config, processes, before)
     eligible = [p for p in processes if p.get('scope') == 'observed_process'
                 and p.get('vendor_loaded') and p.get('process_identity_stable')
                 and p.get('config_matches') and p.get('domain_matches') and p.get('rmw_matches')

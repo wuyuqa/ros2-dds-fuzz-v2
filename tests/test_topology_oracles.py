@@ -1,4 +1,4 @@
-"""Independent rule/evaluator tests over strict NON-real raw fixtures."""
+"""Independent rule/evaluator tests over NON-real raw and offline-backend fixtures."""
 from copy import deepcopy
 from types import SimpleNamespace
 
@@ -113,15 +113,43 @@ def test_tool_failure_is_unknown_harness_not_sut(tmp_path):
 
 
 def test_harness_guard_is_not_claimed_as_sut_rejection(tmp_path):
-    f = RawFixture()
-    end = f.events.pop()
-    f.add("topology_guard_reject", kind="guard", no_side_effect=True, code="controlled_fixture_guard")
-    f.add("runtime_end", **{k: end[k] for k in ("mutation_receipt", "cleanup_complete", "real_execution")})
-    facts, result = evaluate(f, tmp_path)
+    from test_topology_cycle import SOURCE, capsule_from_registry
+    from r2f.core import ReplayCapsule, Scenario
+    from r2f.campaign.replay import _replay_config
+    from r2f.campaign.topology_adapter import TopologyFactProducer
+    from r2f.modules.s1 import topology_model as model
+    from r2f.modules.s1.topology_input import make_topology_plan
+    from r2f.runtime.ros2_pair import run_pair
+    from r2f.runtime.topology_worker import OfflineTopologyBackend
+
+    registry, original, _, _ = capsule_from_registry(1)
+    parent = model.generate_program(3, writers=1, readers=1)
+    # Valid model input requiring the optional native ownership carrier, which
+    # this public-only route has not selected. KEEP_ALL is now supported.
+    # The offline route emits bound before/guard/after/action receipts; a loose
+    # guard event appended to a successful trace is correctly evidence-invalid.
+    for endpoint in parent["endpoints"]:
+        if endpoint["role"] == "writer":
+            endpoint["qos"]["ownership"] = "exclusive"
+    plan = make_topology_plan(parent, [{"operator_id": "action.insert"}], rng_seed=7)
+    scenario = Scenario(original.target, original.rmw, "mutated", 0, 7,
+        {"mutation_kind": "endpoint_program", "carrier": "ros2_endpoint",
+         "mutation_parameters": plan.final_config}, plan)
+    prepared = registry.get_services(scenario.target_id).mutation_provider.prepare_plan(scenario, plan)
+    capsule = ReplayCapsule.from_scenario(scenario, source_manifest=SOURCE,
+        final_input=plan.final_config, input_layer_receipts=prepared["input_layer_receipts"], origin_domain=80)
+    config = _replay_config(capsule, "offline-guard", 80, SOURCE)
+    runtime = run_pair(config, tmp_path / "offline-runtime", topology_backend=OfflineTopologyBackend())
+    facts = TopologyFactProducer().produce({"events": runtime["events"], "runtime": runtime, "config": config})
+    result = TopologyOracle().evaluate(scenario, facts)
+    assert facts["diagnostic_valid"], facts.get("evidence_error")
+    assert facts["fixture"] and not facts["execution_evidence"]
+    assert not facts["tool_error"] and facts["guard_rejected_by"] == "harness"
     assert facts["control_excluded"]
     assert result["verdict"] == "not_applicable"
     assert result["responsibility_layer"] == "harness"
     assert "not_sut_rejection" in result["reason_codes"][0]
+    assert not result["candidate_eligible"] and not result["forbidden_residuals"]
 
 
 def test_harness_fault_always_excluded_even_when_rule_fails(tmp_path):

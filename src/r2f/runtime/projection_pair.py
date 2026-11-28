@@ -86,6 +86,13 @@ def validate_qos(qos):
 
 def normalize_projection_config(config):
     c = deepcopy(config)
+    from .discovery_tools import validate_tools_reference
+    validate_tools_reference(c)
+    from .projection_sut import validate_sut_reference
+    validate_sut_reference(c)
+    if 'projection_discovery_layers' in c:
+        from .discovery_profiles import validate_discovery_layers
+        validate_discovery_layers(c['projection_discovery_layers'], c['rmw'])
     c.setdefault('message_type', 'std_msgs/msg/String')
     if c['message_type'] != 'std_msgs/msg/String':
         raise ValueError('unsupported_projection_message_type')
@@ -187,14 +194,14 @@ def capture_libraries(pid, start_ticks, path):
     return write_artifact(path, {'pid': pid, 'process_start_ticks': start_ticks, 'loaded_libraries': libraries})
 
 
-def _write_extra_profiles(out, roles, rmw, profiles, role_env):
+def _write_extra_profiles(out, roles, rmw, profiles, role_env, *, discovery_layers=None):
     """Add only the explicitly requested extra roles; never rewrite pair files.
 
     The fake-profile seam used by offline tests returns empty mappings and
     deliberately does not create a profiles directory. In that case there is
     nothing to extend; real execution always has the pair records.
     """
-    from .discovery_profiles import CYCLONE_XML, FAST_XML
+    from .discovery_profiles import cyclone_profile, FAST_XML
     if not profiles:
         return profiles, role_env
     root = Path(out) / 'profiles'
@@ -203,7 +210,7 @@ def _write_extra_profiles(out, roles, rmw, profiles, role_env):
         if role in profiles:
             continue
         if rmw == 'rmw_cyclonedds_cpp':
-            text = CYCLONE_XML
+            text = cyclone_profile(discovery_layers)
         else:
             text = FAST_XML.format(role=role, index=index)
         path = root / (role + '.xml')
@@ -269,13 +276,15 @@ def _graph_violations(event, writer_gids, reader_gids):
     return reasons
 
 
-def export_graph(proof, endpoints, topic, path, *, strict=True):
+def export_graph(proof, endpoints, topic, path, *, strict=True, include_schema_check=False):
     """Export one actual public graph projection for every configured role.
 
     ``strict`` retains the historical pair contract (raise on disagreement).
     The multi-endpoint path sets it false: a missing or extra endpoint is a S1
     projection fact to be judged, not a reason to discard the observation.
     """
+    # CP1 opt-in artifacts are offline schema material until the adapter contract
+    # explicitly supports them; keep the canonical raw reproduction guard intact.
     roles = tuple(endpoints)
     if not roles or set(proof) != set(roles):
         raise RuntimeError('projection_graph_role_set_differs')
@@ -304,6 +313,24 @@ def export_graph(proof, endpoints, topic, path, *, strict=True):
                    != set(writer_gids.values()) | set(reader_gids.values())):
         raise RuntimeError('projection_graph_ambiguous_endpoints')
     result = {'source': 'ros_graph', 'captured_at_unix_ns': graph['time_ns'], 'endpoints': entries}
+    # Qualify only declarations from every acknowledged observer, never config.
+    if all(proof[role]['graph'].get('timestamp_clock') == 'unix_ns_realtime'
+           and type(proof[role]['graph']['time_ns']) is int for role in roles):
+        result['timestamp_clock'] = 'unix_ns_realtime'
+    if include_schema_check:
+        from r2f.instrumentation.sedp_fields import discovery_layer_schema
+        snapshot_times = {role: proof[role]['graph']['time_ns'] for role in roles}
+        valid_times = all(isinstance(t, int) and not isinstance(t, bool)
+                          for t in snapshot_times.values())
+        compatible_clocks = all(proof[role]['graph'].get('timestamp_clock') == 'unix_ns_realtime'
+                                for role in roles)
+        qualified = valid_times and compatible_clocks
+        result.update(schema_layers=discovery_layer_schema(),
+                      observer_timing_status='qualified' if qualified else 'unknown',
+                      observer_timing_reasons=([] if qualified else ['observer_clock_or_timestamp_unverified']),
+                      observer_snapshot_times_unix_ns=snapshot_times,
+                      observer_snapshot_spread_ns=(max(snapshot_times.values()) - min(snapshot_times.values())
+                                                   if qualified else None))
     result['raw'] = write_artifact(path, result)
     return result
 
@@ -479,7 +506,8 @@ def namespace_body(request, owner_channel):
     receipt['planned'] = active
     result = {'runtime_status': 'failed', 'reason': None, 'facts': {}, 'environment': {}, 'workers': [],
               'precondition_receipts': [], 'observation_receipts': [], 'mutation_receipt': receipt}
-    pool = observer = None
+    pool = observer = builtin_observer = tools_observer = None
+    builtin_receipt = tools_receipt = None
     graph = capture = None
     window = None
 
@@ -529,9 +557,19 @@ def namespace_body(request, owner_channel):
                          namespace_rtps_probe=ports, drop_installed=False)
             return {'raw_event_ref': event['raw_event_ref'], 'isolation': proof, 'rtps_probe': ports}
         step('namespace_ready', ['environment_ok', 'locks_held'], namespace_ready)
-        profiles, role_env = write_profiles(out, c['rmw'])
+        if 'projection_discovery_tools' in c:
+            from .discovery_tools import load_tools_environment
+            load_tools_environment(c['projection_discovery_tools'])
+        from .projection_sut import KEY as SUT_KEY, load_sut_environment, verify_sut_libraries
+        sut = load_sut_environment(c[SUT_KEY]) if SUT_KEY in c else None
+        layers = c.get('projection_discovery_layers')
+        if layers:
+            profiles, role_env = write_profiles(out, c['rmw'], discovery_layers=layers)
+        else:
+            profiles, role_env = write_profiles(out, c['rmw'])
         if roles != DEFAULT_PROJECTION_ROLES:
-            profiles, role_env = _write_extra_profiles(out, roles, c['rmw'], profiles, role_env)
+            profiles, role_env = _write_extra_profiles(out, roles, c['rmw'], profiles, role_env,
+                                                       discovery_layers=layers)
         spec = build_capture_spec(out / 'discovery-observer', run_id=c['run_id'], domain_id=c['domain_id'],
                 netns_identity=proof, limits={'timeout_sec': 240, 'max_bytes': 32 * 1024 * 1024, 'snaplen': 65535})
         observer = PassiveSedpObserver(spec)
@@ -542,6 +580,18 @@ def namespace_body(request, owner_channel):
                 raise RuntimeError('projection_observer_not_ready')
             return {'raw_event_ref': event['raw_event_ref'], 'ready': ready}
         ready = step('observer_ready', ['namespace_ready'], observer_ready)['ready']
+        if layers:
+            from .discovery_builtin_observer import DiscoveryBuiltinObserver
+            builtin_observer = DiscoveryBuiltinObserver(out / 'discovery-builtins.json')
+            builtin_observer.start(domain_id=c['domain_id'], admission=admission,
+                profile=profiles['builtin_observer'], environment=role_env['builtin_observer'])
+            emit('discovery_builtin_observer_started', profile=profiles['builtin_observer'],
+                 environment=role_env['builtin_observer'], admission_ref=admission['raw_event_ref'])
+        if 'projection_discovery_tools' in c:
+            from .discovery_tools import DiscoveryToolsObserver
+            tools_observer = DiscoveryToolsObserver(c, out / 'discovery-tools', emit,
+                owner_channel, role_env['builtin_observer'])
+            tools_observer.start()
         result['environment'].update(isolation=proof, profiles=profiles, observer_ready=ready,
             implementation='isolated_netns_passive_sedp_public_qos', drop_installed=False)
         receipt.update(submitted=active, carrier_admitted=active, configured=active)
@@ -569,6 +619,12 @@ def namespace_body(request, owner_channel):
                 raise RuntimeError('projection_endpoint_identity_or_chronology_incomplete')
             endpoints[role] = endpoint
             library_refs[role] = capture_libraries(endpoint['pid'], endpoint['process_start_ticks'], out / (role + '-libraries.json'))
+            if sut:
+                mapped = json.loads(Path(library_refs[role]['path']).read_text())
+                verify_sut_libraries(sut, mapped['loaded_libraries'])
+                emit('projection_sut_libraries_verified', role=role, manifest=c[SUT_KEY],
+                     worker_pid=endpoint['pid'], process_start_ticks=endpoint['process_start_ticks'],
+                     libraries=library_refs[role])
         if len({endpoint['pid'] for endpoint in endpoints.values()}) != len(roles):
             raise RuntimeError('projection_requires_independent_worker_processes')
         if c['target_id'] == FUZZ_TARGET:
@@ -642,6 +698,8 @@ def namespace_body(request, owner_channel):
         writer_role = next(role for role in roles if is_writer_role(role))
         policy = {'protocol_defaults': True, 'vendor_versions': {'0110': '0.10.5', '010f': '2.14.7'},
                   'vendor_provenance': {vendor: library_refs[writer_role]}}
+        if sut:
+            policy['vendor_versions']['0110'] = sut['core']['version']
         starts = {role: next(e for e in events if e['event'] == 'endpoint_create_begin' and e['role'] == role)
                   for role in roles}
         prefixes = []
@@ -692,10 +750,22 @@ def namespace_body(request, owner_channel):
             raise RuntimeError('projection_clock_discontinuity')
         emit('window_close', window='endpoint_creation', **window,
              clock_guard_ns=CLOCK_GUARD_NS, clock_offset_delta_ns=end_offset - start_offset)
-        # Ready-to-graph capture includes initial SEDP; no injection or native observer.
+        if tools_observer is not None:
+            tools_observer.collect()
+        # Finish native observation while the same passive capture is still active.
+        if builtin_observer is not None:
+            builtin_receipt = builtin_observer.finish()
+            builtin_observer = None
+            emit('discovery_builtin_observer_stopped', receipt=builtin_receipt)
+        # Default path remains passive SEDP only.
         capture = observer.stop()
         observer = None
         emit('discovery_observer_stopped', receipt=capture)
+        if tools_observer is not None:
+            tools_receipt = tools_observer.finish()
+            result['workers'].extend(tools_observer.pool.metadata)
+            tools_observer = None
+            emit('discovery_tools_observer_stopped', receipt=tools_receipt)
         if (capture.get('health', {}).get('status') != 'ok' or capture.get('thread_stopped') is not True
                 or capture.get('socket_closed') is not True):
             raise RuntimeError('projection_capture_health_incomplete')
@@ -707,7 +777,9 @@ def namespace_body(request, owner_channel):
                 'begin': next(e['namespace_event_index'] for e in events if e['event'] == 'endpoint_create_begin' and e['role'] == role),
                 'return': endpoints[role]['namespace_event_index']} for role in roles},
             graph_export_ref=exported['raw_event_ref'], readiness_ref=readiness['raw_event_ref'],
-            prefix_chain_ref=verified['raw_event_ref'])
+            prefix_chain_ref=verified['raw_event_ref'],
+            **({'discovery_layers': builtin_receipt} if layers else {}),
+            **({'discovery_tools': tools_receipt} if tools_receipt else {}))
         if c['fault_id']:
             fault = controlled_graph(graph, capture, out / 'controlled-public-graph.json')
             emit('fault_control_receipt', **fault, projection_observation_ref=observation['raw_event_ref'])
@@ -718,6 +790,21 @@ def namespace_body(request, owner_channel):
         result.update(runtime_status='failed', reason=str(exc))
         emit('runtime_abort', reason=str(exc))
     finally:
+        if tools_observer is not None:
+            try:
+                tools_receipt = tools_observer.finish()
+                result['workers'].extend(tools_observer.pool.metadata)
+                emit('discovery_tools_observer_stopped', receipt=tools_receipt)
+            except Exception as exc:
+                result.update(runtime_status='failed', reason='projection_tools_cleanup_failed:' + str(exc))
+                emit('runtime_abort', reason=result['reason'])
+        if builtin_observer is not None:
+            try:
+                builtin_receipt = builtin_observer.finish()
+                emit('discovery_builtin_observer_stopped', receipt=builtin_receipt)
+            except Exception as exc:
+                result.update(runtime_status='failed', reason='projection_builtin_cleanup_failed:' + str(exc))
+                emit('runtime_abort', reason=result['reason'])
         if observer is not None:
             try:
                 capture = observer.stop()
@@ -732,9 +819,16 @@ def namespace_body(request, owner_channel):
             except Exception as exc:
                 result.update(runtime_status='failed', reason='projection_worker_cleanup_failed:' + str(exc))
                 emit('runtime_abort', reason=result['reason'])
-            result['workers'] = pool.metadata
+            result['workers'].extend(pool.metadata)
             if any(worker.get('returncode') != 0 for worker in pool.metadata):
                 result.update(runtime_status='failed', reason='worker_shutdown_failed')
+        if 'projection_sut_environment' in c:
+            try:
+                from .projection_sut import load_sut_environment
+                load_sut_environment(c['projection_sut_environment'])
+            except (OSError, ValueError) as exc:
+                result.update(runtime_status='failed', reason='projection_sut_identity_changed:' + str(exc))
+                emit('runtime_abort', reason=result['reason'])
         if not same_source(request['source'], execution_chain_identity()):
             result.update(runtime_status='failed', reason='source_identity_changed_during_execution')
         if not endpoints:
@@ -765,3 +859,6 @@ def finalize_projection(result):
     result['discovery_projection'] = {key: deepcopy(observation[key]) for key in
         ('capture_receipt', 'graph_snapshot', 'observation_window', 'field_policy')}
     result['discovery_projection']['endpoint_bindings'] = bindings
+    for key in ('discovery_layers', 'discovery_tools'):
+        if key in observation:
+            result['discovery_projection'][key] = deepcopy(observation[key])

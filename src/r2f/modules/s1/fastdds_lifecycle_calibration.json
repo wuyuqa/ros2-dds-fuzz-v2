@@ -1,0 +1,310 @@
+{
+  "schema": "r2f.s1-lifecycle-calibration-capture/v1",
+  "case_id": "Fast-DDS-issue3770",
+  "source_captures": {
+    "Fast-DDS-3770-issue.json": {
+      "locator": "https://api.github.com/repos/eProsima/Fast-DDS/issues/3770",
+      "artifact_sha256": "86e0c74f4580290db3824035b4461369a949d799d6776275af2f011e61faf7fc",
+      "verification_scope": "captured_artifact_only",
+      "format": "json"
+    },
+    "Fast-DDS-4220-pr.json": {
+      "locator": "https://api.github.com/repos/eProsima/Fast-DDS/pulls/4220",
+      "artifact_sha256": "a4d641e2e38d52f685a7da51f041f01d8601a749e3aebe93f2b6376e58b2013b",
+      "verification_scope": "captured_artifact_only",
+      "format": "json"
+    },
+    "Fast-DDS-4220-merge.json": {
+      "locator": "https://api.github.com/repos/eProsima/Fast-DDS/commits/305383295a9bbb9f12c5c0aa303667872d65ea33",
+      "artifact_sha256": "7d37380fde3abf6f23ff4ff7482f4899a3b7fdfc1461cd59e55788261b125683",
+      "verification_scope": "captured_artifact_only",
+      "format": "json"
+    },
+    "Fast-DDS-4220-files.json": {
+      "locator": "https://api.github.com/repos/eProsima/Fast-DDS/pulls/4220/files",
+      "artifact_sha256": "bbd4bc0dac19520bd99344c56994f00805a9b1da3d518838e97f6eb624cc9827",
+      "verification_scope": "captured_artifact_only",
+      "format": "json"
+    }
+  },
+  "lifecycle_calibration": {
+    "schema": "r2f.s1-lifecycle-calibration/v1",
+    "checkpoint": "source_lifecycle_obligations",
+    "status": "requirements_identified_not_validated",
+    "case_id": "Fast-DDS-issue3770",
+    "obligation_ids": [
+      "C01",
+      "C02",
+      "C06",
+      "C08",
+      "C16"
+    ],
+    "story_ids": [
+      1,
+      5,
+      8,
+      14,
+      20,
+      21,
+      37
+    ],
+    "test_ids": [
+      "T08",
+      "T09",
+      "T11"
+    ],
+    "source_assessment": {
+      "kind": "historical_concurrency_failure",
+      "source_refs": [
+        {
+          "artifact_id": "Fast-DDS-3770-issue.json",
+          "json_pointer": "/body"
+        },
+        {
+          "artifact_id": "Fast-DDS-4220-pr.json",
+          "json_pointer": "/body"
+        },
+        {
+          "artifact_id": "Fast-DDS-4220-files.json",
+          "json_pointer": "/2/patch"
+        }
+      ],
+      "scope": "PDP participant proxy lifetime across discovery processing and removal/update; not a graph-equality predicate.",
+      "legacy_taxonomy_limit": "The captured S1.B3 row is historical attribution, not proof of builtin/graph inconsistency or a normative oracle.",
+      "reported_affected_version": "latest master; exact reported SHA unknown",
+      "affected_release_range": "unknown",
+      "not_sufficient": [
+        "Configured concurrency or concurrent user-data publishing does not demonstrate a PDP update/removal interleaving.",
+        "The original reporter lock-placement suggestion is not an accepted fix; the report also describes intra-process deadlock concerns.",
+        "A later normal result, graph snapshot, or fixed-version pass cannot establish a historical failure."
+      ]
+    },
+    "model_context": [
+      {
+        "target_id": "discovery.endpoint_topology.fuzz_v1",
+        "surface_ids": [
+          "S1.topology.program"
+        ],
+        "relation": "context_not_full_coverage"
+      },
+      {
+        "target_id": "builtin.discovery_projection_reconciliation",
+        "surface_ids": [],
+        "relation": "context_not_full_coverage"
+      }
+    ],
+    "observation_layers": [
+      {
+        "layer": "model_declaration",
+        "scope": "Participant/endpoint lifecycle intent and logical generation.",
+        "limitation": "An input or plan is not applied DDS behavior."
+      },
+      {
+        "layer": "endpoint_peer_snapshot",
+        "scope": "Opt-in Fast DDS reliable stateful matched GUID set under the sampled entity mutex.",
+        "limitation": "Not a PDP proxy create/update/clear trace, distributed atomic snapshot, or matching epoch."
+      },
+      {
+        "layer": "external_graph_and_delivery",
+        "scope": "Fresh identity-bound graph snapshots and attributable delivery observations when independently qualified.",
+        "limitation": "Cannot substitute for an independent internal discovery source or infer an unobserved interleaving."
+      },
+      {
+        "layer": "pdp_proxy_lifecycle",
+        "scope": "Proxy creation/update/removal and use by assignRemoteEndpoints, with ordering and lifetime identity.",
+        "limitation": "Current peer snapshot provider does not observe these events; a separately qualified observer is required."
+      }
+    ],
+    "requirements": [
+      {
+        "id": "proxy_lifetime",
+        "obligation_ids": [
+          "C06"
+        ],
+        "statement": "Correlate the lifetime of one remote participant proxy across discovery processing, update/removal and endpoint assignment.",
+        "evidence_required": [
+          "Actual internal event order around proxy create/update/clear and assignRemoteEndpoints.",
+          "Proxy identity/incarnation, participant GUID, thread identity, lock/copy lifetime evidence and before/after raw anchors.",
+          "Independent external result and process health; missing internal events remain unknown."
+        ],
+        "source_refs": [
+          {
+            "artifact_id": "Fast-DDS-3770-issue.json",
+            "json_pointer": "/body"
+          },
+          {
+            "artifact_id": "Fast-DDS-4220-pr.json",
+            "json_pointer": "/body"
+          },
+          {
+            "artifact_id": "Fast-DDS-4220-files.json",
+            "json_pointer": "/2/patch"
+          }
+        ],
+        "current_source_status": "unverified",
+        "named_gaps": [
+          "pdp_proxy_lifecycle_trace_not_observed"
+        ]
+      },
+      {
+        "id": "entity_incarnation",
+        "obligation_ids": [
+          "C01",
+          "C02"
+        ],
+        "statement": "Bind actual participant and endpoint create/destroy/recreate to ownership, generation and directed peer relations.",
+        "evidence_required": [
+          "Actual participant GUID and endpoint GID per logical entity/incarnation.",
+          "Participant group and same-process/cross-process ownership, PID/start identity and create/delete acknowledgement.",
+          "Old association removal and new-generation binding; aggregate counts alone retain an identity gap."
+        ],
+        "source_refs": [
+          {
+            "artifact_id": "Fast-DDS-3770-issue.json",
+            "json_pointer": "/body"
+          }
+        ],
+        "current_source_status": "unverified",
+        "named_gaps": [
+          "real_lifecycle_identity_and_ownership_not_validated"
+        ]
+      },
+      {
+        "id": "independent_observation",
+        "obligation_ids": [
+          "C08"
+        ],
+        "statement": "Keep model intent, internal discovery facts and external graph/delivery observations independently attributable.",
+        "evidence_required": [
+          "Separate raw sources with supported schema, observation mode, entity/generation and execution binding.",
+          "Fresh before/after snapshots, requires/ACK chronology, raw path/hash, rule/verdict and any unavailable field.",
+          "Missing internal fields are unknown; never copy graph/configuration values into internal observations."
+        ],
+        "source_refs": [
+          {
+            "artifact_id": "Fast-DDS-4220-pr.json",
+            "json_pointer": "/body"
+          }
+        ],
+        "current_source_status": "unverified",
+        "named_gaps": [
+          "independent_internal_external_reconciliation_not_validated"
+        ]
+      },
+      {
+        "id": "normal_and_observer_controls",
+        "obligation_ids": [
+          "C01",
+          "C02",
+          "C06",
+          "C08",
+          "C16"
+        ],
+        "statement": "Qualify a stable normal workload and independently measure observer/tool effects before interpreting anomalies.",
+        "evidence_required": [
+          "Stable normal control with workload/input identity, vendor/version, RMW, repeat and observation completeness.",
+          "Black-box control without instrumentation overrides and a separate instrumented build/binary/process manifest.",
+          "Observer/tool control with comparable workload and version; retain failures and overhead/loss limitations."
+        ],
+        "source_refs": [
+          {
+            "artifact_id": "Fast-DDS-3770-issue.json",
+            "json_pointer": "/body"
+          },
+          {
+            "artifact_id": "Fast-DDS-4220-pr.json",
+            "json_pointer": "/body"
+          }
+        ],
+        "current_source_status": "unverified",
+        "named_gaps": [
+          "stable_normal_and_observer_controls_not_run"
+        ]
+      },
+      {
+        "id": "historical_comparison",
+        "obligation_ids": [
+          "C16"
+        ],
+        "statement": "Record exact pre/post and reported-version limitations separately; assess each real result without transferring qualification.",
+        "evidence_required": [
+          "Exact source parent/fix commit and independent build/binary/environment provenance for each side.",
+          "Comparable normal workload, raw result and failure attribution per version; absent material is unverified.",
+          "Use the common anomaly/replay/review records with original raw hashes and replay attempt or a named non_replayable reason.",
+          "Historical reproduction and user-confirmed independent new-root counting remain distinct."
+        ],
+        "source_refs": [
+          {
+            "artifact_id": "Fast-DDS-4220-pr.json",
+            "json_pointer": "/body"
+          },
+          {
+            "artifact_id": "Fast-DDS-4220-merge.json",
+            "json_pointer": "/parents/0/sha"
+          }
+        ],
+        "current_source_status": "unverified",
+        "named_gaps": [
+          "exact_pre_post_runtime_evidence_not_available"
+        ]
+      }
+    ],
+    "execution_binding_required": [
+      "source_repo",
+      "head",
+      "behavior_tree_sha256",
+      "target_id",
+      "target_revision",
+      "input_sha256",
+      "run_id",
+      "rmw",
+      "repeat",
+      "domain_id",
+      "observation_mode",
+      "vendor_version",
+      "build_manifest_sha256",
+      "binary_sha256",
+      "logical_id",
+      "participant_guid",
+      "endpoint_gid",
+      "generation",
+      "pid",
+      "process_start_ticks",
+      "event_index",
+      "raw_path",
+      "raw_sha256"
+    ],
+    "historical_comparison": {
+      "pre": "8c3e3b30e769ef94bdbc04da519ed193855ad05c",
+      "post": "305383295a9bbb9f12c5c0aa303667872d65ea33",
+      "status": "proposed_not_executed",
+      "pre_source_ref": {
+        "artifact_id": "Fast-DDS-4220-merge.json",
+        "json_pointer": "/parents/0/sha"
+      },
+      "post_source_ref": {
+        "artifact_id": "Fast-DDS-4220-merge.json",
+        "json_pointer": "/sha"
+      },
+      "reported_version_is_exact_pre": false,
+      "backport_limit": "Release references do not establish identical backport commit identity or all affected releases."
+    },
+    "assessment_policy": {
+      "missing_observation": "unknown",
+      "internal_race_status": "not_observed",
+      "historical_reproduction_status": "unverified",
+      "candidate_interface": "existing_common_anomaly_replay_review",
+      "failure_preservation": "append_replay_attempts_and_reviews_without_rewriting_original_raw_or_report",
+      "tool_or_control_result": "not_natural_sut_candidate",
+      "historical_discovery_credit": 0,
+      "user_confirmation_required_for_new_root": true
+    },
+    "remaining_checkpoints": [
+      "stable_normal_workload_and_observation_completeness",
+      "assess_existing_anomalous_material_with_same_evidence_contract"
+    ],
+    "execution_evidence": false,
+    "maturity_evidence": false,
+    "new_discovery_credit": 0
+  }
+}

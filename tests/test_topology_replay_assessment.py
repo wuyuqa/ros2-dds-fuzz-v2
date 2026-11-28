@@ -277,7 +277,7 @@ def test_campaign_replay_and_readonly_auditor_consume_both_views(pending, monkey
         replay_attempts=deepcopy(capsule.replay_attempts), non_replayable=None)
     monkeypatch.setattr(replay.ReplayCapsule, 'from_dict', lambda doc: capsule)
     monkeypatch.setattr(replay, '_check_source', lambda *a: None)
-    monkeypatch.setattr(replay, '_replay_config', lambda *a: deepcopy(config))
+    monkeypatch.setattr(replay, '_replay_config', lambda *a, **kw: deepcopy(config))
     monkeypatch.setattr(replay, '_bind_execution_input', lambda row, *a: row)
     monkeypatch.setattr(runner, '_runtime_execution_config', lambda config, **kw: deepcopy(config))
     runtime = Mock(return_value=deepcopy(result))

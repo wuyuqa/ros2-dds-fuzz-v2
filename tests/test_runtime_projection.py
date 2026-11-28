@@ -521,3 +521,25 @@ class ProjectionReadinessContracts(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class GraphClockWorkerContract(unittest.TestCase):
+    """Offline endpoint fake; the graph timestamp uses the realtime clock only."""
+
+    def test_emit_snapshot_declares_its_realtime_graph_clock(self):
+        from r2f.runtime.worker import emit_snapshot
+        endpoint = SimpleNamespace(get_subscription_count=lambda: 1)
+        tokens = []
+        def emit(event, **fields):
+            tokens.append({'event': event, **fields})
+        with patch('r2f.runtime.worker.time.time_ns', return_value=1700000000000000123), \
+                patch('r2f.runtime.worker.time.monotonic_ns', return_value=456):
+            emit_snapshot(endpoint, 'writer', 31, GUIDS['writer'],
+                          lambda: {'publishers': [], 'subscriptions': []}, emit)
+        match, graph = tokens
+        self.assertEqual(graph['time_ns'], 1700000000000000123)
+        self.assertEqual(graph['timestamp_clock'], 'unix_ns_realtime')
+        self.assertEqual(graph['command_id'], 31)
+        self.assertEqual(match['sampled_monotonic_ns'], 456)
+        self.assertNotIn('timestamp_clock', match)
+        self.assertNotIn('time_ns', match)

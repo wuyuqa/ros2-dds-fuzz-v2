@@ -8,7 +8,7 @@ from collections.abc import Mapping
 from datetime import datetime, timezone
 import json
 from pathlib import Path
-from r2f.core._json import snapshot
+from r2f.core._json import sha256_digest, snapshot
 from r2f.core.evidence import canonical_hash, verify_raw
 from r2f.core.execution import ExecutionRecord, ExecutionStage
 from r2f.core.mutation import MutationReceipt
@@ -248,13 +248,21 @@ def _g01_receipts(scenario, runtime, events, config):
                         checks, "executed", _iso(before["time_ns"]), _iso(after["time_ns"]), proof).to_dict()]
 
 
-def facts_from_events(events, runtime, config):
-    """Only raw tokens produce primary facts; summaries cannot substitute."""
+def facts_from_events(events, runtime, config, *, capture_source=None):
+    """Only raw tokens produce primary facts; summaries cannot substitute.
+
+    capture_source is an explicit archival Python argument, never a config flag.
+    Only audited saved topology reconstruction supplies it; execution uses None.
+    """
+    if capture_source is not None and config.get("target_id") != "discovery.endpoint_topology.fuzz_v1":
+        raise ValueError("saved_capture_source_requires_topology")
     if config.get("target_id") == G01_TARGET:
         return _g01_facts(events, runtime, config)
     if config.get("target_id") == "discovery.endpoint_topology.fuzz_v1":
         from .topology_adapter import facts_from_events as topology_facts
-        return topology_facts(events, runtime, config)
+        if capture_source is None:
+            return topology_facts(events, runtime, config)
+        return topology_facts(events, runtime, config, capture_source=capture_source)
     if str(config.get("target_id", "")).startswith("builtin.discovery_projection_reconciliation"):
         from .projection_adapter import projection_facts
         return projection_facts(events, runtime, config)
@@ -346,15 +354,19 @@ def facts_from_events(events, runtime, config):
     return attach_state_observations(facts, events, runtime, config)
 
 
-def canonical_receipts(scenario, runtime, events, *, config=None):
+def canonical_receipts(scenario, runtime, events, *, config=None, capture_source=None):
     """Exact 1:1 runtime step mapping; raw before/after events are mandatory."""
+    if capture_source is not None and scenario.target_id != "discovery.endpoint_topology.fuzz_v1":
+        raise ValueError("saved_capture_source_requires_topology")
     if scenario.target_id == G01_TARGET:
         if not isinstance(config, dict) or config.get("target_id") != G01_TARGET:
             raise ValueError("g01_receipts_require_exact_runtime_config")
         return _g01_receipts(scenario, runtime, events, config)
     if scenario.target_id == "discovery.endpoint_topology.fuzz_v1":
         from .topology_adapter import canonical_receipts as topology_receipts
-        return topology_receipts(scenario, runtime, events, config=config)
+        if capture_source is None:
+            return topology_receipts(scenario, runtime, events, config=config)
+        return topology_receipts(scenario, runtime, events, config=config, capture_source=capture_source)
     if scenario.target_id.startswith("builtin.discovery_projection_reconciliation"):
         from .projection_adapter import projection_receipts
         return projection_receipts(scenario, runtime, events)
@@ -401,12 +413,13 @@ def canonical_receipts(scenario, runtime, events, *, config=None):
     return receipts
 
 
-def _produce_facts(services, evidence):
+def _produce_facts(services, evidence, *, capture_source=None):
     """Contain provider faults before facts can enter oracle or persistence."""
     returned = False
     result = None
     try:
-        result = services.fact_producer.produce(evidence)
+        result = (services.fact_producer.produce(evidence) if capture_source is None else
+                  services.fact_producer.produce(evidence, capture_source=capture_source))
         returned = True
         if not isinstance(result, Mapping):
             raise TypeError("fact producer result must be a mapping")
@@ -417,6 +430,349 @@ def _produce_facts(services, evidence):
         return {}, {"kind": "invalid_result" if returned else "exception",
                     "exception_type": type(exc).__name__, "reason": str(exc),
                     "returned_result_type": type(result).__name__ if returned else None}
+
+
+def _saved_topology_capture(row, runtime, submitted, scenario, source):
+    """Admit the existing topology v1 capture, including its namespace sidecar.
+
+    This is an artifact audit only. Source qualification and action chronology
+    still belong to the canonical topology receipt/fact producers below.
+    """
+    from r2f.runtime.topology_namespace import AUTHENTICATION, _load_ref, _receipt_refs
+    from r2f.runtime.topology_pair import _execution_workers
+    from .boundary_audit import NAMESPACES, _Audit
+
+    def require(ok, reason):
+        if not ok:
+            raise ValueError("saved_case_topology_" + reason)
+
+    def same(a, b):
+        return canonical_hash(a) == canonical_hash(b)
+
+    metadata = runtime.get("execution_metadata", {})
+    # Only the sealed program can select the group contract, never metadata.
+    program = submitted["effective_input"]["final_input"].get("topology_program")
+    from r2f.runtime.participant_groups import enabled, project_lineage
+    group_control = enabled(program)
+    schema = "r2f.topology-execution-metadata/v2" if group_control else "r2f.topology-execution-metadata/v1"
+    require(runtime.get("schema") == "r2f.topology-run-facts/v1"
+            and metadata.get("schema") == schema
+            and (group_control or "participant_groups" not in metadata),
+            "unsupported_capture_schema")
+    require(runtime.get("real_execution") is True and runtime.get("fixture") is False
+            and runtime.get("runtime_status") == "completed"
+            and metadata.get("real_ros") is True and metadata.get("real_execution") is True
+            and metadata.get("execution_evidence") is True
+            and metadata.get("runtime_status") == "completed"
+            and metadata.get("backend") == "ros2_public_api", "execution_identity_mismatch")
+    require(isinstance(source, dict) and source.get("source_frozen") is True
+            and same(metadata.get("source_manifest"), source)
+            and same(metadata.get("source_after"), source), "source_identity_mismatch")
+    if (row.get("arm") == "negative" or row.get("control_kind") not in (None, "health", "transparency")
+            or row.get("candidate_source") == "control"
+            or metadata.get("fault_id") or metadata.get("fault_control")):
+        raise ValueError("saved_case_control_contamination")
+    identity = metadata.get("source_identity", {})
+    sha256_digest(identity.get("runtime_source_sha256"))
+    require(all(same(identity.get(k), source.get(k)) for k in ("head", "source_repo"))
+            and same(runtime.get("environment", {}).get("source"), identity), "runtime_source_mismatch")
+    require(same(row.get("runtime_execution_metadata"), metadata), "metadata_mismatch")
+    for key in ("run_id", "target_id", "target_revision", "rmw", "arm", "repeat", "domain_id"):
+        require(same(metadata.get(key), row.get(key)), "context_mismatch:" + key)
+    require(all(type(metadata.get(k)) is int for k in ("target_revision", "repeat", "domain_id"))
+            and metadata["repeat"] == scenario.repeat, "context_integer_invalid")
+    context = metadata.get("sealed_execution_context", {})
+    expected = {k: metadata[k] for k in
+                ("run_id", "target_id", "target_revision", "rmw", "domain_id", "arm", "repeat")}
+    expected.update(input_identity_schema=submitted["input_identity_schema"],
+                    effective_input_sha256=submitted["effective_input_sha256"],
+                    plan_hash=scenario.mutation_plan.plan_hash())
+    require(same(context, expected), "sealed_context_mismatch")
+    require(metadata.get("actual_rmws") == [metadata["rmw"]]
+            and same(metadata.get("actual_domains"), [metadata["domain_id"]])
+            and same(metadata.get("declared_domain_id"), metadata["domain_id"])
+            and metadata.get("declared_rmw") == metadata["rmw"], "actual_context_mismatch")
+    require(runtime.get("raw_path") == row["raw_path"] == metadata.get("raw_path")
+            and runtime.get("raw_sha256") == row["raw_sha256"], "raw_identity_mismatch")
+    verify_raw(row["raw_path"], row["raw_sha256"])
+    events = read_events(row["raw_path"])
+    require(same(runtime.get("events"), events), "raw_events_mismatch")
+    # Namespace annotations are parent observations, never fields of raw worker
+    # tokens. Verify the immutable sidecar before permitting those exact extras.
+    ns = runtime.get("topology_namespace", {})
+    require(ns.get("schema") == "r2f.topology-namespace/v1", "namespace_schema_unsupported")
+    verify_raw(ns["manifest_path"], ns["manifest_sha256"])
+    manifest = json.loads(Path(ns["manifest_path"]).read_text())
+    require(manifest.get("schema") == "r2f.topology-namespace-manifest/v1"
+            and manifest.get("error") is None, "namespace_manifest_invalid")
+    require(all(same(ns.get(k), manifest.get(k)) for k in
+                ("bridge_id", "cleanup", "inner_lease_scope", "nested_controller_binding",
+                 "outer_controller", "raw_pid_scope", "worker_bindings")), "namespace_manifest_mismatch")
+    root, scope = manifest["output_root"], ns["raw_pid_scope"]
+    require(Path(root) == Path(row["raw_path"]).parent, "artifact_root_mismatch")
+    environment = metadata.get("environment_manifest", {})
+    verify_raw(environment["path"], environment["sha256"])
+    require(same(json.loads(Path(environment["path"]).read_text()), runtime.get("environment")),
+            "environment_artifact_mismatch")
+    child = _load_ref(manifest["inner_result_ref"], root)
+    wrapper_fields = {"topology_namespace", "execution", "execution_boundary", "execution_metadata"}
+    require(same({k: v for k, v in child.items() if k not in wrapper_fields},
+                 {k: v for k, v in runtime.items() if k not in wrapper_fields}), "inner_result_mismatch")
+    require(same(manifest.get("source_manifest"), source), "namespace_source_mismatch")
+    for key in ("source_before_ref", "source_after_ref"):
+        require(same(_load_ref(manifest[key], root), source), "namespace_source_mismatch")
+    envelope = _load_ref(manifest["envelope_ref"], root)
+    require(all(same(envelope.get(k), manifest.get(k)) for k in
+                ("raw_ref", "inner_result_ref", "source_before_ref", "source_after_ref")),
+            "envelope_artifact_mismatch")
+    lease, bindings = _receipt_refs(envelope, runtime, root, scope)
+    require(same(lease, ns["inner_lease_scope"]) and same(bindings, ns["worker_bindings"]),
+            "namespace_raw_binding_mismatch")
+    request = _load_ref(manifest["request_ref"], root)
+    require(same(ns.get("outer_controller"), request.get("outer"))
+            and isinstance(request.get("outer"), dict), "namespace_request_outer_mismatch")
+    binding = ns["nested_controller_binding"]
+    require(isinstance(binding, dict) and set(binding) == {
+                "authentication", "parent_pid_scope", "outer", "reported_inner",
+                "inner_pid", "pid_scope", "pid_namespace_chain"}
+            and binding.get("authentication") == AUTHENTICATION,
+            "controller_binding_schema_invalid")
+    ancestor, reported = binding.get("outer"), binding.get("reported_inner")
+    require(isinstance(ancestor, dict) and isinstance(reported, dict),
+            "controller_identity_mismatch")
+    require(type(ancestor.get("pid")) is int and ancestor["pid"] > 1
+            and same(ancestor.get("nspid"), [ancestor["pid"], 1])
+            and same(binding.get("inner_pid"), 1)
+            and same(reported.get("pid"), 1) and same(reported.get("nspid"), [1])
+            and same(ancestor.get("uid"), 1000) and same(reported.get("uid"), 0)
+            and type(ancestor.get("start_ticks")) is int and ancestor["start_ticks"] > 0,
+            "controller_identity_mismatch")
+    require(binding.get("pid_scope") == scope
+            and ancestor.get("namespaces", {}).get("pid") == scope
+            and same(ancestor.get("start_ticks"), lease.get("controller_start_ticks"))
+            and all(same(ancestor.get(k), reported.get(k)) for k in
+                    ("namespaces", "start_ticks", "cap_eff", "uid_map", "gid_map")),
+            "controller_identity_mismatch")
+    # Reuse the canonical pure identity/map checks, without the live boundary
+    # audit's enclosing runtime artifacts. The saved request is independent of
+    # the parent descriptor; the child proof must describe a distinct PID1.
+    proof = _Audit()
+    outer = proof.identity(request["outer"], "saved_request.outer")
+    require(same(outer.get("pid"), 1) and same(outer.get("nspid"), [1]),
+            "controller_identity_mismatch")
+    outer_gids = proof.mapping(outer.get("gid_map"), "saved_request.outer.gid_map")
+    expected_gid = outer_gids[0][0] if len(outer_gids) == 1 else None
+    require(type(reported.get("cap_eff")) is int and reported["cap_eff"] > 0
+            and bool(reported["cap_eff"] & (1 << 12))
+            and isinstance(reported.get("namespaces"), dict)
+            and set(reported["namespaces"]) == set(NAMESPACES)
+            and all(isinstance(reported["namespaces"][name], str)
+                    and reported["namespaces"][name] != outer["namespaces"].get(name)
+                    for name in NAMESPACES), "controller_identity_mismatch")
+    require(proof.mapping(reported.get("uid_map"), "saved_controller.uid_map") == [[0, 1000, 1]]
+            and proof.mapping(reported.get("gid_map"), "saved_controller.gid_map") == [[0, expected_gid, 1]]
+            and not proof.errors, "controller_identity_mismatch")
+    outer_scope = outer["namespaces"]["pid"]
+    require(binding.get("parent_pid_scope") == outer_scope
+            and same(binding.get("pid_namespace_chain"), [
+                {"pid_scope": outer_scope, "pid": ancestor.get("pid")},
+                {"pid_scope": scope, "pid": 1}]), "controller_pid_chain_mismatch")
+    cleanup = ns["cleanup"]
+    require(cleanup.get("confirmed") is True and cleanup.get("controller_exited") is True
+            and type(cleanup.get("wrapper_returncode")) is int and cleanup["wrapper_returncode"] == 0,
+            "namespace_cleanup_incomplete")
+    workers = metadata.get("workers")
+    require(isinstance(workers, list) and bool(workers), "workers_missing")
+    if group_control:
+        lineage = project_lineage(program, events, row["raw_path"], config=request["config"])
+        require(same(metadata.get("participant_groups"), lineage), "group_raw_lineage_mismatch")
+        projected = lineage["workers"]
+    else:
+        projected = _execution_workers(events, row["raw_path"], program)
+    bare = []
+    for worker in workers:
+        require(worker.get("pid_namespace") == scope
+                and worker.get("pid_interpretation") == "namespace_PID_not_host_PID",
+                "worker_namespace_mismatch")
+        require(all(type(worker.get(k)) is int and worker[k] > 0 for k in
+                    ("pid", "pgid", "process_start_ticks", "generation", "worker_generation"))
+                and type(worker.get("returncode")) is int and worker["returncode"] == 0
+                and worker.get("closed") is True and worker.get("real_ros") is True
+                and worker.get("fixture") is False and worker.get("fresh_process") is True
+                and (worker.get("group_context_owned") is True if group_control
+                     else worker.get("separate_context") is True)
+                and worker.get("unknowns") == []
+                and same(worker.get("domain_id"), metadata["domain_id"])
+                and worker.get("rmw_identifier") == metadata["rmw"], "worker_identity_mismatch")
+        keys = ("logical_id", "generation", "endpoint_gid", "endpoint_generation", "pid", "process_start_ticks")
+        if group_control:
+            keys += ("group_id", "worker_instance_id", "context_instance_id")
+        matches = [b for b in bindings if all(same(b.get(k), worker.get(k)) for k in keys)
+                   and (not group_control or b.get("lineage_schema") == lineage["schema"])]
+        require(len(matches) == 1 and same(matches[0].get("namespaces"), binding["outer"]["namespaces"]),
+                "worker_process_binding_mismatch")
+        bare.append({k: v for k, v in worker.items() if k not in ("pid_namespace", "pid_interpretation")})
+    require(same(bare, projected), "worker_raw_projection_mismatch")
+    raw_metadata = _one(events, "topology_execution_metadata")["metadata"]
+    require(same(child.get("execution_metadata"), raw_metadata), "inner_metadata_mismatch")
+    expected_metadata = {k: v for k, v in metadata.items() if k not in ("pid_namespace", "pid_interpretation")}
+    expected_metadata["workers"] = bare
+    require(metadata.get("pid_namespace") == scope
+            and metadata.get("pid_interpretation") == "namespace_PID_not_host_PID"
+            and same(raw_metadata, expected_metadata), "raw_metadata_mismatch")
+    if (row.get("arm") == "negative" or row.get("control_kind") not in (None, "health", "transparency")
+            or metadata.get("fault_id") or metadata.get("fault_control")
+            or any(e.get("event") in ("harness_omission", "fault_control_receipt") for e in events)):
+        raise ValueError("saved_case_control_contamination")
+    # Use the saved, hash-bound request config. Rebuilding it from capsule
+    # fields can change defaults (notably the episode contract identity).
+    config = request["config"]
+    require(request.get("bridge_id") == ns["bridge_id"]
+            and request.get("output_root") == root
+            and same(request.get("source_manifest"), source)
+            and request.get("config_sha256") == manifest.get("config_sha256") == canonical_hash(config),
+            "request_identity_mismatch")
+    effective = submitted["effective_input"]
+    for key in ("target_id", "target_revision", "rmw", "arm", "repeat", "seed", "mutation_kind",
+                "mutation_parameters", "carrier", "input_identity_schema", "effective_input_sha256",
+                "scenario", "source_manifest", "mutation_plan"):
+        require(same(config.get(key), submitted.get(key)), "config_input_mismatch:" + key)
+    require(all(same(config.get(k), v) for k, v in expected.items())
+            and same(config.get("effective_input"), effective)
+            and same(config.get("final_input"), effective["final_input"])
+            and same(config.get("input_layer_receipts"), effective["input_layer_receipts"]),
+            "config_context_mismatch")
+    if (config.get("fault_id") or config.get("fault_control") or config.get("control_kind")
+            or config.get("candidate_source") == "control"):
+        raise ValueError("saved_case_control_contamination")
+    require(metadata.get("input_program_sha256") == canonical_hash(config["topology_program"]),
+            "input_program_mismatch")
+    return config, events
+
+
+def rebuild_saved_case_facts(case, *, runtime, capsule, services):
+    """Read-only canonical raw reconstruction; never ingest a new execution.
+
+    The caller verifies the saved JSON artifact references. This seam binds their
+    contents to the original row/capsule, uses the normal raw/receipt validators,
+    and independently compares the registered producer with canonical facts.
+    Supplied row typed_facts and recorded oracle outputs are never inputs.
+    """
+    from r2f.core.scenario import Scenario
+
+    case, runtime = snapshot(case), snapshot(runtime)
+    row, submitted = case["row"], capsule.input
+    effective = submitted["effective_input"]
+    scenario = Scenario.from_dict(submitted["scenario"])
+    source = row.get("source_identity") or row.get("source_manifest") or row.get("provenance")
+    if (canonical_hash(submitted["source_manifest"]) != canonical_hash(source)
+            or submitted["effective_input_sha256"] != row["effective_input_sha256"]
+            or case["input_sha256"] != row["effective_input_sha256"]
+            or any(canonical_hash(submitted[key]) != canonical_hash(row.get(key)) for key in
+                   ("target_id", "target_revision", "rmw", "arm"))
+            or any(canonical_hash(row.get(key)) != canonical_hash(effective[key])
+                   for key in ("final_input", "input_layer_receipts") if key in row)
+            or ("target" in row and row["target"] != submitted["target"])):
+        raise ValueError("saved_case_capture_input_mismatch")
+    if scenario.target_id == "discovery.endpoint_topology.fuzz_v1":
+        from r2f.runtime.execution_boundary import BoundaryError
+        try:
+            config, events = _saved_topology_capture(row, runtime, submitted, scenario, source)
+        except BoundaryError as exc:
+            raise ValueError("saved_case_topology_" + str(exc)) from exc
+    else:
+        metadata = runtime.get("execution_metadata") or runtime.get("execution") or {}
+        capture_source = metadata.get("source")
+        source_bound = canonical_hash(capture_source) == canonical_hash(source)
+        # Public-pair captures measure the runtime/observer tree separately from
+        # the campaign behavior manifest. Bind that existing schema through the
+        # row's complete captured metadata, then join its repository and HEAD.
+        if not source_bound and isinstance(capture_source, dict) and isinstance(source, dict):
+            sha256_digest(capture_source.get("runtime_source_sha256"))
+            if "observer_source_sha256" in capture_source:
+                sha256_digest(capture_source["observer_source_sha256"])
+            source_bound = (bool(source.get("head")) and bool(source.get("source_repo"))
+                            and all(canonical_hash(capture_source.get(key)) == canonical_hash(source[key])
+                                    for key in ("head", "source_repo"))
+                            and canonical_hash(row.get("runtime_execution_metadata")) == canonical_hash(metadata))
+        if (runtime.get("real_execution") is not True or runtime.get("runtime_status") != "completed"
+                or not source_bound
+                or canonical_hash(metadata.get("source_after")) != canonical_hash(capture_source)
+                or ("runtime_execution_metadata" in row
+                    and canonical_hash(row["runtime_execution_metadata"]) != canonical_hash(metadata))
+                or type(metadata.get("target_revision")) is not int
+                or any(canonical_hash(metadata.get(key)) != canonical_hash(row.get(key)) for key in
+                       ("run_id", "target_id", "target_revision", "rmw", "arm"))
+                or any(canonical_hash(metadata.get(key)) != canonical_hash(row[key])
+                       for key in ("domain_id", "repeat") if key in row)
+                or type(metadata.get("repeat")) is not int or metadata["repeat"] != scenario.repeat
+                or type(metadata.get("domain_id")) is not int
+                or runtime.get("raw_path") != row["raw_path"]
+                or runtime.get("raw_sha256") != row["raw_sha256"]):
+            raise ValueError("saved_case_runtime_identity_mismatch")
+        # Capture-side markers must survive configuration merging. Null in the
+        # capsule cannot erase a fault actually recorded by the runtime.
+        if metadata.get("fault_id") or metadata.get("fault_control"):
+            raise ValueError("saved_case_control_contamination")
+        if any(canonical_hash(metadata[key]) != canonical_hash(value)
+               for key, value in effective["final_input"].items() if key in metadata):
+            raise ValueError("saved_case_capture_config_mismatch")
+        config = dict(metadata, **effective["final_input"])
+        verify_raw(row["raw_path"], row["raw_sha256"])
+        events = read_events(row["raw_path"])
+        if (not events or canonical_hash(runtime.get("events")) != canonical_hash(events)
+                or any(type(e.get("event_index")) is not int or e["event_index"] != i
+                       or e.get("run_id") != config["run_id"]
+                       or canonical_hash(e.get("domain_id")) != canonical_hash(config["domain_id"])
+                       for i, e in enumerate(events))):
+            raise ValueError("saved_case_raw_identity_mismatch")
+        if (row.get("arm") == "negative" or row.get("control_kind") not in
+                (None, "health", "transparency") or config.get("fault_id")
+                or any(e.get("event") in ("harness_omission", "fault_control_receipt") for e in events)):
+            raise ValueError("saved_case_control_contamination")
+        # Only the processes that created these endpoints can supply their health.
+        workers = metadata.get("workers", [])
+        tokens = {role: _one(events, "endpoint_created", role=role)
+                  for role in ("writer", "reader")}
+        if (not isinstance(workers, list) or len(workers) != 2
+                or {w.get("role") for w in workers} != set(tokens)
+                or any(type(w.get("pid")) is not int or w["pid"] <= 0
+                       or type(w.get("returncode")) is not int or w["returncode"] != 0
+                       or canonical_hash(w["pid"]) != canonical_hash(tokens[w["role"]].get("pid"))
+                       or any(canonical_hash(w[key]) != canonical_hash(tokens[w["role"]][key])
+                              for key in ("pid_namespace", "worker_generation")
+                              if key in w and key in tokens[w["role"]])
+                       for w in workers)
+                or len({w["pid"] for w in workers}) != 2):
+            raise ValueError("saved_case_worker_identity_mismatch")
+    receipt = MutationReceipt.from_dict(runtime["mutation_receipt"]).to_dict()
+    if (_one(events, "runtime_end").get("mutation_receipt") != receipt
+            or row.get("mutation_receipt") != receipt):
+        raise ValueError("saved_case_raw_mutation_receipt_mismatch")
+    # Capture admission above authenticates this recorded source and all raw
+    # source-check phases. Current evaluation source is measured by the caller.
+    # Keep this explicit argument out of JSON config and every execution call.
+    archival = ({"capture_source": source}
+                if scenario.target_id == "discovery.endpoint_topology.fuzz_v1" else {})
+    canonical_receipts(scenario, runtime, events, config=config, **archival)
+    canonical = facts_from_events(events, runtime, config, **archival)
+    if (canonical.get("evidence_error") or not all(canonical.get(key) is True for key in
+            ("environment_healthy", "process_healthy", "preconditions_reached", "endpoint_identity_complete"))):
+        raise ValueError("saved_case_raw_facts_incomplete:" + str(canonical.get("evidence_error")))
+    evidence = snapshot({"events": events, "runtime": runtime, "config": config})
+    digest = canonical_hash(evidence)
+    facts, failure = _produce_facts(services, evidence, **archival)
+    if failure is not None:
+        raise ValueError("saved_case_fact_producer_failure:" + str(failure))
+    if canonical_hash(evidence) != digest or canonical_hash(facts) != canonical_hash(canonical):
+        raise ValueError("saved_case_fact_producer_changed_raw_or_facts")
+    if "input_identity_schema" in submitted:
+        scenario.input_identity_schema = submitted["input_identity_schema"]
+    scenario.final_input = snapshot(effective["final_input"])
+    scenario.input_layer_receipts = snapshot(effective["input_layer_receipts"])
+    scenario.source_manifest = snapshot(source)
+    scenario.effective_input_sha256 = submitted["effective_input_sha256"]
+    return scenario, snapshot(canonical)
 
 
 def _primary_rule_id(scenario):
@@ -765,6 +1121,8 @@ def ingest_execution(scenario, config, runtime, capsule, *, services=None):
                raw_path=runtime.get("raw_path"), raw_sha256=runtime.get("raw_sha256"),
                runtime_execution_metadata=runtime.get("execution_metadata") or runtime.get("execution"),
                observation_receipts=runtime.get("observation_receipts", []), environment=runtime.get("environment", {}))
+    if config.get('observe_participant_leases'):
+        row['observation_mode'] = config.get('observation_mode', 'blackbox')
     if "observation" in runtime:
         from .observations import qualify_observation
         row["instrumentation_observation"] = qualify_observation(row, runtime, config, capsule=capsule)

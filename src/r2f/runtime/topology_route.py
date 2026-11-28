@@ -18,7 +18,7 @@ from r2f.modules.s1.topology_input import (
     TOPOLOGY_TARGET, TOPOLOGY_CAPABILITY, TOPOLOGY_MUTATION_KIND, TOPOLOGY_CARRIER,
     validate_topology_plan, topology_input_layer_receipts,
 )
-from .topology_worker import OFFLINE_BACKEND, ROS_BACKEND, OfflineTopologyBackend, RosTopologyBackend
+from .topology_worker import OFFLINE_BACKEND, ROS_BACKEND, OfflineTopologyBackend, RosTopologyBackend, TopologyUnsupported
 from .topology_operator_application import (
     audit_operator_application, is_deadline_configuration_delay,
 )
@@ -208,7 +208,7 @@ def run_topology_route(config, output_dir, *, backend=None):
     result = run_topology(deepcopy(plan.final_config["topology_program"]), cfg, output_dir, backend=backend)
     result["runtime_capability"] = TOPOLOGY_CAPABILITY
     result["route_binding"] = cfg["topology_route_binding"]
-    result["application_audit"] = audit_topology_application(plan, cfg["input_layer_receipts"], result)
+    result["application_audit"] = audit_topology_application(plan, cfg["input_layer_receipts"], result, config=cfg)
     # These are separate artifact/application observations, not a candidate or
     # oracle verdict. Preserve the original scenario receipt and all failures.
     result.setdefault("scenario_mutation_receipt", deepcopy(result["mutation_receipt"]))
@@ -235,7 +235,97 @@ def _raw(runtime):
     return rows, str(path), digest
 
 
-def _action_proof(action, events):
+def _group_application_context(program, events):
+    """Index already lineage-authenticated raw; never accept caller opt-in flags."""
+    from .participant_groups import closed_destroy_receipts
+    retirements = closed_destroy_receipts(program, events, before_index=len(events))
+    for retirement in retirements:
+        if any(events[retirement[k + "_ref"]].get("command", "destroy_endpoint")
+               != "destroy_endpoint" for k in ("request", "cleanup", "ack", "controller")):
+            raise ValueError("group_application:unknown_retirement_command")
+    tokens = {(e["logical_id"], e["generation"]): e for e in events
+              if e.get("event") == "endpoint_created"}
+    creates = {}
+    for key, token in tokens.items():
+        requests = [e for e in events if e.get("event") == "group_command_requested"
+                    and e.get("command") == "create_endpoint"
+                    and (e.get("logical_id"), e.get("generation")) == key]
+        if len(requests) != 1:
+            raise ValueError("group_application:create_request_ambiguous")
+        request = requests[0]
+        # project_lineage has checked exact process/context/incarnation links.
+        bound = [e for e in events if e.get("event") == "endpoint_group_bound"
+                 and e.get("endpoint", {}).get("endpoint_gid") == token["endpoint_gid"]]
+        acks = [e for e in events if e.get("event") == "command_done"
+                and e.get("group_id") == token["group_id"]
+                and e.get("command_id") == request["command_id"]]
+        if len(bound) != 1 or len(acks) != 1:
+            raise ValueError("group_application:create_binding_or_ack_ambiguous")
+        creates[key] = [request, token, bound[0], acks[0]]
+    return {"creates": creates, "retirements": {
+        (events[r["controller_ref"]]["logical_id"],
+         events[r["controller_ref"]]["generation"]): r for r in retirements}}
+
+
+def _group_lifecycle_proof(action, events, start, end, receipt, context):
+    """Use closed chains once authenticated, but enforce each action's prefix."""
+    def require(ok):
+        if not ok:
+            raise ValueError("group_application:action_identity_or_chronology_not_proven")
+
+    def ordered(rows):
+        return all(a["event_index"] < b["event_index"]
+                   and a["monotonic_ns"] <= b["monotonic_ns"]
+                   for a, b in zip(rows, rows[1:]))
+
+    eid, gen, op = action["endpoint_id"], action["generation"], action["op"]
+    before, after = start.get("before") or {}, receipt.get("after") or {}
+    require(ordered([start, end]))
+    if op == "destroy":
+        require(before.get("generation") == gen and before.get("alive") is True
+                and after.get("generation") == gen and after.get("alive") is False)
+        retirement = context["retirements"].get((eid, gen))
+        require(retirement is not None)
+        chain = [events[retirement[k + "_ref"]] for k in
+                 ("action_begin", "request", "cleanup", "ack", "controller", "action_done")]
+        require(chain[0] is start and chain[-1] is end)
+        require(ordered([context["creates"][(eid, gen)][-1], start]))
+        return [e["event_index"] for e in chain]
+
+    creation = context["creates"].get((eid, gen))
+    require(creation is not None and ordered([start, *creation, end]))
+    created = creation[1]
+    identity = ("endpoint_gid", "pid", "process_start_ticks", "endpoint_generation")
+    require(all(created.get(k) is not None and after.get(k) == created[k] for k in identity)
+            and all(created.get(k) is not None for k in ("topic", "message_type", "qos"))
+            and after.get("generation") == gen and after.get("alive") is True
+            and before.get("generation") == gen - 1)
+    refs = [e["event_index"] for e in creation]
+    if op == "create":
+        require(gen == 1 and before.get("alive") is False)
+    else:
+        predecessor = context["creates"].get((eid, gen - 1))
+        retirement = context["retirements"].get((eid, gen - 1))
+        require(predecessor is not None and retirement is not None)
+        prior = predecessor[1]
+        require(all(prior.get(k) == created.get(k) for k in
+                    ("pid", "pgid", "process_start_ticks", "group_id",
+                     "context_instance_id", "worker_instance_id"))
+                and all(prior.get(k) != created.get(k) for k in
+                        ("endpoint_gid", "endpoint_generation")))
+        chain = [events[retirement[k + "_ref"]] for k in
+                 ("action_begin", "request", "cleanup", "ack", "controller", "action_done")]
+        if before.get("alive") is True:  # implicit recreate retires within this action
+            require(chain[0] is start and chain[-1] is end
+                    and ordered([*chain[:-1], *creation, end]))
+        else:  # explicit destroy must have completed before recreate begins
+            require(before.get("alive") is False and chain[0]["action"]["op"] == "destroy"
+                    and ordered([*chain, start, *creation, end]))
+        refs.extend(e["event_index"] for e in chain)
+    return [start["event_index"], end["event_index"], *refs]
+
+
+def _action_proof(action, events, *, group_context=None):
     aid = action["action_id"]
     starts = [e for e in events if e.get("event") == "topology_action_begin" and e.get("action_id") == aid]
     ends = [e for e in events if e.get("event") == "topology_action_done" and e.get("action_id") == aid]
@@ -251,6 +341,12 @@ def _action_proof(action, events):
     segment = events[start["event_index"] + 1:end["event_index"]]
     op = action["op"]
     eid, gen = action["endpoint_id"], action["generation"]
+    if group_context is not None and op in {"create", "recreate", "destroy"}:
+        try:
+            refs = _group_lifecycle_proof(action, events, start, end, receipt, group_context)
+            return refs + [e["event_index"] for e in segment], None
+        except (ValueError, KeyError) as exc:
+            return [], str(exc)
     if op in {"create", "recreate"}:
         creates = [e for e in segment if e.get("event") == "endpoint_created"
                    and e.get("logical_id") == eid and e.get("generation") == gen]
@@ -569,7 +665,7 @@ def _worker_configuration_proven(created, program):
     if source != "public_endpoint_actual_qos":
         return False
     from .qos_binding import validate_created_qos
-    from .topology_worker import endpoint_expressibility
+    from .topology_worker import observed_endpoint_expressibility
     try:
         specs = [e for e in program["endpoints"]
                  if e.get("logical_id") == created.get("logical_id")]
@@ -581,14 +677,14 @@ def _worker_configuration_proven(created, program):
         if (created.get("identity_source") != api or created.get("topic") != spec["topic"]
                 or created.get("message_type") != spec["type_name"]):
             return False
-        requested = endpoint_expressibility(spec, {"rmw": created.get("rmw_identifier")})["public_qos"]
+        requested = observed_endpoint_expressibility(spec, created)["public_qos"]
         validate_created_qos(created, requested)
         return True
-    except (ValueError, TypeError, KeyError, RuntimeError):
+    except (ValueError, TypeError, KeyError, RuntimeError, TopologyUnsupported):
         return False
 
 
-def audit_topology_application(plan, input_layer_receipts, runtime):
+def audit_topology_application(plan, input_layer_receipts, runtime, *, config=None):
     """Audit per-layer input→application, retaining unsupported/unknown gaps.
 
     Endpoint count: exact created configuration/generation identities for all
@@ -641,7 +737,13 @@ def audit_topology_application(plan, input_layer_receipts, runtime):
         expected_source_phases = ["before_preflight", "after_preflight", "before_presteps"] + ["before_action:" + a["action_id"] for a in program["actions"]] + ["after_actions", "after_cleanup"]
         source_phases_complete = [e.get("phase") for e in sources] == expected_source_phases
         from .topology_pair import _execution_workers
-        workers = _execution_workers(events, path)
+        workers = _execution_workers(events, path, program, config=config)
+        from .participant_groups import enabled, project_lineage
+        grouped = enabled(program)
+        group_context = None
+        if grouped:
+            project_lineage(program, events, path, config=config)  # exact raw-bound opt-in only
+            group_context = _group_application_context(program, events)
         worker_provenance = bool(created_workers) and all(
             e.get("backend") == ROS_BACKEND and e.get("real_ros") is True
             and _worker_configuration_proven(e, program)
@@ -649,7 +751,8 @@ def audit_topology_application(plan, input_layer_receipts, runtime):
             and e.get("rmw_identifier") in {"rmw_cyclonedds_cpp", "rmw_fastrtps_cpp"}
             and all(e.get(k) is not None for k in ("pid", "process_start_ticks", "endpoint_generation", "endpoint_gid"))
             for e in created_workers) and all(
-                not w["unknowns"] and w["fresh_process"] and w["separate_context"]
+                not w["unknowns"] and w["fresh_process"]
+                and (w.get('group_context_owned') is True if grouped else w['separate_context'])
                 and w["returncode"] == 0 and w["closed"] for w in workers)
         ready = {"environment_ok": len(environments) == 1 and environments[0].get("ok") is True,
                  "locks_held": len(locks) == 1 and len(locks[0].get("locks", [])) == 3,
@@ -681,7 +784,8 @@ def audit_topology_application(plan, input_layer_receipts, runtime):
         from .topology_concurrency import action_trace_complete
         trace_complete = action_trace_complete(events, program["actions"])
         final_actions = {a["action_id"]: a for a in program["actions"]}
-        all_proofs = {aid: _action_proof(action, events) for aid, action in final_actions.items()}
+        all_proofs = {aid: _action_proof(action, events, group_context=group_context)
+                      for aid, action in final_actions.items()}
         netem_audit_status = (audit.get("netem_application") or {}).get("status")
         operator_records = {}
         for index, receipt in enumerate(input_layer_receipts):
@@ -740,8 +844,8 @@ def audit_topology_application(plan, input_layer_receipts, runtime):
                 # distinct observed schemas; neither is filled from config.
                 expected_qos = spec["qos"]
                 if created.get("backend") != OFFLINE_BACKEND:
-                    from .topology_worker import endpoint_expressibility
-                    expected_qos = endpoint_expressibility(spec, {"rmw": created.get("rmw_identifier")})["public_qos"]
+                    from .topology_worker import observed_endpoint_expressibility
+                    expected_qos = observed_endpoint_expressibility(spec, created)["public_qos"]
                 observed_qos = created.get("qos")
                 if created.get("backend") != OFFLINE_BACKEND:
                     mandatory = {"reliability", "durability", "deadline_ns", "liveliness", "liveliness_lease_duration_ns"}
@@ -822,7 +926,10 @@ def audit_topology_application(plan, input_layer_receipts, runtime):
             if not affected and not removed and operator != "endpoint.count":
                 layer["reasons"].append("operator_effect_not_identified")
             proof_actions = set(final_actions) if operator in {"endpoint.count", "action.delete", "action.swap"} else affected
-            proof_actions |= {aid for aid, a in final_actions.items() if a["op"] in {"create", "recreate"}}
+            # Shared retirement is part of the creation proof even for QoS layers.
+            # Do not hide an invalid destroy action behind a valid recreate chain.
+            proof_actions |= {aid for aid, a in final_actions.items()
+                              if a["op"] in {"create", "recreate"} or (grouped and a["op"] == "destroy")}
             for aid in sorted(proof_actions):
                 refs, reason = all_proofs.get(aid, ([], "action_not_in_final_program"))
                 layer["raw_refs"].extend(refs)
@@ -854,6 +961,6 @@ def audit_topology_application(plan, input_layer_receipts, runtime):
                                             effect_observed=all_observed and all(
                                                 l.get("effect_observed", l["hit"]) for l in audit["layers"]))
         audit["receipt_reason"] = audit["status"]
-    except (OSError, ValueError, TypeError, KeyError, AttributeError) as exc:
+    except (OSError, ValueError, TypeError, KeyError, AttributeError, TopologyUnsupported) as exc:
         audit.update(status="invalid", reasons=[type(exc).__name__ + ":" + str(exc)])
     return audit

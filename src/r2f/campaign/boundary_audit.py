@@ -748,6 +748,20 @@ def _audit_nested_receipts(a, manifest, request, envelope, child, raw, binding, 
     metadata = a.obj(child.get('execution_metadata'), label + '.child.execution_metadata')
     actual = a.seq(metadata.get('workers'), label + '.child.execution_metadata.workers')
     a.check(bool(workers) and len(workers) == len(actual), 'contract_gap', label + '.worker_count', 'complete worker generation bindings required')
+    from r2f.runtime.participant_groups import enabled, project_lineage, PROCESS_KEYS, LINK_KEYS
+    group_lineage = None
+    if enabled(config.get('topology_program')):
+        try:
+            group_lineage = project_lineage(config['topology_program'], raw, child.get('raw_path'), config=config)
+            a.equal(metadata.get('schema'), 'r2f.topology-execution-metadata/v2', label + '.group_schema')
+            a.equal(metadata.get('participant_groups'), group_lineage, label + '.group_raw_projection')
+            a.equal(actual, group_lineage['workers'], label + '.group_worker_projection')
+        except (ValueError, TypeError, KeyError, IndexError) as exc:
+            a.check(False, 'worker_lineage', label + '.group_lineage', str(exc))
+    else:
+        a.check(metadata.get('schema') != 'r2f.topology-execution-metadata/v2'
+                and 'participant_groups' not in metadata, 'worker_lineage',
+                label + '.group_schema', 'group schema requires exact sealed opt-in')
     offsets, identities, translated = [], set(), []
     keys = ('logical_id', 'generation', 'pid', 'process_start_ticks', 'endpoint_generation', 'endpoint_gid')
     for index, value in enumerate(workers):
@@ -775,8 +789,16 @@ def _audit_nested_receipts(a, manifest, request, envelope, child, raw, binding, 
         a.check(len(matches) == 1, 'worker_lineage', field, 'must identify exactly one child metadata worker generation')
         created = [e for e in raw if e.get('event') == 'endpoint_created' and all(_equal(e.get(k), worker.get(k)) for k in keys)]
         starts = [e for e in raw if e.get('event') == 'process_started' and all(_equal(e.get(k), worker.get(k)) for k in keys if k not in ('endpoint_gid', 'endpoint_generation', 'process_start_ticks'))]
+        if group_lineage is not None:
+            for key in LINK_KEYS:
+                a.equal(worker.get(key), matches[0].get(key) if len(matches) == 1 else None, field + '.' + key)
+            a.equal(worker.get('lineage_schema'), group_lineage['schema'], field + '.lineage_schema')
+            starts = [e for e in raw if e.get('event') == 'process_started'
+                      and all(_equal(e.get(k), worker.get(k)) for k in PROCESS_KEYS + LINK_KEYS if k != 'pgid')]
         try:
-            exits = _incarnation_process_exits(raw, worker, keys)
+            exits = ([e for e in raw if e.get('event') == 'process_exit'
+                      and all(_equal(e.get(k), worker.get(k)) for k in PROCESS_KEYS + LINK_KEYS if k != 'pgid')]
+                     if group_lineage is not None else _incarnation_process_exits(raw, worker, keys))
         except (ValueError, KeyError, TypeError, IndexError) as exc:
             exits = []
             a.check(False, 'worker_lineage', field + '.exit_incarnation', str(exc))

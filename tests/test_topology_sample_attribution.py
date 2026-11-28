@@ -249,3 +249,150 @@ def test_payload_native_claim_cannot_downgrade_after_all_direct_gids_are_changed
         info['publisher_gid']['value'] = info['publisher_gid']['raw_value'] = legacy['endpoint_gid']
     with pytest.raises(ValueError, match='native_delivery_identity:'):
         native_delivery_identity(received, sends(rows), rows, ref=raw_ref)
+
+
+def test_later_control_retirement_and_replacement_preserve_historical_identity():
+    rows, _ = prepared()
+    control = rows[2]
+    rows.append(dict(control, event="topology_endpoint_destroyed", event_index=len(rows),
+                     monotonic_ns=100 + len(rows)))
+    rows.append(dict(control, event="endpoint_created", generation=2,
+                     endpoint_gid="09" * 16, pid=302, process_start_ticks=20,
+                     endpoint_generation="offline-control-generation-2",
+                     event_index=len(rows), monotonic_ns=100 + len(rows)))
+    original = deepcopy(rows)
+    identity = native_delivery_identity(sample(rows), sends(rows), rows, ref=raw_ref)
+    assert identity["control_identity"]["logical_id"] == "r1"
+    assert identity["control_identity"]["generation"] == 1
+    assert identity["control_identity"]["endpoint_gid"] == control["endpoint_gid"]
+    assert identity["control_ref"] == raw_ref(sample(rows, reader="r1"))
+    assert rows == original
+
+
+@pytest.mark.parametrize("event", ["endpoint_destroyed", "topology_endpoint_destroyed",
+                                   "endpoint_identity_transition", "content_filter_dynamic_update"])
+def test_control_changes_proven_later_do_not_erase_prior_sample_identity(event):
+    rows, _ = prepared()
+    rows.append(dict(rows[2], event=event, event_index=len(rows), monotonic_ns=100 + len(rows)))
+    original = deepcopy(rows)
+    identity = native_delivery_identity(sample(rows), sends(rows), rows, ref=raw_ref)
+    assert identity["control_identity"]["generation"] == 1
+    assert identity["control_ref"] == raw_ref(sample(rows, reader="r1"))
+    assert rows == original
+
+
+@pytest.mark.parametrize("clock", [None, True, 0, 110])
+def test_control_change_without_proven_later_clock_remains_unknown(clock):
+    rows, _ = prepared()
+    rows.append(dict(rows[2], event="topology_endpoint_destroyed", event_index=len(rows),
+                     monotonic_ns=clock))
+    with pytest.raises(ValueError, match="native_delivery_identity:"):
+        native_delivery_identity(sample(rows), sends(rows), rows, ref=raw_ref)
+
+
+def test_future_reader_cannot_replace_missing_historical_control_configuration():
+    rows, _ = prepared()
+    future = dict(rows[2], generation=2, endpoint_gid="09" * 16,
+                  endpoint_generation="offline-future-control", pid=302, process_start_ticks=20,
+                  event_index=len(rows), monotonic_ns=100 + len(rows))
+    rows[2].pop("initial_content_filter")
+    rows.append(future)
+    with pytest.raises(ValueError, match="native_delivery_identity:"):
+        native_delivery_identity(sample(rows), sends(rows), rows, ref=raw_ref)
+
+
+
+def delayed_control_receive(rows):
+    control = sample(rows, reader="r1")
+    delayed = deepcopy(control)
+    control["event"] = "offline_removed_control_receive"
+    change = dict(rows[2], event="content_filter_dynamic_update",
+                  event_index=len(rows), monotonic_ns=100 + len(rows),
+                  command="update_filter", command_id=999)
+    requested = dict(expression="data = %0", parameters=[delayed["string_data"]])
+    change.update(reader_gid=rows[2]["endpoint_gid"], before_gid=rows[2]["endpoint_gid"],
+                  after_gid=rows[2]["endpoint_gid"],
+                  filter_receipt=dict(receipt_kind="filter_update", requested=requested,
+                                      observed=deepcopy(requested), api_status="succeeded",
+                                      readback_status="matched", applied=True,
+                                      filter_effect_observed=None, hit=False))
+    rows.append(change)
+    delayed.update(event_index=len(rows), monotonic_ns=change["monotonic_ns"] + 3)
+    delayed["rcl_take_receipt"].update(take_begin_monotonic_ns=change["monotonic_ns"] + 1,
+                                       take_return_monotonic_ns=change["monotonic_ns"] + 2)
+    rows.append(delayed)
+    return change, delayed
+
+
+def test_control_filtered_between_target_and_actual_control_sample_is_rejected():
+    rows, _ = prepared()
+    change, control = delayed_control_receive(rows)
+    assert (sample(rows)["event_index"], sample(rows)["monotonic_ns"]) == (14, 114)
+    assert (change["event_index"], change["monotonic_ns"]) == (21, 121)
+    assert (control["event_index"], control["monotonic_ns"]) == (22, 124)
+    original = deepcopy(rows)
+    with pytest.raises(ValueError, match="native_delivery_identity:"):
+        native_delivery_identity(sample(rows), sends(rows), rows, ref=raw_ref)
+    assert rows == original
+
+
+@pytest.mark.parametrize("event", ["endpoint_destroyed", "topology_endpoint_destroyed",
+                                   "endpoint_identity_transition", "content_filter_dynamic_update"])
+def test_changes_after_both_delayed_samples_preserve_actual_control_identity(event):
+    rows, _ = prepared()
+    change, control = delayed_control_receive(rows)
+    rows.remove(change)
+    change.update(event=event, monotonic_ns=control["monotonic_ns"] + 1)
+    rows.append(change)
+    for index, row in enumerate(rows):
+        row["event_index"] = index
+    original = deepcopy(rows)
+    identity = native_delivery_identity(sample(rows), sends(rows), rows, ref=raw_ref)
+    assert identity["control_ref"] == raw_ref(control)
+    assert identity["sequence"] == 2
+    assert identity["control_identity"]["generation"] == 1
+    assert rows == original
+
+
+@pytest.mark.parametrize("event", ["endpoint_destroyed", "topology_endpoint_destroyed",
+                                   "endpoint_identity_transition", "content_filter_dynamic_update"])
+@pytest.mark.parametrize("raw_after,clock", [(False, 125), (True, 123), (True, 124),
+                                            (True, None), (True, True)])
+def test_control_change_requires_raw_and_clock_proof_after_actual_control_sample(event, raw_after, clock):
+    rows, _ = prepared()
+    change, control = delayed_control_receive(rows)
+    change.update(event=event, monotonic_ns=clock)
+    if raw_after:
+        rows.remove(change)
+        rows.append(change)
+        for index, row in enumerate(rows):
+            row["event_index"] = index
+    original = deepcopy(rows)
+    with pytest.raises(ValueError, match="native_delivery_identity:"):
+        native_delivery_identity(sample(rows), sends(rows), rows, ref=raw_ref)
+    assert rows == original
+
+
+@pytest.mark.parametrize("fault", ["body", "pubseq", "generation", "take", "send_collision", "alias"])
+def test_later_control_change_cannot_weaken_actual_native_witness_authentication(fault):
+    rows, _ = prepared()
+    rows.append(dict(rows[2], event="content_filter_dynamic_update",
+                     event_index=len(rows), monotonic_ns=100 + len(rows)))
+    control = sample(rows, reader="r1")
+    if fault == "body":
+        control["string_data"] = "foreign body"
+    elif fault == "pubseq":
+        control["message_info_receipt"]["fields"]["publication_sequence_number"]["value"] = 999
+        control["rcl_take_receipt"]["message_info_receipt"] = deepcopy(control["message_info_receipt"])
+    elif fault == "generation":
+        control["generation"] = 2
+    elif fault == "take":
+        control["rcl_take_receipt"]["take_index"] = sample(rows, reader="r1", stamp=7001)["rcl_take_receipt"]["take_index"]
+    elif fault == "send_collision":
+        rows.append(dict(deepcopy(sends(rows)[1]), event_index=len(rows), monotonic_ns=100 + len(rows)))
+    else:
+        control["role"] = "writer2"
+    original = deepcopy(rows)
+    with pytest.raises(ValueError, match="native_delivery_identity:"):
+        native_delivery_identity(sample(rows), sends(rows), rows, ref=raw_ref)
+    assert rows == original

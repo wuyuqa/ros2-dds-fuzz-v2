@@ -300,3 +300,58 @@ def test_real_live_capsule_replay_boundary_preserves_selection_but_never_runs_dd
     assert report['observation_replay']['selection'] == {key: config[key] for key in KEYS}
     assert report['real_ros_execution'] is False and report['status'] != 'pass'
     assert replay.audit_replay(report['report_path'])['valid']
+
+
+
+def test_observer_control_replay_projection_preserves_selection_and_rejects_raw_disagreement(bound):
+    # Necessary replay carrier seam: authored capsules cannot qualify as real ROS.
+    for record in (bound.execution, bound.execution['runtime_execution_metadata'],
+                   bound.events[0]['metadata']):
+        record['observe_native_peers'] = False
+    _persist_raw(bound)
+    original = deepcopy(bound.capsule.to_dict())
+    selected = project(bound)
+    assert selected['observe_native_peers'] is False
+    assert selected['effective_input_sha256'] == bound.capsule.input['effective_input_sha256']
+    assert replay._observation_replay_declaration(bound.capsule, selected)['selection']['observe_native_peers'] is False
+    assert bound.capsule.to_dict() == original
+    bound.execution['observe_native_peers'] = True
+    with pytest.raises(ValueError, match='observation_execution_selection_mismatch'):
+        project(bound)
+
+
+@pytest.mark.parametrize('damage', ['worker_enabled', 'worker_undeclared', 'native_capture'])
+def test_observer_control_replay_rejects_worker_raw_even_when_all_metadata_agree(bound, damage):
+    for record in (bound.execution, bound.execution['runtime_execution_metadata'],
+                   bound.events[0]['metadata']):
+        record['observe_native_peers'] = False
+    row = dict(event='endpoint_created', observation_mode='instrumentation')
+    if damage == 'worker_enabled':
+        row['observe_native_peers'] = True
+    elif damage == 'native_capture':
+        row = dict(event='match_snapshot', observe_native_peers=False,
+            native_peer_observation={'schema': 'r2f.fastdds-native-matched-peer-observation/v1'})
+    bound.events.append(row)
+    _persist_raw(bound)
+    with pytest.raises(ValueError, match='native_peer_sampling_control'):
+        project(bound)
+
+
+@pytest.mark.parametrize('location', ['runtime_metadata', 'raw_metadata', 'raw_event'])
+def test_native_matching_carrier_cannot_disappear_from_replay_selection(bound, location):
+    # Necessary execution-selection seam; these are unsigned, non-DDS artifacts.
+    for record in (bound.execution, bound.execution['runtime_execution_metadata'], bound.events[0]['metadata']):
+        for key in ('observation_mode', 'fastdds_peer_instrumentation'):
+            record.pop(key, None)
+    reference = {'path': '/offline/native-matching-build.json', 'sha256': 'a' * 64}
+    if location == 'runtime_metadata':
+        bound.execution['runtime_execution_metadata']['native_matching_qos'] = reference
+    elif location == 'raw_metadata':
+        bound.events[0]['metadata']['native_matching_qos'] = reference
+    else:
+        bound.events.append({'event': 'native_partition_configuration', 'fixture': True})
+    _persist_raw(bound)
+    before = bound.raw_path.read_bytes()
+    with pytest.raises(ValueError, match='observation_execution_metadata_invalid|observation_'):
+        project(bound)
+    assert bound.raw_path.read_bytes() == before

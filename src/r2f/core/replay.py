@@ -445,8 +445,19 @@ def _topology_conformance_signature(metadata, facts, rule):
         claimed = oracle.get("forbidden_residuals")
         if not isinstance(claimed, list) or any(not isinstance(v, str) for v in claimed):
             return None
-        if set(claimed) - {"topology.pair_graph_mismatch", "topology.closed_delivery_gap"}:
+        if set(claimed) - {"topology.pair_graph_mismatch", "topology.closed_delivery_gap",
+                           "topology.identity_mismatch", "topology.cft_predicate_mismatch", "topology.topic_lookup_mismatch"}:
             return None
+        from .candidate import _topology_participant_identity
+        identity = _topology_participant_identity(metadata, events)
+        if identity is not None and identity.get("status") == "conflict":
+            residuals.add("topology.identity_mismatch")
+            for conflict in identity["conflicts"]:
+                subjects = sorted([conflict[side]["subject"] for side in ("first", "second")], key=canonical_hash)
+                anomaly = {"residual": "topology.identity_mismatch", "kind": conflict["kind"],
+                           "subjects": subjects, "initialization": identity["contract"]["initialization"]}
+                if anomaly not in anomalies:
+                    anomalies.append(anomaly)
         for pair in facts["pairs"]:
             subjects = {role: {"logical_id": pair[role], "generation": pair[role + "_generation"]}
                         for role in ("writer", "reader")}
@@ -636,6 +647,35 @@ def _topology_conformance_signature(metadata, facts, rule):
             anomalies.append(dict(subjects, residual=residual, obligation=obligation,
                                   expected=expected, missing=sorted(missing), received=sorted(received),
                                   sentinel_sequence=sentinel, reliable_history_contract=True, filter_free=True))
+        cft_signature = None
+        if (facts.get("content_filter_observations") or {}).get("declared") is True:
+            from r2f.campaign.topology_cft_observation import (
+                predicate_contract, replay_cft_observations,
+            )
+            cft_contract = predicate_contract()
+            if canonical_hash(oracle.get('cft_rule_contract')) != canonical_hash(cft_contract):
+                return None
+            cft_signature = replay_cft_observations(metadata["final_input"]["topology_program"],
+                events, facts["content_filter_observations"],
+                peer_reference=facts.get("fastdds_peer_instrumentation"),
+                ref=lambda ev: dict(path=metadata["raw_path"], sha256=metadata["raw_sha256"],
+                                    event_index=ev["event_index"]))
+            for item in cft_signature:
+                if item.get("violation") == "topology.cft_predicate_mismatch":
+                    residuals.add(item["violation"])
+                    anomalies.append(dict(item, residual=item["violation"]))
+        lookup_signature = None
+        from .candidate import _topology_topic_lookup
+        verified = _topology_topic_lookup(metadata, events)
+        if verified is not None:
+            from r2f.campaign.topology_lookup_observation import semantic_checks
+            if verified.get("unknown_reasons"):
+                return None
+            lookup_signature = semantic_checks(verified)
+            for item in lookup_signature:
+                if item.get("violation") == "topology.topic_lookup_mismatch":
+                    residuals.add(item["violation"])
+                    anomalies.append(dict(item, residual=item["violation"]))
         if verdict == "fail" and (not anomalies or residuals != set(claimed)):
             return None
         if verdict == "pass" and (anomalies or claimed):
@@ -643,7 +683,13 @@ def _topology_conformance_signature(metadata, facts, rule):
         return {"schema": TOPOLOGY_SIGNATURE_SCHEMA, "endpoint_identity_schema": TOPOLOGY_IDENTITY_SCHEMA,
                 "rule_id": rule, "target_id": _TOPOLOGY_TARGET, "target_revision": metadata["target_revision"],
                 "effective_input_sha256": metadata["effective_input_sha256"], "oracle_verdict": verdict,
-                "typed_anomaly_signature": sorted(anomalies, key=canonical_hash)}
+                "typed_anomaly_signature": sorted(anomalies, key=canonical_hash),
+                **({"cft_sample_signature": cft_signature,
+                    "cft_rule_contract_sha256": canonical_hash(oracle["cft_rule_contract"])}
+                   if cft_signature is not None else {}),
+                **({"topic_lookup_signature": lookup_signature,
+                    "lookup_rule_contract_sha256": canonical_hash(oracle["lookup_rule_contract"])}
+                   if lookup_signature is not None else {})}
     except (ValueError, KeyError, TypeError, OSError, IndexError, AttributeError):
         return None
 

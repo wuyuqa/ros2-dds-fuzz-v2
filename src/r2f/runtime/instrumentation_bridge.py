@@ -215,6 +215,11 @@ class ObservationContext:
         if self.mode not in ('blackbox', 'instrumentation'):
             raise ValueError('observation_mode must be blackbox or instrumentation')
         self.profile_policy = observation_policy(config.get('rmw'), self.mode)
+        self.observe_adopted_config = config.get('observe_adopted_config', False)
+        if type(self.observe_adopted_config) is not bool:
+            raise ValueError('observe_adopted_config must be boolean')
+        if self.observe_adopted_config and config.get('rmw') == RMW and self.mode != 'instrumentation':
+            raise ValueError('adopted config tracing requires instrumentation mode')
         domain = config.get('domain_id')
         if type(domain) is not int or not 0 <= domain <= 231:
             raise ValueError('domain_id must be an integer in 0..231')
@@ -238,7 +243,8 @@ class ObservationContext:
                 clean, digest, source = _xml(original.get('CYCLONEDDS_URI'), domain)
                 self.profiles[role] = {'non_tracing_sha256': digest, 'source': source, 'xml': clean}
                 if self.mode == 'instrumentation':
-                    trace = build_trace_config(self.directory / (role + '.trace.log'), domain_id=domain, base_xml=clean)
+                    trace = build_trace_config(self.directory / (role + '.trace.log'), domain_id=domain, base_xml=clean,
+                                               observe_adopted_config=self.observe_adopted_config)
                     if _xml(trace.xml, domain)[1] != digest:
                         raise ValueError('Tracing changed the non-Tracing profile')
                     self.trace_configs[role] = trace
@@ -263,6 +269,7 @@ class ObservationContext:
             'schema': 'r2f.runtime-observation-prepared/v1', 'observation_mode': self.mode,
             'run_id': config['run_id'], 'domain_id': domain, 'rmw': config['rmw'],
             'execution_input': self.execution_input, 'profile_policy': self.profile_policy,
+            'observe_adopted_config': self.observe_adopted_config,
             'profiles': self.profiles, 'trace_configs': {k: v.to_dict() for k, v in self.trace_configs.items()},
             'execution_metadata_only': True, 'started_unix_ns': self.started_ns,
             'observer_source_sha256': self.observer_sources,
@@ -512,6 +519,73 @@ class ObservationContext:
                 'new_run_id_required': True, 'new_domain_required': True, 'new_output_directory_required': True,
                 'execution_authority': 'existing campaign/runtime owner', 'executed_by_bridge': False}
 
+    def _adopted_settings(self, traces, result, binding_errors):
+        """Execution metadata only; configuration is never SEDP/candidate authority."""
+        summary = {'schema': 'r2f.adopted-domain-settings/v1', 'roles': {},
+                   'status': 'not_run', 'semantic_effect': 'unknown',
+                   'parser_acceptance': 'pending_real_trace',
+                   'fastdds': {'status': 'unsupported', 'execution': 'not_run'}}
+        if self.config['rmw'] != RMW:
+            summary['status'] = 'unsupported'
+            return summary
+        if not self.observe_adopted_config:
+            return summary
+        errors = list(binding_errors)
+        try:
+            prepared = json.loads(_read(self.prepared['raw_path']))
+            if (prepared['trace_configs'] != json.loads(json.dumps({k: v.to_dict() for k, v in self.trace_configs.items()}))
+                    or prepared['profiles'] != self.profiles):
+                errors.append('prepared_projection_changed')
+            if _sha(_read(result['raw_path'])) != result['raw_sha256']:
+                errors.append('runtime_raw_changed_after_collection')
+            if _observer_sources() != self.observer_sources:
+                errors.append('observer_source_changed')
+        except (OSError, ValueError, KeyError, TypeError):
+            errors.append('configuration_binding_unavailable')
+        for role, config in self.trace_configs.items():
+            worker = self.workers.get(role)
+            matches = [t for t in traces if t['config']['output_file'] == config.output_file]
+            adopted = deepcopy(matches[0]['adopted_domain_settings']) if len(matches) == 1 else {
+                'fields': {name: {'status': 'unknown', 'value': None, 'reason': 'trace_unavailable',
+                                  'references': []} for name in ('transport', 'spdp_interval')}}
+            role_errors = list(errors)
+            try:
+                captured = json.loads(_read(worker['artifact']['raw_path'])) if worker else {}
+                if not isinstance(captured, dict):
+                    role_errors.append('process_capture_not_object')
+                elif (not worker or any(captured.get(key) != worker.get(key) for key in
+                        ('role', 'pid', 'endpoint_guid', 'endpoint_event', 'process', 'audit', 'accepted'))):
+                    role_errors.append('process_capture_projection_changed')
+                trace_stat = Path(config.output_file).stat()
+                if (not worker or not worker['accepted'] or len(matches) != 1
+                        or adopted.get('provenance_status') != 'verified_vendor_process'
+                        or worker['audit'].get('trace_file_identity') != [trace_stat.st_dev, trace_stat.st_ino]
+                        or list(_stat(trace_stat)) != adopted.get('collection_identity')
+                        or _sha(_read(config.output_file)) != adopted.get('raw_sha256')):
+                    role_errors.append('trace_or_worker_binding_unverified')
+            except (OSError, ValueError, TypeError, KeyError):
+                role_errors.append('trace_unavailable')
+            adopted['endpoint_binding'] = None
+            if role_errors:
+                adopted['provenance_status'] = 'unknown'
+                for field in adopted['fields'].values():
+                    field.update(status='unknown', value=None, reason='execution_binding_unverified')
+            else:
+                adopted['endpoint_binding'] = {
+                    'role': role, 'pid': worker['pid'], 'endpoint_guid': worker['endpoint_guid'],
+                    'endpoint_generation': worker['endpoint_event']['endpoint_generation'],
+                    'endpoint_event': deepcopy(worker['endpoint_event']),
+                    'process_capture': deepcopy(worker['artifact']),
+                    'runtime_raw_path': result['raw_path'], 'runtime_raw_sha256': result['raw_sha256']}
+            adopted['binding_unknowns'] = sorted(set(role_errors))
+            adopted['unknown_fields'] = [name + ':' + f['reason'] for name, f in adopted['fields'].items()
+                                        if f['status'] == 'unknown']
+            adopted['status'] = 'unknown' if adopted['unknown_fields'] else 'observed'
+            summary['roles'][role] = adopted
+        summary['status'] = ('observed' if len(summary['roles']) == 2
+                             and all(r['status'] == 'observed' for r in summary['roles'].values()) else 'unknown')
+        return summary
+
     def collect(self, runtime_result):
         """Freeze sidecar observations; do not mutate runtime_result or its raw.
 
@@ -535,6 +609,7 @@ class ObservationContext:
                 errors.append('prepared_config_hash_mismatch')
         except (OSError, ValueError):
             errors.append('prepared_config_unavailable')
+        config_binding_errors = list(errors)
         task = self._task(result) if self.mode == 'instrumentation' else None
         traces, comparisons = [], []
         if self.mode == 'instrumentation':
@@ -608,9 +683,18 @@ class ObservationContext:
         verdict = ('unknown' if errors else 'fail' if any(e['comparison']['verdict'] == 'fail' for e in comparisons) else 'pass')
         excluded = bool(self.config.get('fault_id') or self.config.get('control_kind') or self.config.get('arm') == 'negative'
                         or (result.get('execution') or {}).get('candidate_eligible') is False)
+        adopted = self._adopted_settings(traces, result, config_binding_errors)
+        presented = {role: {'scope': 'parent_prepared',
+                           'worker_byte_read': 'not_observed',
+                           'input_xml_source': deepcopy(profile['source']),
+                           'non_tracing_sha256': profile['non_tracing_sha256'],
+                           'trace_xml_sha256': self.trace_configs[role].sha256 if role in self.trace_configs else None,
+                           'prepared': deepcopy(self.prepared)} for role, profile in self.profiles.items()}
         summary = {'schema': 'r2f.runtime-instrumentation/v1', 'observation_mode': self.mode,
                    'execution_metadata_only': True, 'run_id': self.config['run_id'],
                    'execution_input': deepcopy(self.execution_input),
+                   'presented_configuration': presented, 'adopted_domain_settings': adopted,
+                   'semantic_effect': 'unknown',
                    'profile_policy': deepcopy(self.profile_policy),
                    'actual_run': result.get('real_execution') is True,
                    'source_manifest': (result.get('execution') or {}).get('source'),

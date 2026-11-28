@@ -175,6 +175,8 @@ class _Audit:
         _require(config.get("final_input") == self.plan.final_config
                  and set(self.plan.final_config) == {"topology_program"}, "final_program_mismatch")
         self.program = self.plan.final_config["topology_program"]
+        from r2f.instrumentation.fastdds_pdp_trace.refresh import validate_declarations
+        validate_declarations(self.events, self.program, self.native_peer_reference)
         self.program_sha = canonical_hash(self.program)
         binding = _one(self.events, "input_binding")
         self.binding = binding
@@ -206,6 +208,17 @@ class _Audit:
                         or any(e.get("fixture") is True or e.get("offline_fake") is True
                                or e.get("backend") not in (None, "ros2_public_api") for e in self.events))
         self.specs = {e["logical_id"]: e for e in self.program["endpoints"]}
+        from r2f.runtime.participant_groups import enabled, destroy_receipts
+        self.group_lineage = None
+        self.group_destroys = []
+        if enabled(self.program):
+            self.group_lineage, self.group_destroys = destroy_receipts(
+                self.program, self.events, self.path, config=config)
+            _require(runtime.get('execution_metadata', {}).get('participant_groups') == self.group_lineage,
+                     'group_lineage_metadata_mismatch')
+        elif (runtime.get('execution_metadata', {}).get('schema') == 'r2f.topology-execution-metadata/v2'
+              or 'participant_groups' in runtime.get('execution_metadata', {})):
+            _require(False, 'group_metadata_without_sealed_opt_in')
         self.tokens = {}
         self.action_receipts = []
 
@@ -222,6 +235,9 @@ class _Audit:
 
     def identity(self):
         retired, seen_gids, seen_workers = set(), set(), set()
+        destroys = getattr(self, "group_destroys", ())
+        destroy_acks = {r["ack_ref"] for r in destroys}
+        destroy_controllers = {r["controller_ref"] for r in destroys}
         for event in self.events:
             kind, eid = event["event"], event.get("logical_id")
             if kind == "endpoint_created":
@@ -261,6 +277,8 @@ class _Audit:
                 self.tokens[key] = event
             elif kind in {"endpoint_destroyed", "topology_endpoint_destroyed"}:
                 key = (eid, event.get("generation"))
+                if event["event_index"] in destroy_controllers and key in retired:
+                    continue  # Same authenticated cleanup, not a second retirement.
                 _require(key in self.tokens and key not in retired, "retirement_unknown_generation")
                 token = endpoint_identity_at(self.events, self.tokens[key], before_index=event["event_index"] + 1)
                 _require(event["monotonic_ns"] >= token["identity_valid_after_ns"],
@@ -276,7 +294,8 @@ class _Audit:
                 seen_gids.add(event.get("after_gid"))
             elif kind in _WORKER_EVENTS and eid is not None and kind not in {"endpoint_create_begin", "worker_ready"}:
                 key = (eid, event.get("generation"))
-                _require(key in self.tokens and key not in retired, "worker_event_unknown_or_retired_generation")
+                _require(key in self.tokens and (key not in retired or event["event_index"] in destroy_acks),
+                         "worker_event_unknown_or_retired_generation")
                 self.bound(event, self.tokens[key])
         for event in self.events:
             if event["event"] in {"endpoint_create_begin", "worker_ready"}:
@@ -520,6 +539,35 @@ class _Audit:
                          and receipt["after"].get("alive") is True
                          and receipt["after"].get("next_sequence") == params["start_sequence"] + params["count"],
                          "action_publish_after_state_mismatch")
+            elif (op == "snapshot" and physical_before == {"alive": []}
+                  and not any(e["event"] == "command_done" for e in inside)):
+                # No worker exists to acknowledge this controller-only capture.
+                # The raw lifecycle replay above, not the receipt, proves emptiness.
+                captured = _one(inside, "topology_pair_observation", step_id="snapshot:" + aid)
+                state_before = _one(inside, "state_step_before", step_id="action:" + aid)
+                _require(inside == [state_before, captured, after]
+                         and all(k in captured for k in ("pairs", "delivery", "snapshot_command_id"))
+                         and captured["pairs"] == [] and captured["delivery"] == []
+                         and captured["snapshot_command_id"] is None
+                         and canonical_hash(receipt["after"]) ==
+                             canonical_hash({"complete": True, "snapshot_command_id": None})
+                         and receipt["requires"] == [{"id": "runtime_snapshot_receipt",
+                              "kind": "observation", "status": "satisfied"}],
+                         "action_empty_snapshot_not_raw_backed")
+                initial = {"step_id": "action:" + aid, "action": action, "before": physical_before,
+                           "after": None, "requires": [], "satisfied": None}
+                _require(all(k in state_before for k in initial)
+                         and canonical_hash({k: state_before[k] for k in initial}) == canonical_hash(initial)
+                         and all(k in after for k in receipt)
+                         and canonical_hash({k: after[k] for k in receipt}) == canonical_hash(receipt),
+                         "action_empty_snapshot_state_receipt_mismatch")
+                _chain(begin, state_before, captured, after, done)
+                controller = ("pid", "pgid", "role", "backend", "run_id", "domain_id",
+                              "monotonic_clock_identity")
+                _require(all(canonical_hash({k: e.get(k) for k in controller}) ==
+                             canonical_hash({k: self.begin.get(k) for k in controller})
+                             for e in (begin, state_before, captured, after, done)),
+                         "action_empty_snapshot_controller_mismatch")
             elif op in {"snapshot", "barrier"}:
                 _require(any(e["event"] == "command_done" for e in inside), "action_snapshot_ack_missing")
             elif op == "update_filter":
@@ -527,6 +575,13 @@ class _Audit:
                          and receipt["after"] == {**receipt["before"], "filter_update_raw_ref": evidence["update_ref"]}
                          and evidence["update_ref"] < after["event_index"],
                          "action_filter_after_state_mismatch")
+            elif op == "update_participant_userdata":
+                _require(self.specs[action["endpoint_id"]].get("role") == "writer"
+                         and receipt["before"].get("alive") is True
+                         and receipt["before"].get("generation") == action["generation"],
+                         "action_refresh_requires_current_live_writer")
+                from r2f.instrumentation.fastdds_pdp_trace.refresh import validate_action
+                validate_action(self.events, action, receipt, begin, done, self.native_peer_reference, raw_path=self.path)
             elif op == "assert_liveliness":
                 _require(self.specs[action["endpoint_id"]].get("role") == "writer",
                          "action_assert_requires_writer")
@@ -595,7 +650,7 @@ class _Audit:
                 "send_ref": self.ref(sent), "receive_ref": self.ref(event)}
 
 
-def _source_qualification(audit, *, before=None):
+def _source_qualification(audit, *, before=None, capture_source=None):
     """Reopen source and independently bind every producer phase to raw order.
 
     Admission uses only its own prefix. Final qualification additionally needs
@@ -607,7 +662,14 @@ def _source_qualification(audit, *, before=None):
         return False
     try:
         from .identity import source_manifest
-        _require(source == source_manifest(Path(source["source_repo"])), "source_changed")
+        if capture_source is None:
+            _require(source == source_manifest(Path(source["source_repo"])), "source_changed")
+        else:
+            # Explicit archival reconstruction validates the immutable capture,
+            # not the checkout that happened to occupy this path at capture time.
+            # Runtime callers use the default current-source measurement.
+            _require(isinstance(capture_source, dict) and source == capture_source,
+                     "saved_capture_source_mismatch")
         checks = [e for e in audit.events if e["event"] == "topology_source_checked"]
         if before is not None:
             checks = [e for e in checks if e["event_index"] < before["event_index"]
@@ -649,7 +711,7 @@ def _application(audit):
         from r2f.runtime.topology_route import audit_topology_application
     except ImportError:
         return {"status": "unknown", "reason": "topology_application_auditor_unavailable"}
-    application = audit_topology_application(audit.plan, audit.layers, audit.runtime)
+    application = audit_topology_application(audit.plan, audit.layers, audit.runtime, config=audit.config)
     computed = application.get("mutation_receipt")
     application["canonical_receipt_matches"] = (isinstance(computed, dict)
         and {k: computed.get(k) for k in MutationReceipt.field_names()} == audit.mutation.to_dict())
@@ -687,7 +749,7 @@ def _pair_facts(audit, projection, deliveries):
             if len(values) >= 2 and all(v == values[0] for v in values):
                 policies[eid] = values[0]
         row["reliable_history_contract"] = (len(policies) == 2 and all(
-            p.get("reliability") == "reliable" and (p.get("history") == "keep_all"
+            isinstance(p, dict) and p.get("reliability") == "reliable" and (p.get("history") == "keep_all"
                 or p.get("history") == "keep_last" and _integer(p.get("depth"), max(1, len(expected))))
             for p in policies.values()))
         # A dynamic update may alter filtering even when the initial spec was empty.
@@ -1172,6 +1234,141 @@ def _history_windows_for_pairs(audit, projection, deliveries, live_pairs, scope)
 
 
 
+
+def _retired_reader_history_windows(audit, pairs, projection, deliveries):
+    """Reconcile a replaced process reader only through its own retirement.
+
+    The writer must remain in the same live generation. A closed window needs
+    the old reader's authenticated cleanup, successful worker exit, and fresh
+    successor before the final boundary. Missing closes/proofs stay explicit.
+    Participant-control and both-peer episode paths keep their own contracts.
+    """
+    if audit.group_lineage is not None:
+        return []
+    boundary = audit.resolve(projection["receipt"]["after"]["boundary_ref"])
+    if boundary.get("lifecycle_complete") is not True:
+        return []
+    final = {e["logical_id"]: e for e in projection["state_after"]["endpoints"]}
+    live_writers = {(p["writer"], p.get("writer_generation")) for p in pairs
+                    if final.get(p["writer"], {}).get("liveness") == "alive"}
+    keys, retirement_refs = set(), {}
+    for event in audit.events[:boundary["event_index"] + 1]:
+        if event["event"] not in {"topology_delivery_window_open", "topology_delivery_window_closed"}:
+            continue
+        w, wg, r, rg = (event.get(k) for k in ("writer", "writer_generation", "reader", "reader_generation"))
+        if ((w, wg) not in live_writers or final.get(r, {}).get("generation") == rg
+                or (r, rg + 1) not in audit.tokens):
+            continue
+        key = (w, wg, r, rg)
+        keys.add(key)
+        if event["event"] != "topology_delivery_window_closed":
+            continue
+        try:
+            token, successor = audit.tokens[(r, rg)], audit.tokens[(r, rg + 1)]
+            retired = [e for e in audit.events[:boundary["event_index"] + 1]
+                       if e["event"] in {"endpoint_destroyed", "topology_endpoint_destroyed"}
+                       and e.get("logical_id") == r and e.get("generation") == rg]
+            exited = [e for e in audit.events[:boundary["event_index"] + 1]
+                      if e["event"] == "topology_worker_exit"
+                      and e.get("logical_id") == r and e.get("generation") == rg]
+            _require(len(retired) == len(exited) == 1, "reader_history_retirement_or_exit_missing")
+            retired, exited = retired[0], exited[0]
+            _chain(token, event, retired, successor, boundary)
+            _chain(token, event, exited, successor, boundary)
+            identity = endpoint_identity_at(audit.events, token, before_index=retired["event_index"] + 1)
+            _require(retired.get("cleanup_status") == "closed" and exited.get("returncode") == 0
+                     and all(all(e.get(k) == identity.get(k) for k in (*_LINEAGE, "endpoint_gid"))
+                             for e in (retired, exited)), "reader_history_retirement_identity_incomplete")
+            fresh = endpoint_identity_at(audit.events, successor, before_index=boundary["event_index"] + 1)
+            _require(fresh["endpoint_gid"] != identity["endpoint_gid"]
+                     and (fresh["pid"], fresh["process_start_ticks"])
+                         != (identity["pid"], identity["process_start_ticks"]),
+                     "reader_history_successor_not_fresh")
+            retirement_refs[event["event_index"]] = {
+                "retirement": audit.ref(retired), "worker_exit": audit.ref(exited),
+                "successor": audit.ref(successor), "successor_identity": audit.ref(audit.events[fresh["identity_valid_after_ref"]])}
+        except (ValueError, KeyError, TypeError, IndexError):
+            continue
+    windows = _history_windows_for_pairs(audit, projection, deliveries, keys,
+                                        "verified_replaced_reader_historical_window")
+    for row in windows:
+        proof = retirement_refs.get((row.get("close_ref") or {}).get("event_index"))
+        row["reader_retirement_refs"] = proof
+        if proof is None:
+            row.update(window_projection_valid=False, delivery_closure="unknown",
+                       delivery_window_identity_complete=False, delivery_witnesses=[],
+                       reason="reader_history_close_without_qualified_retirement")
+            if "proofs" in row:
+                row["proofs"]["delivery_closure"].update(status="unknown", value="unknown")
+    return windows
+
+
+def _participant_group_history_windows(audit, projection, deliveries):
+    """Reconcile group history only through authenticated, pre-boundary cleanup.
+
+    A surviving peer keeps its exact final incarnation; every retired peer needs
+    its own closed destroy operation after this window. Whole-run group lineage
+    was audited independently, and no incomplete boundary is upgraded here.
+    """
+    if audit.group_lineage is None:
+        return []
+    boundary = audit.resolve(projection["receipt"]["after"]["boundary_ref"])
+    if boundary.get("lifecycle_complete") is not True:
+        return []
+    final = {e["logical_id"]: e for e in projection["state_after"]["endpoints"]}
+    retired = {(audit.events[r["cleanup_ref"]]["logical_id"],
+                audit.events[r["cleanup_ref"]]["generation"]): r
+               for r in audit.group_destroys if r["action_done_ref"] < boundary["event_index"]
+               and audit.events[r["action_done_ref"]]["monotonic_ns"] <= boundary["monotonic_ns"]}
+    pending_pairs, refs = set(), {}
+    # Opens identify obligations to inspect, but only an authenticated close
+    # before retirement can qualify a window. Missing closes stay unknown.
+    for event in audit.events[:boundary["event_index"] + 1]:
+        if event.get("event") not in {"topology_delivery_window_open", "topology_delivery_window_closed"}:
+            continue
+        key = (event.get("writer"), event.get("writer_generation"),
+               event.get("reader"), event.get("reader_generation"))
+        proofs = []
+        for eid, generation in ((key[0], key[1]), (key[2], key[3])):
+            receipt = retired.get((eid, generation))
+            if receipt is not None:
+                request = audit.events[receipt["request_ref"]]
+                if (event["event_index"] >= request["event_index"]
+                        or event["monotonic_ns"] > request["monotonic_ns"]):
+                    break
+                proofs.append(receipt)
+            elif (final.get(eid, {}).get("liveness") != "alive"
+                  or final[eid].get("generation") != generation):
+                break
+        else:
+            if proofs:
+                pending_pairs.add(key)
+                if event["event"] == "topology_delivery_window_closed":
+                    refs[event["event_index"]] = proofs
+    windows = _history_windows_for_pairs(audit, projection, deliveries, pending_pairs,
+        "participant_control_verified_retirement_historical_window")
+    for row in windows:
+        row["destroy_operation_refs"] = [
+            {name: audit.ref(audit.events[index]) for name, index in receipt.items()}
+            for receipt in refs.get((row.get("close_ref") or {}).get("event_index"), [])]
+        if row.get("close_ref") is not None and not row["destroy_operation_refs"]:
+            row.update(window_projection_valid=False, delivery_closure="unknown",
+                       delivery_window_identity_complete=False, delivery_witnesses=[],
+                       reason="group_history_close_without_qualified_destroy")
+            if "proofs" in row:
+                row["proofs"]["delivery_closure"].update(status="unknown", value="unknown")
+    return windows
+
+
+def _participant_group_send_coverage(audit, group_windows, live_windows, send):
+    if not group_windows:
+        return None
+    coverage = _live_history_send_coverage(audit, group_windows + live_windows, send)
+    if coverage is not None:
+        coverage["scope"] = "received_sample_in_verified_participant_control_historical_windows"
+    return coverage
+
+
 def _retired_episode_history_windows(audit, projection, deliveries, episode_observation):
     """Only opt-in completed episodes may reconcile a retired BOTH-peer window.
 
@@ -1354,9 +1551,18 @@ def _live_history_send_coverage(audit, windows, send, *, filter_decisions=()):
                       "received_sample_in_still_live_generation_historical_windows")}
 
 
-def facts_from_events(events, runtime, config):
+def facts_from_events(events, runtime, config, *, capture_source=None):
     """Produce typed facts from persisted raw. All missing evidence is explicit."""
+    pdp_control = isinstance(events, list) and any(
+        isinstance(event, dict) and event.get("event") == "native_pdp_provider_selected"
+        and event.get("capture_enabled") is False for event in events)
+    refresh_control = (isinstance(events, list) and any(
+        isinstance(event, dict) and event.get("event") in {"participant_refresh_observation", "participant_refresh_result"} for event in events))
+    refresh_control = refresh_control or (isinstance(config.get("topology_program"), dict) and any(
+        isinstance(action, dict) and action.get("op") == "update_participant_userdata"
+        for action in config["topology_program"].get("actions", [])))
     facts = {"schema": SCHEMA, "producer_id": TOPOLOGY_FACT_PRODUCER, "target_id": TOPOLOGY_TARGET,
+             "control_excluded": pdp_control or refresh_control,
              "environment_healthy": False, "process_healthy": False, "preconditions_reached": False,
              "endpoint_identity_complete": False, "observed_effects": [], "candidate_eligible": False,
              "seal_eligible": False, "execution_evidence": False, "diagnostic_valid": False,
@@ -1366,9 +1572,12 @@ def facts_from_events(events, runtime, config):
         if a.native_peer_reference is not None:
             facts.update(observation_mode="instrumentation",
                          fastdds_peer_instrumentation=a.native_peer_reference)
+            if "observe_native_peers" in config:
+                facts["observe_native_peers"] = config["observe_native_peers"]
         facts.update(raw={"path": a.path, "sha256": a.sha}, program_sha256=a.program_sha,
                      plan_hash=a.plan.plan_hash(), fixture=a.fixture, arm=config.get("arm"),
-                     control_excluded=(config.get("arm") == "negative" or bool(config.get("control_kind"))
+                     control_excluded=(pdp_control or refresh_control or config.get("observe_native_peers") is False
+                        or config.get("arm") == "negative" or bool(config.get("control_kind"))
                         or config.get("candidate_source") == "control"
                         or any(e["event"] in {"fault_control_receipt", "harness_omission", "topology_guard_reject"} for e in a.events)),
                      input_binding_ref=a.ref(a.binding))
@@ -1380,8 +1589,24 @@ def facts_from_events(events, runtime, config):
             facts["guard_rejected_by"] = "harness"
             facts["guard_refs"] = [a.ref(e) for e in guard]
         facts["endpoint_lineage"] = a.identity()
+        if a.group_lineage is not None:
+            facts['participant_group_observations'] = snapshot(a.group_lineage['observations'])
+            facts['participant_group_relation'] = {
+                'observed': a.group_lineage['group_relation_observed'],
+                'supporting_diagnostic': True, 'candidate_eligible': False}
+        from .participant_identity import audit_participant_identity
+        identity_audit = audit_participant_identity(a)
+        if identity_audit is not None:
+            facts["participant_identity"] = identity_audit
         facts["endpoint_identity_complete"] = True
+        from .topology_cft_observation import content_filter_observations
+        facts["content_filter_observations"] = content_filter_observations(
+            a.program, a.events, decisions=None, deliveries=[], ref=a.ref, fixture=a.fixture)
         facts["action_receipts"] = a.actions()
+        if any(action["op"] == "lookup_topic" for action in a.program["actions"]):
+            from .topology_lookup_observation import lookup_observations
+            facts["topic_lookup_observations"] = lookup_observations(a.program, a.events, ref=a.ref)
+
         groups = sorted({x["params"]["concurrency_group"] for x in a.program["actions"]
                          if x.get("params", {}).get("concurrency_group") is not None})
         if groups:
@@ -1405,9 +1630,35 @@ def facts_from_events(events, runtime, config):
                 facts["unknown_reasons"].append(str(exc))
         facts["unknown_reasons_sample_identity"] = list(facts["unknown_reasons"])
         facts["pairs"] = _pair_facts(a, projection, facts["deliveries"])
+        if config.get("native_matching_qos") is not None:
+            from r2f.runtime.matching_qos import audit_run
+            facts["matching_boundary"] = audit_run(a.program, a.events, config, fixture=a.fixture)
+            facts["matching_boundary"]["pairs"] = [{
+                "writer": pair["writer"], "reader": pair["reader"],
+                "compatibility": pair["compatibility"], "observed_match": pair["observed_match"],
+                "delivery_closure": pair["delivery_closure"],
+                "policy_scope": pair.get("proofs", {}).get("compatibility", {}).get("detail", {}).get("policy_scope"),
+                "raw_refs": pair.get("proofs", {}).get("compatibility", {}).get("refs", [])}
+                for pair in facts["pairs"]]
+            gaps = [gap for pair in facts["matching_boundary"]["pairs"]
+                    for gap in (pair.get("policy_scope") or {}).get("observation_gaps", [])]
+            facts["matching_boundary"]["observation_gaps"] = gaps
+            facts["matching_observation_incomplete"] = bool(gaps)
+            facts["unknown_reasons"].extend(gaps)
+        from r2f.runtime.native_matching import audit_run as audit_native_controls
+        controls = audit_native_controls(a.program, a.events, fixture=a.fixture, rmw=config.get("rmw"), raw_path=a.path)
+        if controls:
+            facts["native_matching_controls"] = controls
+            gaps = [c.get("reason", "native_matching_control_incomplete") for c in controls if c["status"] == "unknown"]
+            gaps.extend(gap for c in controls for gap in c.get("observation_gaps", []))
+            facts["matching_observation_incomplete"] = bool(facts.get("matching_observation_incomplete") or gaps)
+            facts["unknown_reasons"].extend(gaps)
         empty_windows = _historical_no_obligation_windows(a, facts["pairs"], projection)
         historical = _recreated_history_windows(a, facts["pairs"], projection, facts["deliveries"])
         facts["historical_live_windows"] = _live_history_windows(a, facts["pairs"], projection, facts["deliveries"])
+        facts["historical_retired_reader_windows"] = _retired_reader_history_windows(a, facts["pairs"], projection, facts["deliveries"])
+        facts["historical_participant_group_windows"] = _participant_group_history_windows(
+            a, projection, facts["deliveries"])
         if "episode" in a.program:
             from .topology_episode import audit_topology_episode
             facts["episode_observation"] = audit_topology_episode(a.program, runtime, config)
@@ -1418,6 +1669,9 @@ def facts_from_events(events, runtime, config):
         facts["native_filter_decision_evidence"] = native_filter_decision_evidence(
             a.program, a.events, peer_reference=a.native_peer_reference, ref=a.ref)
         decision_evidence = facts["native_filter_decision_evidence"]
+        facts["content_filter_observations"] = content_filter_observations(
+            a.program, a.events, decisions=facts["native_filter_decision_evidence"],
+            deliveries=facts["deliveries"], ref=a.ref, fixture=a.fixture)
         # A declared capture with partial/broken worker provenance cannot waive
         # a historical delivery obligation using its surviving subset.
         filter_decisions = decision_evidence["observations"] if not decision_evidence["unknowns"] else []
@@ -1430,6 +1684,12 @@ def facts_from_events(events, runtime, config):
             for p in facts["pairs"])}
         facts["historical_send_coverage"] = [coverage for send in sends
             if (coverage := (_recreated_history_send_coverage(a, historical, send)
+                             or (_participant_group_send_coverage(a, facts["historical_participant_group_windows"],
+                                                                 facts["historical_live_windows"], send)
+                                 if send["event_index"] not in current_window_sends else None)
+                             or (_live_history_send_coverage(a, facts["historical_retired_reader_windows"]
+                                                                 + facts["historical_live_windows"], send)
+                                 if facts["historical_retired_reader_windows"] and send["event_index"] not in current_window_sends else None)
                              or (_retired_episode_send_coverage(a, facts["retired_episode_history_windows"], send)
                                  if "episode_observation" in facts else None)
                              or (_live_history_send_coverage(a, facts["historical_live_windows"], send,
@@ -1439,22 +1699,37 @@ def facts_from_events(events, runtime, config):
             row["filter_decision_evidence"] for coverage in facts["historical_send_coverage"]
             for row in coverage["reader_windows"] if "filter_decision_evidence" in row]
         covered_history = {c["send_ref"]["event_index"] for c in facts["historical_send_coverage"]}
+        # A current label avoids double-counting, not the obligations to every
+        # reader alive at send time (including retired peers and overlaps).
+        qualified_current_window_sends = current_window_sends if (a.group_lineage is None
+            and not facts["historical_retired_reader_windows"]) else {
+            s["event_index"] for s in sends if s["event_index"] in current_window_sends
+            and _live_history_send_coverage(a, facts["historical_participant_group_windows"]
+                                           + facts["historical_retired_reader_windows"]
+                                           + facts["historical_live_windows"], s) is not None}
         facts["unresolved_historical_obligations"] = [a.ref(s) for s in sends
-            if s["event_index"] not in current_window_sends and not _no_obligation_send_covered(a, empty_windows, s)
+            if s["event_index"] not in qualified_current_window_sends and not _no_obligation_send_covered(a, empty_windows, s)
             and s["event_index"] not in covered_history]
         facts["application_audit"] = _application(a)
-        facts["source_provenance_qualified"] = _source_qualification(a)
+        facts["source_provenance_qualified"] = _source_qualification(a, capture_source=capture_source)
         facts["execution_evidence"] = not a.fixture
         env = [e for e in a.events if e["event"] == "environment_preflight"]
         locks = [e for e in a.events if e["event"] == "isolation_locks_acquired"]
         facts["environment_healthy"] = (not a.fixture and len(env) == 1 and env[0].get("ok") is True
                                          and len(locks) == 1 and bool(locks[0].get("locks")))
-        exits = [e for e in a.events if e["event"] == "topology_worker_exit"]
-        facts["process_healthy"] = (not facts["tool_error"] and len(exits) == len(a.tokens)
-            and len({tuple(e.get(k) for k in _LINEAGE) for e in exits}) == len(exits)
-            and all(e.get("returncode") == 0 and (e.get("logical_id"), e.get("generation")) in a.tokens
-                    and all(e.get(k) == a.tokens[(e["logical_id"], e["generation"])][k] for k in _LINEAGE)
-                    for e in exits) and a.end.get("cleanup_complete") is True)
+        if a.group_lineage is not None:
+            # _Audit independently authenticates the sealed opt-in raw lineage:
+            # one clean exit per process, context shutdown, and every endpoint's
+            # cleanup. Shared endpoints must not invent per-endpoint exits.
+            facts["process_healthy"] = (not facts["tool_error"]
+                and a.end.get("cleanup_complete") is True)
+        else:
+            exits = [e for e in a.events if e["event"] == "topology_worker_exit"]
+            facts["process_healthy"] = (not facts["tool_error"] and len(exits) == len(a.tokens)
+                and len({tuple(e.get(k) for k in _LINEAGE) for e in exits}) == len(exits)
+                and all(e.get("returncode") == 0 and (e.get("logical_id"), e.get("generation")) in a.tokens
+                        and all(e.get(k) == a.tokens[(e["logical_id"], e["generation"])][k] for k in _LINEAGE)
+                        for e in exits) and a.end.get("cleanup_complete") is True)
         # Precondition execution is separately checked against the actual target
         # in canonical_receipts; no helper boolean qualifies a step here.
         try:
@@ -1462,7 +1737,8 @@ def facts_from_events(events, runtime, config):
             from r2f.modules.s1.topology_targets import topology_target_declaration
             scenario = Scenario(topology_target_declaration(), config["rmw"], config["arm"],
                                 config.get("repeat", 0), mutation_plan=a.plan)
-            facts["canonical_step_receipts"] = canonical_receipts(scenario, runtime, events, config=config)
+            facts["canonical_step_receipts"] = canonical_receipts(
+                scenario, runtime, events, config=config, capture_source=capture_source)
             facts["preconditions_reached"] = len(facts["canonical_step_receipts"]) == len(scenario.state_steps)
         except (ValueError, KeyError, TypeError, OSError) as exc:
             facts["canonical_receipt_error"] = str(exc)
@@ -1471,7 +1747,8 @@ def facts_from_events(events, runtime, config):
             and facts["source_provenance_qualified"] and facts["preconditions_reached"] and not facts["control_excluded"]
             and facts["application_audit"].get("status") == "application_observed"
             and facts["application_audit"].get("execution_evidence") is True
-            and facts["application_audit"].get("canonical_receipt_matches") is True)
+            and facts["application_audit"].get("canonical_receipt_matches") is True
+            and not facts.get("matching_observation_incomplete"))
         if "episode_observation" in facts:
             observation = facts["episode_observation"]
             facts["candidate_eligible"] = (facts["candidate_eligible"] and observation["completed"]
@@ -1492,6 +1769,10 @@ def facts_from_events(events, runtime, config):
         TOPOLOGY_FACT_GRAPH: None, TOPOLOGY_FACT_DELIVERY: None,
         TOPOLOGY_FACT_GUARDS: None,
     }
+    if "participant_identity" in facts:
+        status = facts["participant_identity"]["status"]
+        facts["fact_values"][TOPOLOGY_FACT_IDENTITY] = (True if status == "consistent" else
+            False if status == "conflict" else None)
     from r2f.modules.s1.topology_oracles import resolve_fact
     for fact_id in (TOPOLOGY_FACT_GRAPH, TOPOLOGY_FACT_DELIVERY, TOPOLOGY_FACT_GUARDS):
         facts["fact_values"][fact_id] = resolve_fact(fact_id, facts)
@@ -1502,7 +1783,7 @@ def facts_from_events(events, runtime, config):
     return facts
 
 
-def canonical_receipts(scenario, runtime, events, *, config=None):
+def canonical_receipts(scenario, runtime, events, *, config=None, capture_source=None):
     """Raw-backed core StepReceipts, with independently established requires.
 
     This does not advance execution stages. Fixtures can be audited, but cannot
@@ -1522,7 +1803,7 @@ def canonical_receipts(scenario, runtime, events, *, config=None):
     first = _one(a.events, "state_step_before", step_id="admit_topology")
     _chain(env, first)
     _chain(locks, first)
-    source_ok = _source_qualification(a, before=first)
+    source_ok = _source_qualification(a, before=first, capture_source=capture_source)
     state = {"environment_ok": env.get("ok") is True, "locks_held": bool(locks.get("locks")),
              "source_identity_ok": source_ok, "topology_capability_admitted": True}
     receipts = []
@@ -1568,8 +1849,11 @@ def canonical_receipts(scenario, runtime, events, *, config=None):
 class TopologyFactProducer:
     id = TOPOLOGY_FACT_PRODUCER
 
-    def produce(self, raw):
-        return facts_from_events(raw["events"], raw["runtime"], raw["config"])
+    def produce(self, raw, *, capture_source=None):
+        if capture_source is None:
+            return facts_from_events(raw["events"], raw["runtime"], raw["config"])
+        return facts_from_events(raw["events"], raw["runtime"], raw["config"],
+                                 capture_source=capture_source)
 
 
 # Spelled-out aliases retained for the registry handoff, not target aliases.

@@ -125,9 +125,11 @@ def semantic_input(arm, parameters=None, *, target_id="discovery.late_endpoint")
     recovery = target_id == "discovery.interruption_recovery"
     discovery_defaults = {"drop_duration_sec": 3.0, "recovery_timeout_sec": 8.0, "counter_interval_sec": 0.25}
     if recovery:
-        supported |= set(discovery_defaults)
+        supported |= set(discovery_defaults) | {"observe_participant_leases"}
     if set(p) - supported:
         raise ValueError("unknown semantic parameter(s): " + ",".join(sorted(set(p) - supported)))
+    if "observe_participant_leases" in p and type(p["observe_participant_leases"]) is not bool:
+        raise ValueError("observe_participant_leases must be a bool")
     base_delay = p.get("baseline_reader_delay_sec", 0.02)
     result = {
         "topic": p.get("topic", "/r2f/s1/discovery_recovery" if recovery else "/r2f/s1/late_endpoint"), "message_type": "std_msgs/msg/String",
@@ -146,6 +148,9 @@ def semantic_input(arm, parameters=None, *, target_id="discovery.late_endpoint")
         raise ValueError("post_match_count requires an intermediate omission and a later sentinel")
     if recovery:
         result.update({key: p.get(key, default) for key, default in discovery_defaults.items()})
+        # Supporting advertisement observation only; omission preserves legacy identity.
+        if "observe_participant_leases" in p:
+            result["observe_participant_leases"] = p["observe_participant_leases"]
     reject_execution_identity(result)
     return result
 
@@ -195,7 +200,7 @@ def projection_input(arm, parameters=None):
     """Initial fourth-target payload; no execution/source paths enter identity."""
     from copy import deepcopy
     p = dict(parameters or {})
-    supported = {"topic", "baseline_qos", "variant_qos", "match_timeout_sec", "startup_timeout_sec", "projection_timeout_sec"}
+    supported = {"topic", "baseline_qos", "variant_qos", "match_timeout_sec", "startup_timeout_sec", "projection_timeout_sec", "projection_discovery_layers", "projection_discovery_tools", "projection_sut_environment"}
     if set(p) - supported:
         raise ValueError("unknown projection parameters: " + ",".join(sorted(set(p) - supported)))
     baseline = deepcopy(p.get("baseline_qos", {"reliability": "reliable", "durability": "volatile", "depth": 64,
@@ -209,5 +214,19 @@ def projection_input(arm, parameters=None):
               "match_timeout_sec": p.get("match_timeout_sec", 8.0), "startup_timeout_sec": p.get("startup_timeout_sec", 10.0),
               "projection_timeout_sec": p.get("projection_timeout_sec", 8.0),
               "fault_id": "controlled_projection_field_mismatch" if arm == "negative" else None}
+    if "projection_discovery_layers" in p:
+        from r2f.runtime.discovery_profiles import validate_discovery_layers
+        # Validate the observation token here; runtime_config separately checks
+        # the actual cell RMW and continues to reject non-Cyclone admission.
+        validate_discovery_layers(p["projection_discovery_layers"], "rmw_cyclonedds_cpp")
+        result["projection_discovery_layers"] = p["projection_discovery_layers"]
+    if "projection_discovery_tools" in p:
+        from r2f.runtime.discovery_tools import validate_tools_reference
+        result["projection_discovery_tools"] = deepcopy(p["projection_discovery_tools"])
+        validate_tools_reference(result)
+    if "projection_sut_environment" in p:
+        from r2f.runtime.projection_sut import validate_sut_reference
+        result["projection_sut_environment"] = deepcopy(p["projection_sut_environment"])
+        validate_sut_reference(result)
     reject_execution_identity(result)
     return result

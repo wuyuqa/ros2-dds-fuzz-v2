@@ -96,12 +96,20 @@ def evaluate_topology(scenario, facts):
     if facts.get("endpoint_identity_complete") is not True:
         result["reason_codes"] = ["topology_endpoint_identity_incomplete"]
         return _assessed_result(scenario, facts, result)
+    identity = facts.get("participant_identity")
+    identity_unknown = identity is not None and identity.get("status") not in {"consistent", "conflict"}
+    if identity is not None:
+        result["participant_identity"] = identity
     # Supporting diagnostics only: no ordering residual is declared in the
     # frozen target rule. Do not fold this observation into its verdict/facts.
     result["ordering_observations"] = [pair["ordering_observation"]
         for pair in facts.get("pairs", []) if "ordering_observation" in pair]
     result["ordering_oracle_coverage"] = "not_declared_by_target_rule"
     graph_values, delivery_values, reasons, residuals = [], [], [], []
+    if identity is not None and identity.get("status") == "conflict":
+        residuals.append("topology.identity_mismatch")
+    if identity_unknown:
+        reasons.append("participant_identity_observation_incomplete")
     for pair in facts.get("pairs", []):
         detail = {"writer": pair["writer"], "reader": pair["reader"],
                   "writer_generation": pair.get("writer_generation"), "reader_generation": pair.get("reader_generation"),
@@ -147,13 +155,49 @@ def evaluate_topology(scenario, facts):
             delivery_values.append(None)
             reasons.append("finite_tail_or_delivery_contract_unknown" if closure in {"open", "closed_with_gap"}
                            else "per_writer_delivery_identity_unknown")
+    lookup = facts.get("topic_lookup_observations") or {}
+    lookup_unknown = bool(lookup.get("unknown_reasons"))
+    if lookup.get("declared") is True:
+        from .topology_lookup_contract import predicate_contract as lookup_contract, RESIDUAL as LOOKUP_RESIDUAL
+        from r2f.campaign.topology_lookup_observation import semantic_checks
+        result["lookup_rule_contract"] = lookup_contract()
+        result["lookup_checks"] = semantic_checks(lookup)
+        residuals.extend(c["violation"] for c in lookup.get("checks", [])
+                         if c.get("status") == "mismatch" and c.get("violation") == LOOKUP_RESIDUAL)
+        if lookup_unknown:
+            reasons.append("topic_lookup_observation_incomplete")
+    cft = facts.get("content_filter_observations") or {}
+    checks = cft.get("sample_observations", [])
+    if cft.get("declared") is True:
+        from .topology_cft_contract import predicate_contract
+        result["cft_rule_contract"] = predicate_contract()
+    result["cft_sample_checks"] = [{k: item.get(k) for k in (
+        "action_id", "writer", "writer_generation", "reader", "reader_generation", "sequence",
+        "status", "expected_decision", "actual_decision", "violation", "send_ref")}
+        for item in checks]
+    result["cft_review_required"] = cft.get("review_required") is True
+    residuals.extend(item["violation"] for item in checks
+        if item.get("violation") == "topology.cft_predicate_mismatch"
+        and item.get("sample_effect_observed") is True and item.get("status") != "evidence_conflict")
+    for control in facts.get("native_matching_controls", []):
+        if control["status"] == "fail":
+            graph_values.append(False)
+            residuals.append("topology.pair_graph_mismatch")
+            reasons.append(control["reason"])
+        elif control["status"] == "pass":
+            graph_values.append(True)
+        elif control["status"] == "unknown":
+            graph_values.append(None)
+            reasons.append(control.get("reason", "native_matching_control_incomplete"))
+        # Explicit vendor unsupported is retained in facts, never a SUT failure.
     values = dict(facts["fact_values"])
     values[TOPOLOGY_FACT_GRAPH] = _aggregate(graph_values)
     values[TOPOLOGY_FACT_DELIVERY] = _aggregate(delivery_values)
     values[TOPOLOGY_FACT_GUARDS] = True if facts.get("action_receipts") else None
     result["fact_values"] = values
     excluded = facts.get("fixture") is True or facts.get("control_excluded") is True or scenario.arm == "negative"
-    result["diagnostic_only"] = excluded or facts.get("source_provenance_qualified") is not True
+    result["diagnostic_only"] = (excluded or facts.get("source_provenance_qualified") is not True
+                                 or bool(facts.get("matching_observation_incomplete")))
     # Forbidden residuals outrank allowed effects AND unrelated unknown pairs.
     # A fail is a diagnostic rule violation, never by itself a natural candidate.
     if residuals:
@@ -163,10 +207,12 @@ def evaluate_topology(scenario, facts):
     elif graph_values and values[TOPOLOGY_FACT_GRAPH] is True \
             and (not delivery_values or values[TOPOLOGY_FACT_DELIVERY] is True) \
             and not facts.get("unknown_reasons_sample_identity") \
-            and not facts.get("unresolved_historical_obligations"):
+            and not facts.get("unresolved_historical_obligations") and not identity_unknown \
+            and not facts.get("matching_observation_incomplete") and not lookup_unknown:
         result.update(verdict="pass", reason_codes=["bounded_observed_topology_consistency"],
                       observed_effects=["observed_consistency"], effect_id=TOPOLOGY_EFFECT)
-    elif not graph_values and not delivery_values and not facts.get("unresolved_historical_obligations"):
+    elif not graph_values and not delivery_values and not facts.get("unresolved_historical_obligations") and not identity_unknown \
+            and not facts.get("matching_observation_incomplete") and not lookup_unknown:
         result.update(verdict="not_applicable", reason_codes=["no_applicable_pair_obligation"])
     else:
         result["reason_codes"] = sorted(set(reasons or ["topology_evidence_incomplete"]))
